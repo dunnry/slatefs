@@ -24,8 +24,26 @@ striped lock manager + advisory byte-range locks (DD-5), `slatefs fsck
 reference FS, errno-exact) and a crash-consistency loop (abort →
 reopen/reap → clean fsck), both scaled up nightly in CI.
 
-Next: Phase 2 — the NFSv3 frontend (library spike, exports, pjdfstest/fsx
-over a kernel mount) per plan §14.
+**Phase 2 in progress** (NFSv3 frontend): library spike decided —
+`nfs3_server` 0.11 (BSD-3-Clause; real u64 readdir cookies, WRITE
+`stable_how` + COMMIT for the DD-7 durability mapping, READDIRPLUS,
+restart-stable custom file handles; see `slatefs-nfs/src/lib.rs` for the
+full rationale). Implemented: HMAC'd file handles (`{fsid, ino, gen}` under
+a control-plane server key), the full `Vfs → NfsFileSystem` adapter,
+`[[exports]]` config + `slatefsd` listeners, and an in-process wire-level
+integration suite via `nfs3_client` (no root needed): UNSTABLE/COMMIT,
+cookie pagination, server-restart handle survival, DQUOT, forged-handle
+rejection. A real Linux kernel-client mount test runs in CI
+(`scripts/nfs-kernel-mount-test.sh`).
+
+Remaining for Phase 2 AC: vendored patch (or upstream PR) for per-request
+AUTH_UNIX credentials, LINK/MKNOD, and a quota-aware FSSTAT hook in
+nfs3_server; then the pjdfstest/fsx/fsstress runs.
+
+> Testing against kernel NFS clients: always mount with
+> `soft,intr,timeo=…` and bound every command touching the mountpoint
+> with a timeout — a `hard,nointr` mount to a misbehaving dev server
+> wedges macOS's global NFS client state until reboot/root intervention.
 
 ## Workspace
 

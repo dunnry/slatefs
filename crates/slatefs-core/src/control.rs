@@ -292,4 +292,17 @@ impl ControlPlane {
             &record.wrapped_dek,
         )
     }
+
+    /// Server key that HMACs NFS file handles (plan §5) so handles can't be
+    /// forged across tenants. Created lazily, shared by every node of the
+    /// deployment, at rest only inside the encrypted control DB.
+    pub async fn server_fh_key(&self) -> Result<Secret32> {
+        const KEY: &[u8] = b"k/fhmac";
+        if let Some(bytes) = self.db.get(KEY).await? {
+            return Secret32::try_from_slice(&bytes);
+        }
+        let key = Secret32::generate();
+        self.db.put(KEY, key.expose_secret()).await?;
+        Ok(key)
+    }
 }

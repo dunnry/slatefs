@@ -13,6 +13,43 @@ pub struct Config {
     pub kms: KmsConfig,
     #[serde(default)]
     pub volume_defaults: VolumeDefaults,
+    /// NFS exports served by `slatefsd` (DD-10: one listener per export).
+    /// Phase 2 keeps exports in the config file; per-volume export records
+    /// in the control DB come with the multi-tenant hardening phase.
+    #[serde(default)]
+    pub exports: Vec<ExportConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportConfig {
+    pub tenant: String,
+    pub volume: String,
+    /// `ip:port` for this export's NFS+mount listener, e.g. `127.0.0.1:12049`.
+    pub listen: String,
+    /// Identity squash policy. nfs3_server 0.11 does not expose per-request
+    /// AUTH_UNIX credentials to the filesystem, so every request on an export
+    /// acts as this one identity.
+    #[serde(default)]
+    pub squash: SquashMode,
+    #[serde(default = "default_anon_id")]
+    pub anon_uid: u32,
+    #[serde(default = "default_anon_id")]
+    pub anon_gid: u32,
+}
+
+fn default_anon_id() -> u32 {
+    65534
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SquashMode {
+    /// Everyone acts as `anon_uid`/`anon_gid` (like `all_squash`).
+    #[default]
+    AllSquash,
+    /// Everyone acts as root — single-user/dev exports only.
+    TrustAsRoot,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -52,6 +52,50 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p slatefs-core --test phase0 -- phase0_bucket_store --nocapture
 
+  # Phase 2: real Linux kernel NFS client against slatefsd (plan §14 AC).
+  # Runner sudo gives us genuine mount(2); MinIO backs the volume.
+  kernel-mount:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      minio:
+        image: bitnami/minio:latest
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+          MINIO_DEFAULT_BUCKETS: slatefs-test
+        ports:
+          - 9000:9000
+    env:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT: http://localhost:9000
+      AWS_ALLOW_HTTP: "true"
+      AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y nfs-common
+      - run: cargo build -p slatefs-daemon -p slatefs-cli
+      - name: provision tenant/volume and export config
+        run: |
+          cat > /tmp/slatefs.toml <<'EOF'
+          [object_store]
+          url = "s3://slatefs-test/kernel-mount"
+          [kms]
+          provider = "static"
+          key_hex = "0000000000000000000000000000000000000000000000000000000000000001"
+          [[exports]]
+          tenant = "t1"
+          volume = "v1"
+          listen = "127.0.0.1:12049"
+          squash = "trust_as_root"
+          EOF
+          ./target/debug/slatefs -c /tmp/slatefs.toml tenant create t1
+          ./target/debug/slatefs -c /tmp/slatefs.toml volume create t1 v1
+      - run: SLATEFS_CONFIG=/tmp/slatefs.toml ./scripts/nfs-kernel-mount-test.sh
+
   # Phase 1 acceptance criteria at scale, nightly only (plan §14): model
   # property runs and the crash/fsck loop with large iteration counts.
   nightly-heavy:

@@ -44,6 +44,13 @@ impl Secret32 {
     pub(crate) fn expose(&self) -> &[u8; KEY_LEN] {
         &self.0
     }
+
+    /// Raw key bytes for callers outside this crate (e.g. the NFS frontend
+    /// keying file-handle HMACs). Never log or persist outside an encrypted
+    /// store.
+    pub fn expose_secret(&self) -> &[u8; KEY_LEN] {
+        &self.0
+    }
 }
 
 /// Random u64 from the OS RNG (fsid generation and the like — not key

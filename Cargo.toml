@@ -36,11 +36,16 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# NFSv3 frontend (plan §9.2 spike outcome; zerofs_nfsserve excluded by license)
+nfs3_server = "0.11"
+nfs3_client = { version = "0.9", features = ["tokio"] }
+
 # Crypto (DD-8, DD-3)
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 aes-siv = "0.7"
 hkdf = "0.12"
+hmac = "0.12"
 sha2 = "0.10"
 age = { version = "0.11", features = ["armor"] }
 zeroize = { version = "1", features = ["derive"] }
