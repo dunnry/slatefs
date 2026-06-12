@@ -5,6 +5,7 @@
 //! layer (`mkfs`/open/info). The `Vfs` trait and metadata/data paths land in
 //! Phase 1 (see `slatefs-plan.md` §14).
 
+pub mod attrcache;
 pub mod config;
 pub mod control;
 pub mod crypto;
@@ -13,6 +14,7 @@ pub mod error;
 pub mod fsck;
 pub mod locks;
 pub mod meta;
+pub mod metrics;
 pub mod quota;
 pub mod store;
 pub mod vfs;

@@ -13,7 +13,7 @@ use slatefs_core::config::Config;
 use slatefs_core::control::ControlPlane;
 use slatefs_core::crypto::kms;
 use slatefs_core::store;
-use slatefs_core::volume::Volume;
+use slatefs_core::volume::{Volume, VolumeCaches};
 use slatefs_nfs::{NFSTcp, SquashPolicy};
 
 #[derive(Parser)]
@@ -61,10 +61,42 @@ async fn main() -> anyhow::Result<()> {
 
     let mut volumes = Vec::new();
     let mut servers = tokio::task::JoinSet::new();
+    let share_count = config.exports.len();
     for (export, record, dek) in planned {
-        let volume = Volume::open(&record, dek, Arc::clone(&object_store))
+        let mut caches =
+            VolumeCaches::from_config(&config.cache, &export.tenant, &export.volume, share_count);
+        let recorder = Arc::new(slatefs_core::metrics::AggregatingRecorder::default());
+        caches.recorder = Some(Arc::clone(&recorder));
+        let volume = Volume::open_with_caches(&record, dek, Arc::clone(&object_store), &caches)
             .await
             .with_context(|| format!("opening volume {}/{}", export.tenant, export.volume))?;
+
+        // Cache hit-rate visibility (plan §13 / Phase 3 AC): log the
+        // cache-related engine metrics periodically per volume.
+        {
+            let (tenant, volume_name) = (export.tenant.clone(), export.volume.clone());
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                tick.tick().await; // skip the immediate tick
+                loop {
+                    tick.tick().await;
+                    let stats: Vec<String> = recorder
+                        .snapshot()
+                        .into_iter()
+                        .filter(|(name, value)| name.contains("cache") && *value != 0.0)
+                        .map(|(name, value)| format!("{name}={value}"))
+                        .collect();
+                    if !stats.is_empty() {
+                        tracing::info!(
+                            tenant,
+                            volume = volume_name,
+                            "cache metrics: {}",
+                            stats.join(" ")
+                        );
+                    }
+                }
+            });
+        }
         volumes.push(Arc::clone(&volume));
 
         let policy = SquashPolicy {

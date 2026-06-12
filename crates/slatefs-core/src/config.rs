@@ -18,6 +18,25 @@ pub struct Config {
     /// in the control DB come with the multi-tenant hardening phase.
     #[serde(default)]
     pub exports: Vec<ExportConfig>,
+    /// Cache tiers (plan §8, DD-4). Budgets are deployment-wide and divided
+    /// across open volumes — caches are per-volume by design (a shared
+    /// block cache would alias WAL ids across volumes; see
+    /// docs/threat-model.md).
+    #[serde(default)]
+    pub cache: CacheConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CacheConfig {
+    /// Total in-RAM block-cache budget in bytes (tier 1, plaintext blocks).
+    /// Unset ⇒ the engine default (64 MiB) per volume.
+    pub memory_bytes: Option<u64>,
+    /// Root directory for the local disk part cache (tier 2, ciphertext;
+    /// safe on untrusted disks). Unset ⇒ tier disabled.
+    pub disk_path: Option<std::path::PathBuf>,
+    /// Total disk-cache budget in bytes across volumes.
+    pub disk_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -79,6 +98,9 @@ pub enum KmsConfig {
     Age { keyfile: std::path::PathBuf },
     /// Fixed 32-byte hex key. Tests and throwaway environments only.
     Static { key_hex: String },
+    /// AWS KMS key (requires the `aws-kms` build feature). Credentials and
+    /// region come from the standard AWS environment/profile chain.
+    Aws { key_id: String },
 }
 
 impl KmsConfig {
@@ -86,6 +108,7 @@ impl KmsConfig {
         match self {
             KmsConfig::Age { .. } => "age",
             KmsConfig::Static { .. } => "static",
+            KmsConfig::Aws { .. } => "aws",
         }
     }
 }

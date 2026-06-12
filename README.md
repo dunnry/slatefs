@@ -53,8 +53,19 @@ rename; NFSv3 u32 timestamps). Three genuine bugs the suite caught are
 fixed: mkdir mode pass-through, EPERM on non-owner same-value chown, and
 write-permission enforcement on cross-parent directory renames.
 
-Remaining for Phase 2 AC: fsx/fsstress endurance runs (nightly-scale) and
-mid-workload restart drills over a kernel mount.
+**Phase 3 in progress** (encryption hardening + cache tiers): the §7
+filter-block question is closed — slatedb 0.13 runs data, index, filter,
+and stats blocks through the transformer (verified in source; only SST
+first/last keys and manifests are plaintext, see
+[docs/threat-model.md](docs/threat-model.md)). Cache tiers wired per §8:
+per-volume RAM block cache + ciphertext NVMe part cache (`[cache]` config;
+shared-cache spike found cross-volume WAL-id aliasing, so caches stay
+per-volume), moka attr/negative-dentry cache with synchronous
+write-through, sequential read-ahead, engine metrics with periodic cache
+hit-rate logs, feature-gated AWS KMS provider. AC tests: deep no-plaintext
+scan through every FS surface, wrong-DEK fail-closed, warm-restart reads
+with **zero** object-store GETs, and a read-latency bench harness (warm
+128 KiB p99 ≈ 60 µs on a local store in release).
 
 > Testing against kernel NFS clients: always mount with
 > `soft,intr,timeo=…` and bound every command touching the mountpoint

@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 slatedb.workspace = true
+slatedb-common.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
@@ -17,6 +18,7 @@ postcard.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+moka.workspace = true
 aes-gcm.workspace = true
 chacha20poly1305.workspace = true
 aes-siv.workspace = true
@@ -25,6 +27,14 @@ sha2.workspace = true
 age.workspace = true
 zeroize.workspace = true
 hex.workspace = true
+
+aws-config = { workspace = true, optional = true }
+aws-sdk-kms = { workspace = true, optional = true }
+
+[features]
+# AWS KMS as the master-KEK provider (DD-8). Off by default: heavy
+# dependency tree, only needed in cloud deployments.
+aws-kms = ["dep:aws-config", "dep:aws-sdk-kms"]
 
 [dev-dependencies]
 tempfile.workspace = true

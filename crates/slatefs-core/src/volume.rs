@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use slatedb::object_store::ObjectStore;
 use slatedb::{Db, DbReader, Settings, WriteBatch};
 
-use crate::config::{Compression, VolumeDefaults};
+use crate::attrcache::AttrCache;
+use crate::config::{CacheConfig, Compression, VolumeDefaults};
 use crate::control::{ControlPlane, QuotaLimits, TenantState, VolumeRecord, VolumeState, now_unix};
 use crate::crypto::kms::contexts;
 use crate::crypto::names::NameCodec;
@@ -46,6 +47,42 @@ impl CreateVolumeOptions {
             compression: defaults.compression,
             quota: QuotaLimits::default(),
             note: None,
+        }
+    }
+}
+
+/// Cache wiring for one open volume (plan §8). Per-volume by design:
+/// sharing a block cache across volumes aliases `SsTableId::Wal` ids
+/// (cross-tenant plaintext leak — see docs/threat-model.md).
+#[derive(Clone, Default)]
+pub struct VolumeCaches {
+    /// Tier-1 in-RAM block cache budget for this volume, in bytes.
+    pub memory_bytes: Option<u64>,
+    /// Tier-2 ciphertext part cache directory for this volume.
+    pub disk_root: Option<std::path::PathBuf>,
+    /// Tier-2 budget for this volume, in bytes.
+    pub disk_bytes: Option<u64>,
+    /// Engine metrics sink (cache hit rates, flush latency, …).
+    pub recorder: Option<Arc<crate::metrics::AggregatingRecorder>>,
+}
+
+impl VolumeCaches {
+    /// Split the deployment-wide budgets across `share_count` open volumes.
+    pub fn from_config(
+        cache: &CacheConfig,
+        tenant: &str,
+        volume: &str,
+        share_count: usize,
+    ) -> VolumeCaches {
+        let n = share_count.max(1) as u64;
+        VolumeCaches {
+            memory_bytes: cache.memory_bytes.map(|b| (b / n).max(8 * 1024 * 1024)),
+            disk_root: cache
+                .disk_path
+                .as_ref()
+                .map(|root| root.join(tenant).join(volume)),
+            disk_bytes: cache.disk_bytes.map(|b| (b / n).max(64 * 1024 * 1024)),
+            recorder: None,
         }
     }
 }
@@ -144,7 +181,7 @@ async fn mkfs(
     dek: Secret32,
     object_store: Arc<dyn ObjectStore>,
 ) -> Result<()> {
-    let db = open_volume_db(record, dek, object_store).await?;
+    let db = open_volume_db(record, dek, object_store, &VolumeCaches::default()).await?;
 
     let result = async {
         match db.get(KEY_SUPERBLOCK).await? {
@@ -195,18 +232,43 @@ pub async fn open_volume_db(
     record: &VolumeRecord,
     dek: Secret32,
     object_store: Arc<dyn ObjectStore>,
+    caches: &VolumeCaches,
 ) -> Result<Db> {
+    use slatedb::config::{ObjectStoreCacheOptions, PreloadLevel};
+    use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
+
     let path = store::volume_db_path(&record.tenant, &record.name);
-    Db::builder(path, object_store)
+    // Tier 2 (DD-4): ciphertext object parts on local disk; preload L0 so a
+    // warm restart serves recent data without object-store GETs.
+    let object_store_cache_options = match (&caches.disk_root, caches.disk_bytes) {
+        (Some(root), _) => ObjectStoreCacheOptions {
+            root_folder: Some(root.clone()),
+            max_cache_size_bytes: caches.disk_bytes.map(|b| b as usize),
+            preload_disk_cache_on_startup: Some(PreloadLevel::L0Sst),
+            ..ObjectStoreCacheOptions::default()
+        },
+        _ => ObjectStoreCacheOptions::default(),
+    };
+
+    let mut builder = Db::builder(path, object_store)
         .with_settings(Settings {
             compression_codec: record.compression.to_slatedb(),
+            object_store_cache_options,
             ..Settings::default()
         })
         .with_block_transformer(Arc::new(SlateBlockTransformer::new(record.cipher, dek)))
-        .with_merge_operator(Arc::new(CounterMergeOperator))
-        .build()
-        .await
-        .map_err(Error::from)
+        .with_merge_operator(Arc::new(CounterMergeOperator));
+    // Tier 1: in-RAM plaintext block cache, byte-weighted.
+    if let Some(bytes) = caches.memory_bytes {
+        builder = builder.with_db_cache(Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+            max_capacity: bytes,
+            ..FoyerCacheOptions::default()
+        })));
+    }
+    if let Some(recorder) = &caches.recorder {
+        builder = builder.with_metrics_recorder(Arc::clone(recorder) as _);
+    }
+    builder.build().await.map_err(Error::from)
 }
 
 /// Read the control record plus the superblock. Uses a read-only `DbReader`,
@@ -303,6 +365,19 @@ pub struct Volume {
     pub(crate) alloc: InodeAllocator,
     pub(crate) handles: Mutex<HandleTable>,
     pub(crate) chunk_size: u64,
+    /// Attr + negative-dentry cache (plan §8); see vfs_impl write-through.
+    pub(crate) attrs: AttrCache,
+    /// Sequential-read detector state for read-ahead: ino → stream state.
+    pub(crate) readahead: Mutex<HashMap<u64, ReadAheadState>>,
+}
+
+/// Per-ino sequential stream state (plan §8 read-ahead).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ReadAheadState {
+    /// Offset the next sequential read would start at.
+    pub(crate) expected: u64,
+    /// Highest chunk index already queued for prefetch.
+    pub(crate) prefetched_to: u32,
 }
 
 impl Volume {
@@ -313,13 +388,23 @@ impl Volume {
         dek: Secret32,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Arc<Volume>> {
+        Self::open_with_caches(record, dek, object_store, &VolumeCaches::default()).await
+    }
+
+    /// [`Volume::open`] with cache tiers wired (plan §8).
+    pub async fn open_with_caches(
+        record: &VolumeRecord,
+        dek: Secret32,
+        object_store: Arc<dyn ObjectStore>,
+        caches: &VolumeCaches,
+    ) -> Result<Arc<Volume>> {
         if record.state != VolumeState::Active {
             return Err(Error::invalid(
                 "volume state",
                 format!("{:?}, not Active", record.state),
             ));
         }
-        let db = open_volume_db(record, dek.clone(), object_store).await?;
+        let db = open_volume_db(record, dek.clone(), object_store, caches).await?;
 
         let superblock = match db.get(KEY_SUPERBLOCK).await? {
             Some(bytes) => Superblock::decode(&bytes)?,
@@ -350,6 +435,8 @@ impl Volume {
             quota: QuotaTracker::new(bytes_used, inodes_used, record.quota),
             alloc,
             handles: Mutex::new(HandleTable::default()),
+            attrs: AttrCache::default(),
+            readahead: Mutex::new(HashMap::new()),
         }))
     }
 

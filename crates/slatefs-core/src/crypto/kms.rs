@@ -29,6 +29,12 @@ pub fn from_config(config: &KmsConfig) -> Result<std::sync::Arc<dyn Kms>> {
     match config {
         KmsConfig::Static { key_hex } => Ok(std::sync::Arc::new(StaticKms::from_hex(key_hex)?)),
         KmsConfig::Age { keyfile } => Ok(std::sync::Arc::new(LocalAgeKms::from_file(keyfile)?)),
+        #[cfg(feature = "aws-kms")]
+        KmsConfig::Aws { key_id } => Ok(std::sync::Arc::new(AwsKms::new(key_id.clone()))),
+        #[cfg(not(feature = "aws-kms"))]
+        KmsConfig::Aws { .. } => Err(Error::Config(
+            "kms.provider = \"aws\" requires building with --features aws-kms".into(),
+        )),
     }
 }
 
@@ -131,6 +137,75 @@ impl Kms for LocalAgeKms {
 
     fn name(&self) -> &'static str {
         "age"
+    }
+}
+
+/// AWS KMS as the master KEK (DD-8). Encrypt/Decrypt of 32-byte keys with
+/// the wrap context bound via KMS `EncryptionContext` — KMS itself refuses
+/// to decrypt under a different context, mirroring the local AAD binding.
+#[cfg(feature = "aws-kms")]
+pub struct AwsKms {
+    key_id: String,
+    client: tokio::sync::OnceCell<aws_sdk_kms::Client>,
+}
+
+#[cfg(feature = "aws-kms")]
+impl AwsKms {
+    pub fn new(key_id: String) -> AwsKms {
+        AwsKms {
+            key_id,
+            client: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    async fn client(&self) -> &aws_sdk_kms::Client {
+        self.client
+            .get_or_init(|| async {
+                let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                aws_sdk_kms::Client::new(&config)
+            })
+            .await
+    }
+}
+
+#[cfg(feature = "aws-kms")]
+#[async_trait::async_trait]
+impl Kms for AwsKms {
+    async fn wrap(&self, key: &Secret32, context: &str) -> Result<Vec<u8>> {
+        let response = self
+            .client()
+            .await
+            .encrypt()
+            .key_id(&self.key_id)
+            .plaintext(aws_sdk_kms::primitives::Blob::new(key.expose().to_vec()))
+            .encryption_context("slatefs", context)
+            .send()
+            .await
+            .map_err(|e| Error::crypto(format!("KMS Encrypt failed: {e}")))?;
+        response
+            .ciphertext_blob()
+            .map(|b| b.as_ref().to_vec())
+            .ok_or_else(|| Error::crypto("KMS Encrypt returned no ciphertext"))
+    }
+
+    async fn unwrap(&self, blob: &[u8], context: &str) -> Result<Secret32> {
+        let response = self
+            .client()
+            .await
+            .decrypt()
+            .ciphertext_blob(aws_sdk_kms::primitives::Blob::new(blob.to_vec()))
+            .encryption_context("slatefs", context)
+            .send()
+            .await
+            .map_err(|e| Error::crypto(format!("KMS Decrypt failed (fail-closed): {e}")))?;
+        let plaintext = response
+            .plaintext()
+            .ok_or_else(|| Error::crypto("KMS Decrypt returned no plaintext"))?;
+        Secret32::try_from_slice(plaintext.as_ref())
+    }
+
+    fn name(&self) -> &'static str {
+        "aws"
     }
 }
 

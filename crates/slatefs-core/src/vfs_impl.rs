@@ -94,6 +94,68 @@ impl Volume {
         Ok(())
     }
 
+    /// Read-path inode fetch through the attr cache (plan §8). Mutation
+    /// paths use [`Volume::load_inode`] (DB-direct) so a missed
+    /// write-through can never feed a read-modify-write.
+    async fn load_inode_cached(&self, ino: u64) -> FsResult<Inode> {
+        if let Some(inode) = self.attrs.get(ino) {
+            return Ok(inode);
+        }
+        let inode = self.load_inode(ino).await?;
+        self.attrs.insert(ino, inode.clone());
+        Ok(inode)
+    }
+
+    async fn load_dir_cached(&self, ino: u64) -> FsResult<Inode> {
+        let inode = self.load_inode_cached(ino).await?;
+        if !inode.kind.is_dir() {
+            return Err(FsError::NotDir);
+        }
+        Ok(inode)
+    }
+
+    /// Sequential-read detection + chunk prefetch (plan §8). Best-effort:
+    /// a background task scans upcoming chunk keys, pulling their blocks
+    /// through the (plaintext, tier-1) block cache.
+    fn plan_readahead(&self, ino: u64, offset: u64, end: u64, size: u64) {
+        const WINDOW_CHUNKS: u32 = 8;
+        if end == 0 || end >= size {
+            return;
+        }
+        let mut map = self.readahead.lock().expect("readahead poisoned");
+        if map.len() > 4096 {
+            map.clear();
+        }
+        let st = map.entry(ino).or_default();
+        let sequential = offset == st.expected;
+        st.expected = end;
+        let cur_chunk = data::chunk_of(end - 1, self.chunk_size);
+        if !sequential {
+            st.prefetched_to = cur_chunk;
+            return;
+        }
+        let last_file_chunk = data::chunk_of(size - 1, self.chunk_size);
+        let wanted = cur_chunk.saturating_add(WINDOW_CHUNKS).min(last_file_chunk);
+        // Refill only when the stream gets near the prefetched horizon.
+        if st.prefetched_to >= wanted || st.prefetched_to > cur_chunk.saturating_add(2) {
+            return;
+        }
+        let from = st.prefetched_to.max(cur_chunk) + 1;
+        st.prefetched_to = wanted;
+        drop(map);
+
+        let db = self.db.clone();
+        tokio::spawn(async move {
+            let options =
+                slatedb::config::ScanOptions::default().with_read_ahead_bytes(1024 * 1024);
+            let range = keys::chunk(ino, from).to_vec()
+                ..keys::chunk(ino, wanted.saturating_add(1)).to_vec();
+            if let Ok(mut iter) = db.scan_with_options::<Vec<u8>, _>(range, &options).await {
+                while let Ok(Some(_)) = iter.next().await {}
+            }
+        });
+    }
+
     async fn load_inode(&self, ino: u64) -> FsResult<Inode> {
         match self.db.get(keys::inode(ino)).await? {
             Some(bytes) => Ok(Inode::decode(&bytes)?),
@@ -225,6 +287,9 @@ impl Volume {
             self.quota.release(0, 1);
             return Err(e);
         }
+        self.attrs.insert(child_ino, child.clone());
+        self.attrs.insert(parent_ino, parent);
+        self.attrs.remove_negative(parent_ino, name);
         Ok(())
     }
 
@@ -283,6 +348,7 @@ impl Volume {
             self.commit(batch).await?;
             self.quota.reserve(-(inode.billed_bytes as i64), -1)?;
         }
+        self.attrs.remove(ino);
         self.reap_orphan(ino).await?;
         Ok(())
     }
@@ -307,7 +373,9 @@ impl Volume {
             let mut batch = WriteBatch::new();
             if let Ok(encoded) = current.encode() {
                 batch.put(keys::inode(ino), encoded);
-                let _ = self.commit(batch).await;
+                if self.commit(batch).await.is_ok() {
+                    self.attrs.insert(ino, current);
+                }
             }
         }
     }
@@ -316,31 +384,37 @@ impl Volume {
 #[async_trait::async_trait]
 impl Vfs for Volume {
     async fn lookup(&self, creds: &Credentials, parent: u64, name: &[u8]) -> FsResult<FileAttr> {
-        let dir = self.load_dir(parent).await?;
+        let dir = self.load_dir_cached(parent).await?;
         access(creds, &dir, ACCESS_X)?;
         if name == b"." {
             return Ok(self.make_attr(parent, &dir));
         }
         if name == b".." {
             let up = dir.parent_dir;
-            let upnode = self.load_inode(up).await?;
+            let upnode = self.load_inode_cached(up).await?;
             return Ok(self.make_attr(up, &upnode));
         }
         validate_name(name)?;
+        if self.attrs.is_negative(parent, name) {
+            return Err(FsError::NotFound);
+        }
         match self.dirent_of(parent, name).await? {
             Some(d) => {
                 let inode = self
-                    .load_inode(d.child_ino)
+                    .load_inode_cached(d.child_ino)
                     .await
                     .map_err(|_| FsError::NotFound)?;
                 Ok(self.make_attr(d.child_ino, &inode))
             }
-            None => Err(FsError::NotFound),
+            None => {
+                self.attrs.insert_negative(parent, name);
+                Err(FsError::NotFound)
+            }
         }
     }
 
     async fn getattr(&self, _creds: &Credentials, ino: u64) -> FsResult<FileAttr> {
-        let inode = self.load_inode(ino).await?;
+        let inode = self.load_inode_cached(ino).await?;
         Ok(self.make_attr(ino, &inode))
     }
 
@@ -454,6 +528,7 @@ impl Vfs for Volume {
             self.quota.release(quota_delta, 0);
             return Err(e);
         }
+        self.attrs.insert(ino, inode.clone());
         for group in spill_deletes.chunks(1024) {
             let mut batch = WriteBatch::new();
             for idx in group {
@@ -465,7 +540,7 @@ impl Vfs for Volume {
     }
 
     async fn read(&self, creds: &Credentials, ino: u64, offset: u64, len: u32) -> FsResult<Bytes> {
-        let inode = self.load_inode(ino).await?;
+        let inode = self.load_inode_cached(ino).await?;
         match inode.kind {
             FileKind::File => {}
             FileKind::Dir => return Err(FsError::IsDir),
@@ -474,6 +549,7 @@ impl Vfs for Volume {
         access(creds, &inode, ACCESS_R)?;
         let bytes =
             data::read_range(&self.db, self.chunk_size, ino, inode.size, offset, len).await?;
+        self.plan_readahead(ino, offset, offset + bytes.len() as u64, inode.size);
         self.maybe_update_atime(ino, &inode).await;
         Ok(bytes)
     }
@@ -530,6 +606,7 @@ impl Vfs for Volume {
             self.quota.release(plan.billed_delta, 0);
             return Err(e);
         }
+        self.attrs.insert(ino, inode);
         Ok(data_buf.len() as u32)
     }
 
@@ -708,6 +785,9 @@ impl Vfs for Volume {
         batch.put(keys::dirent_idx(new_parent, dirent_id), idx.encode()?);
         batch.put(keys::inode(new_parent), dir.encode()?);
         self.commit(batch).await?;
+        self.attrs.insert(ino, inode.clone());
+        self.attrs.insert(new_parent, dir);
+        self.attrs.remove_negative(new_parent, new_name);
         Ok(self.make_attr(ino, &inode))
     }
 
@@ -756,6 +836,9 @@ impl Vfs for Volume {
             };
 
             self.commit(batch).await?;
+            self.attrs.insert(parent, dir);
+            self.attrs.remove(d.child_ino);
+            self.attrs.insert_negative(parent, name);
             // Frees never fail; tracker moves only after the commit landed.
             let _ = self.quota.reserve(qb, qi);
             if reap {
@@ -827,6 +910,9 @@ impl Vfs for Volume {
             batch.put(keys::inode(parent), dir.encode()?);
             batch.merge(keys::KEY_QUOTA_INODES, encode_delta(-1));
             self.commit(batch).await?;
+            self.attrs.insert(parent, dir);
+            self.attrs.remove(d.child_ino);
+            self.attrs.insert_negative(parent, name);
             let _ = self.quota.reserve(0, -1); // free, post-commit
             return Ok(());
         }
@@ -1025,6 +1111,18 @@ impl Vfs for Volume {
             }
 
             self.commit(batch).await?;
+            self.attrs.insert(src.child_ino, moved);
+            if same_parent {
+                self.attrs.insert(new_parent, new_dir);
+            } else {
+                self.attrs.insert(old_parent, old_dir);
+                self.attrs.insert(new_parent, new_dir);
+            }
+            if let Some(dstd) = &dst {
+                self.attrs.remove(dstd.child_ino);
+            }
+            self.attrs.insert_negative(old_parent, old_name);
+            self.attrs.remove_negative(new_parent, new_name);
             let _ = self.quota.reserve(qb, qi); // frees, post-commit
             if let Some(ino) = reap {
                 self.reap_orphan(ino).await?;
@@ -1040,7 +1138,7 @@ impl Vfs for Volume {
         cookie: u64,
         max_entries: usize,
     ) -> FsResult<ReadDir> {
-        let dir = self.load_dir(parent).await?;
+        let dir = self.load_dir_cached(parent).await?;
         access(creds, &dir, ACCESS_R)?;
 
         let start = keys::dirent_idx(parent, cookie.saturating_add(1));
@@ -1106,6 +1204,7 @@ impl Vfs for Volume {
         batch.put(keys::xattr(ino, name), value);
         batch.put(keys::inode(ino), inode.encode()?);
         self.commit(batch).await?;
+        self.attrs.insert(ino, inode);
         Ok(())
     }
 
@@ -1139,6 +1238,7 @@ impl Vfs for Volume {
         batch.delete(keys::xattr(ino, name));
         batch.put(keys::inode(ino), inode.encode()?);
         self.commit(batch).await?;
+        self.attrs.insert(ino, inode);
         Ok(())
     }
 
