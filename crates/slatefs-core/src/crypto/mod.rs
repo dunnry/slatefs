@@ -7,6 +7,7 @@
 
 pub mod aead;
 pub mod kms;
+pub mod names;
 pub mod transformer;
 
 use serde::{Deserialize, Serialize};

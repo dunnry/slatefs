@@ -14,8 +14,18 @@ per-volume SlateDB with an AEAD block transformer (AES-256-GCM /
 XChaCha20-Poly1305 after LZ4/Zstd compression), `slatefs tenant|volume`
 CLI, volume `mkfs` writing an encrypted superblock.
 
-Next: Phase 1 — the VFS core (inodes, dirents, chunked I/O, locks, quotas,
-name encryption) per plan §14.
+**Phase 1 complete** (VFS core): the full `Vfs` trait implemented on
+SlateDB — inodes/dirents with AES-SIV-encrypted names (DD-3), chunked
+sparse-aware I/O (DD-6), atomic rename with cycle checks, hardlinks,
+symlinks, xattrs, orphan handling for unlinked-but-open files,
+merge-operator quota counters with exact `EDQUOT` enforcement (DD-9),
+striped lock manager + advisory byte-range locks (DD-5), `slatefs fsck
+--recount`. Verified by model-based property tests (real vs in-memory
+reference FS, errno-exact) and a crash-consistency loop (abort →
+reopen/reap → clean fsck), both scaled up nightly in CI.
+
+Next: Phase 2 — the NFSv3 frontend (library spike, exports, pjdfstest/fsx
+over a kernel mount) per plan §14.
 
 ## Workspace
 

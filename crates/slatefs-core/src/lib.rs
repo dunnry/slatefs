@@ -8,9 +8,16 @@
 pub mod config;
 pub mod control;
 pub mod crypto;
+pub mod data;
 pub mod error;
+pub mod fsck;
+pub mod locks;
 pub mod meta;
+pub mod quota;
 pub mod store;
+pub mod vfs;
 pub mod volume;
+
+mod vfs_impl;
 
 pub use error::{Error, Result};

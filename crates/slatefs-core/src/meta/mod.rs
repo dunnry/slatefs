@@ -1,9 +1,10 @@
-//! Per-volume metadata schema (plan §5).
-//!
-//! Phase 0 ships only the superblock; inode/dirent/xattr codecs land in
-//! Phase 1. All values are postcard-encoded structs prefixed with a one-byte
-//! format version.
+//! Per-volume metadata schema (plan §5). All values are postcard-encoded
+//! structs prefixed with a one-byte format version.
 
+pub mod alloc;
+pub mod dirent;
+pub mod inode;
+pub mod keys;
 pub mod superblock;
 
 use serde::Serialize;

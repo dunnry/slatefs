@@ -76,6 +76,15 @@ enum VolumeCmd {
     Info { tenant: String, volume: String },
     /// List a tenant's volumes.
     List { tenant: String },
+    /// Verify volume invariants and quota counters (volume must not be
+    /// actively served — fsck opens it as the writer).
+    Fsck {
+        tenant: String,
+        volume: String,
+        /// Rewrite the persistent counters from the recount on drift.
+        #[arg(long)]
+        recount: bool,
+    },
 }
 
 fn parse_compression(s: &str) -> Result<config::Compression, String> {
@@ -231,6 +240,43 @@ async fn run(
                     "{}/{}\t{:?}\tfsid={:016x}\tcipher={}\tchunk={}",
                     v.tenant, v.name, v.state, v.fsid, v.cipher, v.chunk_size
                 );
+            }
+        }
+        Command::Volume(VolumeCmd::Fsck {
+            tenant,
+            volume: vol_name,
+            recount,
+        }) => {
+            let record = control.get_volume(tenant, vol_name).await?;
+            let dek = control.unwrap_volume_dek(&record).await?;
+            let vol = volume::Volume::open(&record, dek, object_store).await?;
+            let report = if *recount {
+                vol.fsck_recount().await?
+            } else {
+                vol.fsck().await?
+            };
+            vol.shutdown().await?;
+
+            println!(
+                "inodes: counter={} recount={}",
+                report.counter_inodes, report.inodes_counted
+            );
+            println!(
+                "bytes:  counter={} recount={}",
+                report.counter_bytes, report.bytes_counted
+            );
+            for r in &report.reapable {
+                println!("reapable: {r}");
+            }
+            for p in &report.problems {
+                println!("PROBLEM: {p}");
+            }
+            if report.is_clean() {
+                println!("clean");
+            } else if *recount && report.problems.is_empty() {
+                println!("counters rewritten from recount");
+            } else {
+                anyhow::bail!("fsck found problems");
             }
         }
     }
