@@ -892,7 +892,11 @@ where
         }
     };
 
-    let result = context.vfs.mkdir(&dirid, &args.where_.name).await;
+    // [slatefs patch] pass through the requested attributes
+    let result = context
+        .vfs
+        .mkdir(&dirid, &args.where_.name, &args.attributes)
+        .await;
     let after = nfs_option_from_result(context.vfs.getattr(&dirid).await);
     let dir_wcc = wcc_data { before, after };
 

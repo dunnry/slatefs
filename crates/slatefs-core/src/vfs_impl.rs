@@ -363,22 +363,22 @@ impl Vfs for Volume {
             }
             inode.mode = mode;
         }
-        if let Some(uid) = attrs.uid
-            && uid != inode.uid
-        {
-            if !creds.is_root() {
+        // chown permission rules apply even when the requested values equal
+        // the current ones — a non-owner's no-op chown is still EPERM
+        // (pjdfstest chown/07).
+        if let Some(uid) = attrs.uid {
+            let allowed = creds.is_root() || (is_owner && uid == inode.uid);
+            if !allowed {
                 return Err(FsError::NotPermitted);
             }
             inode.uid = uid;
         }
-        if let Some(gid) = attrs.gid
-            && gid != inode.gid
-        {
-            let owner_with_group = is_owner && creds.in_group(gid);
+        if let Some(gid) = attrs.gid {
+            let owner_with_group = is_owner && (gid == inode.gid || creds.in_group(gid));
             if !creds.is_root() && !owner_with_group {
                 return Err(FsError::NotPermitted);
             }
-            if !creds.is_root() {
+            if !creds.is_root() && gid != inode.gid {
                 inode.mode &= !0o6000; // chown clears setuid/setgid
             }
             inode.gid = gid;
@@ -896,6 +896,13 @@ impl Vfs for Volume {
                 .await
                 .map_err(|_| FsError::Io)?;
             check_sticky(creds, &old_dir, &moved)?;
+
+            // Moving a directory to a different parent rewrites its `..`
+            // entry, so POSIX requires write permission on the directory
+            // being moved (pjdfstest rename/09, rename/21).
+            if moved.kind.is_dir() && !same_parent {
+                access(creds, &moved, ACCESS_W)?;
+            }
 
             // Directory moves: cycle check — new_parent must not live under
             // the moved directory (walk parent_dir chain to root).

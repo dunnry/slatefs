@@ -44,9 +44,17 @@ credentials (squash policies `none` / `root_squash` / `all_squash` /
 handlers, and FSSTAT/ACCESS trait hooks so `df` reflects quotas. All
 verified over the wire by `slatefs-nfs/tests/nfs_creds.rs`.
 
-Remaining for Phase 2 AC: pjdfstest/fsx/fsstress runs over a Linux kernel
-mount (harness: `scripts/nfs-kernel-mount-test.sh` + the `kernel-mount`
-CI job).
+**pjdfstest over a Linux kernel mount: 8796/8798** (238 files, suite run
+via `scripts/docker-kernel-mount-test.sh scripts/pjdfstest-over-nfs.sh` —
+a real kernel NFS client in a privileged container). The two remaining
+failures are protocol-inherent and documented with reasons in
+[docs/pjdfstest-exclusions.md](docs/pjdfstest-exclusions.md) (NFS silly
+rename; NFSv3 u32 timestamps). Three genuine bugs the suite caught are
+fixed: mkdir mode pass-through, EPERM on non-owner same-value chown, and
+write-permission enforcement on cross-parent directory renames.
+
+Remaining for Phase 2 AC: fsx/fsstress endurance runs (nightly-scale) and
+mid-workload restart drills over a kernel mount.
 
 > Testing against kernel NFS clients: always mount with
 > `soft,intr,timeo=…` and bound every command touching the mountpoint

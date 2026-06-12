@@ -134,6 +134,7 @@ where
         &self,
         _dirid: &Self::Handle,
         _dirname: &filename3<'_>,
+        _attr: &nfs3_types::nfs3::sattr3, // [slatefs patch]
     ) -> Result<(Self::Handle, fattr3), nfsstat3> {
         Err(nfsstat3::NFS3ERR_ROFS)
     }

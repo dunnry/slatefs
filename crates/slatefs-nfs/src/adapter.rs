@@ -531,14 +531,32 @@ impl NfsFileSystem for SlateFsNfs {
         &self,
         dirid: &SlateFsHandle,
         dirname: &filename3<'_>,
+        attr: &sattr3,
     ) -> Result<(SlateFsHandle, fattr3), nfsstat3> {
         let dir = self.ino_of(dirid)?;
-        let attr = self
+        let creds = self.creds();
+        let requested = to_setattrs(attr);
+        let mode = requested.mode.unwrap_or(0o755);
+        let mut made = self
             .volume
-            .mkdir(&self.creds(), dir, dirname.0.as_ref(), 0o755)
+            .mkdir(&creds, dir, dirname.0.as_ref(), mode)
             .await
             .map_err(map_err)?;
-        Ok((self.handle_for(&attr), self.fattr(&attr)))
+        // Remaining requested attributes (uid/gid/times) apply post-create,
+        // mirroring the CREATE path.
+        let followup = SetAttrs {
+            mode: None,
+            size: None,
+            ..requested
+        };
+        if !followup.is_empty() {
+            made = self
+                .volume
+                .setattr(&creds, made.ino, followup)
+                .await
+                .map_err(map_err)?;
+        }
+        Ok((self.handle_for(&made), self.fattr(&made)))
     }
 
     async fn remove(

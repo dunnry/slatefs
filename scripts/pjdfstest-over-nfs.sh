@@ -40,14 +40,28 @@ mount -t nfs \
     -o "vers=3,tcp,nolock,soft,timeo=50,retrans=5,port=$PORT,mountport=$PORT" \
     127.0.0.1:/ "$MNT"
 
+# PJD_TESTS: space-separated test paths relative to the pjdfstest tests dir
+# (default: everything). PJD_PROVE_ARGS: extra prove flags (e.g. -v).
+PJD_TESTS="${PJD_TESTS:-}"
+PJD_PROVE_ARGS="${PJD_PROVE_ARGS:--rQ}"
+targets=()
+if [ -n "$PJD_TESTS" ]; then
+    for t in $PJD_TESTS; do targets+=("/tmp/pjdfstest/tests/$t"); done
+else
+    targets=(/tmp/pjdfstest/tests)
+fi
+
 echo "== running pjdfstest (timeout ${PJD_TIMEOUT}s)"
 cd "$MNT"
 set +e
-timeout "$PJD_TIMEOUT" prove -rQ /tmp/pjdfstest/tests 2>&1 | tee /tmp/pjdfstest-results.txt | tail -40
+# shellcheck disable=SC2086
+timeout "$PJD_TIMEOUT" prove $PJD_PROVE_ARGS "${targets[@]}" 2>&1 | tee /tmp/pjdfstest-results.txt | tail -40
 status=$?
 set -e
 cd /
 echo "== prove exit: $status"
 echo "== failure summary"
 grep -E '^/tmp/pjdfstest/tests.*\(Wstat' /tmp/pjdfstest-results.txt | head -40 || echo "(no failing test files)"
+echo "== failing assertions (verbose runs)"
+grep -E '^not ok' /tmp/pjdfstest-results.txt | head -60 || echo "(none captured)"
 exit "$status"

@@ -18,6 +18,7 @@ docker volume create slatefs-cargo-registry >/dev/null
 docker volume create slatefs-target-linux >/dev/null
 
 docker run --rm --privileged \
+    -e PJD_TESTS -e PJD_PROVE_ARGS -e PJD_TIMEOUT -e SKIP_SMOKE \
     -v "$PWD":/src:ro \
     -v slatefs-cargo-registry:/usr/local/cargo/registry \
     -v slatefs-target-linux:/target \
@@ -44,6 +45,6 @@ EOF
         /target/debug/slatefs -c /tmp/slatefs.toml volume create t1 v1
 
         export SLATEFS_CONFIG=/tmp/slatefs.toml
-        ./scripts/nfs-kernel-mount-test.sh
+        [ -n "${SKIP_SMOKE:-}" ] || ./scripts/nfs-kernel-mount-test.sh
         '"${EXTRA:+/src/$EXTRA}"'
     '

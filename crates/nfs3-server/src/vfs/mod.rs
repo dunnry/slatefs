@@ -291,10 +291,13 @@ pub trait NfsFileSystem: NfsReadFileSystem {
     /// Makes a directory with the following attributes.
     /// If not supported dur to readonly file system
     /// this should return `Err(nfsstat3::NFS3ERR_ROFS)`
+    /// [slatefs patch] now receives the client-requested attributes
+    /// (`MKDIR3args.attributes`), which were previously dropped.
     fn mkdir(
         &self,
         dirid: &Self::Handle,
         dirname: &filename3<'_>,
+        attr: &sattr3,
     ) -> impl Future<Output = Result<(Self::Handle, fattr3), nfsstat3>> + Send;
 
     /// Removes a file.

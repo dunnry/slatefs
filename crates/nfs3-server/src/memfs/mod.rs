@@ -797,6 +797,7 @@ impl NfsFileSystem for MemFs {
         &self,
         dirid: &FileHandleU64,
         dirname: &filename3<'_>,
+        _attr: &sattr3, // [slatefs patch] memfs ignores requested attrs
     ) -> Result<(FileHandleU64, fattr3), nfsstat3> {
         self.add_dir(*dirid, dirname.clone_to_owned())
     }
