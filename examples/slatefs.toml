@@ -1,0 +1,23 @@
+# Example slatefs configuration. Copy to /etc/slatefs/slatefs.toml and adjust.
+# Secrets never go in this file: KMS settings point at key *files* or cloud
+# KMS key ids; S3 credentials come from the environment/instance profile.
+
+[object_store]
+# Everything lives under this root: control DB at <url>/control, volumes at
+# <url>/volumes/<tenant>/<volume>.
+url = "s3://slatefs-test/dev"
+# url = "file:///var/lib/slatefs"   # local development without an object store
+
+[kms]
+# Local age identity as master KEK (dev/single-node). Generate with:
+#   slatefs keygen --out /etc/slatefs/master.key
+provider = "age"
+keyfile = "/etc/slatefs/master.key"
+# Or, for tests/throwaway environments only:
+# provider = "static"
+# key_hex = "<64 hex chars>"
+
+[volume_defaults]
+chunk_size = 131072          # 128 KiB (DD-6); power of two in [4KiB, 4MiB]
+compression = "lz4"          # none | lz4 | zstd — applied by SlateDB before encryption
+cipher = "auto"              # auto | aes256gcm | xchacha20poly1305

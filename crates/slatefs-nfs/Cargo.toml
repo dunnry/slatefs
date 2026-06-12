@@ -1,0 +1,11 @@
+[package]
+name = "slatefs-nfs"
+description = "NFSv3 frontend for SlateFS (Phase 2; placeholder until then)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+slatefs-core.workspace = true

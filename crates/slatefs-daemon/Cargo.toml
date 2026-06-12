@@ -1,0 +1,20 @@
+[package]
+name = "slatefs-daemon"
+description = "slatefsd: serves volumes over NFSv3 and 9P2000.L"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "slatefsd"
+path = "src/main.rs"
+
+[dependencies]
+slatefs-core.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

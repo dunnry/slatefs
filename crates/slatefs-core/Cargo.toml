@@ -1,0 +1,28 @@
+[package]
+name = "slatefs-core"
+description = "Protocol-independent core of SlateFS: VFS semantics, metadata schema, crypto, control plane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+slatedb.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+serde.workspace = true
+postcard.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+age.workspace = true
+zeroize.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+futures.workspace = true

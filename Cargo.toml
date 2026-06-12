@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/slatefs-core",
+    "crates/slatefs-nfs",
+    "crates/slatefs-9p",
+    "crates/slatefs-daemon",
+    "crates/slatefs-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/dunnry/slatefs"
+rust-version = "1.88"
+
+[workspace.dependencies]
+slatefs-core = { path = "crates/slatefs-core" }
+slatefs-nfs = { path = "crates/slatefs-nfs" }
+slatefs-9p = { path = "crates/slatefs-9p" }
+
+# Storage engine. Pinned against the API surface verified in slatefs-plan.md §0;
+# re-verify the BlockTransformer/DbBuilder contract before bumping.
+slatedb = { version = "0.13.1", features = ["lz4", "zstd", "foyer"] }
+
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+toml = "0.8"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Crypto (DD-8)
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+age = { version = "0.11", features = ["armor"] }
+zeroize = { version = "1", features = ["derive"] }
+hex = "0.4"
+
+# Test-only
+tempfile = "3"
+futures = "0.3"

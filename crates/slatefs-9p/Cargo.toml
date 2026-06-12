@@ -1,0 +1,11 @@
+[package]
+name = "slatefs-9p"
+description = "9P2000.L frontend for SlateFS (Phase 4; placeholder until then)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+slatefs-core.workspace = true
