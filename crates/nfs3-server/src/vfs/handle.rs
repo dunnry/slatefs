@@ -98,6 +98,14 @@ impl PartialEq<u64> for FileHandleU64 {
 pub struct FileHandleConverter {
     generation_number: u64,
     generation_number_le: [u8; 8],
+    /// [slatefs patch] RFC 1813 write verifier, distinct from the handle
+    /// generation. The verifier must change across server instances so
+    /// clients retransmit uncommitted (UNSTABLE) writes after a restart;
+    /// the handle generation, by contrast, is often *pinned* across
+    /// restarts (`with_generation_number`) to keep handles valid. Reusing
+    /// the pinned generation as the verifier silently loses acked
+    /// uncommitted writes on restart.
+    instance_verf: [u8; 8],
 }
 
 impl FileHandleConverter {
@@ -117,10 +125,24 @@ impl FileHandleConverter {
     /// generation number so that file handles remain valid across all
     /// instances (e.g. behind a load balancer).
     #[must_use]
-    pub const fn with_generation_number(generation_number: u64) -> Self {
+    pub fn with_generation_number(generation_number: u64) -> Self {
+        // [slatefs patch] per-instance verifier. Cross-restart uniqueness
+        // comes from boot time and pid; the process-wide counter guarantees
+        // distinct verifiers even for instances created within one clock
+        // tick of each other.
+        static INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        #[allow(clippy::cast_possible_truncation)] // low 64 nanosecond bits suffice
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("failed to get system time")
+            .as_nanos() as u64;
+        let unique = INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let instance_verf =
+            (nanos ^ (u64::from(std::process::id()) << 32) ^ unique.rotate_left(17)).to_le_bytes();
         Self {
             generation_number,
             generation_number_le: generation_number.to_le_bytes(),
+            instance_verf,
         }
     }
 
@@ -169,7 +191,8 @@ impl FileHandleConverter {
     /// unique between instances of the NFS version 3 protocol
     /// server where uncommitted data may be lost.
     pub const fn verf(&self) -> writeverf3 {
-        writeverf3(self.generation_number_le)
+        // [slatefs patch] see instance_verf: must differ per server instance.
+        writeverf3(self.instance_verf)
     }
 }
 
@@ -269,8 +292,18 @@ mod tests {
 
     #[test]
     fn test_with_generation_number_verf() {
+        // [slatefs patch] The write verifier must be stable within an
+        // instance but differ between instances even when the handle
+        // generation is pinned (RFC 1813 §3.3.7): clients rely on a verf
+        // change to retransmit uncommitted writes after a server restart.
         let converter = FileHandleConverter::with_generation_number(12345);
-        assert_eq!(converter.verf().0, 12345u64.to_le_bytes());
+        assert_eq!(converter.verf().0, converter.verf().0);
+        let second = FileHandleConverter::with_generation_number(12345);
+        assert_ne!(
+            converter.verf().0,
+            second.verf().0,
+            "pinned generation must not pin the write verifier"
+        );
     }
 
     #[test]

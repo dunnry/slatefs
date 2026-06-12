@@ -10,7 +10,7 @@ set -euo pipefail
 
 CONFIG="${SLATEFS_CONFIG:?set SLATEFS_CONFIG}"
 PORT="${SLATEFS_NFS_PORT:-12049}"
-BIN="${CARGO_TARGET_DIR:-target}/debug"
+BIN="${CARGO_TARGET_DIR:-target}/${BIN_OVERRIDE:-debug}"
 MNT="$(mktemp -d)"
 # Cap the whole prove run; partial results still print a summary.
 PJD_TIMEOUT="${PJD_TIMEOUT:-3600}"

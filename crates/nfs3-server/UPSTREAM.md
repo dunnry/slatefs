@@ -26,7 +26,16 @@ scope `RPCContext.auth` into a tokio task-local around dispatch and expose
 `&CallContext` parameter on every trait method — at the cost of breaking
 all implementors; offer both, let the maintainer choose.
 
-## PR 4 (candidate) — demote expected client errors in handler logs
+## PR 4 — write verifier must not be the (pinnable) handle generation
+`FileHandleConverter::verf()` returned the generation number. With
+`with_generation_number` (the advertised load-balancer/restart-stable
+mode) the verifier then never changes across server instances, so clients
+never learn that a restarted server lost their acked-but-uncommitted
+UNSTABLE writes — silent data loss instead of the RFC 1813 §3.3.7
+retransmit. Fixed: a per-instance verifier (boot nanos ⊕ pid ⊕ counter),
+independent of the handle generation.
+
+## PR 5 (candidate) — demote expected client errors in handler logs
 Handlers log every errno returned to a client at `error!` level; under a
 permission-testing workload (pjdfstest) or any multi-user production use,
 EPERM/EACCES/ENOENT/EEXIST flood the logs. Expected request-level errors

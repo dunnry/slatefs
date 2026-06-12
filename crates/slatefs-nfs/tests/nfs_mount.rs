@@ -429,6 +429,7 @@ async fn file_handles_survive_restart() {
     let fh = create_file(&mut conn, &root, "persistent.txt").await;
     write_all(&mut conn, &fh, 0, b"survive me", stable_how::FILE_SYNC).await;
     let saved_fh = fh.data.to_vec();
+    let verf_before = write_verf(&mut conn, &fh).await;
     conn.unmount().await.expect("unmount");
 
     // "Restart": stop the server, close the volume, reopen everything.
@@ -447,7 +448,37 @@ async fn file_handles_survive_restart() {
     let (data, eof) = read_range(&mut conn, &revived, 0, 100).await;
     assert!(eof);
     assert_eq!(&data[..], b"survive me");
+
+    // RFC 1813 §3.3.7: the write verifier must CHANGE across server
+    // instances (clients use it to retransmit uncommitted writes), even
+    // though the file-handle generation is pinned for handle stability.
+    let verf_after = write_verf(&mut conn, &revived).await;
+    assert_ne!(
+        verf_before, verf_after,
+        "write verifier must differ across server restarts"
+    );
     conn.unmount().await.expect("unmount");
+}
+
+/// The writeverf3 returned by a 1-byte UNSTABLE write.
+async fn write_verf(conn: &mut Conn, fh: &nfs_fh3) -> [u8; 8] {
+    let res = conn
+        .nfs3_client
+        .write(&WRITE3args {
+            file: nfs_fh3 {
+                data: Opaque::owned(fh.data.to_vec()),
+            },
+            offset: 0,
+            count: 1,
+            stable: stable_how::UNSTABLE,
+            data: Opaque::borrowed(b"s"),
+        })
+        .await
+        .expect("write rpc");
+    match res {
+        WRITE3res::Ok(ok) => ok.verf.0,
+        WRITE3res::Err((stat, _)) => panic!("verf write failed: {stat:?}"),
+    }
 }
 
 #[tokio::test]

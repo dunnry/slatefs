@@ -17,7 +17,7 @@ CONFIG="${SLATEFS_CONFIG:?set SLATEFS_CONFIG}"
 if [ "$(id -u)" = "0" ]; then SUDO=""; else SUDO="${SUDO:-sudo}"; fi
 PORT="${SLATEFS_NFS_PORT:-12049}"
 MNT="$(mktemp -d)"
-BIN="${CARGO_TARGET_DIR:-target}/debug"
+BIN="${CARGO_TARGET_DIR:-target}/${BIN_OVERRIDE:-debug}"
 
 cleanup() {
     $SUDO umount -f "$MNT" 2>/dev/null || true

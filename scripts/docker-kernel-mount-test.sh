@@ -19,12 +19,16 @@ docker volume create slatefs-target-linux >/dev/null
 
 docker run --rm --privileged \
     -e PJD_TESTS -e PJD_PROVE_ARGS -e PJD_TIMEOUT -e SKIP_SMOKE \
+    -e FSX_OPS -e FSSTRESS_OPS -e FSSTRESS_PROCS -e RESTARTS \
     -v "$PWD":/src:ro \
     -v slatefs-cargo-registry:/usr/local/cargo/registry \
     -v slatefs-target-linux:/target \
     -e CARGO_TARGET_DIR=/target \
     -w /src \
     rust:1 bash -ceu '
+        # Snapshot the harness scripts: /src is a live bind mount and a host
+        # edit mid-run would corrupt a script bash is still reading.
+        cp -r /src/scripts /tmp/scripts
         apt-get update -qq >/dev/null && apt-get install -y -qq nfs-common >/dev/null
         cargo build -q -p slatefs-daemon -p slatefs-cli
 
@@ -45,6 +49,6 @@ EOF
         /target/debug/slatefs -c /tmp/slatefs.toml volume create t1 v1
 
         export SLATEFS_CONFIG=/tmp/slatefs.toml
-        [ -n "${SKIP_SMOKE:-}" ] || ./scripts/nfs-kernel-mount-test.sh
-        '"${EXTRA:+/src/$EXTRA}"'
+        [ -n "${SKIP_SMOKE:-}" ] || /tmp/scripts/nfs-kernel-mount-test.sh
+        '"${EXTRA:+/tmp/$EXTRA}"'
     '
