@@ -41,7 +41,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Vendored fork of nfs3_server 0.11.0 (BSD-3-Clause) carrying the slatefs
 # patch set: AUTH_UNIX creds, LINK/MKNOD, fsstat/access hooks — see
 # crates/nfs3-server/README.md.
-nfs3_server = { path = "crates/nfs3-server" }
+nfs3_server = { path = "crates/nfs3-server", features = ["memfs"] }
 nfs3_client = { version = "0.9", features = ["tokio"] }
 
 # Crypto (DD-8, DD-3)

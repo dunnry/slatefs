@@ -127,8 +127,8 @@ impl SlateFsNfs {
             nlink: attr.nlink,
             uid: attr.uid,
             gid: attr.gid,
-            size: attr.size,
-            used: attr.blocks * 512,
+            size: wire_size(attr),
+            used: wire_used(attr),
             rdev: specdata3 {
                 specdata1: (attr.rdev >> 32) as u32,
                 specdata2: attr.rdev as u32,
@@ -154,6 +154,26 @@ impl SlateFsNfs {
             return Err(nfsstat3::NFS3ERR_STALE);
         }
         Ok(attr)
+    }
+}
+
+/// Directories carry no byte size in SlateFS; report the conventional
+/// 4 KiB instead of 0. Real filesystems never report size-0 directories,
+/// and clients use st_size of directories for heuristics (allocation,
+/// du output) — match convention rather than leak the internal 0.
+fn wire_size(attr: &FileAttr) -> u64 {
+    if attr.kind == FileKind::Dir {
+        4096
+    } else {
+        attr.size
+    }
+}
+
+fn wire_used(attr: &FileAttr) -> u64 {
+    if attr.kind == FileKind::Dir {
+        4096
+    } else {
+        attr.blocks * 512
     }
 }
 
@@ -738,8 +758,8 @@ fn fattr_for(volume: &Volume, attr: &FileAttr) -> fattr3 {
         nlink: attr.nlink,
         uid: attr.uid,
         gid: attr.gid,
-        size: attr.size,
-        used: attr.blocks * 512,
+        size: wire_size(attr),
+        used: wire_used(attr),
         rdev: specdata3 {
             specdata1: (attr.rdev >> 32) as u32,
             specdata2: attr.rdev as u32,
