@@ -9,12 +9,12 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
-use slatefs_core::config::{Config, SquashMode};
+use slatefs_core::config::Config;
 use slatefs_core::control::ControlPlane;
 use slatefs_core::crypto::kms;
 use slatefs_core::store;
 use slatefs_core::volume::Volume;
-use slatefs_nfs::{ExportIdentity, NFSTcp};
+use slatefs_nfs::{NFSTcp, SquashPolicy};
 
 #[derive(Parser)]
 #[command(name = "slatefsd", version, about = "SlateFS file server daemon")]
@@ -67,14 +67,12 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("opening volume {}/{}", export.tenant, export.volume))?;
         volumes.push(Arc::clone(&volume));
 
-        let identity = match export.squash {
-            SquashMode::AllSquash => ExportIdentity::Anonymous {
-                uid: export.anon_uid,
-                gid: export.anon_gid,
-            },
-            SquashMode::TrustAsRoot => ExportIdentity::Root,
+        let policy = SquashPolicy {
+            mode: export.squash,
+            anon_uid: export.anon_uid,
+            anon_gid: export.anon_gid,
         };
-        let listener = slatefs_nfs::bind_export(volume, fh_key.clone(), &identity, &export.listen)
+        let listener = slatefs_nfs::bind_export(volume, fh_key.clone(), policy, &export.listen)
             .await
             .with_context(|| format!("binding {}", export.listen))?;
         tracing::info!(

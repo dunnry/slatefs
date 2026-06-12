@@ -27,9 +27,9 @@ pub struct ExportConfig {
     pub volume: String,
     /// `ip:port` for this export's NFS+mount listener, e.g. `127.0.0.1:12049`.
     pub listen: String,
-    /// Identity squash policy. nfs3_server 0.11 does not expose per-request
-    /// AUTH_UNIX credentials to the filesystem, so every request on an export
-    /// acts as this one identity.
+    /// Identity squash policy (DD-10). AUTH_SYS uids are unauthenticated
+    /// assertions — pair `none`/`root_squash` with network-level tenant
+    /// isolation per the plan.
     #[serde(default)]
     pub squash: SquashMode,
     #[serde(default = "default_anon_id")]
@@ -48,6 +48,13 @@ pub enum SquashMode {
     /// Everyone acts as `anon_uid`/`anon_gid` (like `all_squash`).
     #[default]
     AllSquash,
+    /// Honor the client's AUTH_UNIX uid/gid/groups as-is (classic
+    /// `no_root_squash` trust model).
+    #[serde(rename = "none")]
+    NoSquash,
+    /// Honor client identities except root, which maps to anon (the
+    /// traditional NFS default).
+    RootSquash,
     /// Everyone acts as root — single-user/dev exports only.
     TrustAsRoot,
 }

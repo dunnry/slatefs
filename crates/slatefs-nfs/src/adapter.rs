@@ -2,23 +2,25 @@
 //! (plan §9.2). `fileid3` = ino; handles per `fh.rs`; DD-7 durability mapping
 //! lives in `write`/`commit`.
 //!
-//! Credential note: nfs3_server 0.11 does not thread per-request AUTH_UNIX
-//! identities into these traits, so each export runs under one squash
-//! identity chosen in [`ExportIdentity`]. Per-request credentials arrive
-//! with the vendored trait patch (tracked for the pjdfstest milestone).
+//! Credentials: the vendored nfs3_server patch exposes each request's
+//! AUTH_UNIX identity via `nfs3_server::current_rpc_auth()`; the export's
+//! [`SquashPolicy`] maps that unauthenticated assertion (DD-10) to the
+//! [`Credentials`] every Vfs call runs under.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use nfs3_server::nfs3_types::nfs3::{
-    FSF3_CANSETTIME, FSF3_HOMOGENEOUS, FSF3_SYMLINK, FSINFO3resok as fsinfo3, Nfs3Option,
-    createverf3, fattr3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, set_atime,
-    set_mtime, specdata3, stable_how,
+    ACCESS3_DELETE, ACCESS3_EXECUTE, ACCESS3_EXTEND, ACCESS3_LOOKUP, ACCESS3_MODIFY, ACCESS3_READ,
+    FSF3_CANSETTIME, FSF3_HOMOGENEOUS, FSF3_SYMLINK, FSINFO3resok as fsinfo3,
+    FSSTAT3resok as fsstat3, Nfs3Option, createverf3, fattr3, filename3, ftype3, mknoddata3,
+    nfspath3, nfsstat3, nfstime3, sattr3, set_atime, set_mtime, specdata3, stable_how,
 };
 use nfs3_server::vfs::{
     DirEntryPlus, NextResult, NfsFileSystem, NfsReadFileSystem, ReadDirPlusIterator,
     VFSCapabilities,
 };
+use slatefs_core::config::SquashMode;
 use slatefs_core::crypto::Secret32;
 use slatefs_core::meta::inode::{FileKind, ROOT_INO, Timespec};
 use slatefs_core::vfs::{Credentials, FileAttr, FsError, SetAttrs, TimeSet, Vfs};
@@ -30,20 +32,66 @@ use crate::fh::{FhCodec, SlateFsHandle};
 /// calls are idempotent (RFC 1813 §3.3.8).
 const EXCL_VERF_XATTR: &[u8] = b"system.slatefs.createverf";
 
-/// The identity every request on this export acts as (squash policy).
+/// Maps the caller's (unauthenticated) AUTH_UNIX assertion to the identity
+/// Vfs calls run under (DD-10 squash policy).
 #[derive(Debug, Clone)]
-pub enum ExportIdentity {
-    /// Map everyone to the anonymous uid/gid (like `all_squash`).
-    Anonymous { uid: u32, gid: u32 },
-    /// Treat everyone as root (dev/test or single-user exports).
-    Root,
+pub struct SquashPolicy {
+    pub mode: SquashMode,
+    pub anon_uid: u32,
+    pub anon_gid: u32,
 }
 
-impl ExportIdentity {
+impl SquashPolicy {
+    pub fn all_squash(anon_uid: u32, anon_gid: u32) -> SquashPolicy {
+        SquashPolicy {
+            mode: SquashMode::AllSquash,
+            anon_uid,
+            anon_gid,
+        }
+    }
+
+    pub fn trust_as_root() -> SquashPolicy {
+        SquashPolicy {
+            mode: SquashMode::TrustAsRoot,
+            anon_uid: 65534,
+            anon_gid: 65534,
+        }
+    }
+
+    pub fn no_squash() -> SquashPolicy {
+        SquashPolicy {
+            mode: SquashMode::NoSquash,
+            anon_uid: 65534,
+            anon_gid: 65534,
+        }
+    }
+
+    fn anon(&self) -> Credentials {
+        Credentials::user(self.anon_uid, self.anon_gid)
+    }
+
+    /// Credentials for the RPC currently being served.
     fn credentials(&self) -> Credentials {
-        match self {
-            ExportIdentity::Anonymous { uid, gid } => Credentials::user(*uid, *gid),
-            ExportIdentity::Root => Credentials::root(),
+        let auth = nfs3_server::current_rpc_auth();
+        match self.mode {
+            SquashMode::AllSquash => self.anon(),
+            SquashMode::TrustAsRoot => Credentials::root(),
+            SquashMode::NoSquash => match auth {
+                Some(a) => Credentials {
+                    uid: a.uid,
+                    gid: a.gid,
+                    groups: a.gids,
+                },
+                None => self.anon(),
+            },
+            SquashMode::RootSquash => match auth {
+                Some(a) if a.uid != 0 => Credentials {
+                    uid: a.uid,
+                    gid: a.gid,
+                    groups: a.gids,
+                },
+                _ => self.anon(),
+            },
         }
     }
 }
@@ -51,17 +99,17 @@ impl ExportIdentity {
 pub struct SlateFsNfs {
     volume: Arc<Volume>,
     fh: FhCodec,
-    creds: Credentials,
+    policy: SquashPolicy,
 }
 
 impl SlateFsNfs {
-    pub fn new(volume: Arc<Volume>, fh_key: Secret32, identity: &ExportIdentity) -> SlateFsNfs {
+    pub fn new(volume: Arc<Volume>, fh_key: Secret32, policy: SquashPolicy) -> SlateFsNfs {
         let fh = FhCodec::new(volume.fsid(), fh_key);
-        SlateFsNfs {
-            volume,
-            fh,
-            creds: identity.credentials(),
-        }
+        SlateFsNfs { volume, fh, policy }
+    }
+
+    fn creds(&self) -> Credentials {
+        self.policy.credentials()
     }
 
     fn ino_of(&self, handle: &SlateFsHandle) -> Result<u64, nfsstat3> {
@@ -97,7 +145,7 @@ impl SlateFsNfs {
         let ino = self.ino_of(handle)?;
         let attr = self
             .volume
-            .getattr(&self.creds, ino)
+            .getattr(&self.creds(), ino)
             .await
             .map_err(map_err)?;
         // Generation mismatch ⇒ the ino was reused since this handle was
@@ -208,7 +256,7 @@ impl NfsReadFileSystem for SlateFsNfs {
         let dir = self.ino_of(dirid)?;
         let attr = self
             .volume
-            .lookup(&self.creds, dir, filename.0.as_ref())
+            .lookup(&self.creds(), dir, filename.0.as_ref())
             .await
             .map_err(map_err)?;
         Ok(self.handle_for(&attr))
@@ -228,12 +276,12 @@ impl NfsReadFileSystem for SlateFsNfs {
         let ino = self.ino_of(id)?;
         let attr = self
             .volume
-            .getattr(&self.creds, ino)
+            .getattr(&self.creds(), ino)
             .await
             .map_err(map_err)?;
         let bytes = self
             .volume
-            .read(&self.creds, ino, offset, count)
+            .read(&self.creds(), ino, offset, count)
             .await
             .map_err(map_err)?;
         let eof = offset + bytes.len() as u64 >= attr.size;
@@ -251,7 +299,7 @@ impl NfsReadFileSystem for SlateFsNfs {
         // READDIRPLUS call itself.
         let attr = self
             .volume
-            .getattr(&self.creds, dir)
+            .getattr(&self.creds(), dir)
             .await
             .map_err(map_err)?;
         if attr.kind != FileKind::Dir {
@@ -260,7 +308,7 @@ impl NfsReadFileSystem for SlateFsNfs {
         Ok(SlateDirIter {
             volume: Arc::clone(&self.volume),
             fh: FhCodec::new(self.volume.fsid(), self.fh_key_clone()),
-            creds: self.creds.clone(),
+            creds: self.creds(),
             dir,
             cookie,
             buffer: VecDeque::new(),
@@ -272,7 +320,7 @@ impl NfsReadFileSystem for SlateFsNfs {
         let ino = self.ino_of(id)?;
         let target = self
             .volume
-            .readlink(&self.creds, ino)
+            .readlink(&self.creds(), ino)
             .await
             .map_err(map_err)?;
         Ok(nfspath3::from(target))
@@ -298,6 +346,52 @@ impl NfsReadFileSystem for SlateFsNfs {
             properties: FSF3_SYMLINK | FSF3_HOMOGENEOUS | FSF3_CANSETTIME,
         })
     }
+
+    async fn access(&self, id: &SlateFsHandle, requested: u32) -> Result<u32, nfsstat3> {
+        let creds = self.creds();
+        if creds.is_root() {
+            return Ok(requested);
+        }
+        let ino = self.ino_of(id)?;
+        let attr = self.volume.getattr(&creds, ino).await.map_err(map_err)?;
+        let rwx = if creds.uid == attr.uid {
+            (attr.mode >> 6) & 7
+        } else if creds.in_group(attr.gid) {
+            (attr.mode >> 3) & 7
+        } else {
+            attr.mode & 7
+        };
+        let mut allowed = 0;
+        if rwx & 4 != 0 {
+            allowed |= ACCESS3_READ;
+        }
+        if rwx & 2 != 0 {
+            // DELETE is really governed by the parent directory, which this
+            // proc can't see; granting it with write keeps clients moving and
+            // the actual op still enforces the sticky/parent checks.
+            allowed |= ACCESS3_MODIFY | ACCESS3_EXTEND | ACCESS3_DELETE;
+        }
+        if rwx & 1 != 0 {
+            allowed |= ACCESS3_LOOKUP | ACCESS3_EXECUTE;
+        }
+        Ok(requested & allowed)
+    }
+
+    async fn fsstat(&self, root: &SlateFsHandle) -> Result<fsstat3, nfsstat3> {
+        let creds = self.creds();
+        let attr = self.getattr_checked(root).await?;
+        let stat = self.volume.statfs(&creds).await.map_err(map_err)?;
+        Ok(fsstat3 {
+            obj_attributes: Nfs3Option::Some(self.fattr(&attr)),
+            tbytes: stat.total_bytes,
+            fbytes: stat.free_bytes,
+            abytes: stat.avail_bytes,
+            tfiles: stat.total_inodes,
+            ffiles: stat.free_inodes,
+            afiles: stat.free_inodes,
+            invarsec: 0,
+        })
+    }
 }
 
 impl SlateFsNfs {
@@ -317,14 +411,14 @@ impl NfsFileSystem for SlateFsNfs {
         if attrs.is_empty() {
             let attr = self
                 .volume
-                .getattr(&self.creds, ino)
+                .getattr(&self.creds(), ino)
                 .await
                 .map_err(map_err)?;
             return Ok(self.fattr(&attr));
         }
         let attr = self
             .volume
-            .setattr(&self.creds, ino, attrs)
+            .setattr(&self.creds(), ino, attrs)
             .await
             .map_err(map_err)?;
         Ok(self.fattr(&attr))
@@ -339,7 +433,7 @@ impl NfsFileSystem for SlateFsNfs {
     ) -> Result<(fattr3, stable_how), nfsstat3> {
         let ino = self.ino_of(id)?;
         self.volume
-            .write(&self.creds, ino, offset, data)
+            .write(&self.creds(), ino, offset, data)
             .await
             .map_err(map_err)?;
         // DD-7: UNSTABLE acks from memtable+WAL buffer; DATA_SYNC/FILE_SYNC
@@ -347,13 +441,16 @@ impl NfsFileSystem for SlateFsNfs {
         let achieved = match stable {
             stable_how::UNSTABLE => stable_how::UNSTABLE,
             stable_how::DATA_SYNC | stable_how::FILE_SYNC => {
-                self.volume.fsync(&self.creds, ino).await.map_err(map_err)?;
+                self.volume
+                    .fsync(&self.creds(), ino)
+                    .await
+                    .map_err(map_err)?;
                 stable_how::FILE_SYNC
             }
         };
         let attr = self
             .volume
-            .getattr(&self.creds, ino)
+            .getattr(&self.creds(), ino)
             .await
             .map_err(map_err)?;
         Ok((self.fattr(&attr), achieved))
@@ -370,7 +467,7 @@ impl NfsFileSystem for SlateFsNfs {
         let mode = requested.mode.unwrap_or(0o644);
         let created = self
             .volume
-            .create(&self.creds, dir, filename.0.as_ref(), mode, false)
+            .create(&self.creds(), dir, filename.0.as_ref(), mode, false)
             .await
             .map_err(map_err)?;
         // UNCHECKED create may carry attributes (typically size=0 to
@@ -383,7 +480,7 @@ impl NfsFileSystem for SlateFsNfs {
         if !followup.is_empty() {
             post = self
                 .volume
-                .setattr(&self.creds, post.ino, followup)
+                .setattr(&self.creds(), post.ino, followup)
                 .await
                 .map_err(map_err)?;
         }
@@ -400,13 +497,13 @@ impl NfsFileSystem for SlateFsNfs {
         let name = filename.0.as_ref();
         match self
             .volume
-            .create(&self.creds, dir, name, 0o644, true)
+            .create(&self.creds(), dir, name, 0o644, true)
             .await
         {
             Ok(attr) => {
                 // Persist the verifier so a retransmit is recognized.
                 self.volume
-                    .setxattr(&self.creds, attr.ino, EXCL_VERF_XATTR, &createverf.0)
+                    .setxattr(&self.creds(), attr.ino, EXCL_VERF_XATTR, &createverf.0)
                     .await
                     .map_err(map_err)?;
                 Ok(self.handle_for(&attr))
@@ -414,12 +511,12 @@ impl NfsFileSystem for SlateFsNfs {
             Err(FsError::Exists) => {
                 let existing = self
                     .volume
-                    .lookup(&self.creds, dir, name)
+                    .lookup(&self.creds(), dir, name)
                     .await
                     .map_err(map_err)?;
                 match self
                     .volume
-                    .getxattr(&self.creds, existing.ino, EXCL_VERF_XATTR)
+                    .getxattr(&self.creds(), existing.ino, EXCL_VERF_XATTR)
                     .await
                 {
                     Ok(verf) if verf == createverf.0 => Ok(self.handle_for(&existing)),
@@ -438,7 +535,7 @@ impl NfsFileSystem for SlateFsNfs {
         let dir = self.ino_of(dirid)?;
         let attr = self
             .volume
-            .mkdir(&self.creds, dir, dirname.0.as_ref(), 0o755)
+            .mkdir(&self.creds(), dir, dirname.0.as_ref(), 0o755)
             .await
             .map_err(map_err)?;
         Ok((self.handle_for(&attr), self.fattr(&attr)))
@@ -454,17 +551,17 @@ impl NfsFileSystem for SlateFsNfs {
         // REMOVE and RMDIR share this trait method; dispatch on the child.
         let child = self
             .volume
-            .lookup(&self.creds, dir, name)
+            .lookup(&self.creds(), dir, name)
             .await
             .map_err(map_err)?;
         if child.kind == FileKind::Dir {
             self.volume
-                .rmdir(&self.creds, dir, name)
+                .rmdir(&self.creds(), dir, name)
                 .await
                 .map_err(map_err)
         } else {
             self.volume
-                .unlink(&self.creds, dir, name)
+                .unlink(&self.creds(), dir, name)
                 .await
                 .map_err(map_err)
         }
@@ -481,7 +578,7 @@ impl NfsFileSystem for SlateFsNfs {
         let to = self.ino_of(to_dirid)?;
         self.volume
             .rename(
-                &self.creds,
+                &self.creds(),
                 from,
                 from_filename.0.as_ref(),
                 to,
@@ -501,7 +598,54 @@ impl NfsFileSystem for SlateFsNfs {
         let dir = self.ino_of(dirid)?;
         let attr = self
             .volume
-            .symlink(&self.creds, dir, linkname.0.as_ref(), symlink.0.as_ref())
+            .symlink(&self.creds(), dir, linkname.0.as_ref(), symlink.0.as_ref())
+            .await
+            .map_err(map_err)?;
+        Ok((self.handle_for(&attr), self.fattr(&attr)))
+    }
+
+    async fn link(
+        &self,
+        file: &SlateFsHandle,
+        link_dir: &SlateFsHandle,
+        link_name: &filename3<'_>,
+    ) -> Result<fattr3, nfsstat3> {
+        let ino = self.ino_of(file)?;
+        let dir = self.ino_of(link_dir)?;
+        let attr = self
+            .volume
+            .link(&self.creds(), ino, dir, link_name.0.as_ref())
+            .await
+            .map_err(map_err)?;
+        Ok(self.fattr(&attr))
+    }
+
+    async fn mknod(
+        &self,
+        dir: &SlateFsHandle,
+        name: &filename3<'_>,
+        what: &mknoddata3,
+    ) -> Result<(SlateFsHandle, fattr3), nfsstat3> {
+        let dir = self.ino_of(dir)?;
+        let (kind, rdev, sattr) = match what {
+            mknoddata3::NF3CHR(dev) => (
+                FileKind::CharDev,
+                ((dev.spec.specdata1 as u64) << 32) | dev.spec.specdata2 as u64,
+                &dev.dev_attributes,
+            ),
+            mknoddata3::NF3BLK(dev) => (
+                FileKind::BlockDev,
+                ((dev.spec.specdata1 as u64) << 32) | dev.spec.specdata2 as u64,
+                &dev.dev_attributes,
+            ),
+            mknoddata3::NF3SOCK(sattr) => (FileKind::Socket, 0, sattr),
+            mknoddata3::NF3FIFO(sattr) => (FileKind::Fifo, 0, sattr),
+            mknoddata3::default => return Err(nfsstat3::NFS3ERR_BADTYPE),
+        };
+        let mode = to_setattrs(sattr).mode.unwrap_or(0o644);
+        let attr = self
+            .volume
+            .mknod(&self.creds(), dir, name.0.as_ref(), mode, kind, rdev)
             .await
             .map_err(map_err)?;
         Ok((self.handle_for(&attr), self.fattr(&attr)))
@@ -510,7 +654,7 @@ impl NfsFileSystem for SlateFsNfs {
     async fn commit(&self, id: &SlateFsHandle, _offset: u64, _count: u32) -> Result<(), nfsstat3> {
         // COMMIT durability is volume-wide (DD-7): flush the WAL.
         let ino = self.ino_of(id)?;
-        self.volume.fsync(&self.creds, ino).await.map_err(map_err)
+        self.volume.fsync(&self.creds(), ino).await.map_err(map_err)
     }
 }
 

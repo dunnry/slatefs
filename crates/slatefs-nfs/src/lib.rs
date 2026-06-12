@@ -20,12 +20,11 @@
 //! - *license/maintenance*: BSD-3-Clause, actively maintained.
 //!   `zerofs_nfsserve` was excluded outright (unsuitable license).
 //!
-//! Known gaps in nfs3_server 0.11, tracked for a vendored patch or upstream
-//! PR before the pjdfstest milestone:
-//! - LINK and MKNOD return `PROC_UNAVAIL` (no trait methods);
-//! - per-request AUTH_UNIX credentials are not threaded into the traits, so
-//!   each export runs under one squash identity ([`adapter::ExportIdentity`]);
-//! - FSSTAT is hardcoded in the handler (df can't see quotas yet).
+//! The three gaps found in the spike (no LINK/MKNOD, no per-request
+//! AUTH_UNIX credentials, hardcoded FSSTAT) are fixed by the vendored fork
+//! in `crates/nfs3-server` (search `[slatefs patch]`; intended for an
+//! upstream PR). Exports now enforce per-caller permissions under a
+//! configurable squash policy ([`adapter::SquashPolicy`]).
 
 pub mod adapter;
 pub mod fh;
@@ -37,7 +36,7 @@ use nfs3_server::tcp::NFSTcpListener;
 use slatefs_core::crypto::Secret32;
 use slatefs_core::volume::Volume;
 
-pub use adapter::{ExportIdentity, SlateFsNfs};
+pub use adapter::{SlateFsNfs, SquashPolicy};
 pub use nfs3_server::tcp::NFSTcp;
 
 /// Bind an NFS listener for one volume export.
@@ -47,10 +46,10 @@ pub use nfs3_server::tcp::NFSTcp;
 pub async fn bind_export(
     volume: Arc<Volume>,
     fh_key: Secret32,
-    identity: &ExportIdentity,
+    policy: SquashPolicy,
     listen: &str,
 ) -> io::Result<NFSTcpListener<SlateFsNfs>> {
     let fsid = volume.fsid();
-    let fs = SlateFsNfs::new(volume, fh_key, identity);
+    let fs = SlateFsNfs::new(volume, fh_key, policy);
     NFSTcpListener::bind_with_generation(listen, fs, fsid).await
 }

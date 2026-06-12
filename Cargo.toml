@@ -6,6 +6,7 @@ members = [
     "crates/slatefs-9p",
     "crates/slatefs-daemon",
     "crates/slatefs-cli",
+    "crates/nfs3-server",
 ]
 
 [workspace.package]
@@ -36,8 +37,11 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# NFSv3 frontend (plan §9.2 spike outcome; zerofs_nfsserve excluded by license)
-nfs3_server = "0.11"
+# NFSv3 frontend (plan §9.2 spike outcome; zerofs_nfsserve excluded by license).
+# Vendored fork of nfs3_server 0.11.0 (BSD-3-Clause) carrying the slatefs
+# patch set: AUTH_UNIX creds, LINK/MKNOD, fsstat/access hooks — see
+# crates/nfs3-server/README.md.
+nfs3_server = { path = "crates/nfs3-server" }
 nfs3_client = { version = "0.9", features = ["tokio"] }
 
 # Crypto (DD-8, DD-3)

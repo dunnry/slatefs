@@ -23,7 +23,7 @@ use slatefs_core::crypto::kms::{Kms, StaticKms};
 use slatefs_core::crypto::{Cipher, Secret32};
 use slatefs_core::store::{self, ObjectStore};
 use slatefs_core::volume::{self, CreateVolumeOptions, Volume};
-use slatefs_nfs::{ExportIdentity, NFSTcp};
+use slatefs_nfs::{NFSTcp, SquashPolicy};
 
 const TEST_CHUNK: u32 = 4096;
 
@@ -82,9 +82,14 @@ async fn reopen_volume(object_store: Arc<dyn ObjectStore>) -> Arc<Volume> {
 
 /// Serve `volume` on an ephemeral port; returns (port, server task).
 async fn serve(volume: Arc<Volume>) -> (u16, tokio::task::JoinHandle<()>) {
-    let listener = slatefs_nfs::bind_export(volume, fh_key(), &ExportIdentity::Root, "127.0.0.1:0")
-        .await
-        .expect("bind export");
+    let listener = slatefs_nfs::bind_export(
+        volume,
+        fh_key(),
+        SquashPolicy::trust_as_root(),
+        "127.0.0.1:0",
+    )
+    .await
+    .expect("bind export");
     let port = listener.get_listen_port();
     let task = tokio::spawn(async move {
         let _ = listener.handle_forever().await;

@@ -36,9 +36,17 @@ cookie pagination, server-restart handle survival, DQUOT, forged-handle
 rejection. A real Linux kernel-client mount test runs in CI
 (`scripts/nfs-kernel-mount-test.sh`).
 
-Remaining for Phase 2 AC: vendored patch (or upstream PR) for per-request
-AUTH_UNIX credentials, LINK/MKNOD, and a quota-aware FSSTAT hook in
-nfs3_server; then the pjdfstest/fsx/fsstress runs.
+The spike's three library gaps are closed by a vendored fork
+(`crates/nfs3-server`, BSD-3-Clause with attribution, patches marked
+`[slatefs patch]` and intended for an upstream PR): per-request AUTH_UNIX
+credentials (squash policies `none` / `root_squash` / `all_squash` /
+`trust_as_root` now enforce real per-uid permissions), LINK + MKNOD
+handlers, and FSSTAT/ACCESS trait hooks so `df` reflects quotas. All
+verified over the wire by `slatefs-nfs/tests/nfs_creds.rs`.
+
+Remaining for Phase 2 AC: pjdfstest/fsx/fsstress runs over a Linux kernel
+mount (harness: `scripts/nfs-kernel-mount-test.sh` + the `kernel-mount`
+CI job).
 
 > Testing against kernel NFS clients: always mount with
 > `soft,intr,timeo=…` and bound every command touching the mountpoint
