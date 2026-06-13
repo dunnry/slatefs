@@ -20,6 +20,8 @@ docker volume create slatefs-target-linux >/dev/null
 docker run --rm --privileged \
     -e PJD_TESTS -e PJD_PROVE_ARGS -e PJD_TIMEOUT -e SKIP_SMOKE \
     -e FSX_OPS -e FSSTRESS_OPS -e FSSTRESS_PROCS -e RESTARTS \
+    -e FAILOVER_PRIMARY_PORT -e FAILOVER_TAKEOVER_PORT \
+    -e FAILOVER_PRIMARY_METRICS_PORT -e FAILOVER_TAKEOVER_METRICS_PORT \
     -v "$PWD":/src:ro \
     -v slatefs-cargo-registry:/usr/local/cargo/registry \
     -v slatefs-target-linux:/target \

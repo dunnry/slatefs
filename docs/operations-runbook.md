@@ -21,6 +21,16 @@ Immediate action:
 Expected behavior: the stale daemon marks the volume dead and drops exports; the takeover daemon
 opens the same SlateDB path, advances the writer epoch, replays WAL, and serves with the same fsid.
 
+Automated drill:
+
+```sh
+scripts/docker-kernel-mount-test.sh scripts/nfs-failover-drill.sh
+```
+
+The drill writes a durable marker through a real kernel NFS client, starts a takeover daemon on a
+second port, forces the stale daemon to observe SlateDB fencing, remounts to the takeover export,
+checks `/metrics`, and runs `slatefs volume scrub`.
+
 ## Object Store Outage
 
 Signal:
