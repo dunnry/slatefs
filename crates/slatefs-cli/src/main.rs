@@ -97,7 +97,7 @@ enum VolumeCmd {
 
 #[derive(Subcommand)]
 enum QuotaCmd {
-    /// Show a volume's configured quota limits.
+    /// Show configured quota limits and current usage.
     Show { tenant: String, volume: String },
     /// Set quota limits. Values are bytes/counts, or `none` to clear a limit.
     Set {
@@ -167,6 +167,17 @@ fn print_quota(tenant: &str, volume: &str, quota: QuotaLimits) {
         format_limit(quota.inodes.hard),
         format_limit(quota.inodes.soft),
         format_limit(quota.inodes.grace_until)
+    );
+}
+
+fn print_quota_usage(report: &slatefs_core::fsck::FsckReport) {
+    println!(
+        "usage: bytes counter={} recount={}",
+        report.counter_bytes, report.bytes_counted
+    );
+    println!(
+        "usage: inodes counter={} recount={}",
+        report.counter_inodes, report.inodes_counted
     );
 }
 
@@ -366,6 +377,11 @@ async fn run(
         Command::Quota(QuotaCmd::Show { tenant, volume }) => {
             let record = control.get_volume(tenant, volume).await?;
             print_quota(tenant, volume, record.quota);
+            let report = volume::scrub_volume(control, object_store, tenant, volume).await?;
+            print_quota_usage(&report);
+            if !report.counters_match() {
+                anyhow::bail!("quota counters differ from recount");
+            }
         }
         Command::Quota(QuotaCmd::Set {
             tenant,
