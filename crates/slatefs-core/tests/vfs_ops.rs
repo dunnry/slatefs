@@ -100,6 +100,72 @@ async fn online_scrub_does_not_take_writer_lease() {
 }
 
 #[tokio::test]
+async fn fenced_writer_marks_volume_dead() {
+    let object_store = store::resolve_root("memory:///").unwrap();
+    let control = ControlPlane::open(Arc::clone(&object_store), test_kms())
+        .await
+        .unwrap();
+    control.create_tenant("t", None).await.unwrap();
+    let record = volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "v",
+        CreateVolumeOptions {
+            cipher: Cipher::Aes256Gcm,
+            chunk_size: TEST_CHUNK,
+            compression: Compression::Lz4,
+            quota: QuotaLimits::default(),
+            note: None,
+        },
+    )
+    .await
+    .unwrap();
+    let dek = control.unwrap_volume_dek(&record).await.unwrap();
+    control.close().await.unwrap();
+
+    let stale = volume::Volume::open(&record, dek.clone(), Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let file = stale
+        .create(&root(), ROOT_INO, b"before-fence", 0o644, true)
+        .await
+        .unwrap();
+    stale
+        .write(&root(), file.ino, 0, b"visible to takeover")
+        .await
+        .unwrap();
+
+    let takeover = volume::Volume::open(&record, dek, Arc::clone(&object_store))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        stale
+            .write(&root(), file.ino, 0, b"stale writer")
+            .await
+            .unwrap_err(),
+        FsError::Io
+    );
+    assert!(stale.is_dead(), "stale writer should latch dead");
+    assert_eq!(
+        stale.getattr(&root(), ROOT_INO).await.unwrap_err(),
+        FsError::Io
+    );
+
+    let taken = takeover
+        .create(&root(), ROOT_INO, b"after-fence", 0o644, true)
+        .await
+        .unwrap();
+    takeover
+        .write(&root(), taken.ino, 0, b"new writer")
+        .await
+        .unwrap();
+    assert!(!takeover.is_dead());
+    assert!(takeover.fsck().await.unwrap().is_clean());
+}
+
+#[tokio::test]
 async fn sparse_files_bill_only_allocated_chunks() {
     let v = fresh_volume().await;
     let f = v

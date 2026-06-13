@@ -3,9 +3,11 @@
 //! is one atomic `WriteBatch` commit; the only multi-commit paths are batched
 //! chunk reaping, which the accounting rule makes crash-consistent.
 
+use std::ops::RangeBounds;
+
 use bytes::Bytes;
-use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
+use slatedb::{DbIterator, KeyValue, WriteBatch};
 
 use crate::data;
 use crate::locks::{LockRange, RangeLock};
@@ -83,14 +85,37 @@ fn check_sticky(creds: &Credentials, parent: &Inode, child: &Inode) -> FsResult<
 }
 
 impl Volume {
+    async fn db_get<K: AsRef<[u8]> + Send>(&self, key: K) -> FsResult<Option<Bytes>> {
+        self.ensure_live()?;
+        let result = self.db.get(key).await;
+        self.map_storage(result)
+    }
+
+    async fn db_scan<K, T>(&self, range: T) -> FsResult<DbIterator>
+    where
+        K: AsRef<[u8]> + Send,
+        T: RangeBounds<K> + Send,
+    {
+        self.ensure_live()?;
+        let result = self.db.scan(range).await;
+        self.map_storage(result)
+    }
+
+    async fn iter_next(&self, iter: &mut DbIterator) -> FsResult<Option<KeyValue>> {
+        self.ensure_live()?;
+        let result = iter.next().await;
+        self.map_storage(result)
+    }
+
     async fn commit(&self, batch: WriteBatch) -> FsResult<()> {
+        self.ensure_live()?;
         // DD-7: ack from memtable + WAL buffer; durability comes from the
         // engine's flush_interval, or fsync/COMMIT mapping to flush().
         let opts = WriteOptions {
             await_durable: false,
             ..WriteOptions::default()
         };
-        self.db.write_with_options(batch, &opts).await?;
+        self.map_storage(self.db.write_with_options(batch, &opts).await)?;
         Ok(())
     }
 
@@ -98,6 +123,7 @@ impl Volume {
     /// paths use [`Volume::load_inode`] (DB-direct) so a missed
     /// write-through can never feed a read-modify-write.
     async fn load_inode_cached(&self, ino: u64) -> FsResult<Inode> {
+        self.ensure_live()?;
         if let Some(inode) = self.attrs.get(ino) {
             return Ok(inode);
         }
@@ -157,7 +183,7 @@ impl Volume {
     }
 
     async fn load_inode(&self, ino: u64) -> FsResult<Inode> {
-        match self.db.get(keys::inode(ino)).await? {
+        match self.db_get(keys::inode(ino)).await? {
             Some(bytes) => Ok(Inode::decode(&bytes)?),
             // The ino came from a handle/cookie the client kept; the file is
             // gone — stale handle, not ENOENT (plan §5).
@@ -175,7 +201,7 @@ impl Volume {
 
     async fn dirent_of(&self, parent: u64, name: &[u8]) -> FsResult<Option<Dirent>> {
         let enc = self.names.seal_name(parent, name)?;
-        match self.db.get(keys::dirent(parent, &enc)).await? {
+        match self.db_get(keys::dirent(parent, &enc)).await? {
             Some(bytes) => Ok(Some(Dirent::decode(&bytes)?)),
             None => Ok(None),
         }
@@ -202,20 +228,23 @@ impl Volume {
     /// Allocate an inode number, durably renewing the lease when needed
     /// (ordering argument in `meta::alloc`).
     async fn alloc_ino(&self) -> FsResult<u64> {
+        self.ensure_live()?;
         let (ino, renew) = self.alloc.allocate();
         if let Some(lease_end) = renew {
             let opts = WriteOptions {
                 await_durable: false,
                 ..WriteOptions::default()
             };
-            self.db
+            let result = self
+                .db
                 .put_with_options(
                     keys::KEY_NEXT_INO,
                     lease_end.to_be_bytes(),
                     &Default::default(),
                     &opts,
                 )
-                .await?;
+                .await;
+            self.map_storage(result)?;
         }
         Ok(ino)
     }
@@ -336,7 +365,7 @@ impl Volume {
     /// Finish an orphan whose last handle closed (or that a crash left with
     /// its inode intact): settle quota, drop the inode, reap data.
     pub(crate) async fn finish_orphan(&self, ino: u64) -> FsResult<()> {
-        if let Some(bytes) = self.db.get(keys::inode(ino)).await? {
+        if let Some(bytes) = self.db_get(keys::inode(ino)).await? {
             let inode = Inode::decode(&bytes)?;
             let mut batch = WriteBatch::new();
             batch.delete(keys::inode(ino));
@@ -362,8 +391,13 @@ impl Volume {
             return;
         }
         let _guard = self.locks.write(ino).await;
-        let Ok(Some(bytes)) = self.db.get(keys::inode(ino)).await else {
-            return;
+        let bytes = match self.db.get(keys::inode(ino)).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return,
+            Err(error) => {
+                self.note_storage_error(&error);
+                return;
+            }
         };
         let Ok(mut current) = Inode::decode(&bytes) else {
             return;
@@ -508,9 +542,9 @@ impl Vfs for Volume {
             }
             access(creds, &inode, ACCESS_W)?;
             if new_size != inode.size {
-                let plan =
-                    data::plan_truncate(&self.db, self.chunk_size, ino, inode.size, new_size)
-                        .await?;
+                let plan = self.map_core(
+                    data::plan_truncate(&self.db, self.chunk_size, ino, inode.size, new_size).await,
+                )?;
                 self.quota.reserve(plan.billed_delta, 0)?;
                 quota_delta = plan.billed_delta;
                 if let Some((idx, bytes)) = plan.tail_put {
@@ -558,8 +592,9 @@ impl Vfs for Volume {
             _ => return Err(FsError::Invalid),
         }
         access(creds, &inode, ACCESS_R)?;
-        let bytes =
-            data::read_range(&self.db, self.chunk_size, ino, inode.size, offset, len).await?;
+        let bytes = self.map_core(
+            data::read_range(&self.db, self.chunk_size, ino, inode.size, offset, len).await,
+        )?;
         self.plan_readahead(ino, offset, offset + bytes.len() as u64, inode.size);
         self.maybe_update_atime(ino, &inode).await;
         Ok(bytes)
@@ -593,8 +628,9 @@ impl Vfs for Volume {
         }
         access(creds, &inode, ACCESS_W)?;
 
-        let plan =
-            data::plan_write(&self.db, self.chunk_size, ino, inode.size, offset, data_buf).await?;
+        let plan = self.map_core(
+            data::plan_write(&self.db, self.chunk_size, ino, inode.size, offset, data_buf).await,
+        )?;
         self.quota.reserve(plan.billed_delta, 0)?;
 
         let ts = now();
@@ -745,7 +781,7 @@ impl Vfs for Volume {
         if inode.kind != FileKind::Symlink {
             return Err(FsError::Invalid);
         }
-        match self.db.get(keys::symlink(ino)).await? {
+        match self.db_get(keys::symlink(ino)).await? {
             Some(bytes) => Ok(bytes.to_vec()),
             None => Err(FsError::Io),
         }
@@ -886,14 +922,12 @@ impl Vfs for Volume {
 
             // Emptiness: any dirent under the child?
             let mut iter = self
-                .db
-                .scan(
+                .db_scan::<Vec<u8>, _>(
                     keys::dirent_prefix(d.child_ino).to_vec()
                         ..keys::dirent_prefix(d.child_ino + 1).to_vec(),
                 )
-                .await
-                .map_err(FsError::from)?;
-            if iter.next().await.map_err(FsError::from)?.is_some() {
+                .await?;
+            if self.iter_next(&mut iter).await?.is_some() {
                 return Err(FsError::NotEmpty);
             }
 
@@ -908,14 +942,12 @@ impl Vfs for Volume {
             batch.delete(keys::inode(d.child_ino));
             // Directories own no chunks; drop any xattrs inline.
             let mut xiter = self
-                .db
-                .scan(
+                .db_scan::<Vec<u8>, _>(
                     keys::xattr_prefix(d.child_ino).to_vec()
                         ..keys::xattr_prefix(d.child_ino + 1).to_vec(),
                 )
-                .await
-                .map_err(FsError::from)?;
-            while let Some(kv) = xiter.next().await.map_err(FsError::from)? {
+                .await?;
+            while let Some(kv) = self.iter_next(&mut xiter).await? {
                 batch.delete(kv.key);
             }
             batch.put(keys::inode(parent), dir.encode()?);
@@ -1037,14 +1069,12 @@ impl Vfs for Volume {
                     (false, true) => return Err(FsError::IsDir),
                     (true, true) => {
                         let mut iter = self
-                            .db
-                            .scan(
+                            .db_scan::<Vec<u8>, _>(
                                 keys::dirent_prefix(dstd.child_ino).to_vec()
                                     ..keys::dirent_prefix(dstd.child_ino + 1).to_vec(),
                             )
-                            .await
-                            .map_err(FsError::from)?;
-                        if iter.next().await.map_err(FsError::from)?.is_some() {
+                            .await?;
+                        if self.iter_next(&mut iter).await?.is_some() {
                             return Err(FsError::NotEmpty);
                         }
                         batch.delete(keys::inode(dstd.child_ino));
@@ -1155,14 +1185,12 @@ impl Vfs for Volume {
         let start = keys::dirent_idx(parent, cookie.saturating_add(1));
         let end = keys::dirent_idx(parent, u64::MAX);
         let mut iter = self
-            .db
-            .scan(start.to_vec()..end.to_vec())
-            .await
-            .map_err(FsError::from)?;
+            .db_scan::<Vec<u8>, _>(start.to_vec()..end.to_vec())
+            .await?;
 
         let mut entries = Vec::new();
         let mut eof = true;
-        while let Some(kv) = iter.next().await.map_err(FsError::from)? {
+        while let Some(kv) = self.iter_next(&mut iter).await? {
             if entries.len() == max_entries {
                 eof = false;
                 break;
@@ -1188,7 +1216,7 @@ impl Vfs for Volume {
         }
         let inode = self.load_inode(ino).await?;
         access(creds, &inode, ACCESS_R)?;
-        match self.db.get(keys::xattr(ino, name)).await? {
+        match self.db_get(keys::xattr(ino, name)).await? {
             Some(bytes) => Ok(bytes.to_vec()),
             None => Err(FsError::NoData),
         }
@@ -1223,12 +1251,12 @@ impl Vfs for Volume {
         let inode = self.load_inode(ino).await?;
         access(creds, &inode, ACCESS_R)?;
         let mut iter = self
-            .db
-            .scan(keys::xattr_prefix(ino).to_vec()..keys::xattr_prefix(ino + 1).to_vec())
-            .await
-            .map_err(FsError::from)?;
+            .db_scan::<Vec<u8>, _>(
+                keys::xattr_prefix(ino).to_vec()..keys::xattr_prefix(ino + 1).to_vec(),
+            )
+            .await?;
         let mut names = Vec::new();
-        while let Some(kv) = iter.next().await.map_err(FsError::from)? {
+        while let Some(kv) = self.iter_next(&mut iter).await? {
             names.push(kv.key[9..].to_vec());
         }
         Ok(names)
@@ -1241,7 +1269,7 @@ impl Vfs for Volume {
         let _guard = self.locks.write(ino).await;
         let mut inode = self.load_inode(ino).await?;
         access(creds, &inode, ACCESS_W)?;
-        if self.db.get(keys::xattr(ino, name)).await?.is_none() {
+        if self.db_get(keys::xattr(ino, name)).await?.is_none() {
             return Err(FsError::NoData);
         }
         inode.ctime = now();
@@ -1254,6 +1282,7 @@ impl Vfs for Volume {
     }
 
     async fn statfs(&self, _creds: &Credentials) -> FsResult<StatFs> {
+        self.ensure_live()?;
         let (bytes_used, inodes_used) = self.quota.usage();
         let limits = self.quota.limits();
         let (total_bytes, free_bytes) = match limits.bytes.hard {
@@ -1282,7 +1311,9 @@ impl Vfs for Volume {
 
     async fn fsync(&self, _creds: &Credentials, _ino: u64) -> FsResult<()> {
         // DD-7: fsync/COMMIT acks only after the WAL reaches the object store.
-        self.db.flush().await?;
+        self.ensure_live()?;
+        let result = self.db.flush().await;
+        self.map_storage(result)?;
         Ok(())
     }
 
@@ -1311,7 +1342,7 @@ impl Vfs for Volume {
             return Err(FsError::BadHandle);
         };
         self.range_locks.unlock_owner(handle);
-        if last && self.db.get(keys::orphan(ino)).await?.is_some() {
+        if last && !self.is_dead() && self.db_get(keys::orphan(ino)).await?.is_some() {
             // Last handle on an unlinked file: settle quota and reap.
             let _guard = self.locks.write(ino).await;
             self.finish_orphan(ino).await?;
@@ -1320,6 +1351,7 @@ impl Vfs for Volume {
     }
 
     async fn lock(&self, handle: HandleId, start: u64, end: u64, exclusive: bool) -> FsResult<()> {
+        self.ensure_live()?;
         if start >= end {
             return Err(FsError::Invalid);
         }
@@ -1344,6 +1376,7 @@ impl Vfs for Volume {
     }
 
     async fn unlock(&self, handle: HandleId, start: u64, end: u64) -> FsResult<()> {
+        self.ensure_live()?;
         if start >= end {
             return Err(FsError::Invalid);
         }
@@ -1367,6 +1400,7 @@ impl Vfs for Volume {
         end: u64,
         exclusive: bool,
     ) -> FsResult<Option<(u64, u64, bool)>> {
+        self.ensure_live()?;
         if start >= end {
             return Err(FsError::Invalid);
         }

@@ -4,6 +4,7 @@
 //! manager, quota tracker, inode allocator, name codec, and open-file table.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use slatedb::admin::AdminBuilder;
@@ -20,7 +21,7 @@ use crate::crypto::kms::contexts;
 use crate::crypto::names::NameCodec;
 use crate::crypto::transformer::SlateBlockTransformer;
 use crate::crypto::{Cipher, Secret32, aead, random_u64};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, is_fenced_slatedb_error};
 use crate::locks::{LockManager, RangeLockTable};
 use crate::meta::alloc::InodeAllocator;
 use crate::meta::dirent::Orphan;
@@ -29,7 +30,7 @@ use crate::meta::keys;
 use crate::meta::superblock::{KEY_SUPERBLOCK, Superblock};
 use crate::quota::{self, CounterMergeOperator, QuotaTracker};
 use crate::store;
-use crate::vfs::OpenMode;
+use crate::vfs::{FsError, FsResult, OpenMode};
 
 /// Parameters fixed at volume creation. `cipher` must already be resolved
 /// (no `Auto` here): the choice is recorded in the volume format and must not
@@ -719,6 +720,7 @@ impl HandleTable {
 pub struct Volume {
     pub(crate) db: Db,
     pub(crate) superblock: Superblock,
+    dead: AtomicBool,
     pub(crate) names: NameCodec,
     pub(crate) locks: LockManager,
     pub(crate) range_locks: RangeLockTable,
@@ -790,6 +792,7 @@ impl Volume {
             db,
             chunk_size: superblock.chunk_size as u64,
             superblock,
+            dead: AtomicBool::new(false),
             names: NameCodec::new(dek),
             locks: LockManager::default(),
             range_locks: RangeLockTable::default(),
@@ -809,15 +812,85 @@ impl Volume {
         &self.superblock
     }
 
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn ensure_live(&self) -> FsResult<()> {
+        if self.is_dead() {
+            Err(FsError::Io)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn mark_fenced(&self) {
+        if !self.dead.swap(true, Ordering::AcqRel) {
+            tracing::error!(
+                fsid = %format!("{:016x}", self.superblock.fsid),
+                "volume fenced by newer SlateDB writer; marking export dead"
+            );
+        }
+    }
+
+    pub(crate) fn note_storage_error(&self, error: &slatedb::Error) {
+        if is_fenced_slatedb_error(error) {
+            self.mark_fenced();
+        }
+    }
+
+    pub(crate) fn map_storage<T>(
+        &self,
+        result: std::result::Result<T, slatedb::Error>,
+    ) -> FsResult<T> {
+        if self.is_dead() {
+            return Err(FsError::Io);
+        }
+        match result {
+            Ok(value) => {
+                self.ensure_live()?;
+                Ok(value)
+            }
+            Err(error) => {
+                self.note_storage_error(&error);
+                Err(FsError::from(error))
+            }
+        }
+    }
+
+    pub(crate) fn map_core<T>(&self, result: Result<T>) -> FsResult<T> {
+        if self.is_dead() {
+            return Err(FsError::Io);
+        }
+        match result {
+            Ok(value) => {
+                self.ensure_live()?;
+                Ok(value)
+            }
+            Err(error) => {
+                if error.is_fenced() {
+                    self.mark_fenced();
+                }
+                Err(FsError::from(error))
+            }
+        }
+    }
+
     /// Flush acknowledged writes to durable storage (DD-7).
     pub async fn flush(&self) -> Result<()> {
-        self.db.flush().await.map_err(Error::from)
+        self.db.flush().await.map_err(|error| {
+            self.note_storage_error(&error);
+            Error::from(error)
+        })
     }
 
     /// Stop serving and close the underlying Db. Named to avoid colliding
     /// with `Vfs::close(handle)`.
     pub async fn shutdown(&self) -> Result<()> {
-        self.db.close().await.map_err(Error::from)
+        self.db.close().await.map_err(|error| {
+            self.note_storage_error(&error);
+            Error::from(error)
+        })
     }
 
     /// Delete an orphan's data — see [`reap_orphan_data`].

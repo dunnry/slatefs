@@ -36,6 +36,13 @@ pub enum Error {
     Io(#[from] std::io::Error),
 }
 
+pub(crate) fn is_fenced_slatedb_error(error: &slatedb::Error) -> bool {
+    matches!(
+        error.kind(),
+        slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced)
+    )
+}
+
 impl Error {
     pub fn crypto(msg: impl Into<String>) -> Self {
         Error::Crypto(msg.into())
@@ -60,5 +67,9 @@ impl Error {
             what,
             reason: reason.into(),
         }
+    }
+
+    pub(crate) fn is_fenced(&self) -> bool {
+        matches!(self, Error::SlateDb(error) if is_fenced_slatedb_error(error))
     }
 }
