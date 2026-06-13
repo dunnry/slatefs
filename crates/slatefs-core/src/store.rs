@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use futures::TryStreamExt;
 // Re-exported so frontends/CLI don't need a direct slatedb dependency just to
 // hold a store handle.
 pub use slatedb::object_store::ObjectStore;
@@ -36,6 +37,24 @@ pub fn volume_db_path(tenant: &str, volume: &str) -> String {
 
 pub fn volume_db_prefix(tenant: &str, volume: &str) -> ObjPath {
     ObjPath::from(volume_db_path(tenant, volume))
+}
+
+pub async fn delete_prefix(object_store: &Arc<dyn ObjectStore>, prefix: &ObjPath) -> Result<usize> {
+    let objects: Vec<_> = object_store.list(Some(prefix)).try_collect().await?;
+    let count = objects.len();
+    if count == 0 {
+        return Ok(0);
+    }
+    let locations = futures::stream::iter(
+        objects
+            .into_iter()
+            .map(|meta| Ok::<_, slatedb::object_store::Error>(meta.location)),
+    );
+    object_store
+        .delete_stream(Box::pin(locations))
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(count)
 }
 
 /// Tenant and volume names become object-store path segments, wrap contexts,

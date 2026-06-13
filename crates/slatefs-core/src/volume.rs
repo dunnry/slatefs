@@ -13,7 +13,9 @@ use slatedb::{Checkpoint, Db, DbReader, Settings, WriteBatch};
 
 use crate::attrcache::AttrCache;
 use crate::config::{CacheConfig, Compression, VolumeDefaults};
-use crate::control::{ControlPlane, QuotaLimits, TenantState, VolumeRecord, VolumeState, now_unix};
+use crate::control::{
+    CloneParent, ControlPlane, QuotaLimits, TenantState, VolumeRecord, VolumeState, now_unix,
+};
 use crate::crypto::kms::contexts;
 use crate::crypto::names::NameCodec;
 use crate::crypto::transformer::SlateBlockTransformer;
@@ -51,6 +53,14 @@ impl CreateVolumeOptions {
             note: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CloneVolumeOptions {
+    /// Optional source checkpoint id. If omitted, SlateDB clones the latest
+    /// durable source state. The source volume must not be actively served.
+    pub source_snapshot_id: Option<String>,
+    pub note: Option<String>,
 }
 
 /// Cache wiring for one open volume (plan §8). Per-volume by design:
@@ -160,6 +170,7 @@ pub async fn create_volume(
                 tenant: tenant_name.to_string(),
                 name: volume_name.to_string(),
                 state: VolumeState::Creating,
+                clone_parent: None,
                 fsid: random_u64(),
                 wrapped_dek: aead::wrap_key(
                     &kek,
@@ -191,6 +202,199 @@ pub async fn create_volume(
         "volume created"
     );
     Ok(record)
+}
+
+/// Create an instant writable clone in the same tenant. The SlateDB clone is
+/// shallow and shares source SSTs, so the clone must use the same plaintext DEK
+/// as the source. We still wrap that DEK under the destination volume context
+/// and rewrite the cloned superblock to give the clone its own fsid.
+pub async fn clone_volume(
+    control: &ControlPlane,
+    object_store: Arc<dyn ObjectStore>,
+    tenant_name: &str,
+    source_volume_name: &str,
+    clone_volume_name: &str,
+    opts: CloneVolumeOptions,
+) -> Result<VolumeRecord> {
+    store::validate_name("tenant name", tenant_name)?;
+    store::validate_name("source volume name", source_volume_name)?;
+    store::validate_name("clone volume name", clone_volume_name)?;
+    if source_volume_name == clone_volume_name {
+        return Err(Error::invalid(
+            "clone volume",
+            "source and destination names must differ",
+        ));
+    }
+
+    let tenant = control.get_tenant(tenant_name).await?;
+    if tenant.state != TenantState::Active {
+        return Err(Error::invalid(
+            "tenant state",
+            format!("tenant {tenant_name:?} is {:?}, not Active", tenant.state),
+        ));
+    }
+
+    let source = control.get_volume(tenant_name, source_volume_name).await?;
+    if source.state != VolumeState::Active {
+        return Err(Error::invalid(
+            "source volume state",
+            format!(
+                "{tenant_name}/{source_volume_name} is {:?}, not Active",
+                source.state
+            ),
+        ));
+    }
+
+    let source_dek = control.unwrap_volume_dek(&source).await?;
+    let checkpoint = opts
+        .source_snapshot_id
+        .as_deref()
+        .map(|id| {
+            uuid::Uuid::parse_str(id)
+                .map_err(|e| Error::invalid("snapshot id", format!("{id:?}: {e}")))
+        })
+        .transpose()?;
+
+    let mut record = match control
+        .try_get_volume(tenant_name, clone_volume_name)
+        .await?
+    {
+        Some(existing) if existing.state == VolumeState::Creating => {
+            let same_parent = existing.clone_parent.as_ref().is_some_and(|parent| {
+                parent.tenant == tenant_name && parent.volume == source_volume_name
+            });
+            if !same_parent {
+                return Err(Error::already_exists(
+                    "volume",
+                    format!("{tenant_name}/{clone_volume_name}"),
+                ));
+            }
+            if existing.cipher != source.cipher
+                || existing.chunk_size != source.chunk_size
+                || existing.compression != source.compression
+            {
+                return Err(Error::invalid(
+                    "clone record",
+                    "interrupted clone format differs from source volume",
+                ));
+            }
+            let existing_dek = control.unwrap_volume_dek(&existing).await?;
+            if existing_dek.expose_secret() != source_dek.expose_secret() {
+                return Err(Error::invalid(
+                    "clone record",
+                    "interrupted clone DEK differs from source volume",
+                ));
+            }
+            tracing::warn!(
+                tenant = tenant_name,
+                source = source_volume_name,
+                clone = clone_volume_name,
+                "resuming interrupted clone creation"
+            );
+            let prefix = store::volume_db_prefix(tenant_name, clone_volume_name);
+            let objects_deleted = store::delete_prefix(&object_store, &prefix).await?;
+            tracing::info!(
+                tenant = tenant_name,
+                clone = clone_volume_name,
+                objects_deleted,
+                "deleted interrupted clone object-store prefix"
+            );
+            existing
+        }
+        Some(_) => {
+            return Err(Error::already_exists(
+                "volume",
+                format!("{tenant_name}/{clone_volume_name}"),
+            ));
+        }
+        None => {
+            let tenant_kek = control.unwrap_tenant_kek(&tenant).await?;
+            let record = VolumeRecord {
+                tenant: tenant_name.to_string(),
+                name: clone_volume_name.to_string(),
+                state: VolumeState::Creating,
+                clone_parent: Some(CloneParent {
+                    tenant: tenant_name.to_string(),
+                    volume: source_volume_name.to_string(),
+                }),
+                fsid: random_u64(),
+                wrapped_dek: aead::wrap_key(
+                    &tenant_kek,
+                    &contexts::volume_dek(tenant_name, clone_volume_name),
+                    &source_dek,
+                )?,
+                cipher: source.cipher,
+                chunk_size: source.chunk_size,
+                compression: source.compression,
+                quota: source.quota,
+                note: opts.note,
+                created_at: now_unix(),
+            };
+            control.put_volume(&record).await?;
+            record
+        }
+    };
+
+    let source_path = store::volume_db_path(tenant_name, source_volume_name);
+    let clone_path = store::volume_db_path(tenant_name, clone_volume_name);
+    let admin = AdminBuilder::new(clone_path, Arc::clone(&object_store)).build();
+    admin
+        .create_clone_builder(source_path, checkpoint)
+        .build()
+        .await
+        .map_err(|e| Error::invalid("clone", e.to_string()))?;
+
+    rewrite_cloned_superblock(&record, &source, source_dek, Arc::clone(&object_store)).await?;
+
+    record.state = VolumeState::Active;
+    control.put_volume(&record).await?;
+    tracing::info!(
+        tenant = tenant_name,
+        source = source_volume_name,
+        clone = clone_volume_name,
+        fsid = format_args!("{:016x}", record.fsid),
+        "volume clone created"
+    );
+    Ok(record)
+}
+
+async fn rewrite_cloned_superblock(
+    clone: &VolumeRecord,
+    source: &VolumeRecord,
+    dek: Secret32,
+    object_store: Arc<dyn ObjectStore>,
+) -> Result<()> {
+    let db = open_volume_db(clone, dek, object_store, &VolumeCaches::default()).await?;
+    let result = async {
+        let bytes = db
+            .get(KEY_SUPERBLOCK)
+            .await?
+            .ok_or_else(|| Error::invalid("clone", "no superblock after clone"))?;
+        let mut superblock = Superblock::decode(&bytes)?;
+        if superblock.fsid != source.fsid {
+            return Err(Error::invalid(
+                "clone superblock",
+                format!(
+                    "source fsid {:016x} does not match cloned superblock {:016x}",
+                    source.fsid, superblock.fsid
+                ),
+            ));
+        }
+        if superblock.chunk_size != clone.chunk_size || superblock.cipher != clone.cipher {
+            return Err(Error::invalid(
+                "clone superblock",
+                "chunk size or cipher differs from clone control record",
+            ));
+        }
+        superblock.fsid = clone.fsid;
+        superblock.created_at = clone.created_at;
+        db.put(KEY_SUPERBLOCK, superblock.encode()?).await?;
+        db.flush().await?;
+        Ok(())
+    }
+    .await;
+    db.close().await?;
+    result
 }
 
 /// Initialize the volume DB: superblock, root directory inode, inode

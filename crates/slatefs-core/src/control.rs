@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 
-use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use slatedb::object_store::{ObjectStore, PutMode, PutOptions};
 use slatedb::{Db, Settings};
@@ -21,7 +20,7 @@ use crate::rate::RateLimits;
 use crate::store;
 
 const CONTROL_KEYFILE_VERSION: u8 = 1;
-const TENANT_RECORD_VERSION: u8 = 2;
+const TENANT_RECORD_VERSION: u8 = 1;
 const VOLUME_RECORD_VERSION: u8 = 1;
 
 /// Contents of `<root>/control.dek`. The cipher is recorded here (not chosen
@@ -52,15 +51,6 @@ pub struct TenantRecord {
     pub created_at: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TenantRecordV1 {
-    name: String,
-    display_name: Option<String>,
-    state: TenantState,
-    wrapped_kek: Vec<u8>,
-    created_at: u64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VolumeState {
     /// Record committed, mkfs not yet completed. A retried create resumes
@@ -69,6 +59,12 @@ pub enum VolumeState {
     Creating,
     Active,
     Deleting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneParent {
+    pub tenant: String,
+    pub volume: String,
 }
 
 /// Soft/hard structure reserved now per plan §12; enforcement of `soft` and
@@ -92,6 +88,9 @@ pub struct VolumeRecord {
     pub tenant: String,
     pub name: String,
     pub state: VolumeState,
+    /// Instant clones share source SSTs; keep this so source deletion can
+    /// refuse to orphan active clones.
+    pub clone_parent: Option<CloneParent>,
     pub fsid: u64,
     /// Volume DEK wrapped by the tenant KEK, context `volume_dek(t, v)`.
     pub wrapped_dek: Vec<u8>,
@@ -342,6 +341,28 @@ impl ControlPlane {
         store::validate_name("tenant name", tenant)?;
         store::validate_name("volume name", volume)?;
         let mut record = self.get_volume(tenant, volume).await?;
+        let active_clones: Vec<_> = self
+            .list_volumes(tenant)
+            .await?
+            .into_iter()
+            .filter(|candidate| candidate.state != VolumeState::Deleting)
+            .filter(|candidate| {
+                candidate
+                    .clone_parent
+                    .as_ref()
+                    .is_some_and(|parent| parent.tenant == tenant && parent.volume == volume)
+            })
+            .map(|candidate| candidate.name)
+            .collect();
+        if !active_clones.is_empty() {
+            return Err(Error::invalid(
+                "volume delete",
+                format!(
+                    "volume {tenant}/{volume} has active clones: {}",
+                    active_clones.join(", ")
+                ),
+            ));
+        }
         record.state = VolumeState::Deleting;
         record.wrapped_dek.clear();
         self.put_volume(&record).await?;
@@ -389,22 +410,7 @@ impl ControlPlane {
 
     async fn delete_volume_objects(&self, tenant: &str, volume: &str) -> Result<usize> {
         let prefix = store::volume_db_prefix(tenant, volume);
-        let objects: Vec<_> = self.object_store.list(Some(&prefix)).try_collect().await?;
-        let count = objects.len();
-        if count == 0 {
-            return Ok(0);
-        }
-        let locations = futures::stream::iter(
-            objects
-                .into_iter()
-                .map(|meta| Ok::<_, slatedb::object_store::Error>(meta.location)),
-        )
-        .boxed();
-        self.object_store
-            .delete_stream(locations)
-            .try_collect::<Vec<_>>()
-            .await?;
-        Ok(count)
+        store::delete_prefix(&self.object_store, &prefix).await
     }
 
     pub async fn set_tenant_rate_limits(
@@ -534,49 +540,5 @@ fn validate_rate_limits(limits: &RateLimits) -> Result<()> {
 }
 
 fn decode_tenant_record(bytes: &[u8]) -> Result<TenantRecord> {
-    match bytes.split_first() {
-        Some((&TENANT_RECORD_VERSION, rest)) => Ok(postcard::from_bytes(rest)?),
-        Some((&1, rest)) => {
-            let old: TenantRecordV1 = postcard::from_bytes(rest)?;
-            Ok(TenantRecord {
-                name: old.name,
-                display_name: old.display_name,
-                state: old.state,
-                rate_limits: RateLimits::default(),
-                wrapped_kek: old.wrapped_kek,
-                created_at: old.created_at,
-            })
-        }
-        Some((&version, _)) => Err(Error::invalid(
-            "tenant record",
-            format!("format version {version}, expected {TENANT_RECORD_VERSION}"),
-        )),
-        None => Err(Error::invalid("tenant record", "empty value")),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tenant_v1_records_decode_with_unlimited_rate_limits() {
-        let old = TenantRecordV1 {
-            name: "t1".to_string(),
-            display_name: Some("Tenant One".to_string()),
-            state: TenantState::Active,
-            wrapped_kek: vec![1, 2, 3],
-            created_at: 42,
-        };
-        let mut bytes = vec![1];
-        bytes.extend(postcard::to_allocvec(&old).expect("encode old tenant"));
-
-        let decoded = decode_tenant_record(&bytes).expect("decode old tenant");
-        assert_eq!(decoded.name, "t1");
-        assert_eq!(decoded.display_name.as_deref(), Some("Tenant One"));
-        assert_eq!(decoded.state, TenantState::Active);
-        assert_eq!(decoded.rate_limits, RateLimits::default());
-        assert_eq!(decoded.wrapped_kek, vec![1, 2, 3]);
-        assert_eq!(decoded.created_at, 42);
-    }
+    decode_versioned(TENANT_RECORD_VERSION, bytes)
 }

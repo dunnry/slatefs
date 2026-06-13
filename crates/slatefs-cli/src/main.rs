@@ -45,6 +45,8 @@ enum Command {
     Quota(QuotaCmd),
     #[command(subcommand)]
     Snapshot(SnapshotCmd),
+    #[command(subcommand)]
+    Clone(CloneCmd),
 }
 
 #[derive(Subcommand)]
@@ -176,6 +178,22 @@ enum SnapshotCmd {
         tenant: String,
         volume: String,
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CloneCmd {
+    /// Create an instant writable clone in the same tenant.
+    Create {
+        tenant: String,
+        source_volume: String,
+        clone_volume: String,
+        /// Clone from this checkpoint id instead of the latest source state.
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Free-form operator note stored in the clone control record.
+        #[arg(long)]
+        note: Option<String>,
     },
 }
 
@@ -593,6 +611,36 @@ async fn run(
         }) => {
             volume::delete_snapshot(control, object_store, tenant, volume_name, id).await?;
             println!("deleted snapshot {id} from {tenant}/{volume_name}");
+        }
+        Command::Clone(CloneCmd::Create {
+            tenant,
+            source_volume,
+            clone_volume,
+            snapshot,
+            note,
+        }) => {
+            let record = volume::clone_volume(
+                control,
+                object_store,
+                tenant,
+                source_volume,
+                clone_volume,
+                volume::CloneVolumeOptions {
+                    source_snapshot_id: snapshot.clone(),
+                    note: note.clone(),
+                },
+            )
+            .await?;
+            println!(
+                "created clone {}/{} from {}/{} fsid={:016x} cipher={} chunk_size={}",
+                record.tenant,
+                record.name,
+                tenant,
+                source_volume,
+                record.fsid,
+                record.cipher,
+                record.chunk_size
+            );
         }
     }
     Ok(())

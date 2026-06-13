@@ -116,7 +116,11 @@ the affected volume object-store prefixes.
 `slatefs snapshot create|list|delete` manages SlateDB checkpoints for a volume.
 The current create path opens the volume as the writer so SlateDB can flush
 before checkpointing; do not run it against a volume currently served by
-`slatefsd`. Read-only snapshot exports and writable clones remain follow-ups.
+`slatefsd`. `slatefs clone create <tenant> <source-volume> <clone-volume>`
+creates an instant writable same-tenant clone, optionally from a checkpoint
+with `--snapshot <id>`. Clones get distinct fsids and independent writes, but
+they intentionally share source SSTs, so deleting a source volume is refused
+while active clones point at it. Read-only snapshot exports remain a follow-up.
 
 > Testing against kernel NFS clients: always mount with
 > `soft,intr,timeo=…` and bound every command touching the mountpoint

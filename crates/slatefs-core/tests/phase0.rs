@@ -12,11 +12,15 @@ use std::sync::Arc;
 
 use futures::TryStreamExt;
 use slatefs_core::config::{Compression, VolumeDefaults};
-use slatefs_core::control::{ControlPlane, QuotaLimit, QuotaLimits, TenantState, VolumeState};
+use slatefs_core::control::{
+    ControlPlane, QuotaLimit, QuotaLimits, TenantState, VolumeRecord, VolumeState,
+};
 use slatefs_core::crypto::Secret32;
 use slatefs_core::crypto::kms::{Kms, StaticKms};
 use slatefs_core::error::Error;
+use slatefs_core::meta::inode::ROOT_INO;
 use slatefs_core::store::{self, ObjectStore};
+use slatefs_core::vfs::{Credentials, Vfs};
 use slatefs_core::volume::{self, CreateVolumeOptions};
 
 const TENANT_MARKER: &str = "SLATEFS_PLAINTEXT_MARKER_TENANT_93b1";
@@ -44,6 +48,33 @@ async fn volume_object_count(
         .await
         .expect("list volume objects")
         .len()
+}
+
+fn root() -> Credentials {
+    Credentials::root()
+}
+
+async fn read_root_file(
+    control: &ControlPlane,
+    object_store: Arc<dyn ObjectStore>,
+    record: &VolumeRecord,
+    name: &[u8],
+) -> Vec<u8> {
+    let dek = control.unwrap_volume_dek(record).await.expect("volume dek");
+    let vol = volume::Volume::open(record, dek, object_store)
+        .await
+        .expect("open volume");
+    let attr = vol
+        .lookup(&root(), ROOT_INO, name)
+        .await
+        .expect("lookup file");
+    let bytes = vol
+        .read(&root(), attr.ino, 0, attr.size as u32)
+        .await
+        .expect("read file")
+        .to_vec();
+    vol.shutdown().await.expect("close volume");
+    bytes
 }
 
 /// Exercise the Phase 0 surface against `object_store`, then scan every raw
@@ -224,6 +255,152 @@ async fn phase0_round_trip(object_store: Arc<dyn ObjectStore>) {
             .expect("list snapshots after delete")
             .is_empty()
     );
+
+    // Phase 6 writable clone foundation: latest-state clones and
+    // checkpoint-based clones are writable, independent volumes with their
+    // own fsid. Instant clones are same-tenant only because they share source
+    // SSTs and therefore the source DEK.
+    control
+        .create_tenant("tclone", None)
+        .await
+        .expect("tclone tenant");
+    let source = volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "tclone",
+        "src",
+        default_create_opts(),
+    )
+    .await
+    .expect("create clone source");
+    let source_dek = control
+        .unwrap_volume_dek(&source)
+        .await
+        .expect("source dek");
+    let src_vol = volume::Volume::open(&source, source_dek, Arc::clone(&object_store))
+        .await
+        .expect("open clone source");
+    let file = src_vol
+        .create(&root(), ROOT_INO, b"file", 0o644, true)
+        .await
+        .expect("create source file");
+    src_vol
+        .write(&root(), file.ino, 0, b"baseline")
+        .await
+        .expect("write source baseline");
+    src_vol.flush().await.expect("flush source baseline");
+    src_vol.shutdown().await.expect("close clone source");
+
+    let baseline = volume::create_snapshot(
+        &control,
+        Arc::clone(&object_store),
+        "tclone",
+        "src",
+        Some("baseline".to_string()),
+    )
+    .await
+    .expect("create clone baseline snapshot");
+
+    let source_dek = control
+        .unwrap_volume_dek(&source)
+        .await
+        .expect("source dek");
+    let src_vol = volume::Volume::open(&source, source_dek, Arc::clone(&object_store))
+        .await
+        .expect("reopen clone source");
+    src_vol
+        .write(&root(), file.ino, 0, b"latest!!")
+        .await
+        .expect("write source latest");
+    src_vol.flush().await.expect("flush source latest");
+    src_vol.shutdown().await.expect("close clone source latest");
+
+    let latest_clone = volume::clone_volume(
+        &control,
+        Arc::clone(&object_store),
+        "tclone",
+        "src",
+        "latest",
+        volume::CloneVolumeOptions::default(),
+    )
+    .await
+    .expect("clone latest source state");
+    assert_eq!(
+        latest_clone
+            .clone_parent
+            .as_ref()
+            .expect("clone parent")
+            .volume
+            .as_str(),
+        "src"
+    );
+    let snapshot_clone = volume::clone_volume(
+        &control,
+        Arc::clone(&object_store),
+        "tclone",
+        "src",
+        "snap",
+        volume::CloneVolumeOptions {
+            source_snapshot_id: Some(baseline.id.clone()),
+            note: Some("from baseline".to_string()),
+        },
+    )
+    .await
+    .expect("clone snapshot source state");
+
+    let latest_info = volume::volume_info(&control, Arc::clone(&object_store), "tclone", "latest")
+        .await
+        .expect("latest clone info");
+    assert_eq!(latest_info.superblock.fsid, latest_clone.fsid);
+    assert_ne!(latest_info.superblock.fsid, source.fsid);
+    assert_eq!(
+        read_root_file(&control, Arc::clone(&object_store), &latest_clone, b"file").await,
+        b"latest!!"
+    );
+    assert_eq!(
+        read_root_file(
+            &control,
+            Arc::clone(&object_store),
+            &snapshot_clone,
+            b"file"
+        )
+        .await,
+        b"baseline"
+    );
+
+    let latest_dek = control
+        .unwrap_volume_dek(&latest_clone)
+        .await
+        .expect("latest clone dek");
+    let latest_vol = volume::Volume::open(&latest_clone, latest_dek, Arc::clone(&object_store))
+        .await
+        .expect("open latest clone");
+    let cloned_file = latest_vol
+        .lookup(&root(), ROOT_INO, b"file")
+        .await
+        .expect("lookup latest clone file");
+    latest_vol
+        .write(&root(), cloned_file.ino, 0, b"clone!!!")
+        .await
+        .expect("write latest clone");
+    latest_vol.flush().await.expect("flush latest clone");
+    latest_vol.shutdown().await.expect("close latest clone");
+    assert_eq!(
+        read_root_file(&control, Arc::clone(&object_store), &latest_clone, b"file").await,
+        b"clone!!!"
+    );
+    assert_eq!(
+        read_root_file(&control, Arc::clone(&object_store), &source, b"file").await,
+        b"latest!!"
+    );
+    assert!(matches!(
+        control.delete_volume("tclone", "src").await,
+        Err(Error::Invalid { .. })
+    ));
+    control
+        .delete_tenant("tclone")
+        .await
+        .expect("delete clone tenant");
 
     // Phase 5 delete/crypto-shred: current control-plane state drops wrapped
     // keys and refuses future mount resolution.
