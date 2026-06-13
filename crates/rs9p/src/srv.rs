@@ -15,6 +15,7 @@ use {
     futures::sink::SinkExt,
     std::{
         collections::HashMap,
+        net::SocketAddr,
         path::{Path, PathBuf},
         sync::Arc,
     },
@@ -25,7 +26,7 @@ use {
     },
     tokio_stream::StreamExt,
     tokio_util::codec::length_delimited::LengthDelimitedCodec,
-    tracing::{debug, error, info},
+    tracing::{debug, error, info, warn},
 };
 
 /// Represents a fid of clients holding associated `Filesystem::FId`.
@@ -791,10 +792,29 @@ pub async fn srv_async_tcp<Fs>(filesystem: Fs, addr: &str) -> Result<()>
 where
     Fs: 'static + Filesystem + Send + Sync + Clone,
 {
+    srv_async_tcp_with_client_filter(filesystem, addr, |_| true).await
+}
+
+/// [slatefs patch] Serve TCP 9P while rejecting disallowed client source
+/// addresses immediately after `accept`.
+pub async fn srv_async_tcp_with_client_filter<Fs, F>(
+    filesystem: Fs,
+    addr: &str,
+    client_filter: F,
+) -> Result<()>
+where
+    Fs: 'static + Filesystem + Send + Sync + Clone,
+    F: Fn(SocketAddr) -> bool + Send + Sync + 'static,
+{
     let listener = TcpListener::bind(addr).await?;
+    let client_filter = Arc::new(client_filter);
 
     loop {
         let (stream, peer) = listener.accept().await?;
+        if !(client_filter)(peer) {
+            warn!("rejected 9P client: {peer}");
+            continue;
+        }
         debug!("accepted: {:?}", peer);
 
         let fs = filesystem.clone();

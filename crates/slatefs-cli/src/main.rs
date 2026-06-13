@@ -1,6 +1,5 @@
-//! `slatefs` — management CLI (plan §13). Phase 0 surface: keygen, tenant
-//! create/list, volume create/info/list. Quotas, keys, snapshots, fsck come
-//! with later phases.
+//! `slatefs` — management CLI (plan §13): keygen, tenant lifecycle, volume
+//! create/info/list/fsck, and quota metadata.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,7 +7,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use slatefs_core::config::Config;
-use slatefs_core::control::ControlPlane;
+use slatefs_core::control::{ControlPlane, QuotaLimits};
 use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::volume::{self, CreateVolumeOptions};
 use slatefs_core::{config, store};
@@ -41,6 +40,8 @@ enum Command {
     Tenant(TenantCmd),
     #[command(subcommand)]
     Volume(VolumeCmd),
+    #[command(subcommand)]
+    Quota(QuotaCmd),
 }
 
 #[derive(Subcommand)]
@@ -51,6 +52,10 @@ enum TenantCmd {
         #[arg(long)]
         display_name: Option<String>,
     },
+    /// Suspend a tenant; new volume creates and daemon exports are refused.
+    Suspend { name: String },
+    /// Resume a suspended tenant.
+    Resume { name: String },
     /// List tenants.
     List,
 }
@@ -87,6 +92,25 @@ enum VolumeCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum QuotaCmd {
+    /// Show a volume's configured quota limits.
+    Show { tenant: String, volume: String },
+    /// Set quota limits. Values are bytes/counts, or `none` to clear a limit.
+    Set {
+        tenant: String,
+        volume: String,
+        #[arg(long, value_name = "N|none")]
+        bytes_hard: Option<String>,
+        #[arg(long, value_name = "N|none")]
+        bytes_soft: Option<String>,
+        #[arg(long, value_name = "N|none")]
+        inodes_hard: Option<String>,
+        #[arg(long, value_name = "N|none")]
+        inodes_soft: Option<String>,
+    },
+}
+
 fn parse_compression(s: &str) -> Result<config::Compression, String> {
     match s {
         "none" => Ok(config::Compression::None),
@@ -105,6 +129,38 @@ fn parse_cipher(s: &str) -> Result<config::CipherChoice, String> {
             "unknown cipher {s:?} (auto|aes256gcm|xchacha20poly1305)"
         )),
     }
+}
+
+fn parse_quota_value(raw: &str) -> anyhow::Result<Option<u64>> {
+    match raw {
+        "none" | "unlimited" | "-" => Ok(None),
+        _ => raw
+            .parse::<u64>()
+            .map(Some)
+            .with_context(|| format!("invalid quota value {raw:?}; expected N or none")),
+    }
+}
+
+fn format_limit(value: Option<u64>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn print_quota(tenant: &str, volume: &str, quota: QuotaLimits) {
+    println!("quota: {tenant}/{volume}");
+    println!(
+        "bytes:  hard={} soft={} grace_until={}",
+        format_limit(quota.bytes.hard),
+        format_limit(quota.bytes.soft),
+        format_limit(quota.bytes.grace_until)
+    );
+    println!(
+        "inodes: hard={} soft={} grace_until={}",
+        format_limit(quota.inodes.hard),
+        format_limit(quota.inodes.soft),
+        format_limit(quota.inodes.grace_until)
+    );
 }
 
 #[tokio::main]
@@ -177,6 +233,14 @@ async fn run(
                 record.name,
                 record.wrapped_kek.len()
             );
+        }
+        Command::Tenant(TenantCmd::Suspend { name }) => {
+            let record = control.suspend_tenant(name).await?;
+            println!("tenant {} state={:?}", record.name, record.state);
+        }
+        Command::Tenant(TenantCmd::Resume { name }) => {
+            let record = control.resume_tenant(name).await?;
+            println!("tenant {} state={:?}", record.name, record.state);
         }
         Command::Tenant(TenantCmd::List) => {
             for t in control.list_tenants().await? {
@@ -278,6 +342,43 @@ async fn run(
             } else {
                 anyhow::bail!("fsck found problems");
             }
+        }
+        Command::Quota(QuotaCmd::Show { tenant, volume }) => {
+            let record = control.get_volume(tenant, volume).await?;
+            print_quota(tenant, volume, record.quota);
+        }
+        Command::Quota(QuotaCmd::Set {
+            tenant,
+            volume,
+            bytes_hard,
+            bytes_soft,
+            inodes_hard,
+            inodes_soft,
+        }) => {
+            if bytes_hard.is_none()
+                && bytes_soft.is_none()
+                && inodes_hard.is_none()
+                && inodes_soft.is_none()
+            {
+                anyhow::bail!("provide at least one quota flag");
+            }
+
+            let mut quota = control.get_volume(tenant, volume).await?.quota;
+            if let Some(raw) = bytes_hard {
+                quota.bytes.hard = parse_quota_value(raw)?;
+            }
+            if let Some(raw) = bytes_soft {
+                quota.bytes.soft = parse_quota_value(raw)?;
+            }
+            if let Some(raw) = inodes_hard {
+                quota.inodes.hard = parse_quota_value(raw)?;
+            }
+            if let Some(raw) = inodes_soft {
+                quota.inodes.soft = parse_quota_value(raw)?;
+            }
+            let record = control.set_volume_quota(tenant, volume, quota).await?;
+            print_quota(tenant, volume, record.quota);
+            println!("note: new limits apply when the volume is next opened for serving");
         }
     }
     Ok(())

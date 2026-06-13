@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use futures::TryStreamExt;
 use slatefs_core::config::{Compression, VolumeDefaults};
-use slatefs_core::control::{ControlPlane, VolumeState};
+use slatefs_core::control::{ControlPlane, QuotaLimit, QuotaLimits, TenantState, VolumeState};
 use slatefs_core::crypto::Secret32;
 use slatefs_core::crypto::kms::{Kms, StaticKms};
 use slatefs_core::error::Error;
@@ -94,6 +94,76 @@ async fn phase0_round_trip(object_store: Arc<dyn ObjectStore>) {
     assert!(info.superblock.name_enc);
     assert_eq!(info.record.compression, Compression::Lz4);
     assert_eq!(info.record.note.as_deref(), Some(VOLUME_MARKER));
+
+    // Phase 5 lifecycle gate: suspended tenants retain records/keys but
+    // cannot create new volumes or resolve daemon exports.
+    let suspended = control.suspend_tenant("t1").await.expect("suspend tenant");
+    assert_eq!(suspended.state, TenantState::Suspended);
+    assert!(matches!(
+        volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t1",
+            "v2",
+            default_create_opts(),
+        )
+        .await,
+        Err(Error::Invalid { .. })
+    ));
+    assert!(matches!(
+        control.get_mountable_volume("t1", "v1").await,
+        Err(Error::Invalid { .. })
+    ));
+    let resumed = control.resume_tenant("t1").await.expect("resume tenant");
+    assert_eq!(resumed.state, TenantState::Active);
+    assert_eq!(
+        control
+            .get_mountable_volume("t1", "v1")
+            .await
+            .expect("mountable after resume")
+            .fsid,
+        record.fsid
+    );
+
+    // Quota UX: control-plane updates validate soft <= hard and persist.
+    let quota = QuotaLimits {
+        bytes: QuotaLimit {
+            soft: Some(512),
+            hard: Some(1024),
+            grace_until: None,
+        },
+        inodes: QuotaLimit {
+            soft: Some(8),
+            hard: Some(16),
+            grace_until: None,
+        },
+    };
+    let updated = control
+        .set_volume_quota("t1", "v1", quota)
+        .await
+        .expect("set quota");
+    assert_eq!(updated.quota, quota);
+    assert!(matches!(
+        control
+            .set_volume_quota(
+                "t1",
+                "v1",
+                QuotaLimits {
+                    bytes: QuotaLimit {
+                        soft: Some(2048),
+                        hard: Some(1024),
+                        grace_until: None,
+                    },
+                    inodes: QuotaLimit::default(),
+                },
+            )
+            .await,
+        Err(Error::Invalid { .. })
+    ));
+    let info = volume::volume_info(&control, Arc::clone(&object_store), "t1", "v1")
+        .await
+        .expect("volume info after quota set");
+    assert_eq!(info.record.quota, quota);
 
     control.close().await.expect("close control plane");
 

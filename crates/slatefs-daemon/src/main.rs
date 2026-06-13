@@ -53,7 +53,9 @@ async fn main() -> anyhow::Result<()> {
     let fh_key = control.server_fh_key().await?;
     let mut planned = Vec::new();
     for export in &config.exports {
-        let record = control.get_volume(&export.tenant, &export.volume).await?;
+        let record = control
+            .get_mountable_volume(&export.tenant, &export.volume)
+            .await?;
         let dek = control.unwrap_volume_dek(&record).await?;
         planned.push((export.clone(), record, dek));
     }
@@ -128,10 +130,15 @@ async fn main() -> anyhow::Result<()> {
                     anon_uid: export.anon_uid,
                     anon_gid: export.anon_gid,
                 };
-                let listener =
-                    slatefs_nfs::bind_export(volume, fh_key.clone(), policy, &export.listen)
-                        .await
-                        .with_context(|| format!("binding {}", export.listen))?;
+                let listener = slatefs_nfs::bind_export_with_allowlist(
+                    volume,
+                    fh_key.clone(),
+                    policy,
+                    export.allowed_clients.clone(),
+                    &export.listen,
+                )
+                .await
+                .with_context(|| format!("binding {}", export.listen))?;
                 tracing::info!(
                     tenant = export.tenant,
                     volume = export.volume,
@@ -146,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
                 let export_name = format!("/{}/{}", export.tenant, export.volume);
                 let listen = export.listen.clone();
                 let token = export.p9_token.clone();
+                let allowed_clients = export.allowed_clients.clone();
                 tracing::info!(
                     tenant = export.tenant,
                     volume = export.volume,
@@ -158,7 +166,14 @@ async fn main() -> anyhow::Result<()> {
                     },
                 );
                 servers.spawn(async move {
-                    slatefs_9p::serve_export(volume, export_name, token, &listen).await
+                    slatefs_9p::serve_export_with_allowlist(
+                        volume,
+                        export_name,
+                        token,
+                        allowed_clients,
+                        &listen,
+                    )
+                    .await
                 });
             }
         }

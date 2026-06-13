@@ -21,3 +21,11 @@ keyfile = "/etc/slatefs/master.key"
 chunk_size = 131072          # 128 KiB (DD-6); power of two in [4KiB, 4MiB]
 compression = "lz4"          # none | lz4 | zstd — applied by SlateDB before encryption
 cipher = "auto"              # auto | aes256gcm | xchacha20poly1305
+
+# Example export:
+# [[exports]]
+# tenant = "t1"
+# volume = "v1"
+# listen = "127.0.0.1:12049"
+# protocol = "nfs"            # nfs | p9
+# allowed_clients = ["127.0.0.1", "10.0.0.0/8"]  # empty/unset allows all

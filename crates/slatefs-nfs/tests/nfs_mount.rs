@@ -5,6 +5,7 @@
 //! restart-stable file handles.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use nfs3_client::Nfs3ConnectionBuilder;
 use nfs3_client::nfs3_types::nfs3::{
@@ -17,7 +18,7 @@ use nfs3_client::nfs3_types::nfs3::{
 };
 use nfs3_client::nfs3_types::xdr_codec::Opaque;
 use nfs3_client::tokio::TokioConnector;
-use slatefs_core::config::Compression;
+use slatefs_core::config::{ClientAddrRule, Compression};
 use slatefs_core::control::{ControlPlane, QuotaLimit, QuotaLimits};
 use slatefs_core::crypto::kms::{Kms, StaticKms};
 use slatefs_core::crypto::{Cipher, Secret32};
@@ -97,6 +98,26 @@ async fn serve(volume: Arc<Volume>) -> (u16, tokio::task::JoinHandle<()>) {
     (port, task)
 }
 
+async fn serve_with_allowlist(
+    volume: Arc<Volume>,
+    allowed_clients: Vec<ClientAddrRule>,
+) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = slatefs_nfs::bind_export_with_allowlist(
+        volume,
+        fh_key(),
+        SquashPolicy::trust_as_root(),
+        allowed_clients,
+        "127.0.0.1:0",
+    )
+    .await
+    .expect("bind export");
+    let port = listener.get_listen_port();
+    let task = tokio::spawn(async move {
+        let _ = listener.handle_forever().await;
+    });
+    (port, task)
+}
+
 type Conn = nfs3_client::Nfs3Connection<nfs3_client::tokio::TokioIo<tokio::net::TcpStream>>;
 
 async fn connect(port: u16) -> Conn {
@@ -107,6 +128,29 @@ async fn connect(port: u16) -> Conn {
         .mount()
         .await
         .expect("mount")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_allowlist_rejects_client() {
+    let object_store = store::resolve_root("memory:///").unwrap();
+    let volume = make_volume(Arc::clone(&object_store), None).await;
+    let denied: ClientAddrRule = "192.0.2.0/24".parse().unwrap();
+    let (port, server) = serve_with_allowlist(Arc::clone(&volume), vec![denied]).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        Nfs3ConnectionBuilder::new(TokioConnector, "127.0.0.1", "/")
+            .connect_from_privileged_port(false)
+            .mount_port(port)
+            .nfs3_port(port)
+            .mount()
+            .await
+    })
+    .await;
+    assert!(
+        result.is_err() || result.expect("timeout result").is_err(),
+        "disallowed client unexpectedly mounted the export"
+    );
+    server.abort();
 }
 
 fn dirop<'a>(dir: &nfs_fh3, name: &'a str) -> diropargs3<'a> {

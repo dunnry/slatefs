@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use rs9p::fcall::{Data, FCall, GetAttrMask, Msg, QId, SetAttr, SetAttrMask, Time};
 use rs9p::serialize::{read_msg, write_msg};
-use slatefs_core::config::Compression;
+use slatefs_core::config::{ClientAddrRule, Compression};
 use slatefs_core::control::{ControlPlane, QuotaLimit, QuotaLimits};
 use slatefs_core::crypto::kms::{Kms, StaticKms};
 use slatefs_core::crypto::{Cipher, Secret32};
@@ -64,10 +64,25 @@ fn free_port() -> u16 {
 }
 
 async fn serve_9p(volume: Arc<Volume>, token: Option<String>) -> u16 {
+    serve_9p_with_allowlist(volume, token, Vec::new()).await
+}
+
+async fn serve_9p_with_allowlist(
+    volume: Arc<Volume>,
+    token: Option<String>,
+    allowed_clients: Vec<ClientAddrRule>,
+) -> u16 {
     let port = free_port();
     let listen = format!("127.0.0.1:{port}");
     tokio::spawn(async move {
-        let _ = slatefs_9p::serve_export(volume, "/t/v".to_string(), token, &listen).await;
+        let _ = slatefs_9p::serve_export_with_allowlist(
+            volume,
+            "/t/v".to_string(),
+            token,
+            allowed_clients,
+            &listen,
+        )
+        .await;
     });
     for _ in 0..50 {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -76,6 +91,44 @@ async fn serve_9p(volume: Arc<Volume>, token: Option<String>) -> u16 {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("9p server never came up");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn p9_source_allowlist_rejects_client() {
+    let object_store = store::resolve_root("memory:///").unwrap();
+    let volume = make_volume(Arc::clone(&object_store)).await;
+    let denied: ClientAddrRule = "192.0.2.0/24".parse().unwrap();
+    let port = serve_9p_with_allowlist(Arc::clone(&volume), None, vec![denied]).await;
+
+    tokio::task::spawn_blocking(move || {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let mut payload = Vec::new();
+        write_msg(
+            &mut payload,
+            &Msg {
+                tag: NOTAG,
+                body: FCall::TVersion {
+                    msize: 1024 * 1024,
+                    version: "9P2000.L".to_string(),
+                },
+            },
+        )
+        .expect("encode version");
+        let size = (payload.len() as u32 + 4).to_le_bytes();
+        let _ = stream.write_all(&size);
+        let _ = stream.write_all(&payload);
+        let mut size_buf = [0u8; 4];
+        assert!(
+            stream.read_exact(&mut size_buf).is_err(),
+            "disallowed client unexpectedly received a 9P response"
+        );
+    })
+    .await
+    .unwrap();
 }
 
 /// Minimal synchronous 9P2000.L client.

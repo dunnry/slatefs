@@ -231,6 +231,33 @@ impl ControlPlane {
             .ok_or_else(|| Error::not_found("tenant", name))
     }
 
+    pub async fn suspend_tenant(&self, name: &str) -> Result<TenantRecord> {
+        self.set_tenant_state(name, TenantState::Suspended).await
+    }
+
+    pub async fn resume_tenant(&self, name: &str) -> Result<TenantRecord> {
+        self.set_tenant_state(name, TenantState::Active).await
+    }
+
+    async fn set_tenant_state(&self, name: &str, next_state: TenantState) -> Result<TenantRecord> {
+        store::validate_name("tenant name", name)?;
+        let mut record = self.get_tenant(name).await?;
+        if record.state == TenantState::Deleting && next_state != TenantState::Deleting {
+            return Err(Error::invalid(
+                "tenant state",
+                format!("tenant {name:?} is Deleting and cannot be resumed"),
+            ));
+        }
+        record.state = next_state;
+        self.db
+            .put(
+                tenant_key(name).as_bytes(),
+                encode_versioned(TENANT_RECORD_VERSION, &record)?,
+            )
+            .await?;
+        Ok(record)
+    }
+
     pub async fn list_tenants(&self) -> Result<Vec<TenantRecord>> {
         let mut iter = self.db.scan_prefix(b"t/".as_slice()).await?;
         let mut tenants = Vec::new();
@@ -282,6 +309,40 @@ impl ControlPlane {
         Ok(volumes)
     }
 
+    /// Resolve a volume for serving. This is the Phase 5 mount-time tenant
+    /// lifecycle gate: suspended tenants keep their metadata and keys, but
+    /// new daemon exports refuse to open them.
+    pub async fn get_mountable_volume(&self, tenant: &str, volume: &str) -> Result<VolumeRecord> {
+        let tenant_record = self.get_tenant(tenant).await?;
+        if tenant_record.state != TenantState::Active {
+            return Err(Error::invalid(
+                "tenant state",
+                format!("tenant {tenant:?} is {:?}, not Active", tenant_record.state),
+            ));
+        }
+        let record = self.get_volume(tenant, volume).await?;
+        if record.state != VolumeState::Active {
+            return Err(Error::invalid(
+                "volume state",
+                format!("volume {tenant}/{volume} is {:?}, not Active", record.state),
+            ));
+        }
+        Ok(record)
+    }
+
+    pub async fn set_volume_quota(
+        &self,
+        tenant: &str,
+        volume: &str,
+        quota: QuotaLimits,
+    ) -> Result<VolumeRecord> {
+        validate_quota_limits(&quota)?;
+        let mut record = self.get_volume(tenant, volume).await?;
+        record.quota = quota;
+        self.put_volume(&record).await?;
+        Ok(record)
+    }
+
     /// Unwrap a volume's DEK: master KMS → tenant KEK → volume DEK (DD-8).
     pub async fn unwrap_volume_dek(&self, record: &VolumeRecord) -> Result<Secret32> {
         let tenant = self.get_tenant(&record.tenant).await?;
@@ -305,4 +366,27 @@ impl ControlPlane {
         self.db.put(KEY, key.expose_secret()).await?;
         Ok(key)
     }
+}
+
+fn validate_limit(kind: &'static str, limit: &QuotaLimit) -> Result<()> {
+    if let (Some(soft), Some(hard)) = (limit.soft, limit.hard)
+        && soft > hard
+    {
+        return Err(Error::invalid(
+            kind,
+            format!("soft limit {soft} exceeds hard limit {hard}"),
+        ));
+    }
+    if limit.grace_until.is_some() && limit.soft.is_none() {
+        return Err(Error::invalid(
+            kind,
+            "grace_until requires a soft limit".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_quota_limits(quota: &QuotaLimits) -> Result<()> {
+    validate_limit("bytes quota", &quota.bytes)?;
+    validate_limit("inodes quota", &quota.inodes)
 }

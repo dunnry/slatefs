@@ -1,6 +1,11 @@
 //! TOML configuration (`/etc/slatefs/slatefs.toml`). Secrets never live here:
 //! the KMS section points at key *files* or cloud KMS key ids (plan §13).
 
+use std::fmt;
+use std::net::IpAddr;
+use std::str::FromStr;
+
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::Cipher;
@@ -54,6 +59,11 @@ pub struct ExportConfig {
     pub volume: String,
     /// `ip:port` for this export's listener, e.g. `127.0.0.1:12049`.
     pub listen: String,
+    /// Source IPs/CIDRs allowed to connect to this export. Empty means allow
+    /// all clients. This is a Phase 5 defense-in-depth gate for DD-10's
+    /// network-isolated tenancy model.
+    #[serde(default)]
+    pub allowed_clients: Vec<ClientAddrRule>,
     /// Wire protocol for this export (one listener per export, DD-10).
     #[serde(default)]
     pub protocol: ExportProtocol,
@@ -91,6 +101,102 @@ pub enum SquashMode {
     RootSquash,
     /// Everyone acts as root — single-user/dev exports only.
     TrustAsRoot,
+}
+
+/// One source-IP allowlist rule: exact IP (`127.0.0.1`) or CIDR
+/// (`10.0.0.0/8`, `2001:db8::/32`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientAddrRule {
+    addr: IpAddr,
+    prefix_len: u8,
+}
+
+impl ClientAddrRule {
+    pub fn contains(self, ip: IpAddr) -> bool {
+        match (self.addr, ip) {
+            (IpAddr::V4(rule), IpAddr::V4(ip)) => prefix_matches(
+                u32::from(rule) as u128,
+                u32::from(ip) as u128,
+                32,
+                self.prefix_len,
+            ),
+            (IpAddr::V6(rule), IpAddr::V6(ip)) => {
+                prefix_matches(u128::from(rule), u128::from(ip), 128, self.prefix_len)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn prefix_matches(rule: u128, ip: u128, bits: u8, prefix_len: u8) -> bool {
+    if prefix_len == 0 {
+        return true;
+    }
+    let shift = bits - prefix_len;
+    (rule >> shift) == (ip >> shift)
+}
+
+impl FromStr for ClientAddrRule {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        let (addr_raw, prefix_raw) = raw
+            .split_once('/')
+            .map_or((raw, None), |(addr, prefix)| (addr, Some(prefix)));
+        let addr: IpAddr = addr_raw
+            .parse()
+            .map_err(|e| format!("invalid IP address {addr_raw:?}: {e}"))?;
+        let max_prefix = match addr {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        let prefix_len = match prefix_raw {
+            Some("") => return Err(format!("missing prefix length in {raw:?}")),
+            Some(prefix) => prefix
+                .parse::<u8>()
+                .map_err(|e| format!("invalid prefix length {prefix:?}: {e}"))?,
+            None => max_prefix,
+        };
+        if prefix_len > max_prefix {
+            return Err(format!(
+                "prefix length {prefix_len} exceeds {max_prefix} for {addr}"
+            ));
+        }
+        Ok(ClientAddrRule { addr, prefix_len })
+    }
+}
+
+impl fmt::Display for ClientAddrRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let exact = match self.addr {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if self.prefix_len == exact {
+            write!(f, "{}", self.addr)
+        } else {
+            write!(f, "{}/{}", self.addr, self.prefix_len)
+        }
+    }
+}
+
+impl Serialize for ClientAddrRule {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientAddrRule {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(D::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -215,5 +321,54 @@ impl Config {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_addr_rules_match_exact_and_cidr() {
+        let loopback: ClientAddrRule = "127.0.0.1".parse().unwrap();
+        assert!(loopback.contains("127.0.0.1".parse().unwrap()));
+        assert!(!loopback.contains("127.0.0.2".parse().unwrap()));
+
+        let private: ClientAddrRule = "10.0.0.0/8".parse().unwrap();
+        assert!(private.contains("10.2.3.4".parse().unwrap()));
+        assert!(!private.contains("11.0.0.1".parse().unwrap()));
+
+        let docs_v6: ClientAddrRule = "2001:db8::/32".parse().unwrap();
+        assert!(docs_v6.contains("2001:db8::1".parse().unwrap()));
+        assert!(!docs_v6.contains("2001:db9::1".parse().unwrap()));
+        assert!(!docs_v6.contains("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn client_addr_rules_reject_bad_prefixes() {
+        assert!("127.0.0.1/33".parse::<ClientAddrRule>().is_err());
+        assert!("2001:db8::/129".parse::<ClientAddrRule>().is_err());
+        assert!("127.0.0.1/".parse::<ClientAddrRule>().is_err());
+    }
+
+    #[test]
+    fn export_allowed_clients_parse_from_toml() {
+        let raw = r#"
+            [object_store]
+            url = "memory:///"
+
+            [kms]
+            provider = "static"
+            key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+            [[exports]]
+            tenant = "t"
+            volume = "v"
+            listen = "127.0.0.1:12049"
+            allowed_clients = ["127.0.0.1", "10.0.0.0/8"]
+        "#;
+        let config = Config::parse(raw).unwrap();
+        assert_eq!(config.exports[0].allowed_clients.len(), 2);
+        assert!(config.exports[0].allowed_clients[1].contains("10.9.8.7".parse().unwrap()));
     }
 }

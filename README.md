@@ -95,6 +95,16 @@ nanoseconds; proven by an in-process wire test) — documented in
 the two assertions NFSv3 cannot (open-file unlink `nlink==0`; y2106 time).
 Remaining: QEMU virtio-9p smoke, rustls.
 
+**Phase 5 started** (multi-tenant hardening & quotas UX): tenants can now be
+suspended/resumed via `slatefs tenant suspend|resume`; suspended tenants retain
+their encrypted metadata and keys, but new volume creates and `slatefsd` export
+resolution fail closed until resumed. Per-export source-IP allowlists
+(`allowed_clients = ["127.0.0.1", "10.0.0.0/8"]`) are enforced by both NFS and
+9P before request decoding. Quota limits are operator-manageable with `slatefs
+quota show|set`, including validation that soft limits do not exceed hard
+limits. Live quota enforcement still uses the limits loaded when a volume is
+opened, so changed limits apply on the next serve/open cycle.
+
 > Testing against kernel NFS clients: always mount with
 > `soft,intr,timeo=…` and bound every command touching the mountpoint
 > with a timeout — a `hard,nointr` mount to a misbehaving dev server

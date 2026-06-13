@@ -7,7 +7,7 @@ use anyhow;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::context::RPCContext;
 use crate::rpcwire::{SocketMessageHandler, write_fragment};
@@ -21,6 +21,7 @@ pub struct NFSTcpListener<T: NfsFileSystem + 'static> {
     listener: TcpListener,
     port: u16,
     arcfs: Arc<T>,
+    client_filter: Option<Arc<dyn Fn(SocketAddr) -> bool + Send + Sync>>,
     mount_signal: Option<mpsc::Sender<bool>>,
     export_name: Arc<String>,
     transaction_tracker: Arc<TransactionTracker>,
@@ -221,6 +222,7 @@ impl<T: NfsFileSystem + 'static> NFSTcpListener<T> {
             listener,
             port,
             arcfs,
+            client_filter: None,
             mount_signal: None,
             export_name: Arc::from("/".to_string()),
             transaction_tracker: Self::new_transaction_tracker(),
@@ -255,6 +257,16 @@ impl<T: NfsFileSystem + 'static> NFSTcpListener<T> {
                 .trim_end_matches('/')
                 .trim_start_matches('/')
         ));
+    }
+
+    /// [slatefs patch] Sets a connection-level source filter. Rejected
+    /// clients are dropped immediately after `accept`, before any RPC is
+    /// decoded.
+    pub fn with_client_filter<F>(&mut self, filter: F)
+    where
+        F: Fn(SocketAddr) -> bool + Send + Sync + 'static,
+    {
+        self.client_filter = Some(Arc::new(filter));
     }
 }
 
@@ -293,13 +305,16 @@ impl<T: NfsFileSystem + 'static> NFSTcp for NFSTcpListener<T> {
         tokio::spawn(cleaner_future);
 
         loop {
-            let (socket, _) = self.listener.accept().await?;
+            let (socket, peer) = self.listener.accept().await?;
+            if let Some(filter) = &self.client_filter
+                && !(filter)(peer)
+            {
+                warn!("Rejecting connection from {peer}");
+                continue;
+            }
             let context = RPCContext {
                 local_port: self.port,
-                client_addr: socket
-                    .peer_addr()
-                    .expect("failed to get peer address")
-                    .to_string(),
+                client_addr: peer.to_string(),
                 auth: nfs3_types::rpc::auth_unix::default(),
                 vfs: self.arcfs.clone(),
                 mount_signal: self.mount_signal.clone(),

@@ -34,6 +34,7 @@ pub mod filesystem;
 
 use std::sync::Arc;
 
+use slatefs_core::config::ClientAddrRule;
 use slatefs_core::volume::Volume;
 
 pub use filesystem::SlateFs9p;
@@ -46,8 +47,22 @@ pub async fn serve_export(
     token: Option<String>,
     listen: &str,
 ) -> std::io::Result<()> {
+    serve_export_with_allowlist(volume, export_name, token, Vec::new(), listen).await
+}
+
+/// Serve one volume export with a source-IP allowlist. Empty
+/// `allowed_clients` means allow all clients.
+pub async fn serve_export_with_allowlist(
+    volume: Arc<Volume>,
+    export_name: String,
+    token: Option<String>,
+    allowed_clients: Vec<ClientAddrRule>,
+    listen: &str,
+) -> std::io::Result<()> {
     let fs = SlateFs9p::new(volume, export_name, token);
-    rs9p::srv::srv_async_tcp(fs, listen)
-        .await
-        .map_err(|e| std::io::Error::other(format!("9p server: {e}")))
+    rs9p::srv::srv_async_tcp_with_client_filter(fs, listen, move |peer| {
+        allowed_clients.is_empty() || allowed_clients.iter().any(|rule| rule.contains(peer.ip()))
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("9p server: {e}")))
 }
