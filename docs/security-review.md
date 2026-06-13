@@ -18,6 +18,7 @@ or behavior changes are preferred until a GA contract exists.
 | Control/volume isolation | One SlateDB per volume; per-volume DEK and cache namespace. | `store::volume_db_path`; `VolumeCaches` |
 | NFS handle integrity | File handles include `{fsid, ino, generation}` and HMAC verification rejects forged or foreign handles. | `slatefs-nfs/src/fh.rs` tests |
 | 9P transport protection | 9P listeners can be rustls-wrapped with `p9_tls_cert`/`p9_tls_key`; source allowlists run before TLS handshakes. | `p9_tls_end_to_end`; config validation tests |
+| Daemon admin surface | Optional admin listener is config-validated to loopback and currently exposes live-writer snapshot creation only. | `admin_listener_must_be_loopback`; `admin_snapshot_endpoint_creates_live_checkpoint` |
 | Single-writer safety | SlateDB fencing marks stale volumes dead and drops daemon exports. | `fenced_writer_marks_volume_dead`; failover drill |
 | Quota and deletion safety | Quota counters are committed with mutations; tenant/volume delete drops wrapped keys before deleting prefixes. | `quota` tests; control-plane delete paths |
 | Operator visibility | Prometheus rules cover fenced volumes, missing scrapes, and block decode failures; Grafana dashboard surfaces liveness and decode failures. | `monitoring/` |
