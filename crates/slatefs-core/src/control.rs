@@ -269,6 +269,12 @@ impl ControlPlane {
 
     /// Unwrap a tenant's KEK via the master KMS.
     pub async fn unwrap_tenant_kek(&self, tenant: &TenantRecord) -> Result<Secret32> {
+        if tenant.wrapped_kek.is_empty() {
+            return Err(Error::invalid(
+                "tenant key",
+                format!("tenant {:?} has been crypto-shredded", tenant.name),
+            ));
+        }
         self.kms
             .unwrap(&tenant.wrapped_kek, &contexts::tenant_kek(&tenant.name))
             .await
@@ -309,6 +315,42 @@ impl ControlPlane {
         Ok(volumes)
     }
 
+    /// Mark one volume deleted and drop its wrapped DEK from the current
+    /// control-plane state. Physical object-prefix cleanup is intentionally a
+    /// separate storage operation; after this point normal SlateFS open paths
+    /// cannot unwrap the volume key.
+    pub async fn delete_volume(&self, tenant: &str, volume: &str) -> Result<VolumeRecord> {
+        store::validate_name("tenant name", tenant)?;
+        store::validate_name("volume name", volume)?;
+        let mut record = self.get_volume(tenant, volume).await?;
+        record.state = VolumeState::Deleting;
+        record.wrapped_dek.clear();
+        self.put_volume(&record).await?;
+        Ok(record)
+    }
+
+    /// Mark a tenant deleted, crypto-shredding every volume DEK and finally
+    /// the tenant KEK in the current control-plane state. Idempotent for
+    /// already-deleting tenants.
+    pub async fn delete_tenant(&self, name: &str) -> Result<TenantRecord> {
+        store::validate_name("tenant name", name)?;
+        let mut tenant = self.get_tenant(name).await?;
+        for mut volume in self.list_volumes(name).await? {
+            volume.state = VolumeState::Deleting;
+            volume.wrapped_dek.clear();
+            self.put_volume(&volume).await?;
+        }
+        tenant.state = TenantState::Deleting;
+        tenant.wrapped_kek.clear();
+        self.db
+            .put(
+                tenant_key(name).as_bytes(),
+                encode_versioned(TENANT_RECORD_VERSION, &tenant)?,
+            )
+            .await?;
+        Ok(tenant)
+    }
+
     /// Resolve a volume for serving. This is the Phase 5 mount-time tenant
     /// lifecycle gate: suspended tenants keep their metadata and keys, but
     /// new daemon exports refuse to open them.
@@ -345,6 +387,15 @@ impl ControlPlane {
 
     /// Unwrap a volume's DEK: master KMS → tenant KEK → volume DEK (DD-8).
     pub async fn unwrap_volume_dek(&self, record: &VolumeRecord) -> Result<Secret32> {
+        if record.wrapped_dek.is_empty() {
+            return Err(Error::invalid(
+                "volume key",
+                format!(
+                    "volume {}/{} has been crypto-shredded",
+                    record.tenant, record.name
+                ),
+            ));
+        }
         let tenant = self.get_tenant(&record.tenant).await?;
         let kek = self.unwrap_tenant_kek(&tenant).await?;
         crate::crypto::aead::unwrap_key(

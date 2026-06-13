@@ -165,6 +165,74 @@ async fn phase0_round_trip(object_store: Arc<dyn ObjectStore>) {
         .expect("volume info after quota set");
     assert_eq!(info.record.quota, quota);
 
+    // Phase 5 delete/crypto-shred: current control-plane state drops wrapped
+    // keys and refuses future mount resolution.
+    control
+        .create_tenant("tdel", None)
+        .await
+        .expect("tdel tenant");
+    volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "tdel",
+        "vdel",
+        default_create_opts(),
+    )
+    .await
+    .expect("create volume to delete");
+    let deleted_volume = control
+        .delete_volume("tdel", "vdel")
+        .await
+        .expect("delete volume");
+    assert_eq!(deleted_volume.state, VolumeState::Deleting);
+    assert!(deleted_volume.wrapped_dek.is_empty());
+    assert!(matches!(
+        control.get_mountable_volume("tdel", "vdel").await,
+        Err(Error::Invalid { .. })
+    ));
+    assert!(matches!(
+        control.unwrap_volume_dek(&deleted_volume).await,
+        Err(Error::Invalid { .. })
+    ));
+
+    control
+        .create_tenant("gone", None)
+        .await
+        .expect("gone tenant");
+    let gone_volume = volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "gone",
+        "v",
+        default_create_opts(),
+    )
+    .await
+    .expect("create gone volume");
+    let deleted_tenant = control.delete_tenant("gone").await.expect("delete tenant");
+    assert_eq!(deleted_tenant.state, TenantState::Deleting);
+    assert!(deleted_tenant.wrapped_kek.is_empty());
+    let gone_volume = control
+        .get_volume("gone", &gone_volume.name)
+        .await
+        .expect("gone volume record");
+    assert_eq!(gone_volume.state, VolumeState::Deleting);
+    assert!(gone_volume.wrapped_dek.is_empty());
+    assert!(matches!(
+        control.resume_tenant("gone").await,
+        Err(Error::Invalid { .. })
+    ));
+    assert!(matches!(
+        volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "gone",
+            "new",
+            default_create_opts(),
+        )
+        .await,
+        Err(Error::Invalid { .. })
+    ));
+
     control.close().await.expect("close control plane");
 
     // --- durability: reopen and read back ---

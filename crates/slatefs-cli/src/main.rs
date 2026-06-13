@@ -56,6 +56,13 @@ enum TenantCmd {
     Suspend { name: String },
     /// Resume a suspended tenant.
     Resume { name: String },
+    /// Mark a tenant deleting and crypto-shred its wrapped keys.
+    Delete {
+        name: String,
+        /// Required confirmation for the destructive key-drop operation.
+        #[arg(long)]
+        yes: bool,
+    },
     /// List tenants.
     List,
 }
@@ -93,6 +100,14 @@ enum VolumeCmd {
     /// Read-only online structural scrub. Safe while the volume is served;
     /// reports drift but never rewrites counters.
     Scrub { tenant: String, volume: String },
+    /// Mark a volume deleting and crypto-shred its wrapped DEK.
+    Delete {
+        tenant: String,
+        volume: String,
+        /// Required confirmation for the destructive key-drop operation.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -277,6 +292,17 @@ async fn run(
             let record = control.resume_tenant(name).await?;
             println!("tenant {} state={:?}", record.name, record.state);
         }
+        Command::Tenant(TenantCmd::Delete { name, yes }) => {
+            if !yes {
+                anyhow::bail!("tenant delete requires --yes");
+            }
+            let record = control.delete_tenant(name).await?;
+            println!(
+                "tenant {} state={:?} keys=dropped",
+                record.name, record.state
+            );
+            println!("note: object-store prefix cleanup is a separate storage operation");
+        }
         Command::Tenant(TenantCmd::List) => {
             for t in control.list_tenants().await? {
                 println!(
@@ -373,6 +399,21 @@ async fn run(
             } else {
                 anyhow::bail!("scrub found problems or counter drift");
             }
+        }
+        Command::Volume(VolumeCmd::Delete {
+            tenant,
+            volume,
+            yes,
+        }) => {
+            if !yes {
+                anyhow::bail!("volume delete requires --yes");
+            }
+            let record = control.delete_volume(tenant, volume).await?;
+            println!(
+                "volume {}/{} state={:?} key=dropped",
+                record.tenant, record.name, record.state
+            );
+            println!("note: object-store prefix cleanup is a separate storage operation");
         }
         Command::Quota(QuotaCmd::Show { tenant, volume }) => {
             let record = control.get_volume(tenant, volume).await?;

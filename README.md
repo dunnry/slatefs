@@ -106,7 +106,9 @@ after their grace deadline expires. `slatefs volume scrub` runs the structural
 checker through a read-only SlateDB reader, so it can compare counters/recount
 while the volume is being served. Live quota enforcement still uses the limits
 loaded when a volume is opened, so changed limits apply on the next serve/open
-cycle.
+cycle. `slatefs tenant delete --yes` and `slatefs volume delete --yes` mark
+records deleting and drop wrapped keys from the current control-plane state;
+physical object-prefix cleanup is still a separate follow-up.
 
 > Testing against kernel NFS clients: always mount with
 > `soft,intr,timeo=…` and bound every command touching the mountpoint
