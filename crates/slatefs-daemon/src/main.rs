@@ -149,6 +149,18 @@ async fn main() -> anyhow::Result<()> {
                             .with_context(|| {
                                 format!("opening volume {}/{}", export.tenant, export.volume)
                             })?;
+                            let watched = Arc::clone(&volume);
+                            let watched_tenant = export.tenant.clone();
+                            let watched_volume = export.volume.clone();
+                            servers.spawn(async move {
+                                watched.wait_dead().await;
+                                tracing::error!(
+                                    tenant = watched_tenant,
+                                    volume = watched_volume,
+                                    "volume fenced; dropping daemon exports"
+                                );
+                                Err(std::io::Error::other("volume fenced by newer writer"))
+                            });
 
                             // Cache hit-rate visibility (plan §13 / Phase 3 AC): log the
                             // cache-related engine metrics periodically per volume.

@@ -139,6 +139,10 @@ async fn fenced_writer_marks_volume_dead() {
     let takeover = volume::Volume::open(&record, dek, Arc::clone(&object_store))
         .await
         .unwrap();
+    let stale_watch = Arc::clone(&stale);
+    let wait_dead = tokio::spawn(async move {
+        stale_watch.wait_dead().await;
+    });
 
     assert_eq!(
         stale
@@ -148,6 +152,10 @@ async fn fenced_writer_marks_volume_dead() {
         FsError::Io
     );
     assert!(stale.is_dead(), "stale writer should latch dead");
+    tokio::time::timeout(std::time::Duration::from_secs(1), wait_dead)
+        .await
+        .expect("dead waiter should wake")
+        .expect("dead waiter task should complete");
     assert_eq!(
         stale.getattr(&root(), ROOT_INO).await.unwrap_err(),
         FsError::Io

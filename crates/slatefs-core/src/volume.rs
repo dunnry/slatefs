@@ -11,6 +11,7 @@ use slatedb::admin::AdminBuilder;
 use slatedb::config::{CheckpointOptions, CheckpointScope};
 use slatedb::object_store::ObjectStore;
 use slatedb::{Checkpoint, Db, DbReader, Settings, WriteBatch};
+use tokio::sync::Notify;
 
 use crate::attrcache::AttrCache;
 use crate::config::{CacheConfig, Compression, VolumeDefaults};
@@ -721,6 +722,7 @@ pub struct Volume {
     pub(crate) db: Db,
     pub(crate) superblock: Superblock,
     dead: AtomicBool,
+    dead_notify: Notify,
     pub(crate) names: NameCodec,
     pub(crate) locks: LockManager,
     pub(crate) range_locks: RangeLockTable,
@@ -793,6 +795,7 @@ impl Volume {
             chunk_size: superblock.chunk_size as u64,
             superblock,
             dead: AtomicBool::new(false),
+            dead_notify: Notify::new(),
             names: NameCodec::new(dek),
             locks: LockManager::default(),
             range_locks: RangeLockTable::default(),
@@ -830,6 +833,17 @@ impl Volume {
                 fsid = %format!("{:016x}", self.superblock.fsid),
                 "volume fenced by newer SlateDB writer; marking export dead"
             );
+            self.dead_notify.notify_waiters();
+        }
+    }
+
+    pub async fn wait_dead(&self) {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        while !self.is_dead() {
+            tokio::select! {
+                _ = self.dead_notify.notified() => {}
+                _ = tick.tick() => {}
+            }
         }
     }
 
