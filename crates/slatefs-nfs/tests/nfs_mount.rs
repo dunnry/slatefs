@@ -22,8 +22,11 @@ use slatefs_core::config::{ClientAddrRule, Compression};
 use slatefs_core::control::{ControlPlane, QuotaLimit, QuotaLimits};
 use slatefs_core::crypto::kms::{Kms, StaticKms};
 use slatefs_core::crypto::{Cipher, Secret32};
+use slatefs_core::meta::inode::ROOT_INO;
 use slatefs_core::rate::{RateLimiter, RateLimits};
+use slatefs_core::snapshot::SnapshotVolume;
 use slatefs_core::store::{self, ObjectStore};
+use slatefs_core::vfs::{Credentials, Vfs};
 use slatefs_core::volume::{self, CreateVolumeOptions, Volume};
 use slatefs_nfs::{NFSTcp, SquashPolicy};
 
@@ -140,6 +143,22 @@ async fn serve_with_rate_limit(
     (port, task)
 }
 
+async fn serve_backend(volume: Arc<dyn Vfs>) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = slatefs_nfs::bind_export(
+        volume,
+        fh_key(),
+        SquashPolicy::trust_as_root(),
+        "127.0.0.1:0",
+    )
+    .await
+    .expect("bind export");
+    let port = listener.get_listen_port();
+    let task = tokio::spawn(async move {
+        let _ = listener.handle_forever().await;
+    });
+    (port, task)
+}
+
 type Conn = nfs3_client::Nfs3Connection<nfs3_client::tokio::TokioIo<tokio::net::TcpStream>>;
 
 async fn connect(port: u16) -> Conn {
@@ -238,6 +257,20 @@ async fn create_file(conn: &mut Conn, dir: &nfs_fh3, name: &str) -> nfs_fh3 {
     }
 }
 
+async fn lookup_file(conn: &mut Conn, dir: &nfs_fh3, name: &str) -> nfs_fh3 {
+    let res = conn
+        .nfs3_client
+        .lookup(&LOOKUP3args {
+            what: dirop(dir, name),
+        })
+        .await
+        .expect("lookup rpc");
+    match res {
+        LOOKUP3res::Ok(ok) => ok.object,
+        LOOKUP3res::Err((stat, _)) => panic!("lookup failed: {stat:?}"),
+    }
+}
+
 async fn write_all(
     conn: &mut Conn,
     fh: &nfs_fh3,
@@ -283,6 +316,94 @@ async fn read_range(conn: &mut Conn, fh: &nfs_fh3, offset: u64, count: u32) -> (
         READ3res::Ok(ok) => (ok.data.to_vec(), ok.eof),
         READ3res::Err((stat, _)) => panic!("read failed: {stat:?}"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_export_is_read_only_and_point_in_time() {
+    let object_store = store::resolve_root("memory:///").unwrap();
+    let volume = make_volume(Arc::clone(&object_store), None).await;
+    let file = volume
+        .create(&Credentials::root(), ROOT_INO, b"snap.txt", 0o644, true)
+        .await
+        .expect("create source file");
+    volume
+        .write(&Credentials::root(), file.ino, 0, b"baseline")
+        .await
+        .expect("write baseline");
+    volume.flush().await.expect("flush baseline");
+    volume
+        .shutdown()
+        .await
+        .expect("close source for checkpoint");
+
+    let control = ControlPlane::open(Arc::clone(&object_store), kms())
+        .await
+        .expect("control");
+    let snapshot = volume::create_snapshot(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "v",
+        Some("wire".to_string()),
+    )
+    .await
+    .expect("create snapshot");
+
+    let record = control.get_volume("t", "v").await.expect("record");
+    let dek = control.unwrap_volume_dek(&record).await.expect("dek");
+    let source = Volume::open(&record, dek, Arc::clone(&object_store))
+        .await
+        .expect("reopen source");
+    source
+        .write(&Credentials::root(), file.ino, 0, b"latest!!")
+        .await
+        .expect("write latest");
+    source.flush().await.expect("flush latest");
+    source.shutdown().await.expect("close source latest");
+
+    let snapshot_dek = control
+        .unwrap_volume_dek(&record)
+        .await
+        .expect("snapshot dek");
+    let snapshot_volume = SnapshotVolume::open(
+        &record,
+        snapshot_dek,
+        Arc::clone(&object_store),
+        &snapshot.id,
+    )
+    .await
+    .expect("open snapshot volume");
+    control.close().await.expect("close control");
+
+    let backend: Arc<dyn Vfs> = snapshot_volume.clone();
+    let (port, server) = serve_backend(backend).await;
+    let mut conn = connect(port).await;
+    let root = conn.root_nfs_fh3();
+    let fh = lookup_file(&mut conn, &root, "snap.txt").await;
+    let (bytes, eof) = read_range(&mut conn, &fh, 0, 64).await;
+    assert_eq!(bytes, b"baseline");
+    assert!(eof);
+
+    let res = conn
+        .nfs3_client
+        .write(&WRITE3args {
+            file: nfs_fh3 {
+                data: Opaque::owned(fh.data.to_vec()),
+            },
+            offset: 0,
+            count: 1,
+            stable: stable_how::FILE_SYNC,
+            data: Opaque::borrowed(b"x"),
+        })
+        .await
+        .expect("write rpc");
+    assert!(
+        matches!(res, WRITE3res::Err((nfsstat3::NFS3ERR_ROFS, _))),
+        "snapshot write should fail with ROFS, got {res:?}"
+    );
+    conn.unmount().await.expect("unmount");
+    server.abort();
+    snapshot_volume.shutdown().await.expect("close snapshot");
 }
 
 async fn getattr_size(conn: &mut Conn, fh: &nfs_fh3) -> u64 {
