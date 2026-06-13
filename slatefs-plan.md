@@ -511,6 +511,7 @@ on-disk-format doc with upgrade policy ([docs/on-disk-format.md](docs/on-disk-fo
 Perf harness: [docs/performance.md](docs/performance.md) and
 [scripts/fio-over-nfs.sh](scripts/fio-over-nfs.sh).
 Dashboard: [monitoring/slatefs-grafana-dashboard.json](monitoring/slatefs-grafana-dashboard.json).
+Security review: [docs/security-review.md](docs/security-review.md).
 **AC**: failover under fio load < 10s with zero corruption (fsx continues clean post-failover);
 documented perf table vs targets; runbook covers outage/fence/restore/key-rotation drills;
 snapshot mount of a live volume reads consistently while writes continue.

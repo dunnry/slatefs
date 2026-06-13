@@ -136,6 +136,8 @@ NFS takeover drill in [scripts/nfs-failover-drill.sh](scripts/nfs-failover-drill
 The NFS fio performance matrix is documented in
 [docs/performance.md](docs/performance.md) and runnable via
 [scripts/fio-over-nfs.sh](scripts/fio-over-nfs.sh).
+The Phase 6 security review is recorded in
+[docs/security-review.md](docs/security-review.md).
 The current pre-GA on-disk format and explicit no-backwards-compatibility
 upgrade policy live in [docs/on-disk-format.md](docs/on-disk-format.md).
 
