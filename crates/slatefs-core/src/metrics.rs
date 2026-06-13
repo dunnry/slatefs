@@ -2,13 +2,38 @@
 //! hit-rate visibility). Implements SlateDB's `MetricsRecorder` so engine
 //! metrics (block-cache and object-store-cache hits/misses, flush latency…)
 //! land in a snapshotable map; the daemon logs the cache-relevant slice
-//! periodically. A Prometheus endpoint arrives with the Phase 6 dashboards.
+//! periodically and exposes them through the daemon's Prometheus endpoint.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use slatedb_common::metrics::{CounterFn, GaugeFn, HistogramFn, MetricsRecorder, UpDownCounterFn};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrometheusSample {
+    pub name: String,
+    pub labels: Vec<(String, String)>,
+    pub value: f64,
+}
+
+impl PrometheusSample {
+    pub fn new<I, K, V>(name: impl Into<String>, labels: I, value: f64) -> PrometheusSample
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        PrometheusSample {
+            name: name.into(),
+            labels: labels
+                .into_iter()
+                .map(|(name, value)| (name.into(), value.into()))
+                .collect(),
+            value,
+        }
+    }
+}
 
 #[derive(Default)]
 struct Value {
@@ -67,6 +92,119 @@ impl AggregatingRecorder {
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+
+    pub fn prometheus_samples(&self, base_labels: &[(&str, &str)]) -> Vec<PrometheusSample> {
+        self.snapshot()
+            .into_iter()
+            .map(|(key, value)| {
+                let (name, labels) = split_flat_key(&key);
+                let labels = base_labels
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                    .chain(labels)
+                    .collect();
+                PrometheusSample {
+                    name: format!("slatefs_{name}"),
+                    labels,
+                    value,
+                }
+            })
+            .collect()
+    }
+}
+
+pub fn render_prometheus(samples: &[PrometheusSample]) -> String {
+    let mut out = String::new();
+    for sample in samples {
+        out.push_str(&sanitize_metric_name(&sample.name));
+        if !sample.labels.is_empty() {
+            out.push('{');
+            for (i, (name, value)) in sample.labels.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&sanitize_label_name(name));
+                out.push_str("=\"");
+                out.push_str(&escape_label_value(value));
+                out.push('"');
+            }
+            out.push('}');
+        }
+        out.push(' ');
+        out.push_str(&format_prometheus_value(sample.value));
+        out.push('\n');
+    }
+    out
+}
+
+fn split_flat_key(key: &str) -> (String, Vec<(String, String)>) {
+    let Some((name, labels)) = key.split_once('{') else {
+        return (key.to_string(), Vec::new());
+    };
+    let Some(labels) = labels.strip_suffix('}') else {
+        return (key.to_string(), Vec::new());
+    };
+    let labels = labels
+        .split(',')
+        .filter_map(|label| {
+            let (name, value) = label.split_once('=')?;
+            Some((name.to_string(), value.to_string()))
+        })
+        .collect();
+    (name.to_string(), labels)
+}
+
+fn sanitize_metric_name(name: &str) -> String {
+    sanitize_ident(name, true)
+}
+
+fn sanitize_label_name(name: &str) -> String {
+    sanitize_ident(name, false)
+}
+
+fn sanitize_ident(name: &str, allow_colon: bool) -> String {
+    let mut out = String::with_capacity(name.len().max(1));
+    for (i, ch) in name.chars().enumerate() {
+        let valid = ch == '_'
+            || (allow_colon && ch == ':')
+            || ch.is_ascii_alphabetic()
+            || (i > 0 && ch.is_ascii_digit());
+        out.push(if valid { ch } else { '_' });
+    }
+    if out.is_empty()
+        || out
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_digit() || (!allow_colon && ch == ':'))
+    {
+        out.insert(0, '_');
+    }
+    out
+}
+
+fn escape_label_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn format_prometheus_value(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_string()
+    } else if value == f64::INFINITY {
+        "+Inf".to_string()
+    } else if value == f64::NEG_INFINITY {
+        "-Inf".to_string()
+    } else {
+        value.to_string()
     }
 }
 
@@ -176,5 +314,27 @@ mod tests {
         assert_eq!(snap["cache.hits{volume=v1}"], 5.0);
         assert_eq!(snap["flush.latency.count"], 2.0);
         assert_eq!(snap["flush.latency.sum"], 2.0);
+    }
+
+    #[test]
+    fn renders_prometheus_text() {
+        let r = AggregatingRecorder::default();
+        let c = r.register_counter("cache.hits", "", &[("cache", "ram")]);
+        c.increment(5);
+        let h = r.register_histogram("flush.latency", "", &[], &[]);
+        h.record(1.5);
+
+        let mut samples = vec![PrometheusSample::new(
+            "slatefs_volume.dead",
+            [("tenant", "t\"1"), ("volume", "v\n1")],
+            0.0,
+        )];
+        samples.extend(r.prometheus_samples(&[("tenant", "t1"), ("volume", "v1")]));
+        let body = render_prometheus(&samples);
+
+        assert!(body.contains("slatefs_volume_dead{tenant=\"t\\\"1\",volume=\"v\\n1\"} 0\n"));
+        assert!(body.contains("slatefs_cache_hits{tenant=\"t1\",volume=\"v1\",cache=\"ram\"} 5\n"));
+        assert!(body.contains("slatefs_flush_latency_count{tenant=\"t1\",volume=\"v1\"} 1\n"));
+        assert!(body.contains("slatefs_flush_latency_sum{tenant=\"t1\",volume=\"v1\"} 1.5\n"));
     }
 }

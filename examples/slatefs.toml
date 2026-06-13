@@ -22,6 +22,10 @@ chunk_size = 131072          # 128 KiB (DD-6); power of two in [4KiB, 4MiB]
 compression = "lz4"          # none | lz4 | zstd — applied by SlateDB before encryption
 cipher = "auto"              # auto | aes256gcm | xchacha20poly1305
 
+# Prometheus text endpoint for daemon/export metrics.
+# [metrics]
+# listen = "127.0.0.1:12080"
+
 # Example export:
 # [[exports]]
 # tenant = "t1"

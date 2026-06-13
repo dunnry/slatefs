@@ -12,12 +12,15 @@ use clap::Parser;
 use slatefs_core::config::{Config, ExportProtocol};
 use slatefs_core::control::ControlPlane;
 use slatefs_core::crypto::kms;
+use slatefs_core::metrics::{AggregatingRecorder, PrometheusSample, render_prometheus};
 use slatefs_core::rate::{RateLimiter, RateLimits};
 use slatefs_core::snapshot::SnapshotVolume;
 use slatefs_core::store;
 use slatefs_core::vfs::Vfs;
 use slatefs_core::volume::{Volume, VolumeCaches};
 use slatefs_nfs::{NFSTcp, SquashPolicy};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Parser)]
 #[command(name = "slatefsd", version, about = "SlateFS file server daemon")]
@@ -25,6 +28,14 @@ struct Args {
     /// Path to the slatefs TOML config file.
     #[arg(long, short, default_value = "/etc/slatefs/slatefs.toml")]
     config: std::path::PathBuf,
+}
+
+#[derive(Clone)]
+struct MetricsTarget {
+    tenant: String,
+    volume_name: String,
+    recorder: Arc<AggregatingRecorder>,
+    volume: Arc<Volume>,
 }
 
 fn tenant_rate_limiter(
@@ -41,6 +52,81 @@ fn tenant_rate_limiter(
             .or_insert_with(|| Arc::new(RateLimiter::new(limits)))
             .clone(),
     )
+}
+
+fn render_daemon_metrics(targets: &[MetricsTarget]) -> String {
+    let mut samples = Vec::new();
+    for target in targets {
+        let labels = [
+            ("tenant", target.tenant.as_str()),
+            ("volume", target.volume_name.as_str()),
+        ];
+        samples.push(PrometheusSample::new(
+            "slatefs_volume_dead",
+            labels,
+            if target.volume.is_dead() { 1.0 } else { 0.0 },
+        ));
+        samples.extend(target.recorder.prometheus_samples(&labels));
+    }
+    render_prometheus(&samples)
+}
+
+async fn handle_metrics_connection(
+    mut stream: TcpStream,
+    targets: Vec<MetricsTarget>,
+) -> std::io::Result<()> {
+    let mut buf = [0u8; 1024];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await;
+    let n = match read {
+        Ok(result) => result?,
+        Err(_) => return Ok(()),
+    };
+    if n == 0 {
+        return Ok(());
+    }
+
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let mut request_line = request
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace();
+    let method = request_line.next();
+    let path = request_line.next();
+    let (status, content_type, body) = if method == Some("GET") && path == Some("/metrics") {
+        (
+            "200 OK",
+            "text/plain; version=0.0.4; charset=utf-8",
+            render_daemon_metrics(&targets),
+        )
+    } else {
+        (
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "not found\n".to_string(),
+        )
+    };
+
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await
+}
+
+async fn serve_metrics(listen: String, targets: Vec<MetricsTarget>) -> std::io::Result<()> {
+    let listener = TcpListener::bind(&listen).await?;
+    tracing::info!(listen, "metrics endpoint ready at /metrics");
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let targets = targets.clone();
+        tokio::spawn(async move {
+            if let Err(error) = handle_metrics_connection(stream, targets).await {
+                tracing::debug!(%peer, "metrics scrape failed: {error}");
+            }
+        });
+    }
 }
 
 #[tokio::main]
@@ -83,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut writable_volumes = Vec::new();
     let mut snapshot_volumes = Vec::new();
+    let mut metrics_targets = Vec::new();
     let mut servers = tokio::task::JoinSet::new();
     // One writable Volume per live (tenant, volume) — a SlateDB has exactly
     // one writer (DD-5). Snapshot exports are read-only DbReader backends
@@ -166,6 +253,12 @@ async fn main() -> anyhow::Result<()> {
                             // cache-related engine metrics periodically per volume.
                             let (tenant, volume_name) =
                                 (export.tenant.clone(), export.volume.clone());
+                            metrics_targets.push(MetricsTarget {
+                                tenant: tenant.clone(),
+                                volume_name: volume_name.clone(),
+                                recorder: Arc::clone(&recorder),
+                                volume: Arc::clone(&volume),
+                            });
                             tokio::spawn(async move {
                                 let mut tick =
                                     tokio::time::interval(std::time::Duration::from_secs(60));
@@ -259,6 +352,10 @@ async fn main() -> anyhow::Result<()> {
                 });
             }
         }
+    }
+
+    if let Some(listen) = config.metrics.listen.clone() {
+        servers.spawn(async move { serve_metrics(listen, metrics_targets).await });
     }
 
     tokio::select! {

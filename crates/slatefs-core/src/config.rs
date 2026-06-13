@@ -29,6 +29,9 @@ pub struct Config {
     /// docs/threat-model.md).
     #[serde(default)]
     pub cache: CacheConfig,
+    /// Optional Prometheus text endpoint served by `slatefsd`.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -42,6 +45,13 @@ pub struct CacheConfig {
     pub disk_path: Option<std::path::PathBuf>,
     /// Total disk-cache budget in bytes across volumes.
     pub disk_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MetricsConfig {
+    /// Optional `ip:port` listener for Prometheus text at `/metrics`.
+    pub listen: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -324,6 +334,11 @@ impl Config {
                 "kms.key_hex must be 64 hex chars (32 bytes)".into(),
             ));
         }
+        if self.metrics.listen.as_deref().is_some_and(str::is_empty) {
+            return Err(Error::Config(
+                "metrics.listen must be an ip:port listener or omitted".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -365,6 +380,9 @@ mod tests {
             provider = "static"
             key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
 
+            [metrics]
+            listen = "127.0.0.1:12080"
+
             [[exports]]
             tenant = "t"
             volume = "v"
@@ -377,6 +395,7 @@ mod tests {
             config.exports[0].snapshot.as_deref(),
             Some("018f7d79-0354-77a0-a14b-33b863d8999a")
         );
+        assert_eq!(config.metrics.listen.as_deref(), Some("127.0.0.1:12080"));
         assert_eq!(config.exports[0].allowed_clients.len(), 2);
         assert!(config.exports[0].allowed_clients[1].contains("10.9.8.7".parse().unwrap()));
     }
