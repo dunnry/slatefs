@@ -13,6 +13,7 @@ slatedb-common.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+futures.workspace = true
 serde.workspace = true
 postcard.workspace = true
 toml.workspace = true
@@ -38,5 +39,4 @@ aws-kms = ["dep:aws-config", "dep:aws-sdk-kms"]
 
 [dev-dependencies]
 tempfile.workspace = true
-futures.workspace = true
 proptest.workspace = true

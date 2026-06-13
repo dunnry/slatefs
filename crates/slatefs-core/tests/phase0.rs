@@ -32,6 +32,20 @@ fn default_create_opts() -> CreateVolumeOptions {
     opts
 }
 
+async fn volume_object_count(
+    object_store: &Arc<dyn ObjectStore>,
+    tenant: &str,
+    volume: &str,
+) -> usize {
+    let prefix = store::volume_db_prefix(tenant, volume);
+    object_store
+        .list(Some(&prefix))
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("list volume objects")
+        .len()
+}
+
 /// Exercise the Phase 0 surface against `object_store`, then scan every raw
 /// object for the markers.
 async fn phase0_round_trip(object_store: Arc<dyn ObjectStore>) {
@@ -180,12 +194,21 @@ async fn phase0_round_trip(object_store: Arc<dyn ObjectStore>) {
     )
     .await
     .expect("create volume to delete");
+    assert!(
+        volume_object_count(&object_store, "tdel", "vdel").await > 0,
+        "created volume should have object-store state"
+    );
     let deleted_volume = control
         .delete_volume("tdel", "vdel")
         .await
         .expect("delete volume");
     assert_eq!(deleted_volume.state, VolumeState::Deleting);
     assert!(deleted_volume.wrapped_dek.is_empty());
+    assert_eq!(
+        volume_object_count(&object_store, "tdel", "vdel").await,
+        0,
+        "deleted volume prefix should be empty"
+    );
     assert!(matches!(
         control.get_mountable_volume("tdel", "vdel").await,
         Err(Error::Invalid { .. })
@@ -208,9 +231,18 @@ async fn phase0_round_trip(object_store: Arc<dyn ObjectStore>) {
     )
     .await
     .expect("create gone volume");
+    assert!(
+        volume_object_count(&object_store, "gone", "v").await > 0,
+        "created tenant volume should have object-store state"
+    );
     let deleted_tenant = control.delete_tenant("gone").await.expect("delete tenant");
     assert_eq!(deleted_tenant.state, TenantState::Deleting);
     assert!(deleted_tenant.wrapped_kek.is_empty());
+    assert_eq!(
+        volume_object_count(&object_store, "gone", "v").await,
+        0,
+        "deleted tenant volume prefix should be empty"
+    );
     let gone_volume = control
         .get_volume("gone", &gone_volume.name)
         .await

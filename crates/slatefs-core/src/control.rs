@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use slatedb::object_store::{ObjectStore, PutMode, PutOptions};
 use slatedb::{Db, Settings};
@@ -122,6 +123,7 @@ pub fn now_unix() -> u64 {
 
 pub struct ControlPlane {
     db: Db,
+    object_store: Arc<dyn ObjectStore>,
     kms: Arc<dyn Kms>,
 }
 
@@ -133,7 +135,7 @@ impl ControlPlane {
     /// single-admin at a time, which is fine for Phase 0 CLI use.
     pub async fn open(object_store: Arc<dyn ObjectStore>, kms: Arc<dyn Kms>) -> Result<Self> {
         let (cipher, dek) = Self::load_or_init_dek(&object_store, kms.as_ref()).await?;
-        let db = Db::builder(store::CONTROL_DB_PATH, object_store)
+        let db = Db::builder(store::CONTROL_DB_PATH, Arc::clone(&object_store))
             .with_settings(Settings {
                 compression_codec: Some(slatedb::config::CompressionCodec::Lz4),
                 ..Settings::default()
@@ -141,7 +143,11 @@ impl ControlPlane {
             .with_block_transformer(Arc::new(SlateBlockTransformer::new(cipher, dek)))
             .build()
             .await?;
-        Ok(ControlPlane { db, kms })
+        Ok(ControlPlane {
+            db,
+            object_store,
+            kms,
+        })
     }
 
     /// Fetch the wrapped control DEK, generating it on first run. Uses a
@@ -339,6 +345,13 @@ impl ControlPlane {
         record.state = VolumeState::Deleting;
         record.wrapped_dek.clear();
         self.put_volume(&record).await?;
+        let objects_deleted = self.delete_volume_objects(tenant, volume).await?;
+        tracing::info!(
+            tenant,
+            volume,
+            objects_deleted,
+            "deleted volume object-store prefix"
+        );
         Ok(record)
     }
 
@@ -348,7 +361,8 @@ impl ControlPlane {
     pub async fn delete_tenant(&self, name: &str) -> Result<TenantRecord> {
         store::validate_name("tenant name", name)?;
         let mut tenant = self.get_tenant(name).await?;
-        for mut volume in self.list_volumes(name).await? {
+        let volumes = self.list_volumes(name).await?;
+        for mut volume in volumes.clone() {
             volume.state = VolumeState::Deleting;
             volume.wrapped_dek.clear();
             self.put_volume(&volume).await?;
@@ -361,7 +375,36 @@ impl ControlPlane {
                 encode_versioned(TENANT_RECORD_VERSION, &tenant)?,
             )
             .await?;
+        let mut objects_deleted = 0usize;
+        for volume in volumes {
+            objects_deleted += self.delete_volume_objects(name, &volume.name).await?;
+        }
+        tracing::info!(
+            tenant = name,
+            objects_deleted,
+            "deleted tenant volume object-store prefixes"
+        );
         Ok(tenant)
+    }
+
+    async fn delete_volume_objects(&self, tenant: &str, volume: &str) -> Result<usize> {
+        let prefix = store::volume_db_prefix(tenant, volume);
+        let objects: Vec<_> = self.object_store.list(Some(&prefix)).try_collect().await?;
+        let count = objects.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        let locations = futures::stream::iter(
+            objects
+                .into_iter()
+                .map(|meta| Ok::<_, slatedb::object_store::Error>(meta.location)),
+        )
+        .boxed();
+        self.object_store
+            .delete_stream(locations)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(count)
     }
 
     pub async fn set_tenant_rate_limits(

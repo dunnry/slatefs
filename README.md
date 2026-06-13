@@ -109,8 +109,8 @@ through a read-only SlateDB reader, so it can compare counters/recount while the
 volume is being served. Live quota enforcement still uses the limits loaded when
 a volume is opened, so changed limits apply on the next serve/open cycle.
 `slatefs tenant delete --yes` and `slatefs volume delete --yes` mark records
-deleting and drop wrapped keys from the current control-plane state; physical
-object-prefix cleanup is still a separate follow-up.
+deleting, drop wrapped keys from the current control-plane state, and delete
+the affected volume object-store prefixes.
 
 > Testing against kernel NFS clients: always mount with
 > `soft,intr,timeo=…` and bound every command touching the mountpoint

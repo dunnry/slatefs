@@ -332,7 +332,7 @@ async fn run(
                 "tenant {} state={:?} keys=dropped",
                 record.name, record.state
             );
-            println!("note: object-store prefix cleanup is a separate storage operation");
+            println!("object-store volume prefixes deleted");
         }
         Command::Tenant(TenantCmd::Rate(command)) => match command {
             TenantRateCmd::Show { name } => {
@@ -471,7 +471,7 @@ async fn run(
                 "volume {}/{} state={:?} key=dropped",
                 record.tenant, record.name, record.state
             );
-            println!("note: object-store prefix cleanup is a separate storage operation");
+            println!("object-store volume prefix deleted");
         }
         Command::Quota(QuotaCmd::Show { tenant, volume }) => {
             let record = control.get_volume(tenant, volume).await?;

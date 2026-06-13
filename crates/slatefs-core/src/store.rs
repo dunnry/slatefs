@@ -34,6 +34,10 @@ pub fn volume_db_path(tenant: &str, volume: &str) -> String {
     format!("volumes/{tenant}/{volume}")
 }
 
+pub fn volume_db_prefix(tenant: &str, volume: &str) -> ObjPath {
+    ObjPath::from(volume_db_path(tenant, volume))
+}
+
 /// Tenant and volume names become object-store path segments, wrap contexts,
 /// and control-DB key components, so the charset is strict.
 pub fn validate_name(kind: &'static str, name: &str) -> Result<()> {
