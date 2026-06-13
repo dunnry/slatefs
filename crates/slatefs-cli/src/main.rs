@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use slatefs_core::config::Config;
 use slatefs_core::control::{ControlPlane, QuotaLimits};
 use slatefs_core::crypto::kms::{self, LocalAgeKms};
+use slatefs_core::rate::RateLimits;
 use slatefs_core::volume::{self, CreateVolumeOptions};
 use slatefs_core::{config, store};
 
@@ -63,8 +64,25 @@ enum TenantCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Show or set tenant frontend rate limits.
+    #[command(subcommand)]
+    Rate(TenantRateCmd),
     /// List tenants.
     List,
+}
+
+#[derive(Subcommand)]
+enum TenantRateCmd {
+    /// Show tenant rate limits.
+    Show { name: String },
+    /// Set tenant rate limits. Values are per-second counts, or `none`.
+    Set {
+        name: String,
+        #[arg(long, value_name = "N|none")]
+        ops_per_second: Option<String>,
+        #[arg(long, value_name = "N|none")]
+        bytes_per_second: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -153,20 +171,33 @@ fn parse_cipher(s: &str) -> Result<config::CipherChoice, String> {
     }
 }
 
-fn parse_quota_value(raw: &str) -> anyhow::Result<Option<u64>> {
+fn parse_optional_u64(raw: &str, kind: &'static str) -> anyhow::Result<Option<u64>> {
     match raw {
         "none" | "unlimited" | "-" => Ok(None),
         _ => raw
             .parse::<u64>()
             .map(Some)
-            .with_context(|| format!("invalid quota value {raw:?}; expected N or none")),
+            .with_context(|| format!("invalid {kind} value {raw:?}; expected N or none")),
     }
+}
+
+fn parse_quota_value(raw: &str) -> anyhow::Result<Option<u64>> {
+    parse_optional_u64(raw, "quota")
 }
 
 fn format_limit(value: Option<u64>) -> String {
     value
         .map(|v| v.to_string())
         .unwrap_or_else(|| "none".to_string())
+}
+
+fn print_rate_limits(name: &str, limits: RateLimits) {
+    println!("rate: {name}");
+    println!("ops_per_second:   {}", format_limit(limits.ops_per_second));
+    println!(
+        "bytes_per_second: {}",
+        format_limit(limits.bytes_per_second)
+    );
 }
 
 fn print_quota(tenant: &str, volume: &str, quota: QuotaLimits) {
@@ -303,13 +334,40 @@ async fn run(
             );
             println!("note: object-store prefix cleanup is a separate storage operation");
         }
+        Command::Tenant(TenantCmd::Rate(command)) => match command {
+            TenantRateCmd::Show { name } => {
+                let record = control.get_tenant(name).await?;
+                print_rate_limits(&record.name, record.rate_limits);
+            }
+            TenantRateCmd::Set {
+                name,
+                ops_per_second,
+                bytes_per_second,
+            } => {
+                if ops_per_second.is_none() && bytes_per_second.is_none() {
+                    anyhow::bail!("provide at least one rate flag");
+                }
+                let mut limits = control.get_tenant(name).await?.rate_limits;
+                if let Some(raw) = ops_per_second {
+                    limits.ops_per_second = parse_optional_u64(raw, "ops-per-second")?;
+                }
+                if let Some(raw) = bytes_per_second {
+                    limits.bytes_per_second = parse_optional_u64(raw, "bytes-per-second")?;
+                }
+                let record = control.set_tenant_rate_limits(name, limits).await?;
+                print_rate_limits(&record.name, record.rate_limits);
+                println!("note: new limits apply when tenant exports are next served");
+            }
+        },
         Command::Tenant(TenantCmd::List) => {
             for t in control.list_tenants().await? {
                 println!(
-                    "{}\t{:?}\tcreated={}\t{}",
+                    "{}\t{:?}\tcreated={}\tops/s={}\tbytes/s={}\t{}",
                     t.name,
                     t.state,
                     t.created_at,
+                    format_limit(t.rate_limits.ops_per_second),
+                    format_limit(t.rate_limits.bytes_per_second),
                     t.display_name.as_deref().unwrap_or("-")
                 );
             }

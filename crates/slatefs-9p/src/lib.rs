@@ -35,6 +35,7 @@ pub mod filesystem;
 use std::sync::Arc;
 
 use slatefs_core::config::ClientAddrRule;
+use slatefs_core::rate::RateLimiter;
 use slatefs_core::volume::Volume;
 
 pub use filesystem::SlateFs9p;
@@ -59,7 +60,27 @@ pub async fn serve_export_with_allowlist(
     allowed_clients: Vec<ClientAddrRule>,
     listen: &str,
 ) -> std::io::Result<()> {
-    let fs = SlateFs9p::new(volume, export_name, token);
+    serve_export_with_allowlist_and_rate_limit(
+        volume,
+        export_name,
+        token,
+        allowed_clients,
+        None,
+        listen,
+    )
+    .await
+}
+
+/// Serve one volume export with source-IP and tenant rate-limit gates.
+pub async fn serve_export_with_allowlist_and_rate_limit(
+    volume: Arc<Volume>,
+    export_name: String,
+    token: Option<String>,
+    allowed_clients: Vec<ClientAddrRule>,
+    rate_limiter: Option<Arc<RateLimiter>>,
+    listen: &str,
+) -> std::io::Result<()> {
+    let fs = SlateFs9p::new_with_rate_limiter(volume, export_name, token, rate_limiter);
     rs9p::srv::srv_async_tcp_with_client_filter(fs, listen, move |peer| {
         allowed_clients.is_empty() || allowed_clients.iter().any(|rule| rule.contains(peer.ip()))
     })

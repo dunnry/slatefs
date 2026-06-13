@@ -18,6 +18,7 @@ use rs9p::fcall::{
 };
 use rs9p::srv::{FId, Filesystem};
 use slatefs_core::meta::inode::{FileKind, ROOT_INO, Timespec};
+use slatefs_core::rate::RateLimiter;
 use slatefs_core::vfs::{
     Credentials, FileAttr, FsError, HandleId, OpenMode, SetAttrs, TimeSet, Vfs,
 };
@@ -91,6 +92,7 @@ pub struct SlateFs9p {
     /// mount option only on the first attach; `access=user` re-attaches
     /// carry an empty uname, so the token authenticates the connection.
     conn_authed: Arc<std::sync::atomic::AtomicBool>,
+    rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 /// rs9p clones the filesystem once per accepted connection — give each
@@ -102,17 +104,28 @@ impl Clone for SlateFs9p {
             token: self.token.clone(),
             export_name: self.export_name.clone(),
             conn_authed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rate_limiter: self.rate_limiter.clone(),
         }
     }
 }
 
 impl SlateFs9p {
     pub fn new(volume: Arc<Volume>, export_name: String, token: Option<String>) -> SlateFs9p {
+        Self::new_with_rate_limiter(volume, export_name, token, None)
+    }
+
+    pub fn new_with_rate_limiter(
+        volume: Arc<Volume>,
+        export_name: String,
+        token: Option<String>,
+        rate_limiter: Option<Arc<RateLimiter>>,
+    ) -> SlateFs9p {
         SlateFs9p {
             volume,
             token,
             export_name,
             conn_authed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rate_limiter,
         }
     }
 }
@@ -227,6 +240,13 @@ impl SlateFs9p {
     async fn attr_of(&self, ino: u64, creds: &Credentials) -> Result<FileAttr, P9Error> {
         self.volume.getattr(creds, ino).await.map_err(errno)
     }
+
+    fn check_rate(&self, bytes: u64) -> Result<(), P9Error> {
+        if let Some(limiter) = &self.rate_limiter {
+            limiter.check(bytes).map_err(errno)?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -241,6 +261,7 @@ impl Filesystem for SlateFs9p {
         aname: &str,
         n_uname: u32,
     ) -> P9Result {
+        self.check_rate(0)?;
         use std::sync::atomic::Ordering;
         if let Some(expected) = &self.token {
             if uname == expected {
@@ -282,6 +303,7 @@ impl Filesystem for SlateFs9p {
         newfid: &FId<Self::FId>,
         wnames: &[String],
     ) -> P9Result {
+        self.check_rate(0)?;
         let start = Self::state(fid);
         let creds = start.creds();
         let mut cur = start.ino;
@@ -322,6 +344,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn rlopen(&self, fid: &FId<Self::FId>, flags: u32) -> P9Result {
+        self.check_rate(0)?;
         let mut state = Self::state(fid);
         let creds = state.creds();
         let mode = match flags & O_ACCMODE {
@@ -361,6 +384,7 @@ impl Filesystem for SlateFs9p {
         mode: u32,
         gid: u32,
     ) -> P9Result {
+        self.check_rate(0)?;
         let mut state = Self::state(fid);
         state.gid = gid;
         let creds = state.creds();
@@ -399,6 +423,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn rread(&self, fid: &FId<Self::FId>, offset: u64, count: u32) -> P9Result {
+        self.check_rate(u64::from(count))?;
         let state = Self::state(fid);
         if let Some(XattrFid::Read(buf)) = &state.xattr {
             let from = (offset as usize).min(buf.len());
@@ -418,6 +443,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn rwrite(&self, fid: &FId<Self::FId>, offset: u64, data: &Data) -> P9Result {
+        self.check_rate(data.0.len() as u64)?;
         // Xattr fids buffer writes synchronously; the guard never crosses
         // an await.
         let state = {
@@ -443,6 +469,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn rgetattr(&self, fid: &FId<Self::FId>, _req_mask: GetAttrMask) -> P9Result {
+        self.check_rate(0)?;
         let state = Self::state(fid);
         let attr = self.attr_of(state.ino, &state.creds()).await?;
         Ok(FCall::RGetAttr {
@@ -453,6 +480,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn rsetattr(&self, fid: &FId<Self::FId>, valid: SetAttrMask, stat: &SetAttr) -> P9Result {
+        self.check_rate(0)?;
         let state = Self::state(fid);
         let creds = state.creds();
         let attrs = SetAttrs {
@@ -491,6 +519,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn rreaddir(&self, fid: &FId<Self::FId>, offset: u64, count: u32) -> P9Result {
+        self.check_rate(u64::from(count))?;
         let state = Self::state(fid);
         let creds = state.creds();
         let dir_attr = self.attr_of(state.ino, &creds).await?;
@@ -573,6 +602,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn rfsync(&self, fid: &FId<Self::FId>) -> P9Result {
+        self.check_rate(0)?;
         let state = Self::state(fid);
         self.volume
             .fsync(&state.creds(), state.ino)
@@ -582,6 +612,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn rlock(&self, fid: &FId<Self::FId>, lock: &Flock) -> P9Result {
+        self.check_rate(0)?;
         let state = Self::state(fid);
         let Some(handle) = state.handle else {
             return Err(P9Error::No(rs9p::error::errno::EBADF));
@@ -609,6 +640,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn rgetlock(&self, fid: &FId<Self::FId>, lock: &Getlock) -> P9Result {
+        self.check_rate(0)?;
         let state = Self::state(fid);
         let Some(handle) = state.handle else {
             return Err(P9Error::No(rs9p::error::errno::EBADF));
@@ -648,6 +680,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn rlink(&self, dfid: &FId<Self::FId>, fid: &FId<Self::FId>, name: &str) -> P9Result {
+        self.check_rate(0)?;
         let dir = Self::state(dfid);
         let file = Self::state(fid);
         self.volume
@@ -658,6 +691,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn rmkdir(&self, dfid: &FId<Self::FId>, name: &str, mode: u32, gid: u32) -> P9Result {
+        self.check_rate(0)?;
         let mut state = Self::state(dfid);
         state.gid = gid;
         let attr = self
@@ -677,6 +711,7 @@ impl Filesystem for SlateFs9p {
         newdir: &FId<Self::FId>,
         newname: &str,
     ) -> P9Result {
+        self.check_rate(0)?;
         let old = Self::state(olddir);
         let new = Self::state(newdir);
         self.volume
@@ -693,6 +728,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn runlinkat(&self, dfid: &FId<Self::FId>, name: &str, flags: u32) -> P9Result {
+        self.check_rate(0)?;
         let state = Self::state(dfid);
         let creds = state.creds();
         if flags & AT_REMOVEDIR != 0 {
@@ -710,6 +746,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn rrename(&self, fid: &FId<Self::FId>, dfid: &FId<Self::FId>, name: &str) -> P9Result {
+        self.check_rate(0)?;
         let state = Self::state(fid);
         let dst = Self::state(dfid);
         let Some((parent, old_name)) = state.provenance.clone() else {
@@ -730,6 +767,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn rremove(&self, fid: &FId<Self::FId>) -> P9Result {
+        self.check_rate(0)?;
         let state = Self::state(fid);
         let creds = state.creds();
         let Some((parent, name)) = &state.provenance else {
@@ -754,6 +792,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn rreadlink(&self, fid: &FId<Self::FId>) -> P9Result {
+        self.check_rate(0)?;
         let state = Self::state(fid);
         let target = self
             .volume
@@ -766,6 +805,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn rsymlink(&self, fid: &FId<Self::FId>, name: &str, symtgt: &str, gid: u32) -> P9Result {
+        self.check_rate(symtgt.len() as u64)?;
         let mut state = Self::state(fid);
         state.gid = gid;
         let attr = self
@@ -792,6 +832,7 @@ impl Filesystem for SlateFs9p {
         minor: u32,
         gid: u32,
     ) -> P9Result {
+        self.check_rate(0)?;
         let mut state = Self::state(dfid);
         state.gid = gid;
         let kind = match mode & 0o170000 {
@@ -820,6 +861,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn rstatfs(&self, fid: &FId<Self::FId>) -> P9Result {
+        self.check_rate(0)?;
         let state = Self::state(fid);
         let s = self.volume.statfs(&state.creds()).await.map_err(errno)?;
         Ok(FCall::RStatFs {
@@ -843,6 +885,7 @@ impl Filesystem for SlateFs9p {
         newfid: &FId<Self::FId>,
         name: &str,
     ) -> P9Result {
+        self.check_rate(0)?;
         let state = Self::state(fid);
         let creds = state.creds();
         let buf = if name.is_empty() {
@@ -886,6 +929,7 @@ impl Filesystem for SlateFs9p {
         _attr_size: u64,
         _flags: u32,
     ) -> P9Result {
+        self.check_rate(0)?;
         let mut state = Self::state(fid);
         state.xattr = Some(XattrFid::Write {
             name: name.as_bytes().to_vec(),
@@ -896,6 +940,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn rclunk(&self, fid: &FId<Self::FId>) -> P9Result {
+        self.check_rate(0)?;
         let state = Self::state(fid);
         // Pending xattr write applies at clunk, per the protocol.
         if let Some(XattrFid::Write { name, buf }) = &state.xattr {
@@ -911,6 +956,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn rversion(&self, msize: u32, ver: &str) -> P9Result {
+        self.check_rate(0)?;
         // Only 9P2000.L; clients offering anything else get "unknown".
         let (msize, version) = if ver == "9P2000.L" {
             (msize.min(IOUNIT + 32), ver.to_string())
@@ -921,6 +967,7 @@ impl Filesystem for SlateFs9p {
     }
 
     async fn rflush(&self, _old: Option<&FCall>) -> P9Result {
+        self.check_rate(0)?;
         Ok(FCall::RFlush)
     }
 }

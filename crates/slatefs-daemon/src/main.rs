@@ -12,6 +12,7 @@ use clap::Parser;
 use slatefs_core::config::{Config, ExportProtocol};
 use slatefs_core::control::ControlPlane;
 use slatefs_core::crypto::kms;
+use slatefs_core::rate::{RateLimiter, RateLimits};
 use slatefs_core::store;
 use slatefs_core::volume::{Volume, VolumeCaches};
 use slatefs_nfs::{NFSTcp, SquashPolicy};
@@ -22,6 +23,22 @@ struct Args {
     /// Path to the slatefs TOML config file.
     #[arg(long, short, default_value = "/etc/slatefs/slatefs.toml")]
     config: std::path::PathBuf,
+}
+
+fn tenant_rate_limiter(
+    limiters: &mut std::collections::HashMap<String, Arc<RateLimiter>>,
+    tenant: String,
+    limits: RateLimits,
+) -> Option<Arc<RateLimiter>> {
+    if limits.is_unlimited() {
+        return None;
+    }
+    Some(
+        limiters
+            .entry(tenant)
+            .or_insert_with(|| Arc::new(RateLimiter::new(limits)))
+            .clone(),
+    )
 }
 
 #[tokio::main]
@@ -56,8 +73,9 @@ async fn main() -> anyhow::Result<()> {
         let record = control
             .get_mountable_volume(&export.tenant, &export.volume)
             .await?;
+        let tenant = control.get_tenant(&export.tenant).await?;
         let dek = control.unwrap_volume_dek(&record).await?;
-        planned.push((export.clone(), record, dek));
+        planned.push((export.clone(), record, dek, tenant.rate_limits));
     }
     control.close().await.context("closing control-plane DB")?;
 
@@ -67,14 +85,18 @@ async fn main() -> anyhow::Result<()> {
     // (DD-5), and several exports (e.g. NFS + 9P, plan §9.4) share it.
     let mut open_volumes: std::collections::HashMap<(String, String), Arc<Volume>> =
         std::collections::HashMap::new();
+    let mut rate_limiters: std::collections::HashMap<String, Arc<RateLimiter>> =
+        std::collections::HashMap::new();
     let distinct: std::collections::HashSet<(String, String)> = config
         .exports
         .iter()
         .map(|e| (e.tenant.clone(), e.volume.clone()))
         .collect();
     let share_count = distinct.len();
-    for (export, record, dek) in planned {
+    for (export, record, dek, rate_limits) in planned {
         let key = (export.tenant.clone(), export.volume.clone());
+        let rate_limiter =
+            tenant_rate_limiter(&mut rate_limiters, export.tenant.clone(), rate_limits);
         let volume = match open_volumes.get(&key) {
             Some(v) => Arc::clone(v),
             None => {
@@ -130,11 +152,12 @@ async fn main() -> anyhow::Result<()> {
                     anon_uid: export.anon_uid,
                     anon_gid: export.anon_gid,
                 };
-                let listener = slatefs_nfs::bind_export_with_allowlist(
+                let listener = slatefs_nfs::bind_export_with_allowlist_and_rate_limit(
                     volume,
                     fh_key.clone(),
                     policy,
                     export.allowed_clients.clone(),
+                    rate_limiter.clone(),
                     &export.listen,
                 )
                 .await
@@ -166,11 +189,12 @@ async fn main() -> anyhow::Result<()> {
                     },
                 );
                 servers.spawn(async move {
-                    slatefs_9p::serve_export_with_allowlist(
+                    slatefs_9p::serve_export_with_allowlist_and_rate_limit(
                         volume,
                         export_name,
                         token,
                         allowed_clients,
+                        rate_limiter,
                         &listen,
                     )
                     .await

@@ -100,15 +100,17 @@ suspended/resumed via `slatefs tenant suspend|resume`; suspended tenants retain
 their encrypted metadata and keys, but new volume creates and `slatefsd` export
 resolution fail closed until resumed. Per-export source-IP allowlists
 (`allowed_clients = ["127.0.0.1", "10.0.0.0/8"]`) are enforced by both NFS and
-9P before request decoding. Quota limits are operator-manageable with `slatefs
-quota show|set`, including hard limits and soft limits that become enforcing
-after their grace deadline expires. `slatefs volume scrub` runs the structural
-checker through a read-only SlateDB reader, so it can compare counters/recount
-while the volume is being served. Live quota enforcement still uses the limits
-loaded when a volume is opened, so changed limits apply on the next serve/open
-cycle. `slatefs tenant delete --yes` and `slatefs volume delete --yes` mark
-records deleting and drop wrapped keys from the current control-plane state;
-physical object-prefix cleanup is still a separate follow-up.
+9P before request decoding. Tenant frontend rate limits (`slatefs tenant rate
+show|set`) add shared token buckets for ops/s and request bytes/s across all
+exports of a tenant. Quota limits are operator-manageable with `slatefs quota
+show|set`, including hard limits and soft limits that become enforcing after
+their grace deadline expires. `slatefs volume scrub` runs the structural checker
+through a read-only SlateDB reader, so it can compare counters/recount while the
+volume is being served. Live quota enforcement still uses the limits loaded when
+a volume is opened, so changed limits apply on the next serve/open cycle.
+`slatefs tenant delete --yes` and `slatefs volume delete --yes` mark records
+deleting and drop wrapped keys from the current control-plane state; physical
+object-prefix cleanup is still a separate follow-up.
 
 > Testing against kernel NFS clients: always mount with
 > `soft,intr,timeo=…` and bound every command touching the mountpoint

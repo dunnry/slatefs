@@ -22,6 +22,7 @@ use slatefs_core::config::{ClientAddrRule, Compression};
 use slatefs_core::control::{ControlPlane, QuotaLimit, QuotaLimits};
 use slatefs_core::crypto::kms::{Kms, StaticKms};
 use slatefs_core::crypto::{Cipher, Secret32};
+use slatefs_core::rate::{RateLimiter, RateLimits};
 use slatefs_core::store::{self, ObjectStore};
 use slatefs_core::volume::{self, CreateVolumeOptions, Volume};
 use slatefs_nfs::{NFSTcp, SquashPolicy};
@@ -118,6 +119,27 @@ async fn serve_with_allowlist(
     (port, task)
 }
 
+async fn serve_with_rate_limit(
+    volume: Arc<Volume>,
+    limits: RateLimits,
+) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = slatefs_nfs::bind_export_with_allowlist_and_rate_limit(
+        volume,
+        fh_key(),
+        SquashPolicy::trust_as_root(),
+        Vec::new(),
+        Some(Arc::new(RateLimiter::new(limits))),
+        "127.0.0.1:0",
+    )
+    .await
+    .expect("bind export");
+    let port = listener.get_listen_port();
+    let task = tokio::spawn(async move {
+        let _ = listener.handle_forever().await;
+    });
+    (port, task)
+}
+
 type Conn = nfs3_client::Nfs3Connection<nfs3_client::tokio::TokioIo<tokio::net::TcpStream>>;
 
 async fn connect(port: u16) -> Conn {
@@ -150,6 +172,42 @@ async fn source_allowlist_rejects_client() {
         result.is_err() || result.expect("timeout result").is_err(),
         "disallowed client unexpectedly mounted the export"
     );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn byte_rate_limit_rejects_nfs_write_payload() {
+    let object_store = store::resolve_root("memory:///").unwrap();
+    let volume = make_volume(Arc::clone(&object_store), None).await;
+    let (port, server) = serve_with_rate_limit(
+        Arc::clone(&volume),
+        RateLimits {
+            ops_per_second: None,
+            bytes_per_second: Some(1),
+        },
+    )
+    .await;
+    let mut conn = connect(port).await;
+    let root = conn.root_nfs_fh3();
+    let fh = create_file(&mut conn, &root, "limited.txt").await;
+
+    let res = conn
+        .nfs3_client
+        .write(&WRITE3args {
+            file: nfs_fh3 {
+                data: Opaque::owned(fh.data.to_vec()),
+            },
+            offset: 0,
+            count: 4,
+            stable: stable_how::UNSTABLE,
+            data: Opaque::borrowed(b"nope"),
+        })
+        .await
+        .expect("write rpc");
+    assert!(matches!(
+        res,
+        WRITE3res::Err((nfsstat3::NFS3ERR_JUKEBOX, _))
+    ));
     server.abort();
 }
 

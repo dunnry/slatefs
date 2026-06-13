@@ -35,6 +35,7 @@ use std::sync::Arc;
 use nfs3_server::tcp::NFSTcpListener;
 use slatefs_core::config::ClientAddrRule;
 use slatefs_core::crypto::Secret32;
+use slatefs_core::rate::RateLimiter;
 use slatefs_core::volume::Volume;
 
 pub use adapter::{SlateFsNfs, SquashPolicy};
@@ -62,8 +63,21 @@ pub async fn bind_export_with_allowlist(
     allowed_clients: Vec<ClientAddrRule>,
     listen: &str,
 ) -> io::Result<NFSTcpListener<SlateFsNfs>> {
+    bind_export_with_allowlist_and_rate_limit(volume, fh_key, policy, allowed_clients, None, listen)
+        .await
+}
+
+/// Bind an NFS listener with source-IP and tenant rate-limit gates.
+pub async fn bind_export_with_allowlist_and_rate_limit(
+    volume: Arc<Volume>,
+    fh_key: Secret32,
+    policy: SquashPolicy,
+    allowed_clients: Vec<ClientAddrRule>,
+    rate_limiter: Option<Arc<RateLimiter>>,
+    listen: &str,
+) -> io::Result<NFSTcpListener<SlateFsNfs>> {
     let fsid = volume.fsid();
-    let fs = SlateFsNfs::new(volume, fh_key, policy);
+    let fs = SlateFsNfs::new_with_rate_limiter(volume, fh_key, policy, rate_limiter);
     let mut listener = NFSTcpListener::bind_with_generation(listen, fs, fsid).await?;
     if !allowed_clients.is_empty() {
         listener.with_client_filter(move |peer| {

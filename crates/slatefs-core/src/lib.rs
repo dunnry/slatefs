@@ -16,6 +16,7 @@ pub mod locks;
 pub mod meta;
 pub mod metrics;
 pub mod quota;
+pub mod rate;
 pub mod store;
 pub mod vfs;
 pub mod volume;

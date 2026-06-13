@@ -15,6 +15,7 @@ use slatefs_core::config::{ClientAddrRule, Compression};
 use slatefs_core::control::{ControlPlane, QuotaLimit, QuotaLimits};
 use slatefs_core::crypto::kms::{Kms, StaticKms};
 use slatefs_core::crypto::{Cipher, Secret32};
+use slatefs_core::rate::{RateLimiter, RateLimits};
 use slatefs_core::store::{self, ObjectStore};
 use slatefs_core::volume::{self, CreateVolumeOptions, Volume};
 
@@ -72,14 +73,38 @@ async fn serve_9p_with_allowlist(
     token: Option<String>,
     allowed_clients: Vec<ClientAddrRule>,
 ) -> u16 {
+    serve_9p_with_allowlist_and_rate_limit(volume, token, allowed_clients, None).await
+}
+
+async fn serve_9p_with_rate_limit(
+    volume: Arc<Volume>,
+    token: Option<String>,
+    limits: RateLimits,
+) -> u16 {
+    serve_9p_with_allowlist_and_rate_limit(
+        volume,
+        token,
+        Vec::new(),
+        Some(Arc::new(RateLimiter::new(limits))),
+    )
+    .await
+}
+
+async fn serve_9p_with_allowlist_and_rate_limit(
+    volume: Arc<Volume>,
+    token: Option<String>,
+    allowed_clients: Vec<ClientAddrRule>,
+    rate_limiter: Option<Arc<RateLimiter>>,
+) -> u16 {
     let port = free_port();
     let listen = format!("127.0.0.1:{port}");
     tokio::spawn(async move {
-        let _ = slatefs_9p::serve_export_with_allowlist(
+        let _ = slatefs_9p::serve_export_with_allowlist_and_rate_limit(
             volume,
             "/t/v".to_string(),
             token,
             allowed_clients,
+            rate_limiter,
             &listen,
         )
         .await;
@@ -126,6 +151,35 @@ async fn p9_source_allowlist_rejects_client() {
             stream.read_exact(&mut size_buf).is_err(),
             "disallowed client unexpectedly received a 9P response"
         );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn byte_rate_limit_rejects_p9_write_payload() {
+    let object_store = store::resolve_root("memory:///").unwrap();
+    let volume = make_volume(Arc::clone(&object_store)).await;
+    let port = serve_9p_with_rate_limit(
+        Arc::clone(&volume),
+        None,
+        RateLimits {
+            ops_per_second: None,
+            bytes_per_second: Some(1),
+        },
+    )
+    .await;
+
+    tokio::task::spawn_blocking(move || {
+        let mut c = P9c::connect(port);
+        c.attach(0, "", "/t/v", 0);
+        c.lcreate(0, "limited.txt", 0o2, 0o644);
+        let ecode = c.expect_errno(FCall::TWrite {
+            fid: 0,
+            offset: 0,
+            data: Data(b"nope".to_vec()),
+        });
+        assert_eq!(ecode, rs9p::error::errno::EAGAIN as u32, "expected EAGAIN");
     })
     .await
     .unwrap();
