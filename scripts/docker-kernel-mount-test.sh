@@ -22,6 +22,8 @@ docker run --rm --privileged \
     -e FSX_OPS -e FSSTRESS_OPS -e FSSTRESS_PROCS -e RESTARTS \
     -e FAILOVER_PRIMARY_PORT -e FAILOVER_TAKEOVER_PORT \
     -e FAILOVER_PRIMARY_METRICS_PORT -e FAILOVER_TAKEOVER_METRICS_PORT \
+    -e PERF_NFS_PORT -e PERF_METRICS_PORT -e FIO_RUNTIME -e FIO_SIZE \
+    -e FIO_JOBS -e FIO_BS_LIST -e FIO_RW_LIST -e META_OPS -e PERF_REPORT \
     -v "$PWD":/src:ro \
     -v slatefs-cargo-registry:/usr/local/cargo/registry \
     -v slatefs-target-linux:/target \

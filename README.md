@@ -131,6 +131,9 @@ Starter alert rules live in [monitoring/slatefs-prometheus-rules.yml](monitoring
 outage, fence, restore, and key-rotation drills live in
 [docs/operations-runbook.md](docs/operations-runbook.md), with an automated
 NFS takeover drill in [scripts/nfs-failover-drill.sh](scripts/nfs-failover-drill.sh).
+The NFS fio performance matrix is documented in
+[docs/performance.md](docs/performance.md) and runnable via
+[scripts/fio-over-nfs.sh](scripts/fio-over-nfs.sh).
 The current pre-GA on-disk format and explicit no-backwards-compatibility
 upgrade policy live in [docs/on-disk-format.md](docs/on-disk-format.md).
 
