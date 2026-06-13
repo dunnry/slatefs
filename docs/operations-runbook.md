@@ -1,0 +1,68 @@
+# SlateFS Operations Runbook
+
+Pre-GA note: there is no deployed compatibility contract yet. Prefer direct repair and clear
+operator action over migration shims.
+
+## Fencing And Failover
+
+Signal:
+
+- `SlateFSVolumeFenced` fires, or logs contain `volume fenced; dropping daemon exports`.
+- `/metrics` reports `slatefs_volume_dead{tenant="...",volume="..."} 1`.
+
+Immediate action:
+
+1. Confirm only one `slatefsd` instance is intended to own the affected live volume.
+2. Move the floating IP/DNS/service target to the takeover node.
+3. Start `slatefsd` on the takeover node with the same object-store root and KMS config.
+4. Watch logs until the export-ready line appears for the affected volume.
+5. Run a read/write smoke through the client mount, then `slatefs volume scrub <tenant> <volume>`.
+
+Expected behavior: the stale daemon marks the volume dead and drops exports; the takeover daemon
+opens the same SlateDB path, advances the writer epoch, replays WAL, and serves with the same fsid.
+
+## Object Store Outage
+
+Signal:
+
+- Protocol clients see retries or `EIO`.
+- Daemon logs show object-store or SlateDB unavailable errors.
+
+Immediate action:
+
+1. Check object-store reachability and credentials from the daemon host.
+2. Keep the daemon running if reads are still served from warm caches.
+3. Once storage is healthy, run `slatefs volume scrub <tenant> <volume>` on affected volumes.
+4. If scrub reports drift, stop serving the volume and run `slatefs volume fsck <tenant> <volume> --recount`.
+
+## Restore From Snapshot
+
+Use snapshots for point-in-time read access first:
+
+1. List available checkpoints: `slatefs snapshot list <tenant> <volume>`.
+2. Add an export with `snapshot = "<checkpoint-id>"` and a read-only listen address.
+3. Mount the snapshot export and copy out the required data.
+
+For a writable restore workspace:
+
+1. Create a clone: `slatefs clone create <tenant> <source-volume> <clone-volume> --snapshot <checkpoint-id>`.
+2. Export the clone as a normal writable volume.
+3. Validate with `slatefs volume scrub <tenant> <clone-volume>`.
+
+## Key Rotation
+
+Rotate a tenant KEK:
+
+```sh
+slatefs key rotate-kek <tenant>
+```
+
+This rewraps active volume DEKs in the control plane. It does not rewrite volume data blocks.
+Already-open daemon volumes keep their in-memory DEK; restart exports on the normal maintenance
+cycle if you want every serving process to prove it can unwrap the new envelopes.
+
+After rotation:
+
+1. Reopen or restart one non-critical export for the tenant.
+2. Run `slatefs volume scrub <tenant> <volume>`.
+3. Keep the old master KMS material recoverable until the new wraps have been verified.

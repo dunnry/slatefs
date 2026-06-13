@@ -127,6 +127,9 @@ rotate-kek <tenant>` rotates that tenant's KEK by rewrapping active volume DEKs
 in the control plane; volume data blocks are not rewritten. Optional
 `[metrics].listen = "ip:port"` exposes Prometheus text at `/metrics`, including
 SlateDB cache/flush samples per writable volume and `slatefs_volume_dead`.
+Starter alert rules live in [monitoring/slatefs-prometheus-rules.yml](monitoring/slatefs-prometheus-rules.yml);
+outage, fence, restore, and key-rotation drills live in
+[docs/operations-runbook.md](docs/operations-runbook.md).
 
 > Testing against kernel NFS clients: always mount with
 > `soft,intr,timeo=…` and bound every command touching the mountpoint

@@ -1,0 +1,20 @@
+groups:
+  - name: slatefs.daemon
+    rules:
+      - alert: SlateFSVolumeFenced
+        expr: slatefs_volume_dead == 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "SlateFS volume {{ $labels.tenant }}/{{ $labels.volume }} was fenced"
+          description: "A newer SlateDB writer took over this volume. The stale daemon has marked the volume dead and is dropping exports."
+
+      - alert: SlateFSDaemonMetricsMissing
+        expr: absent(up{job="slatefsd"} == 1)
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SlateFS daemon metrics scrape is missing"
+          description: "Prometheus has no healthy scrape target for job=slatefsd. Check the daemon process, scrape config, and [metrics].listen."
