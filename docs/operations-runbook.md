@@ -9,6 +9,7 @@ Signal:
 
 - `SlateFSVolumeFenced` fires, or logs contain `volume fenced; dropping daemon exports`.
 - `/metrics` reports `slatefs_volume_dead{tenant="...",volume="..."} 1`.
+- The Grafana dashboard's Volume Liveness panel reports `dead`.
 
 Immediate action:
 

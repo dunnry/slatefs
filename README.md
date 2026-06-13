@@ -128,6 +128,8 @@ in the control plane; volume data blocks are not rewritten. Optional
 `[metrics].listen = "ip:port"` exposes Prometheus text at `/metrics`, including
 SlateDB cache/flush samples per writable volume and `slatefs_volume_dead`.
 Starter alert rules live in [monitoring/slatefs-prometheus-rules.yml](monitoring/slatefs-prometheus-rules.yml);
+the starter Grafana dashboard lives in
+[monitoring/slatefs-grafana-dashboard.json](monitoring/slatefs-grafana-dashboard.json);
 outage, fence, restore, and key-rotation drills live in
 [docs/operations-runbook.md](docs/operations-runbook.md), with an automated
 NFS takeover drill in [scripts/nfs-failover-drill.sh](scripts/nfs-failover-drill.sh).
