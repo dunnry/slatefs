@@ -36,14 +36,14 @@ use std::sync::Arc;
 
 use slatefs_core::config::ClientAddrRule;
 use slatefs_core::rate::RateLimiter;
-use slatefs_core::volume::Volume;
+use slatefs_core::vfs::Vfs;
 
 pub use filesystem::SlateFs9p;
 
 /// Serve one volume export over 9P2000.L TCP. Runs until the listener
 /// errors; spawn it like the NFS exports.
 pub async fn serve_export(
-    volume: Arc<Volume>,
+    volume: Arc<dyn Vfs>,
     export_name: String,
     token: Option<String>,
     listen: &str,
@@ -54,7 +54,7 @@ pub async fn serve_export(
 /// Serve one volume export with a source-IP allowlist. Empty
 /// `allowed_clients` means allow all clients.
 pub async fn serve_export_with_allowlist(
-    volume: Arc<Volume>,
+    volume: Arc<dyn Vfs>,
     export_name: String,
     token: Option<String>,
     allowed_clients: Vec<ClientAddrRule>,
@@ -73,7 +73,7 @@ pub async fn serve_export_with_allowlist(
 
 /// Serve one volume export with source-IP and tenant rate-limit gates.
 pub async fn serve_export_with_allowlist_and_rate_limit(
-    volume: Arc<Volume>,
+    volume: Arc<dyn Vfs>,
     export_name: String,
     token: Option<String>,
     allowed_clients: Vec<ClientAddrRule>,

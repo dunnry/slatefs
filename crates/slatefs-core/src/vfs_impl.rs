@@ -383,6 +383,14 @@ impl Volume {
 
 #[async_trait::async_trait]
 impl Vfs for Volume {
+    fn fsid(&self) -> u64 {
+        self.fsid()
+    }
+
+    fn chunk_size(&self) -> u64 {
+        self.chunk_size
+    }
+
     async fn lookup(&self, creds: &Credentials, parent: u64, name: &[u8]) -> FsResult<FileAttr> {
         let dir = self.load_dir_cached(parent).await?;
         access(creds, &dir, ACCESS_X)?;

@@ -25,7 +25,6 @@ use slatefs_core::crypto::Secret32;
 use slatefs_core::meta::inode::{FileKind, ROOT_INO, Timespec};
 use slatefs_core::rate::RateLimiter;
 use slatefs_core::vfs::{Credentials, FileAttr, FsError, SetAttrs, TimeSet, Vfs};
-use slatefs_core::volume::Volume;
 
 use crate::fh::{FhCodec, SlateFsHandle};
 
@@ -100,19 +99,19 @@ impl SquashPolicy {
 }
 
 pub struct SlateFsNfs {
-    volume: Arc<Volume>,
+    volume: Arc<dyn Vfs>,
     fh: FhCodec,
     policy: SquashPolicy,
     rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl SlateFsNfs {
-    pub fn new(volume: Arc<Volume>, fh_key: Secret32, policy: SquashPolicy) -> SlateFsNfs {
+    pub fn new(volume: Arc<dyn Vfs>, fh_key: Secret32, policy: SquashPolicy) -> SlateFsNfs {
         Self::new_with_rate_limiter(volume, fh_key, policy, None)
     }
 
     pub fn new_with_rate_limiter(
-        volume: Arc<Volume>,
+        volume: Arc<dyn Vfs>,
         fh_key: Secret32,
         policy: SquashPolicy,
         rate_limiter: Option<Arc<RateLimiter>>,
@@ -251,6 +250,7 @@ fn map_err(e: FsError) -> nfsstat3 {
         FsError::NotSupported => nfsstat3::NFS3ERR_NOTSUPP,
         FsError::Stale => nfsstat3::NFS3ERR_STALE,
         FsError::QuotaExceeded => nfsstat3::NFS3ERR_DQUOT,
+        FsError::ReadOnly => nfsstat3::NFS3ERR_ROFS,
     }
 }
 
@@ -389,7 +389,7 @@ impl NfsReadFileSystem for SlateFsNfs {
             wtpref: MB,
             wtmult: 4096,
             dtpref: MB,
-            maxfilesize: self.volume.superblock().chunk_size as u64 * u32::MAX as u64,
+            maxfilesize: self.volume.chunk_size() * u32::MAX as u64,
             time_delta: nfstime3 {
                 seconds: 0,
                 nseconds: 1,
@@ -455,7 +455,11 @@ impl SlateFsNfs {
 
 impl NfsFileSystem for SlateFsNfs {
     fn capabilities(&self) -> VFSCapabilities {
-        VFSCapabilities::ReadWrite
+        if self.volume.read_only() {
+            VFSCapabilities::ReadOnly
+        } else {
+            VFSCapabilities::ReadWrite
+        }
     }
 
     async fn setattr(&self, id: &SlateFsHandle, setattr: sattr3) -> Result<fattr3, nfsstat3> {
@@ -742,7 +746,7 @@ impl NfsFileSystem for SlateFsNfs {
 
 /// Streaming READDIRPLUS in stable dirent-id cookie order (plan §5).
 pub struct SlateDirIter {
-    volume: Arc<Volume>,
+    volume: Arc<dyn Vfs>,
     fh: FhCodec,
     creds: Credentials,
     dir: u64,
@@ -766,7 +770,7 @@ impl ReadDirPlusIterator<SlateFsHandle> for SlateDirIter {
                             fileid: entry.ino,
                             name: filename3::from(entry.name.clone()),
                             cookie: entry.cookie,
-                            name_attributes: Some(fattr_for(&self.volume, &attr)),
+                            name_attributes: Some(fattr_for(self.volume.as_ref(), &attr)),
                             name_handle: Some(self.fh.make(attr.ino, attr.generation)),
                         });
                     }
@@ -795,7 +799,7 @@ impl ReadDirPlusIterator<SlateFsHandle> for SlateDirIter {
     }
 }
 
-fn fattr_for(volume: &Volume, attr: &FileAttr) -> fattr3 {
+fn fattr_for(volume: &dyn Vfs, attr: &FileAttr) -> fattr3 {
     fattr3 {
         type_: kind_to_ftype(attr.kind),
         mode: attr.mode,

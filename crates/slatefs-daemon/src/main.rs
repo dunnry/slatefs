@@ -13,7 +13,9 @@ use slatefs_core::config::{Config, ExportProtocol};
 use slatefs_core::control::ControlPlane;
 use slatefs_core::crypto::kms;
 use slatefs_core::rate::{RateLimiter, RateLimits};
+use slatefs_core::snapshot::SnapshotVolume;
 use slatefs_core::store;
+use slatefs_core::vfs::Vfs;
 use slatefs_core::volume::{Volume, VolumeCaches};
 use slatefs_nfs::{NFSTcp, SquashPolicy};
 
@@ -79,69 +81,111 @@ async fn main() -> anyhow::Result<()> {
     }
     control.close().await.context("closing control-plane DB")?;
 
-    let mut volumes = Vec::new();
+    let mut writable_volumes = Vec::new();
+    let mut snapshot_volumes = Vec::new();
     let mut servers = tokio::task::JoinSet::new();
-    // One Volume per (tenant, volume) — a SlateDB has exactly one writer
-    // (DD-5), and several exports (e.g. NFS + 9P, plan §9.4) share it.
-    let mut open_volumes: std::collections::HashMap<(String, String), Arc<Volume>> =
+    // One writable Volume per live (tenant, volume) — a SlateDB has exactly
+    // one writer (DD-5). Snapshot exports are read-only DbReader backends
+    // keyed by checkpoint id.
+    let mut open_backends: std::collections::HashMap<
+        (String, String, Option<String>),
+        Arc<dyn Vfs>,
+    > = std::collections::HashMap::new();
+    let mut open_writers: std::collections::HashMap<(String, String), Arc<Volume>> =
         std::collections::HashMap::new();
     let mut rate_limiters: std::collections::HashMap<String, Arc<RateLimiter>> =
         std::collections::HashMap::new();
     let distinct: std::collections::HashSet<(String, String)> = config
         .exports
         .iter()
+        .filter(|e| e.snapshot.is_none())
         .map(|e| (e.tenant.clone(), e.volume.clone()))
         .collect();
     let share_count = distinct.len();
     for (export, record, dek, rate_limits) in planned {
-        let key = (export.tenant.clone(), export.volume.clone());
+        let key = (
+            export.tenant.clone(),
+            export.volume.clone(),
+            export.snapshot.clone(),
+        );
         let rate_limiter =
             tenant_rate_limiter(&mut rate_limiters, export.tenant.clone(), rate_limits);
-        let volume = match open_volumes.get(&key) {
+        let volume = match open_backends.get(&key) {
             Some(v) => Arc::clone(v),
             None => {
-                let mut caches = VolumeCaches::from_config(
-                    &config.cache,
-                    &export.tenant,
-                    &export.volume,
-                    share_count,
-                );
-                let recorder = Arc::new(slatefs_core::metrics::AggregatingRecorder::default());
-                caches.recorder = Some(Arc::clone(&recorder));
-                let volume =
-                    Volume::open_with_caches(&record, dek, Arc::clone(&object_store), &caches)
-                        .await
-                        .with_context(|| {
-                            format!("opening volume {}/{}", export.tenant, export.volume)
-                        })?;
-
-                // Cache hit-rate visibility (plan §13 / Phase 3 AC): log the
-                // cache-related engine metrics periodically per volume.
-                let (tenant, volume_name) = (export.tenant.clone(), export.volume.clone());
-                tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
-                    tick.tick().await; // skip the immediate tick
-                    loop {
-                        tick.tick().await;
-                        let stats: Vec<String> = recorder
-                            .snapshot()
-                            .into_iter()
-                            .filter(|(name, value)| name.contains("cache") && *value != 0.0)
-                            .map(|(name, value)| format!("{name}={value}"))
-                            .collect();
-                        if !stats.is_empty() {
-                            tracing::info!(
-                                tenant,
-                                volume = volume_name,
-                                "cache metrics: {}",
-                                stats.join(" ")
+                let backend: Arc<dyn Vfs> = if let Some(snapshot) = &export.snapshot {
+                    let snapshot_volume =
+                        SnapshotVolume::open(&record, dek, Arc::clone(&object_store), snapshot)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "opening snapshot {snapshot} for {}/{}",
+                                    export.tenant, export.volume
+                                )
+                            })?;
+                    snapshot_volumes.push(Arc::clone(&snapshot_volume));
+                    snapshot_volume
+                } else {
+                    let writer_key = (export.tenant.clone(), export.volume.clone());
+                    match open_writers.get(&writer_key) {
+                        Some(volume) => Arc::<Volume>::clone(volume),
+                        None => {
+                            let mut caches = VolumeCaches::from_config(
+                                &config.cache,
+                                &export.tenant,
+                                &export.volume,
+                                share_count,
                             );
+                            let recorder =
+                                Arc::new(slatefs_core::metrics::AggregatingRecorder::default());
+                            caches.recorder = Some(Arc::clone(&recorder));
+                            let volume = Volume::open_with_caches(
+                                &record,
+                                dek,
+                                Arc::clone(&object_store),
+                                &caches,
+                            )
+                            .await
+                            .with_context(|| {
+                                format!("opening volume {}/{}", export.tenant, export.volume)
+                            })?;
+
+                            // Cache hit-rate visibility (plan §13 / Phase 3 AC): log the
+                            // cache-related engine metrics periodically per volume.
+                            let (tenant, volume_name) =
+                                (export.tenant.clone(), export.volume.clone());
+                            tokio::spawn(async move {
+                                let mut tick =
+                                    tokio::time::interval(std::time::Duration::from_secs(60));
+                                tick.tick().await; // skip the immediate tick
+                                loop {
+                                    tick.tick().await;
+                                    let stats: Vec<String> = recorder
+                                        .snapshot()
+                                        .into_iter()
+                                        .filter(|(name, value)| {
+                                            name.contains("cache") && *value != 0.0
+                                        })
+                                        .map(|(name, value)| format!("{name}={value}"))
+                                        .collect();
+                                    if !stats.is_empty() {
+                                        tracing::info!(
+                                            tenant,
+                                            volume = volume_name,
+                                            "cache metrics: {}",
+                                            stats.join(" ")
+                                        );
+                                    }
+                                }
+                            });
+                            writable_volumes.push(Arc::clone(&volume));
+                            open_writers.insert(writer_key, Arc::clone(&volume));
+                            volume
                         }
                     }
-                });
-                volumes.push(Arc::clone(&volume));
-                open_volumes.insert(key, Arc::clone(&volume));
-                volume
+                };
+                open_backends.insert(key, Arc::clone(&backend));
+                backend
             }
         };
 
@@ -165,6 +209,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!(
                     tenant = export.tenant,
                     volume = export.volume,
+                    snapshot = export.snapshot.as_deref().unwrap_or("-"),
                     listen = export.listen,
                     port = listener.get_listen_port(),
                     "export ready; mount with: mount -t nfs -o vers=3,nolock,tcp,port={p},mountport={p} <host>:/ <dir>",
@@ -180,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!(
                     tenant = export.tenant,
                     volume = export.volume,
+                    snapshot = export.snapshot.as_deref().unwrap_or("-"),
                     listen = export.listen,
                     "export ready; mount with: mount -t 9p -o trans=tcp,version=9p2000.L,port=<port>{} <host> <dir>",
                     if token.is_some() {
@@ -213,9 +259,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     servers.abort_all();
-    for volume in &volumes {
+    for volume in &writable_volumes {
         if let Err(e) = volume.shutdown().await {
             tracing::error!("volume shutdown: {e}");
+        }
+    }
+    for snapshot in &snapshot_volumes {
+        if let Err(e) = snapshot.shutdown().await {
+            tracing::error!("snapshot shutdown: {e}");
         }
     }
     Ok(())

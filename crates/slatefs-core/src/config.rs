@@ -57,6 +57,10 @@ pub enum ExportProtocol {
 pub struct ExportConfig {
     pub tenant: String,
     pub volume: String,
+    /// Optional SlateDB checkpoint id to serve as a read-only snapshot export.
+    /// Unset means serve the live writable volume.
+    #[serde(default)]
+    pub snapshot: Option<String>,
     /// `ip:port` for this export's listener, e.g. `127.0.0.1:12049`.
     pub listen: String,
     /// Source IPs/CIDRs allowed to connect to this export. Empty means allow
@@ -364,10 +368,15 @@ mod tests {
             [[exports]]
             tenant = "t"
             volume = "v"
+            snapshot = "018f7d79-0354-77a0-a14b-33b863d8999a"
             listen = "127.0.0.1:12049"
             allowed_clients = ["127.0.0.1", "10.0.0.0/8"]
         "#;
         let config = Config::parse(raw).unwrap();
+        assert_eq!(
+            config.exports[0].snapshot.as_deref(),
+            Some("018f7d79-0354-77a0-a14b-33b863d8999a")
+        );
         assert_eq!(config.exports[0].allowed_clients.len(), 2);
         assert!(config.exports[0].allowed_clients[1].contains("10.9.8.7".parse().unwrap()));
     }

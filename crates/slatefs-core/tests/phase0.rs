@@ -19,8 +19,9 @@ use slatefs_core::crypto::Secret32;
 use slatefs_core::crypto::kms::{Kms, StaticKms};
 use slatefs_core::error::Error;
 use slatefs_core::meta::inode::ROOT_INO;
+use slatefs_core::snapshot::SnapshotVolume;
 use slatefs_core::store::{self, ObjectStore};
-use slatefs_core::vfs::{Credentials, Vfs};
+use slatefs_core::vfs::{Credentials, FsError, Vfs};
 use slatefs_core::volume::{self, CreateVolumeOptions};
 
 const TENANT_MARKER: &str = "SLATEFS_PLAINTEXT_MARKER_TENANT_93b1";
@@ -314,6 +315,42 @@ async fn phase0_round_trip(object_store: Arc<dyn ObjectStore>) {
         .expect("write source latest");
     src_vol.flush().await.expect("flush source latest");
     src_vol.shutdown().await.expect("close clone source latest");
+
+    let snapshot_dek = control
+        .unwrap_volume_dek(&source)
+        .await
+        .expect("source dek");
+    let snapshot_vol = SnapshotVolume::open(
+        &source,
+        snapshot_dek,
+        Arc::clone(&object_store),
+        &baseline.id,
+    )
+    .await
+    .expect("open read-only snapshot");
+    assert!(snapshot_vol.read_only());
+    assert_ne!(snapshot_vol.fsid(), source.fsid);
+    let snapshot_file = snapshot_vol
+        .lookup(&root(), ROOT_INO, b"file")
+        .await
+        .expect("lookup snapshot file");
+    assert_eq!(
+        snapshot_vol
+            .read(&root(), snapshot_file.ino, 0, snapshot_file.size as u32)
+            .await
+            .expect("read snapshot file"),
+        b"baseline".as_slice()
+    );
+    assert!(matches!(
+        snapshot_vol
+            .write(&root(), snapshot_file.ino, 0, b"blocked")
+            .await,
+        Err(FsError::ReadOnly)
+    ));
+    snapshot_vol
+        .shutdown()
+        .await
+        .expect("close read-only snapshot");
 
     let latest_clone = volume::clone_volume(
         &control,

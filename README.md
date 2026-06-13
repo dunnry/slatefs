@@ -120,7 +120,9 @@ before checkpointing; do not run it against a volume currently served by
 creates an instant writable same-tenant clone, optionally from a checkpoint
 with `--snapshot <id>`. Clones get distinct fsids and independent writes, but
 they intentionally share source SSTs, so deleting a source volume is refused
-while active clones point at it. Read-only snapshot exports remain a follow-up.
+while active clones point at it. `[[exports]] snapshot = "<checkpoint-id>"`
+serves that checkpoint through the normal NFS or 9P frontend as a read-only
+mount; live writes after the checkpoint are not visible there.
 
 > Testing against kernel NFS clients: always mount with
 > `soft,intr,timeo=…` and bound every command touching the mountpoint

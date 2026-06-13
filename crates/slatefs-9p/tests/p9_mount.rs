@@ -624,8 +624,9 @@ async fn cross_protocol_coherence() {
 
     // Serve BOTH protocols from the same Volume.
     let p9_port = serve_9p(Arc::clone(&volume), None).await;
+    let nfs_backend: Arc<dyn slatefs_core::vfs::Vfs> = volume.clone();
     let nfs_listener = slatefs_nfs::bind_export(
-        Arc::clone(&volume),
+        nfs_backend,
         Secret32::from_bytes([7; 32]),
         slatefs_nfs::SquashPolicy::trust_as_root(),
         "127.0.0.1:0",

@@ -36,7 +36,7 @@ use nfs3_server::tcp::NFSTcpListener;
 use slatefs_core::config::ClientAddrRule;
 use slatefs_core::crypto::Secret32;
 use slatefs_core::rate::RateLimiter;
-use slatefs_core::volume::Volume;
+use slatefs_core::vfs::Vfs;
 
 pub use adapter::{SlateFsNfs, SquashPolicy};
 pub use nfs3_server::tcp::NFSTcp;
@@ -46,7 +46,7 @@ pub use nfs3_server::tcp::NFSTcp;
 /// The handle generation is pinned to the volume fsid, so file handles stay
 /// valid across daemon restarts and across nodes after failover (plan §5).
 pub async fn bind_export(
-    volume: Arc<Volume>,
+    volume: Arc<dyn Vfs>,
     fh_key: Secret32,
     policy: SquashPolicy,
     listen: &str,
@@ -57,7 +57,7 @@ pub async fn bind_export(
 /// Bind an NFS listener with a source-IP allowlist. Empty `allowed_clients`
 /// means allow all clients.
 pub async fn bind_export_with_allowlist(
-    volume: Arc<Volume>,
+    volume: Arc<dyn Vfs>,
     fh_key: Secret32,
     policy: SquashPolicy,
     allowed_clients: Vec<ClientAddrRule>,
@@ -69,7 +69,7 @@ pub async fn bind_export_with_allowlist(
 
 /// Bind an NFS listener with source-IP and tenant rate-limit gates.
 pub async fn bind_export_with_allowlist_and_rate_limit(
-    volume: Arc<Volume>,
+    volume: Arc<dyn Vfs>,
     fh_key: Secret32,
     policy: SquashPolicy,
     allowed_clients: Vec<ClientAddrRule>,

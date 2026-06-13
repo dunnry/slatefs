@@ -22,7 +22,6 @@ use slatefs_core::rate::RateLimiter;
 use slatefs_core::vfs::{
     Credentials, FileAttr, FsError, HandleId, OpenMode, SetAttrs, TimeSet, Vfs,
 };
-use slatefs_core::volume::Volume;
 
 type P9Result = rs9p::Result<FCall>;
 
@@ -82,7 +81,7 @@ impl FidState {
 }
 
 pub struct SlateFs9p {
-    volume: Arc<Volume>,
+    volume: Arc<dyn Vfs>,
     /// Bearer token required in `uname` at attach (DD-10). `None` ⇒ open
     /// export (dev / network-isolated deployments).
     token: Option<String>,
@@ -110,12 +109,12 @@ impl Clone for SlateFs9p {
 }
 
 impl SlateFs9p {
-    pub fn new(volume: Arc<Volume>, export_name: String, token: Option<String>) -> SlateFs9p {
+    pub fn new(volume: Arc<dyn Vfs>, export_name: String, token: Option<String>) -> SlateFs9p {
         Self::new_with_rate_limiter(volume, export_name, token, None)
     }
 
     pub fn new_with_rate_limiter(
-        volume: Arc<Volume>,
+        volume: Arc<dyn Vfs>,
         export_name: String,
         token: Option<String>,
         rate_limiter: Option<Arc<RateLimiter>>,
@@ -153,6 +152,7 @@ fn errno(e: FsError) -> P9Error {
         FsError::NotSupported => EOPNOTSUPP,
         FsError::Stale => ESTALE,
         FsError::QuotaExceeded => EDQUOT,
+        FsError::ReadOnly => EROFS,
     })
 }
 

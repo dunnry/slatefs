@@ -50,6 +50,8 @@ pub enum FsError {
     Stale,
     #[error("EDQUOT: disk quota exceeded")]
     QuotaExceeded,
+    #[error("EROFS: read-only filesystem")]
+    ReadOnly,
 }
 
 impl FsError {
@@ -76,6 +78,7 @@ impl FsError {
             NotSupported => 95,
             Stale => 116,
             QuotaExceeded => 122,
+            ReadOnly => 30,
         }
     }
 }
@@ -245,6 +248,12 @@ pub enum OpenMode {
 
 #[async_trait::async_trait]
 pub trait Vfs: Send + Sync {
+    fn fsid(&self) -> u64;
+    fn chunk_size(&self) -> u64;
+    fn read_only(&self) -> bool {
+        false
+    }
+
     async fn lookup(&self, creds: &Credentials, parent: u64, name: &[u8]) -> FsResult<FileAttr>;
     async fn getattr(&self, creds: &Credentials, ino: u64) -> FsResult<FileAttr>;
     async fn setattr(&self, creds: &Credentials, ino: u64, attrs: SetAttrs) -> FsResult<FileAttr>;
