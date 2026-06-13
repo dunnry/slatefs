@@ -20,7 +20,7 @@ use crate::control::{
 };
 use crate::crypto::kms::contexts;
 use crate::crypto::names::NameCodec;
-use crate::crypto::transformer::SlateBlockTransformer;
+use crate::crypto::transformer::{BlockTransformMetrics, SlateBlockTransformer};
 use crate::crypto::{Cipher, Secret32, aead, random_u64};
 use crate::error::{Error, Result, is_fenced_slatedb_error};
 use crate::locks::{LockManager, RangeLockTable};
@@ -461,6 +461,16 @@ pub async fn open_volume_db(
     object_store: Arc<dyn ObjectStore>,
     caches: &VolumeCaches,
 ) -> Result<Db> {
+    open_volume_db_with_transform_metrics(record, dek, object_store, caches, None).await
+}
+
+async fn open_volume_db_with_transform_metrics(
+    record: &VolumeRecord,
+    dek: Secret32,
+    object_store: Arc<dyn ObjectStore>,
+    caches: &VolumeCaches,
+    block_metrics: Option<BlockTransformMetrics>,
+) -> Result<Db> {
     use slatedb::config::{ObjectStoreCacheOptions, PreloadLevel};
     use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 
@@ -477,13 +487,17 @@ pub async fn open_volume_db(
         _ => ObjectStoreCacheOptions::default(),
     };
 
+    let transformer = match block_metrics {
+        Some(metrics) => SlateBlockTransformer::with_metrics(record.cipher, dek, metrics),
+        None => SlateBlockTransformer::new(record.cipher, dek),
+    };
     let mut builder = Db::builder(path, object_store)
         .with_settings(Settings {
             compression_codec: record.compression.to_slatedb(),
             object_store_cache_options,
             ..Settings::default()
         })
-        .with_block_transformer(Arc::new(SlateBlockTransformer::new(record.cipher, dek)))
+        .with_block_transformer(Arc::new(transformer))
         .with_merge_operator(Arc::new(CounterMergeOperator));
     // Tier 1: in-RAM plaintext block cache, byte-weighted.
     if let Some(bytes) = caches.memory_bytes {
@@ -721,6 +735,7 @@ impl HandleTable {
 pub struct Volume {
     pub(crate) db: Db,
     pub(crate) superblock: Superblock,
+    block_metrics: BlockTransformMetrics,
     dead: AtomicBool,
     dead_notify: Notify,
     pub(crate) names: NameCodec,
@@ -769,7 +784,15 @@ impl Volume {
                 format!("{:?}, not Active", record.state),
             ));
         }
-        let db = open_volume_db(record, dek.clone(), object_store, caches).await?;
+        let block_metrics = BlockTransformMetrics::default();
+        let db = open_volume_db_with_transform_metrics(
+            record,
+            dek.clone(),
+            object_store,
+            caches,
+            Some(block_metrics.clone()),
+        )
+        .await?;
 
         let superblock = match db.get(KEY_SUPERBLOCK).await? {
             Some(bytes) => Superblock::decode(&bytes)?,
@@ -794,6 +817,7 @@ impl Volume {
             db,
             chunk_size: superblock.chunk_size as u64,
             superblock,
+            block_metrics,
             dead: AtomicBool::new(false),
             dead_notify: Notify::new(),
             names: NameCodec::new(dek),
@@ -817,6 +841,10 @@ impl Volume {
 
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Acquire)
+    }
+
+    pub fn block_decode_failures(&self) -> u64 {
+        self.block_metrics.decode_failures()
     }
 
     pub(crate) fn ensure_live(&self) -> FsResult<()> {

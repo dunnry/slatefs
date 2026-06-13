@@ -66,6 +66,11 @@ fn render_daemon_metrics(targets: &[MetricsTarget]) -> String {
             labels,
             if target.volume.is_dead() { 1.0 } else { 0.0 },
         ));
+        samples.push(PrometheusSample::new(
+            "slatefs_block_decode_failures_total",
+            labels,
+            target.volume.block_decode_failures() as f64,
+        ));
         samples.extend(target.recorder.prometheus_samples(&labels));
     }
     render_prometheus(&samples)

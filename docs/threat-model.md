@@ -64,8 +64,8 @@ fallback). Upstream fix would be a per-DB discriminator in the cache key.
 
 ## Fail-closed inventory
 
-- AEAD decrypt failure on any block → `EIO`, logged (alert metric: Phase 6
-  dashboards); never serves questionable plaintext.
+- AEAD decrypt failure on any served writable-volume block → `EIO`, log, and
+  `slatefs_block_decode_failures_total`; never serves questionable plaintext.
 - Wrong/undecryptable DEK or KEK → volume/control open fails.
 - Tampered or foreign NFS file handles → constant-time HMAC reject.
 - SIV name decrypt failure → `EIO` on that dirent.

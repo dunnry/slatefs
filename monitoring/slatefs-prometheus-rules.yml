@@ -18,3 +18,12 @@ groups:
         annotations:
           summary: "SlateFS daemon metrics scrape is missing"
           description: "Prometheus has no healthy scrape target for job=slatefsd. Check the daemon process, scrape config, and [metrics].listen."
+
+      - alert: SlateFSBlockDecodeFailures
+        expr: increase(slatefs_block_decode_failures_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SlateFS block decode failures on {{ $labels.tenant }}/{{ $labels.volume }}"
+          description: "A SlateDB block failed AEAD verification. Treat this as possible wrong-key, corruption, tampering, or object-store rollback and stop serving the affected volume."
