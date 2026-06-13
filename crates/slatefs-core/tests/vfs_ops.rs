@@ -6,9 +6,11 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{TEST_CHUNK, fresh_volume};
+use common::{TEST_CHUNK, fresh_volume, fresh_volume_on, test_kms};
+use slatefs_core::control::ControlPlane;
 use slatefs_core::meta::inode::{FileKind, ROOT_INO};
 use slatefs_core::vfs::{Credentials, FsError, OpenMode, SetAttrs, TimeSet, Vfs};
+use slatefs_core::{store, volume};
 
 fn root() -> Credentials {
     Credentials::root()
@@ -65,6 +67,32 @@ async fn create_lookup_read_write_roundtrip() {
             .is_empty()
     );
 
+    assert!(v.fsck().await.unwrap().is_clean());
+}
+
+#[tokio::test]
+async fn online_scrub_does_not_take_writer_lease() {
+    let object_store = store::resolve_root("memory:///").unwrap();
+    let v = fresh_volume_on(Arc::clone(&object_store), None, None).await;
+    let f = v
+        .create(&root(), ROOT_INO, b"scrubbed", 0o644, true)
+        .await
+        .unwrap();
+    v.write(&root(), f.ino, 0, b"still serving").await.unwrap();
+
+    let control = ControlPlane::open(Arc::clone(&object_store), test_kms())
+        .await
+        .unwrap();
+    let report = volume::scrub_volume(&control, Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap();
+    assert!(report.is_clean(), "{report:?}");
+    control.close().await.unwrap();
+
+    // The original writer was not fenced by the scrub reader.
+    v.create(&root(), ROOT_INO, b"after-scrub", 0o644, true)
+        .await
+        .unwrap();
     assert!(v.fsck().await.unwrap().is_clean());
 }
 

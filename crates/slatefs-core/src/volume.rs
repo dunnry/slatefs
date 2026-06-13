@@ -316,6 +316,50 @@ pub async fn volume_info(
     })
 }
 
+/// Run the fsck structural checker through a read-only [`DbReader`]. Unlike
+/// [`Volume::fsck`], this does not open the volume as the writer, so it can
+/// run while `slatefsd` is serving the volume. It reports drift/corruption but
+/// never rewrites counters.
+pub async fn scrub_volume(
+    control: &ControlPlane,
+    object_store: Arc<dyn ObjectStore>,
+    tenant_name: &str,
+    volume_name: &str,
+) -> Result<crate::fsck::FsckReport> {
+    let record = control.get_volume(tenant_name, volume_name).await?;
+    let dek = control.unwrap_volume_dek(&record).await?;
+    let names = NameCodec::new(dek.clone());
+
+    let path = store::volume_db_path(&record.tenant, &record.name);
+    let reader = DbReader::builder(path, object_store)
+        .with_block_transformer(Arc::new(SlateBlockTransformer::new(record.cipher, dek)))
+        .with_merge_operator(Arc::new(CounterMergeOperator))
+        .build()
+        .await?;
+
+    let result = async {
+        let bytes = reader
+            .get(KEY_SUPERBLOCK)
+            .await?
+            .ok_or_else(|| Error::invalid("volume", "no superblock (mkfs incomplete?)"))?;
+        let superblock = Superblock::decode(&bytes)?;
+        if superblock.fsid != record.fsid {
+            return Err(Error::invalid(
+                "superblock",
+                format!(
+                    "fsid {:016x} does not match control record {:016x}",
+                    superblock.fsid, record.fsid
+                ),
+            ));
+        }
+        crate::fsck::check_reader(&reader, superblock.chunk_size as u64, &names).await
+    }
+    .await;
+
+    reader.close().await?;
+    result
+}
+
 // ---- the mounted volume ----
 
 #[derive(Default)]

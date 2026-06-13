@@ -102,7 +102,9 @@ resolution fail closed until resumed. Per-export source-IP allowlists
 (`allowed_clients = ["127.0.0.1", "10.0.0.0/8"]`) are enforced by both NFS and
 9P before request decoding. Quota limits are operator-manageable with `slatefs
 quota show|set`, including validation that soft limits do not exceed hard
-limits. Live quota enforcement still uses the limits loaded when a volume is
+limits. `slatefs volume scrub` runs the structural checker through a read-only
+SlateDB reader, so it can compare counters/recount while the volume is being
+served. Live quota enforcement still uses the limits loaded when a volume is
 opened, so changed limits apply on the next serve/open cycle.
 
 > Testing against kernel NFS clients: always mount with

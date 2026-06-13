@@ -90,6 +90,9 @@ enum VolumeCmd {
         #[arg(long)]
         recount: bool,
     },
+    /// Read-only online structural scrub. Safe while the volume is served;
+    /// reports drift but never rewrites counters.
+    Scrub { tenant: String, volume: String },
 }
 
 #[derive(Subcommand)]
@@ -161,6 +164,23 @@ fn print_quota(tenant: &str, volume: &str, quota: QuotaLimits) {
         format_limit(quota.inodes.soft),
         format_limit(quota.inodes.grace_until)
     );
+}
+
+fn print_fsck_report(report: &slatefs_core::fsck::FsckReport) {
+    println!(
+        "inodes: counter={} recount={}",
+        report.counter_inodes, report.inodes_counted
+    );
+    println!(
+        "bytes:  counter={} recount={}",
+        report.counter_bytes, report.bytes_counted
+    );
+    for r in &report.reapable {
+        println!("reapable: {r}");
+    }
+    for p in &report.problems {
+        println!("PROBLEM: {p}");
+    }
 }
 
 #[tokio::main]
@@ -321,26 +341,22 @@ async fn run(
             };
             vol.shutdown().await?;
 
-            println!(
-                "inodes: counter={} recount={}",
-                report.counter_inodes, report.inodes_counted
-            );
-            println!(
-                "bytes:  counter={} recount={}",
-                report.counter_bytes, report.bytes_counted
-            );
-            for r in &report.reapable {
-                println!("reapable: {r}");
-            }
-            for p in &report.problems {
-                println!("PROBLEM: {p}");
-            }
+            print_fsck_report(&report);
             if report.is_clean() {
                 println!("clean");
             } else if *recount && report.problems.is_empty() {
                 println!("counters rewritten from recount");
             } else {
                 anyhow::bail!("fsck found problems");
+            }
+        }
+        Command::Volume(VolumeCmd::Scrub { tenant, volume }) => {
+            let report = volume::scrub_volume(control, object_store, tenant, volume).await?;
+            print_fsck_report(&report);
+            if report.is_clean() {
+                println!("clean");
+            } else {
+                anyhow::bail!("scrub found problems or counter drift");
             }
         }
         Command::Quota(QuotaCmd::Show { tenant, volume }) => {

@@ -6,7 +6,9 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use slatedb::{Db, WriteBatch};
+use async_trait::async_trait;
+use bytes::Bytes;
+use slatedb::{Db, DbIterator, DbReader, WriteBatch};
 
 use crate::crypto::names::NameCodec;
 use crate::error::Result;
@@ -52,7 +54,35 @@ struct Scanned {
     counter_inodes: i64,
 }
 
-async fn scan_all(db: &Db) -> Result<Scanned> {
+#[async_trait]
+trait FsckRead {
+    async fn scan_all_keys(&self) -> Result<DbIterator>;
+    async fn get_key(&self, key: &'static [u8]) -> Result<Option<Bytes>>;
+}
+
+#[async_trait]
+impl FsckRead for Db {
+    async fn scan_all_keys(&self) -> Result<DbIterator> {
+        self.scan::<Vec<u8>, _>(..).await.map_err(Into::into)
+    }
+
+    async fn get_key(&self, key: &'static [u8]) -> Result<Option<Bytes>> {
+        self.get(key).await.map_err(Into::into)
+    }
+}
+
+#[async_trait]
+impl FsckRead for DbReader {
+    async fn scan_all_keys(&self) -> Result<DbIterator> {
+        self.scan::<Vec<u8>, _>(..).await.map_err(Into::into)
+    }
+
+    async fn get_key(&self, key: &'static [u8]) -> Result<Option<Bytes>> {
+        self.get(key).await.map_err(Into::into)
+    }
+}
+
+async fn scan_all(db: &(impl FsckRead + Sync)) -> Result<Scanned> {
     let mut s = Scanned {
         inodes: HashMap::new(),
         dirents: HashMap::new(),
@@ -64,7 +94,7 @@ async fn scan_all(db: &Db) -> Result<Scanned> {
         counter_inodes: 0,
     };
 
-    let mut iter = db.scan::<Vec<u8>, _>(..).await?;
+    let mut iter = db.scan_all_keys().await?;
     while let Some(kv) = iter.next().await? {
         let key: &[u8] = &kv.key;
         match key.first() {
@@ -102,14 +132,32 @@ async fn scan_all(db: &Db) -> Result<Scanned> {
             _ => {}
         }
     }
-    s.counter_bytes = quota::decode_counter(db.get(keys::KEY_QUOTA_BYTES).await?.as_deref());
-    s.counter_inodes = quota::decode_counter(db.get(keys::KEY_QUOTA_INODES).await?.as_deref());
+    s.counter_bytes = quota::decode_counter(db.get_key(keys::KEY_QUOTA_BYTES).await?.as_deref());
+    s.counter_inodes = quota::decode_counter(db.get_key(keys::KEY_QUOTA_INODES).await?.as_deref());
     Ok(s)
 }
 
 /// Verify the volume. `names` decrypts dirent names to cross-check the
 /// `d`/`e` records.
 pub async fn check(db: &Db, chunk_size: u64, names: &NameCodec) -> Result<FsckReport> {
+    check_readable(db, chunk_size, names).await
+}
+
+/// Verify the volume through a read-only `DbReader`. This is the online scrub
+/// path: it does not take the SlateDB writer lease for the volume.
+pub async fn check_reader(
+    reader: &DbReader,
+    chunk_size: u64,
+    names: &NameCodec,
+) -> Result<FsckReport> {
+    check_readable(reader, chunk_size, names).await
+}
+
+async fn check_readable(
+    db: &(impl FsckRead + Sync),
+    chunk_size: u64,
+    names: &NameCodec,
+) -> Result<FsckReport> {
     let s = scan_all(db).await?;
     let mut report = FsckReport {
         counter_bytes: s.counter_bytes,
