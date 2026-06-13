@@ -116,9 +116,11 @@ the affected volume object-store prefixes.
 
 **Phase 6 started** (snapshots/clones, HA, performance, GA polish):
 `slatefs snapshot create|list|delete` manages SlateDB checkpoints for a volume.
-The current create path opens the volume as the writer so SlateDB can flush
-before checkpointing; do not run it against a volume currently served by
-`slatefsd`. `slatefs clone create <tenant> <source-volume> <clone-volume>`
+The CLI create path opens the volume as the writer so SlateDB can flush before
+checkpointing; do not run it against a volume currently served by `slatefsd`.
+The core `Volume::create_live_snapshot` primitive covers online checkpoints
+from the live writer and is verified against read-only snapshot mounts.
+`slatefs clone create <tenant> <source-volume> <clone-volume>`
 creates an instant writable same-tenant clone, optionally from a checkpoint
 with `--snapshot <id>`. Clones get distinct fsids and independent writes, but
 they intentionally share source SSTs, so deleting a source volume is refused

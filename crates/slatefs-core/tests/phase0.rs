@@ -324,25 +324,15 @@ async fn phase0_round_trip(object_store: Arc<dyn ObjectStore>) {
         .await
         .expect("write source baseline");
     src_vol.flush().await.expect("flush source baseline");
-    src_vol.shutdown().await.expect("close clone source");
 
-    let baseline = volume::create_snapshot(
-        &control,
-        Arc::clone(&object_store),
-        "tclone",
-        "src",
-        Some("baseline".to_string()),
-    )
-    .await
-    .expect("create clone baseline snapshot");
+    // Online snapshot creation must not take a second writer lease from the
+    // live source volume, and later source writes must not appear in the
+    // snapshot export.
+    let baseline = src_vol
+        .create_live_snapshot(Some("baseline".to_string()))
+        .await
+        .expect("create clone baseline snapshot");
 
-    let source_dek = control
-        .unwrap_volume_dek(&source)
-        .await
-        .expect("source dek");
-    let src_vol = volume::Volume::open(&source, source_dek, Arc::clone(&object_store))
-        .await
-        .expect("reopen clone source");
     src_vol
         .write(&root(), file.ino, 0, b"latest!!")
         .await

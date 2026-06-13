@@ -108,6 +108,13 @@ pub struct VolumeInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedSnapshot {
+    pub id: String,
+    pub manifest_id: u64,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotInfo {
     pub id: String,
     pub manifest_id: u64,
@@ -624,7 +631,7 @@ pub async fn create_snapshot(
     let dek = control.unwrap_volume_dek(&record).await?;
     let path = store::volume_db_path(&record.tenant, &record.name);
     let volume = Volume::open(&record, dek, Arc::clone(&object_store)).await?;
-    let created = volume.create_checkpoint(name).await?;
+    let created = volume.create_live_snapshot(name).await?;
     volume.shutdown().await?;
 
     let admin = AdminBuilder::new(path, object_store).build();
@@ -632,7 +639,7 @@ pub async fn create_snapshot(
         .list_checkpoints(None)
         .await?
         .into_iter()
-        .find(|checkpoint| checkpoint.id == created.id)
+        .find(|checkpoint| checkpoint.id.to_string() == created.id)
         .map(snapshot_info)
         .ok_or_else(|| {
             Error::invalid(
@@ -951,19 +958,30 @@ impl Volume {
         crate::fsck::recount(&self.db, self.chunk_size, &self.names).await
     }
 
-    async fn create_checkpoint(
-        &self,
-        name: Option<String>,
-    ) -> std::result::Result<slatedb::CheckpointCreateResult, slatedb::Error> {
-        self.db
+    /// Create a checkpoint from the live writer. This is the online snapshot
+    /// primitive: it flushes WALs and freezes the current memtable through the
+    /// open `Db`, so all writes issued before the call are included without
+    /// taking a second writer lease.
+    pub async fn create_live_snapshot(&self, name: Option<String>) -> Result<CreatedSnapshot> {
+        let created = self
+            .db
             .create_checkpoint(
                 CheckpointScope::All,
                 &CheckpointOptions {
-                    name,
+                    name: name.clone(),
                     ..CheckpointOptions::default()
                 },
             )
             .await
+            .map_err(|error| {
+                self.note_storage_error(&error);
+                Error::from(error)
+            })?;
+        Ok(CreatedSnapshot {
+            id: created.id.to_string(),
+            manifest_id: created.manifest_id,
+            name,
+        })
     }
 }
 

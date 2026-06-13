@@ -54,6 +54,11 @@ Use snapshots for point-in-time read access first:
 2. Add an export with `snapshot = "<checkpoint-id>"` and a read-only listen address.
 3. Mount the snapshot export and copy out the required data.
 
+The current CLI snapshot-create path takes the writer lease; do not run it
+against a volume actively served by `slatefsd`. Online checkpointing is
+implemented on the live `Volume` writer and should be exposed through a daemon
+admin path before operators use it on served volumes.
+
 For a writable restore workspace:
 
 1. Create a clone: `slatefs clone create <tenant> <source-volume> <clone-volume> --snapshot <checkpoint-id>`.
