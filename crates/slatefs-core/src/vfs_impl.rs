@@ -52,7 +52,7 @@ fn validate_name(name: &[u8]) -> FsResult<()> {
 }
 
 fn access(creds: &Credentials, inode: &Inode, want: u32) -> FsResult<()> {
-    if creds.is_root() {
+    if creds.is_privileged() {
         return Ok(());
     }
     let bits = if creds.uid == inode.uid {
@@ -73,7 +73,7 @@ fn access(creds: &Credentials, inode: &Inode, want: u32) -> FsResult<()> {
 /// entry's owner, the directory's owner, or root may remove/rename it.
 fn check_sticky(creds: &Credentials, parent: &Inode, child: &Inode) -> FsResult<()> {
     if parent.mode & 0o1000 != 0
-        && !creds.is_root()
+        && !creds.is_privileged()
         && creds.uid != child.uid
         && creds.uid != parent.uid
     {
@@ -426,13 +426,14 @@ impl Vfs for Volume {
 
         // Permission gates first, before any mutation is planned.
         if let Some(mode) = attrs.mode {
-            if !creds.is_root() && !is_owner {
+            if !creds.is_privileged() && !is_owner {
                 return Err(FsError::NotPermitted);
             }
             let mut mode = mode & 0o7777;
             // Non-root setting setgid without membership in the file's group
-            // silently loses the bit (POSIX).
-            if !creds.is_root() && !creds.in_group(inode.gid) {
+            // silently loses the bit (POSIX). A trusted frontend already
+            // validated group membership it can see better than we can.
+            if !creds.is_privileged() && !creds.in_group(inode.gid) {
                 mode &= !0o2000;
             }
             inode.mode = mode;
@@ -441,7 +442,7 @@ impl Vfs for Volume {
         // the current ones — a non-owner's no-op chown is still EPERM
         // (pjdfstest chown/07).
         if let Some(uid) = attrs.uid {
-            let allowed = creds.is_root() || (is_owner && uid == inode.uid);
+            let allowed = creds.is_privileged() || (is_owner && uid == inode.uid);
             if !allowed {
                 return Err(FsError::NotPermitted);
             }
@@ -449,9 +450,11 @@ impl Vfs for Volume {
         }
         if let Some(gid) = attrs.gid {
             let owner_with_group = is_owner && (gid == inode.gid || creds.in_group(gid));
-            if !creds.is_root() && !owner_with_group {
+            if !creds.is_privileged() && !owner_with_group {
                 return Err(FsError::NotPermitted);
             }
+            // Clearing keyed on genuine privilege, not the trust flag: a
+            // non-root caller's chown must drop setuid/setgid (POSIX).
             if !creds.is_root() && gid != inode.gid {
                 inode.mode &= !0o6000; // chown clears setuid/setgid
             }
@@ -463,7 +466,7 @@ impl Vfs for Volume {
         {
             match slot {
                 TimeSet::Now => {
-                    if !creds.is_root() && !is_owner {
+                    if !creds.is_privileged() && !is_owner {
                         access(creds, &inode, ACCESS_W)?;
                     }
                     if time {
@@ -473,7 +476,7 @@ impl Vfs for Volume {
                     }
                 }
                 TimeSet::Time(t) => {
-                    if !creds.is_root() && !is_owner {
+                    if !creds.is_privileged() && !is_owner {
                         return Err(FsError::NotPermitted);
                     }
                     if time {

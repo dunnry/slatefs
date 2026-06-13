@@ -107,10 +107,17 @@ jobs:
       # Quick fsx/fsstress + restart drill on every push; nightly raises the
       # scale to the plan's AC numbers.
       - run: SLATEFS_CONFIG=/tmp/slatefs.toml sudo -E env "PATH=$PATH" ./scripts/fsx-fsstress-over-nfs.sh
-      - name: pjdfstest (full suite; exclusions in docs/pjdfstest-exclusions.md)
+      - name: pjdfstest over NFSv3 (full suite; exclusions in docs/pjdfstest-exclusions.md)
         run: |
           SLATEFS_CONFIG=/tmp/slatefs.toml sudo -E env "PATH=$PATH" ./scripts/pjdfstest-over-nfs.sh || {
             failed=$(grep -oE 'Failed: [0-9]+' /tmp/pjdfstest-results.txt | awk '{s+=$2} END {print s+0}')
+            echo "total failed assertions: $failed (2 documented exclusions allowed)"
+            [ "$failed" -le 2 ]
+          }
+      - name: pjdfstest over 9P2000.L (full suite; exclusions in docs/pjdfstest-exclusions.md)
+        run: |
+          SLATEFS_CONFIG=/tmp/slatefs.toml sudo -E env "PATH=$PATH" ./scripts/pjdfstest-over-9p.sh || {
+            failed=$(grep -oE 'Failed: [0-9]+' /tmp/pjdfstest-9p-results.txt | awk '{s+=$2} END {print s+0}')
             echo "total failed assertions: $failed (2 documented exclusions allowed)"
             [ "$failed" -le 2 ]
           }

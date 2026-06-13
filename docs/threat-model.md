@@ -70,11 +70,36 @@ fallback). Upstream fix would be a per-DB discriminator in the cache key.
 - Tampered or foreign NFS file handles → constant-time HMAC reject.
 - SIV name decrypt failure → `EIO` on that dirent.
 
+## Frontend access model (DD-10)
+
+- **NFSv3** authenticates with AUTH_SYS (uid/gid assertions, no
+  cryptographic identity). Per-export squash policy (`none` / `root_squash`
+  / `all_squash` / `trust_as_root`) plus the server's own DAC enforcement
+  gate every op; tenancy binds to the export endpoint, not the credential.
+- **9P2000.L** authenticates the *connection* with a per-tenant bearer
+  token at `Tattach` (`uname`), and `aname` binds the volume. After that,
+  the connection is **trusted for DAC**: 9P2000.L carries no per-operation
+  gid or supplementary groups, and the Linux v9fs client under
+  `access=user` already enforces permissions client-side with the caller's
+  full credentials, so the server cannot re-derive a correct check. SlateFS
+  keeps the asserted uid/gid for *ownership attribution* but skips
+  redundant access gates (`Credentials::trusted`). Implication: a client
+  that has authenticated the connection token and can forge arbitrary
+  `n_uname` values is **not** constrained by server-side DAC — the token
+  *is* the tenant boundary. Deploy 9P exports behind the same network-layer
+  tenant isolation as NFS, and treat the bearer token as a tenant-wide
+  secret. Rules tied to genuine privilege (setuid/setgid clearing,
+  device-node creation) still gate on the real uid, not the trust flag.
+
 ## Out of scope (v1, per plan)
 
 - Host memory compromise (plaintext blocks + DEKs in RAM).
 - AUTH_SYS identity spoofing — mitigated by export squash policy plus
   network-layer tenant isolation (DD-10), not cryptography.
+- 9P intra-tenant uid spoofing — a holder of a tenant's bearer token may
+  assert any uid within that tenant (see Frontend access model); the token,
+  not server DAC, is the boundary. TLS-wrapped tokens + network isolation
+  are the mitigation; per-uid cryptographic identity is not a v1 goal.
 - Traffic analysis, object-store-side replay/rollback (SlateDB fencing
   protects single-writer integrity, not history rollback by the store
   operator).

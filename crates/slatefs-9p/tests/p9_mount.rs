@@ -410,6 +410,61 @@ async fn p9_end_to_end() {
     assert!(report.is_clean(), "{:?}", report.problems);
 }
 
+/// Sub-second timestamps survive a `Tsetattr` → `Tgetattr` round-trip on
+/// the server (plan §10 nanosecond times). This isolates the server from
+/// the Linux v9fs client, which truncates timestamps to `s_time_gran`
+/// (1 s on many kernels) *before* sending `Tsetattr` — so pjdfstest's
+/// `utimensat/08` sub-second check sees `0` over a kernel mount even though
+/// the wire protocol and our server both carry full nanoseconds. See
+/// docs/pjdfstest-exclusions.md.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p9_setattr_subsecond_time_roundtrip() {
+    let object_store = store::resolve_root("memory:///").unwrap();
+    let volume = make_volume(Arc::clone(&object_store)).await;
+    let port = serve_9p(Arc::clone(&volume), None).await;
+
+    tokio::task::spawn_blocking(move || {
+        let mut c = P9c::connect(port);
+        c.attach(0, "", "/t/v", 0);
+        c.walk(0, 1, &[]);
+        c.lcreate(1, "ts.bin", 0o2 /* O_RDWR */, 0o644);
+
+        // utimensat-style: explicit atime/mtime with sub-second nanos.
+        match c.rpc(FCall::TSetAttr {
+            fid: 1,
+            valid: SetAttrMask::ATIME
+                | SetAttrMask::ATIME_SET
+                | SetAttrMask::MTIME
+                | SetAttrMask::MTIME_SET,
+            stat: SetAttr {
+                mode: 0,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                atime: Time {
+                    sec: 100_000_000,
+                    nsec: 100_000_000,
+                },
+                mtime: Time {
+                    sec: 200_000_000,
+                    nsec: 200_000_000,
+                },
+            },
+        }) {
+            FCall::RSetAttr => {}
+            other => panic!("setattr failed: {other:?}"),
+        }
+
+        let stat = c.getattr(1);
+        assert_eq!(stat.atime.sec, 100_000_000, "atime sec");
+        assert_eq!(stat.atime.nsec, 100_000_000, "atime nsec (sub-second)");
+        assert_eq!(stat.mtime.sec, 200_000_000, "mtime sec");
+        assert_eq!(stat.mtime.nsec, 200_000_000, "mtime nsec (sub-second)");
+    })
+    .await
+    .expect("client thread");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p9_attach_auth_enforced() {
     let object_store = store::resolve_root("memory:///").unwrap();

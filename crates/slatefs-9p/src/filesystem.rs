@@ -70,11 +70,13 @@ enum XattrFid {
 
 impl FidState {
     fn creds(&self) -> Credentials {
-        Credentials {
-            uid: self.uid,
-            gid: self.gid,
-            groups: vec![self.gid],
-        }
+        // 9P2000.L carries no per-op gid or supplementary groups — only the
+        // attaching uid (`n_uname`). Linux v9fs under `access=user` enforces
+        // DAC client-side with the caller's full credentials, so we mark the
+        // connection trusted: bypass server-side *access* gates (we can't
+        // redo them correctly) while keeping uid/gid for ownership. See
+        // `Credentials::trusted`.
+        Credentials::trusted(self.uid, self.gid)
     }
 }
 
@@ -186,13 +188,24 @@ fn to_time(ts: Timespec) -> Time {
     }
 }
 
+/// Encode a device number for the 9P2000.L wire. SlateFS stores `rdev`
+/// internally as `(major << 32) | minor` (matching the NFS specdata split);
+/// Linux v9fs feeds `Rgetattr.st_rdev` through `new_decode_dev`, so the wire
+/// must carry the kernel's `new_encode_dev` layout:
+/// `(minor & 0xff) | (major << 8) | ((minor & ~0xff) << 12)`.
+fn encode_rdev(rdev: u64) -> u64 {
+    let major = rdev >> 32;
+    let minor = rdev & 0xffff_ffff;
+    (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)
+}
+
 fn stat_for(attr: &FileAttr) -> Stat {
     Stat {
         mode: mode_with_type(attr),
         uid: attr.uid,
         gid: attr.gid,
         nlink: attr.nlink as u64,
-        rdev: attr.rdev,
+        rdev: encode_rdev(attr.rdev),
         size: attr.size,
         blksize: 4096,
         blocks: attr.blocks,

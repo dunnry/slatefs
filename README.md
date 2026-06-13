@@ -80,8 +80,20 @@ served over NFS and 9P simultaneously, writes visible both ways,
 attr-coherent), and a real kernel v9fs mount exercising I/O, hardlinks,
 xattrs, and readdir (`scripts/p9-kernel-mount-test.sh`, in CI). The
 daemon now shares one `Volume` across all exports of the same
-tenant/volume (single SlateDB writer, DD-5). Remaining: pjdfstest over
-9P, QEMU virtio-9p smoke, rustls.
+tenant/volume (single SlateDB writer, DD-5).
+
+**pjdfstest over a Linux kernel 9P mount: 8796/8798** (same suite as NFS,
+`scripts/pjdfstest-over-9p.sh`, in CI). Under `access=user` v9fs enforces
+DAC client-side and the protocol carries no per-op gid/groups, so the 9P
+connection is marked *trusted* (keeps real uid/gid for ownership, skips
+access checks it can't do correctly; setuid-clearing and device-node
+creation still gate on genuine privilege). The two failures are a v9fs
+client limitation — sub-second timestamps truncated by the 1 s default
+`s_time_gran` before they reach the server (the server round-trips full
+nanoseconds; proven by an in-process wire test) — documented in
+[docs/pjdfstest-exclusions.md](docs/pjdfstest-exclusions.md). 9P *passes*
+the two assertions NFSv3 cannot (open-file unlink `nlink==0`; y2106 time).
+Remaining: QEMU virtio-9p smoke, rustls.
 
 > Testing against kernel NFS clients: always mount with
 > `soft,intr,timeo=…` and bound every command touching the mountpoint

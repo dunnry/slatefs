@@ -105,6 +105,17 @@ pub struct Credentials {
     pub uid: u32,
     pub gid: u32,
     pub groups: Vec<u32>,
+    /// The frontend vouches that the client already enforced DAC and we
+    /// lack the credentials to redo it correctly. Set by the 9P frontend:
+    /// 9P2000.L carries no per-op gid/supplementary groups (only the
+    /// attaching `n_uname`), and Linux v9fs under `access=user` performs
+    /// full permission checks client-side. We therefore bypass *access*
+    /// gates (read/write/exec, owner-only chmod/chown/utimes, sticky) while
+    /// keeping the real `uid`/`gid` for ownership attribution. This never
+    /// confers actual-root semantics: rules keyed on the caller being
+    /// genuinely privileged (setuid/setgid clearing on write or gid-chown,
+    /// device-node creation) still test `is_root()`, not this flag.
+    pub trusted: bool,
 }
 
 impl Credentials {
@@ -113,6 +124,7 @@ impl Credentials {
             uid: 0,
             gid: 0,
             groups: Vec::new(),
+            trusted: false,
         }
     }
 
@@ -121,11 +133,29 @@ impl Credentials {
             uid,
             gid,
             groups: Vec::new(),
+            trusted: false,
+        }
+    }
+
+    /// A caller whose DAC the frontend has already enforced (sets the
+    /// `trusted` flag). `uid`/`gid` are retained for ownership.
+    pub fn trusted(uid: u32, gid: u32) -> Credentials {
+        Credentials {
+            uid,
+            gid,
+            groups: Vec::new(),
+            trusted: true,
         }
     }
 
     pub fn is_root(&self) -> bool {
         self.uid == 0
+    }
+
+    /// May bypass DAC *access* gates — genuine root, or a frontend-trusted
+    /// connection. Not a claim of root identity (see the `trusted` field).
+    pub fn is_privileged(&self) -> bool {
+        self.uid == 0 || self.trusted
     }
 
     pub fn in_group(&self, gid: u32) -> bool {

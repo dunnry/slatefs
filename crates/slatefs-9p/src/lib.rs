@@ -22,6 +22,13 @@
 //! first attach; `access=user` re-attaches carry an empty uname and the
 //! caller's numeric uid in `n_uname` (NONUNAME on the initial mount attach
 //! maps to the mount identity). TLS via rustls remains a follow-up.
+//!
+//! DAC posture: 9P2000.L carries no per-op gid/supplementary groups, and
+//! v9fs enforces permissions client-side under `access=user`, so the
+//! connection is marked trusted (`Credentials::trusted`) — real uid/gid
+//! retained for ownership, server-side access gates skipped (it can't redo
+//! them correctly). The token is therefore the tenant boundary; see
+//! `docs/threat-model.md` and `docs/pjdfstest-exclusions.md`.
 
 pub mod filesystem;
 
