@@ -26,6 +26,10 @@ cipher = "auto"              # auto | aes256gcm | xchacha20poly1305
 # [metrics]
 # listen = "127.0.0.1:12080"
 
+# Loopback-only daemon admin endpoint for live-writer actions.
+# [admin]
+# listen = "127.0.0.1:12081"
+
 # Example export:
 # [[exports]]
 # tenant = "t1"

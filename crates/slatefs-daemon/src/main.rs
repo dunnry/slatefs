@@ -5,6 +5,7 @@
 //! control DB while the daemon runs) → open volumes → one listener per export
 //! (DD-10).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -37,6 +38,8 @@ struct MetricsTarget {
     recorder: Arc<AggregatingRecorder>,
     volume: Arc<Volume>,
 }
+
+type AdminTargets = Arc<HashMap<(String, String), Arc<Volume>>>;
 
 fn tenant_rate_limiter(
     limiters: &mut std::collections::HashMap<String, Arc<RateLimiter>>,
@@ -76,6 +79,20 @@ fn render_daemon_metrics(targets: &[MetricsTarget]) -> String {
     render_prometheus(&samples)
 }
 
+async fn write_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: String,
+) -> std::io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await
+}
+
 async fn handle_metrics_connection(
     mut stream: TcpStream,
     targets: Vec<MetricsTarget>,
@@ -112,12 +129,7 @@ async fn handle_metrics_connection(
         )
     };
 
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(response.as_bytes()).await?;
-    stream.shutdown().await
+    write_http_response(&mut stream, status, content_type, body).await
 }
 
 async fn serve_metrics(listen: String, targets: Vec<MetricsTarget>) -> std::io::Result<()> {
@@ -129,6 +141,91 @@ async fn serve_metrics(listen: String, targets: Vec<MetricsTarget>) -> std::io::
         tokio::spawn(async move {
             if let Err(error) = handle_metrics_connection(stream, targets).await {
                 tracing::debug!(%peer, "metrics scrape failed: {error}");
+            }
+        });
+    }
+}
+
+fn parse_admin_snapshot_path(path: &str) -> Result<(String, String, Option<String>), &'static str> {
+    let (route, query) = path.split_once('?').unwrap_or((path, ""));
+    let mut segments = route.trim_start_matches('/').split('/');
+    if segments.next() != Some("snapshot") {
+        return Err("expected /snapshot/<tenant>/<volume>");
+    }
+    let tenant = segments.next().ok_or("missing tenant")?;
+    let volume = segments.next().ok_or("missing volume")?;
+    if tenant.is_empty() || volume.is_empty() || segments.next().is_some() {
+        return Err("expected /snapshot/<tenant>/<volume>");
+    }
+    let name = query
+        .split('&')
+        .filter_map(|part| part.strip_prefix("name="))
+        .find(|value| !value.is_empty())
+        .map(str::to_string);
+    Ok((tenant.to_string(), volume.to_string(), name))
+}
+
+async fn handle_admin_connection(
+    mut stream: TcpStream,
+    targets: AdminTargets,
+) -> std::io::Result<()> {
+    let mut buf = [0u8; 2048];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await;
+    let n = match read {
+        Ok(result) => result?,
+        Err(_) => return Ok(()),
+    };
+    if n == 0 {
+        return Ok(());
+    }
+
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let mut request_line = request
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace();
+    let method = request_line.next();
+    let path = request_line.next();
+    let (status, body) = match (method, path) {
+        (Some("POST"), Some(path)) => match parse_admin_snapshot_path(path) {
+            Ok((tenant, volume, name)) => match targets.get(&(tenant.clone(), volume.clone())) {
+                Some(target) => match target.create_live_snapshot(name).await {
+                    Ok(snapshot) => (
+                        "200 OK",
+                        format!(
+                            "id={}\nmanifest={}\nname={}\n",
+                            snapshot.id,
+                            snapshot.manifest_id,
+                            snapshot.name.as_deref().unwrap_or("-")
+                        ),
+                    ),
+                    Err(error) => (
+                        "500 Internal Server Error",
+                        format!("snapshot create failed: {error}\n"),
+                    ),
+                },
+                None => (
+                    "404 Not Found",
+                    format!("no live writable volume {tenant}/{volume}\n"),
+                ),
+            },
+            Err(error) => ("400 Bad Request", format!("{error}\n")),
+        },
+        _ => ("404 Not Found", "not found\n".to_string()),
+    };
+    write_http_response(&mut stream, status, "text/plain; charset=utf-8", body).await
+}
+
+async fn serve_admin(listen: String, targets: AdminTargets) -> std::io::Result<()> {
+    let listener = TcpListener::bind(&listen).await?;
+    tracing::info!(listen, "admin endpoint ready");
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let targets = Arc::clone(&targets);
+        tokio::spawn(async move {
+            if let Err(error) = handle_admin_connection(stream, targets).await {
+                tracing::debug!(%peer, "admin request failed: {error}");
             }
         });
     }
@@ -179,14 +276,9 @@ async fn main() -> anyhow::Result<()> {
     // One writable Volume per live (tenant, volume) — a SlateDB has exactly
     // one writer (DD-5). Snapshot exports are read-only DbReader backends
     // keyed by checkpoint id.
-    let mut open_backends: std::collections::HashMap<
-        (String, String, Option<String>),
-        Arc<dyn Vfs>,
-    > = std::collections::HashMap::new();
-    let mut open_writers: std::collections::HashMap<(String, String), Arc<Volume>> =
-        std::collections::HashMap::new();
-    let mut rate_limiters: std::collections::HashMap<String, Arc<RateLimiter>> =
-        std::collections::HashMap::new();
+    let mut open_backends: HashMap<(String, String, Option<String>), Arc<dyn Vfs>> = HashMap::new();
+    let mut open_writers: HashMap<(String, String), Arc<Volume>> = HashMap::new();
+    let mut rate_limiters: HashMap<String, Arc<RateLimiter>> = HashMap::new();
     let distinct: std::collections::HashSet<(String, String)> = config
         .exports
         .iter()
@@ -398,6 +490,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    if let Some(listen) = config.admin.listen.clone() {
+        let targets = Arc::new(
+            open_writers
+                .iter()
+                .map(|(key, volume)| (key.clone(), Arc::clone(volume)))
+                .collect(),
+        );
+        servers.spawn(async move { serve_admin(listen, targets).await });
+    }
+
     if let Some(listen) = config.metrics.listen.clone() {
         servers.spawn(async move { serve_metrics(listen, metrics_targets).await });
     }
@@ -423,4 +525,129 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use slatefs_core::config::Compression;
+    use slatefs_core::control::{ControlPlane, QuotaLimits};
+    use slatefs_core::crypto::kms::StaticKms;
+    use slatefs_core::crypto::{Cipher, Secret32};
+    use slatefs_core::meta::inode::ROOT_INO;
+    use slatefs_core::snapshot::SnapshotVolume;
+    use slatefs_core::vfs::{Credentials, Vfs};
+
+    fn create_opts() -> slatefs_core::volume::CreateVolumeOptions {
+        slatefs_core::volume::CreateVolumeOptions {
+            cipher: Cipher::Aes256Gcm,
+            chunk_size: 4096,
+            compression: Compression::Lz4,
+            quota: QuotaLimits::default(),
+            note: None,
+        }
+    }
+
+    #[test]
+    fn parses_admin_snapshot_path() {
+        assert_eq!(
+            parse_admin_snapshot_path("/snapshot/t/v?name=baseline").unwrap(),
+            (
+                "t".to_string(),
+                "v".to_string(),
+                Some("baseline".to_string())
+            )
+        );
+        assert!(parse_admin_snapshot_path("/metrics").is_err());
+        assert!(parse_admin_snapshot_path("/snapshot/t").is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_snapshot_endpoint_creates_live_checkpoint() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms = Arc::new(StaticKms::new(Secret32::from_bytes([5; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), kms)
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        let record = slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        let dek = control.unwrap_volume_dek(&record).await.unwrap();
+        let volume = Volume::open(&record, dek, Arc::clone(&object_store))
+            .await
+            .unwrap();
+        let creds = Credentials::root();
+        let file = volume
+            .create(&creds, ROOT_INO, b"file", 0o644, true)
+            .await
+            .unwrap();
+        volume
+            .write(&creds, file.ino, 0, b"baseline")
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut targets = HashMap::new();
+        targets.insert(("t".to_string(), "v".to_string()), Arc::clone(&volume));
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_admin_connection(stream, Arc::new(targets))
+                .await
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"POST /snapshot/t/v?name=admin HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        server.await.unwrap();
+
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        let snapshot_id = response
+            .lines()
+            .find_map(|line| line.strip_prefix("id="))
+            .expect("snapshot id")
+            .to_string();
+
+        volume
+            .write(&creds, file.ino, 0, b"latest!!")
+            .await
+            .unwrap();
+        volume.flush().await.unwrap();
+
+        let snapshot_dek = control.unwrap_volume_dek(&record).await.unwrap();
+        let snapshot = SnapshotVolume::open(
+            &record,
+            snapshot_dek,
+            Arc::clone(&object_store),
+            &snapshot_id,
+        )
+        .await
+        .unwrap();
+        let attr = snapshot.lookup(&creds, ROOT_INO, b"file").await.unwrap();
+        let bytes = snapshot
+            .read(&creds, attr.ino, 0, attr.size as u32)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"baseline");
+        snapshot.shutdown().await.unwrap();
+        volume.shutdown().await.unwrap();
+        control.close().await.unwrap();
+    }
 }

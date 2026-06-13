@@ -2,7 +2,7 @@
 //! the KMS section points at key *files* or cloud KMS key ids (plan §13).
 
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
 use serde::de::Error as _;
@@ -32,6 +32,9 @@ pub struct Config {
     /// Optional Prometheus text endpoint served by `slatefsd`.
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Optional loopback-only daemon admin endpoint.
+    #[serde(default)]
+    pub admin: AdminConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -51,6 +54,13 @@ pub struct CacheConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct MetricsConfig {
     /// Optional `ip:port` listener for Prometheus text at `/metrics`.
+    pub listen: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AdminConfig {
+    /// Optional loopback `ip:port` listener for daemon-local admin actions.
     pub listen: Option<String>,
 }
 
@@ -347,6 +357,21 @@ impl Config {
                 "metrics.listen must be an ip:port listener or omitted".into(),
             ));
         }
+        if let Some(listen) = &self.admin.listen {
+            if listen.is_empty() {
+                return Err(Error::Config(
+                    "admin.listen must be a loopback ip:port listener or omitted".into(),
+                ));
+            }
+            let addr: SocketAddr = listen.parse().map_err(|e| {
+                Error::Config(format!("admin.listen must be an ip:port listener: {e}"))
+            })?;
+            if !addr.ip().is_loopback() {
+                return Err(Error::Config(
+                    "admin.listen must bind a loopback address".into(),
+                ));
+            }
+        }
         for export in &self.exports {
             let has_tls_cert = export.p9_tls_cert.is_some();
             let has_tls_key = export.p9_tls_key.is_some();
@@ -407,6 +432,9 @@ mod tests {
             [metrics]
             listen = "127.0.0.1:12080"
 
+            [admin]
+            listen = "127.0.0.1:12081"
+
             [[exports]]
             tenant = "t"
             volume = "v"
@@ -420,8 +448,25 @@ mod tests {
             Some("018f7d79-0354-77a0-a14b-33b863d8999a")
         );
         assert_eq!(config.metrics.listen.as_deref(), Some("127.0.0.1:12080"));
+        assert_eq!(config.admin.listen.as_deref(), Some("127.0.0.1:12081"));
         assert_eq!(config.exports[0].allowed_clients.len(), 2);
         assert!(config.exports[0].allowed_clients[1].contains("10.9.8.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn admin_listener_must_be_loopback() {
+        let raw = r#"
+            [object_store]
+            url = "memory:///"
+
+            [kms]
+            provider = "static"
+            key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+            [admin]
+            listen = "0.0.0.0:12081"
+        "#;
+        assert!(Config::parse(raw).is_err());
     }
 
     #[test]

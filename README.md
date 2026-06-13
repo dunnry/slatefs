@@ -118,8 +118,9 @@ the affected volume object-store prefixes.
 `slatefs snapshot create|list|delete` manages SlateDB checkpoints for a volume.
 The CLI create path opens the volume as the writer so SlateDB can flush before
 checkpointing; do not run it against a volume currently served by `slatefsd`.
-The core `Volume::create_live_snapshot` primitive covers online checkpoints
-from the live writer and is verified against read-only snapshot mounts.
+For served volumes, configure loopback-only `[admin].listen` on `slatefsd` and
+call `POST /snapshot/<tenant>/<volume>?name=<name>` to checkpoint through the
+live writer.
 `slatefs clone create <tenant> <source-volume> <clone-volume>`
 creates an instant writable same-tenant clone, optionally from a checkpoint
 with `--snapshot <id>`. Clones get distinct fsids and independent writes, but
@@ -131,6 +132,8 @@ rotate-kek <tenant>` rotates that tenant's KEK by rewrapping active volume DEKs
 in the control plane; volume data blocks are not rewritten. Optional
 `[metrics].listen = "ip:port"` exposes Prometheus text at `/metrics`, including
 SlateDB cache/flush samples per writable volume and `slatefs_volume_dead`.
+`[admin].listen = "127.0.0.1:port"` exposes loopback-only daemon admin actions
+such as live-writer snapshot creation.
 Starter alert rules live in [monitoring/slatefs-prometheus-rules.yml](monitoring/slatefs-prometheus-rules.yml);
 the starter Grafana dashboard lives in
 [monitoring/slatefs-grafana-dashboard.json](monitoring/slatefs-grafana-dashboard.json);
