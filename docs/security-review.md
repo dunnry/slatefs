@@ -17,6 +17,7 @@ or behavior changes are preferred until a GA contract exists.
 | Filename confidentiality | Directory-entry lookup keys use deterministic AES-SIV encrypted names; plaintext names are in encrypted values. | `crypto::names`; `docs/threat-model.md` |
 | Control/volume isolation | One SlateDB per volume; per-volume DEK and cache namespace. | `store::volume_db_path`; `VolumeCaches` |
 | NFS handle integrity | File handles include `{fsid, ino, generation}` and HMAC verification rejects forged or foreign handles. | `slatefs-nfs/src/fh.rs` tests |
+| 9P transport protection | 9P listeners can be rustls-wrapped with `p9_tls_cert`/`p9_tls_key`; source allowlists run before TLS handshakes. | `p9_tls_end_to_end`; config validation tests |
 | Single-writer safety | SlateDB fencing marks stale volumes dead and drops daemon exports. | `fenced_writer_marks_volume_dead`; failover drill |
 | Quota and deletion safety | Quota counters are committed with mutations; tenant/volume delete drops wrapped keys before deleting prefixes. | `quota` tests; control-plane delete paths |
 | Operator visibility | Prometheus rules cover fenced volumes, missing scrapes, and block decode failures; Grafana dashboard surfaces liveness and decode failures. | `monitoring/` |
@@ -25,7 +26,7 @@ or behavior changes are preferred until a GA contract exists.
 
 | ID | Severity | Finding | Disposition |
 |---|---|---|---|
-| SR-1 | Medium | 9P bearer tokens are not TLS-protected by SlateFS yet. A token holder is the tenant boundary and may assert any uid inside that tenant's 9P connection. | Known v1 risk. Keep 9P behind tenant network isolation until rustls lands. |
+| SR-1 | Medium | Plaintext 9P exports remain available for Linux kernel v9fs and still carry tenant bearer tokens in-band. A token holder is the tenant boundary and may assert any uid inside that tenant's 9P connection. | Use rustls-wrapped 9P for TLS-capable clients/sidecars. Keep plaintext kernel v9fs exports behind tenant network isolation or an external TLS tunnel. |
 | SR-2 | Medium | NFSv3 AUTH_SYS identities are unauthenticated uid/gid assertions. | Accepted by DD-10. Use per-export source allowlists, squash policy, and network isolation. |
 | SR-3 | Low | Xattr names are plaintext key suffixes and can appear in SST first/last-key metadata. Xattr values are encrypted. | Documented v1 exception. Future hardening can SIV-encrypt xattr names like filenames. |
 | SR-4 | Low | Object-store rollback/history replay is out of scope; SlateDB fencing protects live single-writer integrity, not malicious bucket rollback. | Documented out of scope. Use bucket versioning, object lock, audit logs, and cloud IAM controls in production. |

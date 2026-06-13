@@ -18,10 +18,61 @@ use slatefs_core::crypto::{Cipher, Secret32};
 use slatefs_core::rate::{RateLimiter, RateLimits};
 use slatefs_core::store::{self, ObjectStore};
 use slatefs_core::volume::{self, CreateVolumeOptions, Volume};
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
 const TEST_CHUNK: u32 = 4096;
 const NOFID: u32 = u32::MAX;
 const NOTAG: u16 = u16::MAX;
+const TEST_CERT: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDIjCCAgqgAwIBAgIUEl7Eyu49yGOrzKPAXcD/eP02wJMwDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDYxMzIxNTIxNloXDTI2MDYx
+NDIxNTIxNlowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEAu3YvkPc/uBLPg7sVsr9UVUv1jA88qpzO5gI07Wo6v97C
+ZsaG8oKmzYiAIxeMdD3Aa5vHosJ2BizbD6gVJKd5ahjTEUU6xB87mdkKR/kVN71r
+BeRe3xxG1SEUlPk9ClZCyubOBk1b1GvtSfDpQXjkfCfEtIVYn0S9tUgsiq7mhV6n
+7y3GXOEHFTaadEwpl3h5y+cKFEBlUXdG4fACwUne1fT6P7tmAGbWtvEUv7MPIDis
+gdP7Kwe1f0y19B9fLfW2z0UGFhHKOsg9svtG+sJOscFDBy7DXgmG780UoWGwpKzi
+PXmeLxa1hdEzt/3lucMY7eZcFfoKxkfpA+s8bCt03wIDAQABo2wwajAdBgNVHQ4E
+FgQUOgPohdD9CyRnw7d7oKVSypcN8O4wHwYDVR0jBBgwFoAUOgPohdD9CyRnw7d7
+oKVSypcN8O4wGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAwGA1UdEwEB/wQC
+MAAwDQYJKoZIhvcNAQELBQADggEBAB9RSlDLeoDPIaFDnwsZmFn+CQd1zn6srg5D
+LiwYN7nDURlzo2IflU79wXgjsC8sxOZQacSr424bLdtTH7ftp5oh9rgxpHXGf37A
+cVqGdhaJLnsMsh1QIB00rezrNl5VYMG62b5FWL1b5aQ9ly7gV/ZSJjWnSqpoVFlf
+cwb/lxQ7T04Lf6lwCv65KU/OzgbVLHqCNztYS7GBg/a7qw3DbUduY/aHf17V6oAI
+dM9hFiLwohI0nX/3Miy+s/kKuJGhoXNSii2E597v7/j1F6ad9fFbY9buyt53uVbl
+ivRMqRBGH7PR/qeIUlw7dYyK0rYHq5S2USpgh4ds5pCtONl/+zc=
+-----END CERTIFICATE-----
+"#;
+const TEST_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQC7di+Q9z+4Es+D
+uxWyv1RVS/WMDzyqnM7mAjTtajq/3sJmxobygqbNiIAjF4x0PcBrm8eiwnYGLNsP
+qBUkp3lqGNMRRTrEHzuZ2QpH+RU3vWsF5F7fHEbVIRSU+T0KVkLK5s4GTVvUa+1J
+8OlBeOR8J8S0hVifRL21SCyKruaFXqfvLcZc4QcVNpp0TCmXeHnL5woUQGVRd0bh
+8ALBSd7V9Po/u2YAZta28RS/sw8gOKyB0/srB7V/TLX0H18t9bbPRQYWEco6yD2y
++0b6wk6xwUMHLsNeCYbvzRShYbCkrOI9eZ4vFrWF0TO3/eW5wxjt5lwV+grGR+kD
+6zxsK3TfAgMBAAECggEADJcxaasMw6Tryba1v3j1rC1UxopT2K4W5vOyyor0e2Rc
+Q5sSf25CaSwn79nW8qW4Ua63hIx+cQeJOdUTTanVg0hu8+PlwKKYyUplB0fildXq
+JSd2yCucUrGmmFZ6TY8h0rV+x+vHmHRPp/dlmAkLgfU8oAoTiJrzo1EMjZuV2wY1
+GPVC7ysgd3sAzd54mMDCwqy3Yj6vEocSjYcf726KHdHkG4TPl6DahDeU+EO3QszN
+Q5l1Y1dRqoWGTIRi/0Z4E//g0qVQ3AfNNTMI9xWoOkUDI/2JIXBTfdYGO6cdWQTA
+yYHEXXa2v1lne/Pa0qzCUHy8dRRdcsvwXobSrudXJQKBgQDrymu49AlHWm/qQEFh
+CFjgJLy2tJGH0Vk8HLng2AW0wfxn/Fat65nGx5kCNZIVjAsaw2R1A2ZI+K0lvn6o
+uKZkfGfA2M0csiUtK6qR7doQg9fUvCP/MlCycjA9bUCtWcv2nXPR5GxSIzYrwNMW
+LhCiUz/hK0C2ouHq0Bhz4p2EAwKBgQDLh1uiXBW6MUEY39EzrPG3rzXKkteHfOkA
+e2EkuQrAobRynMQNoCRwMLuQ/iPdLEFW+sfMjQft6psGlCqo+So0/WzLeD7TpJK7
+L3yA1vIWq46V2N7uLMnwUnabxZyeb7pymod9OmHW8DV+nPK8It2uoFXZ61VT7l6U
+Y6prkWwK9QKBgQCOJ1hwhjf926kzSg/ghx7F64AWiqBeiLlKw2rRAovWIUmiC4Da
+k/r+26EEsvVipi6fsQMkhKsq/TmuUr2bzM8ML/CBVHO8hC5joDrShdp9MG9z4wW0
+uknqe2tX7UEcAdI02VJVTWh80Ju9HyBj89u1cYlGoEQAmAyp+1FytEIQrwKBgQDJ
+1t2wIQRHFwuIwIW2ap94WyDMWV229tAXc0P+aCfaq0LJmt/u507bl+ibPP2SHI5b
+1O4J1B71+gBtwMihtCAAVwbqrcAYoZAGZGxjVUbV5qLLxjwnFXHai90mVA4jLYhI
+mSkerqRSxPs4KiurGiSgRk99gp2nU7CmFkTu0lPEdQKBgQCaJP1sltAfvTZs2nLh
+OwGeZyeZE/N8KyOLQu7tAV5wKliSp9kbk+PAW7gOm2Ct6TPonMDONjTmnluZt/P4
+IMIV6XjR756H4x0MSZ1187dMgd/rYd/MXm8VbAAKpUVUjeAaoHWaxlbAyeFgP6Eh
+P2XtFTQA1Oxpatb7tHrfkUmymg==
+-----END PRIVATE KEY-----
+"#;
 
 async fn make_volume(object_store: Arc<dyn ObjectStore>) -> Arc<Volume> {
     let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([9; 32])));
@@ -118,6 +169,39 @@ async fn serve_9p_with_allowlist_and_rate_limit(
     panic!("9p server never came up");
 }
 
+async fn serve_9p_tls(volume: Arc<Volume>, token: Option<String>) -> (u16, tempfile::TempDir) {
+    let cert_dir = tempfile::tempdir().expect("cert tempdir");
+    let cert_path = cert_dir.path().join("localhost.crt");
+    let key_path = cert_dir.path().join("localhost.key");
+    std::fs::write(&cert_path, TEST_CERT).expect("write cert");
+    std::fs::write(&key_path, TEST_KEY).expect("write key");
+
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}");
+    tokio::spawn(async move {
+        let _ = slatefs_9p::serve_export_tls_with_allowlist_and_rate_limit(
+            volume,
+            "/t/v".to_string(),
+            token,
+            Vec::new(),
+            None,
+            &listen,
+            slatefs_9p::TlsIdentity {
+                cert_path,
+                key_path,
+            },
+        )
+        .await;
+    });
+    for _ in 0..50 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return (port, cert_dir);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("9p TLS server never came up");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn p9_source_allowlist_rejects_client() {
     let object_store = store::resolve_root("memory:///").unwrap();
@@ -185,18 +269,64 @@ async fn byte_rate_limit_rejects_p9_write_payload() {
     .unwrap();
 }
 
+fn tls_stream(port: u16) -> StreamOwned<ClientConnection, TcpStream> {
+    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(TEST_CERT.as_bytes()))
+        .collect::<std::result::Result<_, _>>()
+        .expect("parse test cert");
+    let mut roots = RootCertStore::empty();
+    for cert in certs {
+        roots.add(cert).expect("trust test cert");
+    }
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = ServerName::try_from("localhost").unwrap().to_owned();
+    let conn = ClientConnection::new(Arc::new(config), server_name).expect("tls client");
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    StreamOwned::new(conn, stream)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn p9_tls_end_to_end() {
+    let object_store = store::resolve_root("memory:///").unwrap();
+    let volume = make_volume(Arc::clone(&object_store)).await;
+    let (port, _cert_dir) = serve_9p_tls(Arc::clone(&volume), Some("sekrit".into())).await;
+
+    tokio::task::spawn_blocking(move || {
+        let mut c = P9c::from_stream(tls_stream(port));
+        c.attach(0, "sekrit", "/t/v", 0);
+        c.lcreate(0, "tls.txt", 0o2, 0o644);
+        c.write(0, 0, b"hello over tls");
+        assert_eq!(c.read(0, 0, 128), b"hello over tls");
+        c.clunk(0);
+    })
+    .await
+    .unwrap();
+}
+
 /// Minimal synchronous 9P2000.L client.
-struct P9c {
-    stream: TcpStream,
+struct P9c<S> {
+    stream: S,
     tag: u16,
 }
 
-impl P9c {
-    fn connect(port: u16) -> P9c {
+impl P9c<TcpStream> {
+    fn connect(port: u16) -> P9c<TcpStream> {
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
+        P9c::from_stream(stream)
+    }
+}
+
+impl<S: Read + Write> P9c<S> {
+    fn from_stream(stream: S) -> P9c<S> {
         let mut c = P9c { stream, tag: 0 };
         let reply = c.rpc_tagged(
             NOTAG,

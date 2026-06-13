@@ -80,9 +80,10 @@ served over NFS and 9P simultaneously, writes visible both ways,
 attr-coherent), and a real kernel v9fs mount exercising I/O, hardlinks,
 xattrs, and readdir (`scripts/p9-kernel-mount-test.sh`, in CI). The QEMU
 guest path is covered by [scripts/qemu-p9-tcp-smoke.sh](scripts/qemu-p9-tcp-smoke.sh)
-and documented in [docs/client-support.md](docs/client-support.md). The
-daemon now shares one `Volume` across all exports of the same tenant/volume
-(single SlateDB writer, DD-5).
+and documented in [docs/client-support.md](docs/client-support.md). 9P exports
+can also be rustls-wrapped with `p9_tls_cert`/`p9_tls_key` for TLS-capable
+clients or sidecar tunnels. The daemon now shares one `Volume` across all
+exports of the same tenant/volume (single SlateDB writer, DD-5).
 
 **pjdfstest over a Linux kernel 9P mount: 8796/8798** (same suite as NFS,
 `scripts/pjdfstest-over-9p.sh`, in CI). Under `access=user` v9fs enforces
@@ -95,7 +96,6 @@ client limitation — sub-second timestamps truncated by the 1 s default
 nanoseconds; proven by an in-process wire test) — documented in
 [docs/pjdfstest-exclusions.md](docs/pjdfstest-exclusions.md). 9P *passes*
 the two assertions NFSv3 cannot (open-file unlink `nlink==0`; y2106 time).
-Remaining: rustls for 9P transport encryption.
 
 **Phase 5 started** (multi-tenant hardening & quotas UX): tenants can now be
 suspended/resumed via `slatefs tenant suspend|resume`; suspended tenants retain

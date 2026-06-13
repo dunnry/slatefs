@@ -90,6 +90,9 @@ fallback). Upstream fix would be a per-DB discriminator in the cache key.
   tenant isolation as NFS, and treat the bearer token as a tenant-wide
   secret. Rules tied to genuine privilege (setuid/setgid clearing,
   device-node creation) still gate on the real uid, not the trust flag.
+  Configure `p9_tls_cert`/`p9_tls_key` for rustls-wrapped exports when the
+  client path supports TLS; Linux kernel v9fs needs network isolation or a
+  tunnel because it only speaks plaintext 9P TCP.
 
 ## Out of scope (v1, per plan)
 
@@ -98,8 +101,9 @@ fallback). Upstream fix would be a per-DB discriminator in the cache key.
   network-layer tenant isolation (DD-10), not cryptography.
 - 9P intra-tenant uid spoofing — a holder of a tenant's bearer token may
   assert any uid within that tenant (see Frontend access model); the token,
-  not server DAC, is the boundary. TLS-wrapped tokens + network isolation
-  are the mitigation; per-uid cryptographic identity is not a v1 goal.
+  not server DAC, is the boundary. Rustls-wrapped exports, external tunnels,
+  and network isolation are the mitigation; per-uid cryptographic identity is
+  not a v1 goal.
 - Traffic analysis, object-store-side replay/rollback (SlateDB fencing
   protects single-writer integrity, not history rollback by the store
   operator).

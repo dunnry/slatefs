@@ -21,7 +21,9 @@
 //! the **connection** — v9fs only sends the mount-option uname on the
 //! first attach; `access=user` re-attaches carry an empty uname and the
 //! caller's numeric uid in `n_uname` (NONUNAME on the initial mount attach
-//! maps to the mount identity). TLS via rustls remains a follow-up.
+//! maps to the mount identity). Exports can be wrapped in rustls with
+//! `p9_tls_cert`/`p9_tls_key`; Linux's kernel v9fs client does not speak
+//! TLS directly, so that mode is for TLS-capable clients or sidecar tunnels.
 //!
 //! DAC posture: 9P2000.L carries no per-op gid/supplementary groups, and
 //! v9fs enforces permissions client-side under `access=user`, so the
@@ -32,13 +34,33 @@
 
 pub mod filesystem;
 
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Once};
 
 use slatefs_core::config::ClientAddrRule;
 use slatefs_core::rate::RateLimiter;
 use slatefs_core::vfs::Vfs;
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 pub use filesystem::SlateFs9p;
+
+static RUSTLS_PROVIDER: Once = Once::new();
+
+/// PEM certificate chain and private key for a TLS-wrapped 9P listener.
+#[derive(Clone, Debug)]
+pub struct TlsIdentity {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
+
+fn install_rustls_provider() {
+    RUSTLS_PROVIDER.call_once(|| {
+        let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
 
 /// Serve one volume export over 9P2000.L TCP. Runs until the listener
 /// errors; spawn it like the NFS exports.
@@ -86,4 +108,84 @@ pub async fn serve_export_with_allowlist_and_rate_limit(
     })
     .await
     .map_err(|e| std::io::Error::other(format!("9p server: {e}")))
+}
+
+fn load_tls_config(cert_path: &Path, key_path: &Path) -> std::io::Result<Arc<ServerConfig>> {
+    install_rustls_provider();
+
+    let cert_file = std::fs::File::open(cert_path)?;
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
+            .collect::<std::result::Result<_, _>>()?;
+    if certs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("no certificates found in {}", cert_path.display()),
+        ));
+    }
+
+    let key_file = std::fs::File::open(key_path)?;
+    let key: PrivateKeyDer<'static> =
+        rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file))?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("no private key found in {}", key_path.display()),
+            )
+        })?;
+
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid TLS certificate/key pair: {error}"),
+            )
+        })?;
+    Ok(Arc::new(config))
+}
+
+/// Serve one volume export over TLS-wrapped 9P2000.L TCP.
+pub async fn serve_export_tls_with_allowlist_and_rate_limit(
+    volume: Arc<dyn Vfs>,
+    export_name: String,
+    token: Option<String>,
+    allowed_clients: Vec<ClientAddrRule>,
+    rate_limiter: Option<Arc<RateLimiter>>,
+    listen: &str,
+    identity: TlsIdentity,
+) -> std::io::Result<()> {
+    let fs = SlateFs9p::new_with_rate_limiter(volume, export_name, token, rate_limiter);
+    let tls = TlsAcceptor::from(load_tls_config(&identity.cert_path, &identity.key_path)?);
+    let listener = TcpListener::bind(listen).await?;
+    tracing::info!(
+        listen,
+        cert = %identity.cert_path.display(),
+        "9p TLS listener ready"
+    );
+
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        if !allowed_clients.is_empty()
+            && !allowed_clients.iter().any(|rule| rule.contains(peer.ip()))
+        {
+            tracing::warn!(%peer, "rejected 9P TLS client");
+            continue;
+        }
+
+        let fs = fs.clone();
+        let tls = tls.clone();
+        tokio::spawn(async move {
+            let stream = match tls.accept(stream).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::warn!(%peer, "9p TLS handshake failed: {error}");
+                    return;
+                }
+            };
+            if let Err(error) = rs9p::srv::srv_async_stream(fs, stream).await {
+                tracing::error!(%peer, "9p TLS connection error: {error:?}");
+            }
+        });
+    }
 }

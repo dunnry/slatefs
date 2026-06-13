@@ -788,6 +788,17 @@ where
     Ok(())
 }
 
+/// [slatefs patch] Serve a single accepted stream. This lets SlateFS wrap the
+/// TCP stream in TLS before handing it to the generic 9P dispatcher.
+pub async fn srv_async_stream<Fs, Stream>(filesystem: Fs, stream: Stream) -> Result<()>
+where
+    Fs: 'static + Filesystem + Send + Sync,
+    Stream: 'static + AsyncRead + AsyncWrite + Send + std::marker::Unpin,
+{
+    let (readhalf, writehalf) = tokio::io::split(stream);
+    dispatch(filesystem, readhalf, writehalf).await
+}
+
 pub async fn srv_async_tcp<Fs>(filesystem: Fs, addr: &str) -> Result<()>
 where
     Fs: 'static + Filesystem + Send + Sync + Clone,
@@ -819,8 +830,7 @@ where
 
         let fs = filesystem.clone();
         tokio::spawn(async move {
-            let (readhalf, writehalf) = stream.into_split();
-            let res = dispatch(fs, readhalf, writehalf).await;
+            let res = srv_async_stream(fs, stream).await;
             if let Err(e) = res {
                 error!("Error: {}: {:?}", e, e);
             }

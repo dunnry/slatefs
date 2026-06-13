@@ -1,9 +1,9 @@
-//! slatefsd — serves SlateFS volumes over NFSv3 (9P arrives in Phase 4).
+//! slatefsd — serves SlateFS volumes over NFSv3 and 9P2000.L.
 //!
 //! Startup: read config → open control plane just long enough to resolve
 //! exports, DEKs, and the fh-HMAC key → close it (so the CLI can use the
-//! control DB while the daemon runs) → open volumes → one NFS listener per
-//! export (DD-10).
+//! control DB while the daemon runs) → open volumes → one listener per export
+//! (DD-10).
 
 use std::sync::Arc;
 
@@ -332,28 +332,67 @@ async fn main() -> anyhow::Result<()> {
                 let listen = export.listen.clone();
                 let token = export.p9_token.clone();
                 let allowed_clients = export.allowed_clients.clone();
-                tracing::info!(
-                    tenant = export.tenant,
-                    volume = export.volume,
-                    snapshot = export.snapshot.as_deref().unwrap_or("-"),
-                    listen = export.listen,
-                    "export ready; mount with: mount -t 9p -o trans=tcp,version=9p2000.L,port=<port>{} <host> <dir>",
-                    if token.is_some() {
-                        ",uname=<token>"
-                    } else {
-                        ""
-                    },
-                );
+                let tls = match (&export.p9_tls_cert, &export.p9_tls_key) {
+                    (Some(cert), Some(key)) => Some((cert.clone(), key.clone())),
+                    (None, None) => None,
+                    _ => anyhow::bail!(
+                        "9P export {}/{} must set both p9_tls_cert and p9_tls_key, or neither",
+                        export.tenant,
+                        export.volume
+                    ),
+                };
+                if tls.is_some() {
+                    tracing::info!(
+                        tenant = export.tenant,
+                        volume = export.volume,
+                        snapshot = export.snapshot.as_deref().unwrap_or("-"),
+                        listen = export.listen,
+                        token_required = token.is_some(),
+                        "TLS-wrapped 9P export ready; connect with a TLS-capable 9P client or tunnel"
+                    );
+                } else {
+                    tracing::info!(
+                        tenant = export.tenant,
+                        volume = export.volume,
+                        snapshot = export.snapshot.as_deref().unwrap_or("-"),
+                        listen = export.listen,
+                        "export ready; mount with: mount -t 9p -o trans=tcp,version=9p2000.L,port=<port>{} <host> <dir>",
+                        if token.is_some() {
+                            ",uname=<token>"
+                        } else {
+                            ""
+                        },
+                    );
+                }
                 servers.spawn(async move {
-                    slatefs_9p::serve_export_with_allowlist_and_rate_limit(
-                        volume,
-                        export_name,
-                        token,
-                        allowed_clients,
-                        rate_limiter,
-                        &listen,
-                    )
-                    .await
+                    match tls {
+                        Some((cert, key)) => {
+                            slatefs_9p::serve_export_tls_with_allowlist_and_rate_limit(
+                                volume,
+                                export_name,
+                                token,
+                                allowed_clients,
+                                rate_limiter,
+                                &listen,
+                                slatefs_9p::TlsIdentity {
+                                    cert_path: cert,
+                                    key_path: key,
+                                },
+                            )
+                            .await
+                        }
+                        None => {
+                            slatefs_9p::serve_export_with_allowlist_and_rate_limit(
+                                volume,
+                                export_name,
+                                token,
+                                allowed_clients,
+                                rate_limiter,
+                                &listen,
+                            )
+                            .await
+                        }
+                    }
                 });
             }
         }

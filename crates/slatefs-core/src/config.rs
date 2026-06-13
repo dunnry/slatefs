@@ -85,6 +85,14 @@ pub struct ExportConfig {
     /// (DD-10). Unset ⇒ open export (use network isolation).
     #[serde(default)]
     pub p9_token: Option<String>,
+    /// 9P only: PEM certificate chain for TLS-wrapped 9P. Must be paired
+    /// with `p9_tls_key`.
+    #[serde(default)]
+    pub p9_tls_cert: Option<std::path::PathBuf>,
+    /// 9P only: PEM private key for TLS-wrapped 9P. Must be paired with
+    /// `p9_tls_cert`.
+    #[serde(default)]
+    pub p9_tls_key: Option<std::path::PathBuf>,
     /// Identity squash policy (DD-10). AUTH_SYS uids are unauthenticated
     /// assertions — pair `none`/`root_squash` with network-level tenant
     /// isolation per the plan.
@@ -339,6 +347,22 @@ impl Config {
                 "metrics.listen must be an ip:port listener or omitted".into(),
             ));
         }
+        for export in &self.exports {
+            let has_tls_cert = export.p9_tls_cert.is_some();
+            let has_tls_key = export.p9_tls_key.is_some();
+            if has_tls_cert != has_tls_key {
+                return Err(Error::Config(format!(
+                    "export {}/{} must set both p9_tls_cert and p9_tls_key, or neither",
+                    export.tenant, export.volume
+                )));
+            }
+            if export.protocol != ExportProtocol::P9 && (has_tls_cert || has_tls_key) {
+                return Err(Error::Config(format!(
+                    "export {}/{} sets 9P TLS fields but protocol is not p9",
+                    export.tenant, export.volume
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -398,5 +422,44 @@ mod tests {
         assert_eq!(config.metrics.listen.as_deref(), Some("127.0.0.1:12080"));
         assert_eq!(config.exports[0].allowed_clients.len(), 2);
         assert!(config.exports[0].allowed_clients[1].contains("10.9.8.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn p9_tls_fields_parse_and_validate_as_a_pair() {
+        let raw = r#"
+            [object_store]
+            url = "memory:///"
+
+            [kms]
+            provider = "static"
+            key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+            [[exports]]
+            tenant = "t"
+            volume = "v"
+            listen = "127.0.0.1:12050"
+            protocol = "p9"
+            p9_tls_cert = "/tmp/slatefs.crt"
+            p9_tls_key = "/tmp/slatefs.key"
+        "#;
+        let config = Config::parse(raw).unwrap();
+        assert_eq!(
+            config.exports[0].p9_tls_cert.as_deref(),
+            Some(std::path::Path::new("/tmp/slatefs.crt"))
+        );
+        assert_eq!(
+            config.exports[0].p9_tls_key.as_deref(),
+            Some(std::path::Path::new("/tmp/slatefs.key"))
+        );
+
+        let missing_key = raw
+            .lines()
+            .filter(|line| !line.contains("p9_tls_key"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(Config::parse(&missing_key).is_err());
+
+        let nfs_tls = raw.replace(r#"protocol = "p9""#, r#"protocol = "nfs""#);
+        assert!(Config::parse(&nfs_tls).is_err());
     }
 }

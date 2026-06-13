@@ -3352,6 +3352,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -3370,6 +3371,15 @@ dependencies = [
  "rustls-pki-types",
  "schannel",
  "security-framework",
+]
+
+[[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]
@@ -3755,10 +3765,12 @@ dependencies = [
  "async-trait",
  "nfs3_client",
  "rs9p",
+ "rustls-pemfile",
  "slatefs-core",
  "slatefs-nfs",
  "tempfile",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tracing",
 ]
 

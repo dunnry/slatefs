@@ -33,4 +33,7 @@ cipher = "auto"              # auto | aes256gcm | xchacha20poly1305
 # snapshot = "<checkpoint-id>" # optional: serve this checkpoint read-only
 # listen = "127.0.0.1:12049"
 # protocol = "nfs"            # nfs | p9
+# p9_token = "tenant-secret"  # p9 only: bearer token sent as uname
+# p9_tls_cert = "/etc/slatefs/p9.crt" # p9 only: PEM cert chain for TLS-capable clients/tunnels
+# p9_tls_key = "/etc/slatefs/p9.key"  # p9 only: PEM private key
 # allowed_clients = ["127.0.0.1", "10.0.0.0/8"]  # empty/unset allows all
