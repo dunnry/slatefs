@@ -129,7 +129,9 @@ in the control plane; volume data blocks are not rewritten. Optional
 SlateDB cache/flush samples per writable volume and `slatefs_volume_dead`.
 Starter alert rules live in [monitoring/slatefs-prometheus-rules.yml](monitoring/slatefs-prometheus-rules.yml);
 outage, fence, restore, and key-rotation drills live in
-[docs/operations-runbook.md](docs/operations-runbook.md).
+[docs/operations-runbook.md](docs/operations-runbook.md). The current
+pre-GA on-disk format and explicit no-backwards-compatibility upgrade policy
+live in [docs/on-disk-format.md](docs/on-disk-format.md).
 
 > Testing against kernel NFS clients: always mount with
 > `soft,intr,timeo=…` and bound every command touching the mountpoint
