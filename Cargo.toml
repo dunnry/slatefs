@@ -7,6 +7,7 @@ members = [
     "crates/slatefs-daemon",
     "crates/slatefs-cli",
     "crates/nfs3-server",
+    "crates/rs9p",
 ]
 
 [workspace.package]
@@ -44,6 +45,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # crates/nfs3-server/README.md.
 nfs3_server = { path = "crates/nfs3-server", features = ["memfs"] }
 slatedb-common = "0.13"
+
+# 9P2000.L frontend (plan §9.3 spike outcome: rs9p revived 2025, BSD-3-Clause)
+rs9p = { path = "crates/rs9p" }
 nfs3_client = { version = "0.9", features = ["tokio"] }
 
 # Crypto (DD-8, DD-3)

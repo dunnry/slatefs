@@ -1,6 +1,6 @@
 [package]
 name = "slatefs-9p"
-description = "9P2000.L frontend for SlateFS (Phase 4; placeholder until then)"
+description = "9P2000.L frontend for SlateFS (adapter: Vfs -> rs9p Filesystem)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,3 +9,12 @@ rust-version.workspace = true
 
 [dependencies]
 slatefs-core.workspace = true
+rs9p.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+slatefs-nfs = { workspace = true }
+nfs3_client.workspace = true
+tempfile.workspace = true

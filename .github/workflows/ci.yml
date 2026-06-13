@@ -91,10 +91,19 @@ jobs:
           volume = "v1"
           listen = "127.0.0.1:12049"
           squash = "none"
+          [[exports]]
+          tenant = "t1"
+          volume = "v1"
+          listen = "127.0.0.1:12050"
+          protocol = "p9"
+          p9_token = "sekrit"
           EOF
           ./target/debug/slatefs -c /tmp/slatefs.toml tenant create t1
           ./target/debug/slatefs -c /tmp/slatefs.toml volume create t1 v1
       - run: SLATEFS_CONFIG=/tmp/slatefs.toml ./scripts/nfs-kernel-mount-test.sh
+      # Phase 4: real kernel v9fs client over the same volume.
+      - run: sudo apt-get install -y attr
+      - run: SLATEFS_CONFIG=/tmp/slatefs.toml sudo -E env "PATH=$PATH" ./scripts/p9-kernel-mount-test.sh
       # Quick fsx/fsstress + restart drill on every push; nightly raises the
       # scale to the plan's AC numbers.
       - run: SLATEFS_CONFIG=/tmp/slatefs.toml sudo -E env "PATH=$PATH" ./scripts/fsx-fsstress-over-nfs.sh

@@ -1,0 +1,598 @@
+//! In-process 9P2000.L wire tests (plan §14 Phase 4): a minimal synchronous
+//! client built on rs9p's public codec talks to the real server over TCP —
+//! attach auth, the full op surface, readdir offsets, xattr fids — plus the
+//! cross-protocol AC: the same volume served over NFS and 9P
+//! simultaneously stays byte- and attr-coherent.
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::sync::Arc;
+use std::time::Duration;
+
+use rs9p::fcall::{Data, FCall, GetAttrMask, Msg, QId, SetAttr, SetAttrMask, Time};
+use rs9p::serialize::{read_msg, write_msg};
+use slatefs_core::config::Compression;
+use slatefs_core::control::{ControlPlane, QuotaLimit, QuotaLimits};
+use slatefs_core::crypto::kms::{Kms, StaticKms};
+use slatefs_core::crypto::{Cipher, Secret32};
+use slatefs_core::store::{self, ObjectStore};
+use slatefs_core::volume::{self, CreateVolumeOptions, Volume};
+
+const TEST_CHUNK: u32 = 4096;
+const NOFID: u32 = u32::MAX;
+const NOTAG: u16 = u16::MAX;
+
+async fn make_volume(object_store: Arc<dyn ObjectStore>) -> Arc<Volume> {
+    let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([9; 32])));
+    let control = ControlPlane::open(Arc::clone(&object_store), kms)
+        .await
+        .expect("control");
+    control.create_tenant("t", None).await.expect("tenant");
+    let record = volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "v",
+        CreateVolumeOptions {
+            cipher: Cipher::Aes256Gcm,
+            chunk_size: TEST_CHUNK,
+            compression: Compression::Lz4,
+            quota: QuotaLimits {
+                bytes: QuotaLimit::default(),
+                inodes: QuotaLimit::default(),
+            },
+            note: None,
+        },
+    )
+    .await
+    .expect("create volume");
+    let dek = control.unwrap_volume_dek(&record).await.expect("dek");
+    control.close().await.expect("close control");
+    Volume::open(&record, dek, object_store)
+        .await
+        .expect("open volume")
+}
+
+/// Reserve an ephemeral port (bind/drop) — rs9p's listener offers no port
+/// introspection. The tiny race is acceptable in tests.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port()
+}
+
+async fn serve_9p(volume: Arc<Volume>, token: Option<String>) -> u16 {
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}");
+    tokio::spawn(async move {
+        let _ = slatefs_9p::serve_export(volume, "/t/v".to_string(), token, &listen).await;
+    });
+    for _ in 0..50 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("9p server never came up");
+}
+
+/// Minimal synchronous 9P2000.L client.
+struct P9c {
+    stream: TcpStream,
+    tag: u16,
+}
+
+impl P9c {
+    fn connect(port: u16) -> P9c {
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut c = P9c { stream, tag: 0 };
+        let reply = c.rpc_tagged(
+            NOTAG,
+            FCall::TVersion {
+                msize: 1024 * 1024,
+                version: "9P2000.L".to_string(),
+            },
+        );
+        match reply {
+            FCall::RVersion { version, .. } => assert_eq!(version, "9P2000.L"),
+            other => panic!("bad version reply: {other:?}"),
+        }
+        c
+    }
+
+    fn rpc(&mut self, body: FCall) -> FCall {
+        self.tag = self.tag.wrapping_add(1);
+        self.rpc_tagged(self.tag, body)
+    }
+
+    fn rpc_tagged(&mut self, tag: u16, body: FCall) -> FCall {
+        // rs9p's Msg codec covers type+tag+body only; the standard 9P
+        // size[4] prefix (little-endian, includes itself) is framing we
+        // add/strip here, mirroring the server's LengthDelimitedCodec.
+        let mut payload = Vec::new();
+        write_msg(&mut payload, &Msg { tag, body }).expect("encode msg");
+        let size = (payload.len() as u32 + 4).to_le_bytes();
+        self.stream.write_all(&size).expect("write size");
+        self.stream.write_all(&payload).expect("write payload");
+        self.stream.flush().expect("flush");
+
+        let mut size_buf = [0u8; 4];
+        self.stream.read_exact(&mut size_buf).expect("read size");
+        let len = u32::from_le_bytes(size_buf) as usize - 4;
+        let mut reply = vec![0u8; len];
+        self.stream.read_exact(&mut reply).expect("read payload");
+        let msg = read_msg(&mut std::io::Cursor::new(reply)).expect("decode msg");
+        assert_eq!(msg.tag, tag, "tag mismatch");
+        msg.body
+    }
+
+    fn expect_errno(&mut self, body: FCall) -> u32 {
+        match self.rpc(body) {
+            FCall::RlError { ecode } => ecode,
+            other => panic!("expected Rlerror, got {other:?}"),
+        }
+    }
+
+    fn attach(&mut self, fid: u32, uname: &str, aname: &str, uid: u32) -> QId {
+        match self.rpc(FCall::TAttach {
+            fid,
+            afid: NOFID,
+            uname: uname.to_string(),
+            aname: aname.to_string(),
+            n_uname: uid,
+        }) {
+            FCall::RAttach { qid } => qid,
+            other => panic!("attach failed: {other:?}"),
+        }
+    }
+
+    fn walk(&mut self, fid: u32, newfid: u32, names: &[&str]) -> Vec<QId> {
+        match self.rpc(FCall::TWalk {
+            fid,
+            newfid,
+            wnames: names.iter().map(|s| s.to_string()).collect(),
+        }) {
+            FCall::RWalk { wqids } => wqids,
+            other => panic!("walk failed: {other:?}"),
+        }
+    }
+
+    fn lopen(&mut self, fid: u32, flags: u32) {
+        match self.rpc(FCall::TlOpen { fid, flags }) {
+            FCall::RlOpen { .. } => {}
+            other => panic!("lopen failed: {other:?}"),
+        }
+    }
+
+    fn lcreate(&mut self, fid: u32, name: &str, flags: u32, mode: u32) {
+        match self.rpc(FCall::TlCreate {
+            fid,
+            name: name.to_string(),
+            flags,
+            mode,
+            gid: 0,
+        }) {
+            FCall::RlCreate { .. } => {}
+            other => panic!("lcreate failed: {other:?}"),
+        }
+    }
+
+    fn write(&mut self, fid: u32, offset: u64, data: &[u8]) -> u32 {
+        match self.rpc(FCall::TWrite {
+            fid,
+            offset,
+            data: Data(data.to_vec()),
+        }) {
+            FCall::RWrite { count } => count,
+            other => panic!("write failed: {other:?}"),
+        }
+    }
+
+    fn read(&mut self, fid: u32, offset: u64, count: u32) -> Vec<u8> {
+        match self.rpc(FCall::TRead { fid, offset, count }) {
+            FCall::RRead { data } => data.0,
+            other => panic!("read failed: {other:?}"),
+        }
+    }
+
+    fn getattr(&mut self, fid: u32) -> rs9p::fcall::Stat {
+        match self.rpc(FCall::TGetAttr {
+            fid,
+            req_mask: GetAttrMask::all(),
+        }) {
+            FCall::RGetAttr { stat, .. } => stat,
+            other => panic!("getattr failed: {other:?}"),
+        }
+    }
+
+    fn clunk(&mut self, fid: u32) {
+        match self.rpc(FCall::TClunk { fid }) {
+            FCall::RClunk => {}
+            other => panic!("clunk failed: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p9_end_to_end() {
+    let object_store = store::resolve_root("memory:///").unwrap();
+    let volume = make_volume(Arc::clone(&object_store)).await;
+    let port = serve_9p(Arc::clone(&volume), Some("sekrit".into())).await;
+
+    let volume_check = Arc::clone(&volume);
+    tokio::task::spawn_blocking(move || {
+        let mut c = P9c::connect(port);
+        let root_qid = c.attach(0, "sekrit", "/t/v", 0);
+        assert!(root_qid.typ.contains(rs9p::fcall::QIdType::DIR));
+
+        // mkdir + create + write + read (multi-chunk).
+        match c.rpc(FCall::TMkDir {
+            dfid: 0,
+            name: "dir".into(),
+            mode: 0o755,
+            gid: 0,
+        }) {
+            FCall::RMkDir { .. } => {}
+            other => panic!("mkdir failed: {other:?}"),
+        }
+        c.walk(0, 1, &["dir"]);
+        c.lcreate(1, "file.bin", 0o2 /* O_RDWR */, 0o644);
+        let payload: Vec<u8> = (0..TEST_CHUNK as usize * 3)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut off = 0u64;
+        for chunk in payload.chunks(64 * 1024) {
+            let n = c.write(1, off, chunk);
+            assert_eq!(n as usize, chunk.len());
+            off += n as u64;
+        }
+        let stat = c.getattr(1);
+        assert_eq!(stat.size, payload.len() as u64);
+        assert_eq!(stat.mode & 0o170000, 0o100000, "regular file type bits");
+
+        // Fresh walk for reading.
+        c.walk(0, 2, &["dir", "file.bin"]);
+        c.lopen(2, 0 /* O_RDONLY */);
+        let mut got = Vec::new();
+        while (got.len() as u64) < payload.len() as u64 {
+            let part = c.read(2, got.len() as u64, 128 * 1024);
+            if part.is_empty() {
+                break;
+            }
+            got.extend_from_slice(&part);
+        }
+        assert_eq!(got, payload);
+
+        // Truncate via setattr.
+        match c.rpc(FCall::TSetAttr {
+            fid: 2,
+            valid: SetAttrMask::SIZE,
+            stat: SetAttr {
+                mode: 0,
+                uid: 0,
+                gid: 0,
+                size: 100,
+                atime: Time { sec: 0, nsec: 0 },
+                mtime: Time { sec: 0, nsec: 0 },
+            },
+        }) {
+            FCall::RSetAttr => {}
+            other => panic!("setattr failed: {other:?}"),
+        }
+        assert_eq!(c.getattr(2).size, 100);
+
+        // readdir with synthesized "." / ".." and small counts (pagination).
+        for i in 0..10 {
+            c.walk(0, 10, &["dir"]);
+            c.lcreate(10, &format!("f{i:02}"), 0o2, 0o644);
+            c.clunk(10);
+        }
+        c.walk(0, 3, &["dir"]);
+        c.lopen(3, 0);
+        let mut names = Vec::new();
+        let mut offset = 0u64;
+        loop {
+            let data = match c.rpc(FCall::TReadDir {
+                fid: 3,
+                offset,
+                count: 512, // small: forces several rounds
+            }) {
+                FCall::RReadDir { data } => data,
+                other => panic!("readdir failed: {other:?}"),
+            };
+            if data.data.is_empty() {
+                break;
+            }
+            for e in &data.data {
+                names.push(e.name.clone());
+                offset = e.offset;
+            }
+        }
+        assert!(names.contains(&".".to_string()));
+        assert!(names.contains(&"..".to_string()));
+        for i in 0..10 {
+            assert!(names.contains(&format!("f{i:02}")), "missing f{i:02}");
+        }
+        assert!(names.contains(&"file.bin".to_string()));
+
+        // symlink + readlink.
+        match c.rpc(FCall::TSymlink {
+            fid: 0,
+            name: "link".into(),
+            symtgt: "dir/file.bin".into(),
+            gid: 0,
+        }) {
+            FCall::RSymlink { qid } => {
+                assert!(qid.typ.contains(rs9p::fcall::QIdType::SYMLINK))
+            }
+            other => panic!("symlink failed: {other:?}"),
+        }
+        c.walk(0, 4, &["link"]);
+        match c.rpc(FCall::TReadLink { fid: 4 }) {
+            FCall::RReadLink { target } => assert_eq!(target, "dir/file.bin"),
+            other => panic!("readlink failed: {other:?}"),
+        }
+
+        // hardlink via Tlink, then unlinkat.
+        c.walk(0, 5, &["dir", "file.bin"]);
+        match c.rpc(FCall::TLink {
+            dfid: 0,
+            fid: 5,
+            name: "hard".into(),
+        }) {
+            FCall::RLink => {}
+            other => panic!("link failed: {other:?}"),
+        }
+        c.walk(0, 6, &["hard"]);
+        assert_eq!(c.getattr(6).nlink, 2);
+
+        // renameat + unlinkat.
+        match c.rpc(FCall::TRenameAt {
+            olddirfid: 0,
+            oldname: "hard".into(),
+            newdirfid: 0,
+            newname: "renamed".into(),
+        }) {
+            FCall::RRenameAt => {}
+            other => panic!("renameat failed: {other:?}"),
+        }
+        match c.rpc(FCall::TUnlinkAt {
+            dirfd: 0,
+            name: "renamed".into(),
+            flags: 0,
+        }) {
+            FCall::RUnlinkAt => {}
+            other => panic!("unlinkat failed: {other:?}"),
+        }
+
+        // xattr: create+write+clunk, then walk+read.
+        c.walk(0, 7, &["dir", "file.bin"]);
+        match c.rpc(FCall::TxAttrCreate {
+            fid: 7,
+            name: "user.color".into(),
+            attr_size: 4,
+            flags: 0,
+        }) {
+            FCall::RxAttrCreate => {}
+            other => panic!("xattrcreate failed: {other:?}"),
+        }
+        assert_eq!(c.write(7, 0, b"blue"), 4);
+        c.clunk(7);
+        c.walk(0, 8, &["dir", "file.bin"]);
+        match c.rpc(FCall::TxAttrWalk {
+            fid: 8,
+            newfid: 9,
+            name: "user.color".into(),
+        }) {
+            FCall::RxAttrWalk { size } => assert_eq!(size, 4),
+            other => panic!("xattrwalk failed: {other:?}"),
+        }
+        assert_eq!(c.read(9, 0, 100), b"blue");
+
+        // statfs sanity.
+        match c.rpc(FCall::TStatFs { fid: 0 }) {
+            FCall::RStatFs { statfs } => {
+                assert!(statfs.blocks > 0);
+                assert_eq!(statfs.namelen, 255);
+            }
+            other => panic!("statfs failed: {other:?}"),
+        }
+    })
+    .await
+    .expect("client thread");
+
+    let report = volume_check.fsck().await.expect("fsck");
+    assert!(report.is_clean(), "{:?}", report.problems);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p9_attach_auth_enforced() {
+    let object_store = store::resolve_root("memory:///").unwrap();
+    let volume = make_volume(Arc::clone(&object_store)).await;
+    let port = serve_9p(volume, Some("sekrit".into())).await;
+
+    tokio::task::spawn_blocking(move || {
+        let mut c = P9c::connect(port);
+        // Wrong token → EACCES.
+        let ecode = c.expect_errno(FCall::TAttach {
+            fid: 0,
+            afid: NOFID,
+            uname: "wrong".into(),
+            aname: "/t/v".into(),
+            n_uname: 0,
+        });
+        assert_eq!(ecode, 13, "expected EACCES");
+        // Right token, wrong volume → ENOENT.
+        let ecode = c.expect_errno(FCall::TAttach {
+            fid: 0,
+            afid: NOFID,
+            uname: "sekrit".into(),
+            aname: "/t/other".into(),
+            n_uname: 0,
+        });
+        assert_eq!(ecode, 2, "expected ENOENT");
+        // Correct attach works.
+        c.attach(1, "sekrit", "/t/v", 0);
+    })
+    .await
+    .expect("client thread");
+}
+
+/// Cross-protocol coherence (plan §14 Phase 4 AC): one volume served over
+/// NFS and 9P at once; writes on one protocol are immediately visible —
+/// byte-identical and attr-coherent — on the other (single Volume, single
+/// writer, shared attr cache; plan §9.4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_protocol_coherence() {
+    use nfs3_client::Nfs3ConnectionBuilder;
+    use nfs3_client::nfs3_types::nfs3::{
+        CREATE3args, CREATE3res, LOOKUP3args, LOOKUP3res, Nfs3Option, READ3args, READ3res,
+        WRITE3args, WRITE3res, createhow3, diropargs3, nfs_fh3, sattr3, stable_how,
+    };
+    use nfs3_client::nfs3_types::xdr_codec::Opaque;
+    use nfs3_client::tokio::TokioConnector;
+
+    let object_store = store::resolve_root("memory:///").unwrap();
+    let volume = make_volume(Arc::clone(&object_store)).await;
+
+    // Serve BOTH protocols from the same Volume.
+    let p9_port = serve_9p(Arc::clone(&volume), None).await;
+    let nfs_listener = slatefs_nfs::bind_export(
+        Arc::clone(&volume),
+        Secret32::from_bytes([7; 32]),
+        slatefs_nfs::SquashPolicy::trust_as_root(),
+        "127.0.0.1:0",
+    )
+    .await
+    .expect("bind nfs");
+    let nfs_port = slatefs_nfs::NFSTcp::get_listen_port(&nfs_listener);
+    tokio::spawn(async move {
+        let _ = slatefs_nfs::NFSTcp::handle_forever(&nfs_listener).await;
+    });
+
+    // 1. Write via NFS.
+    let nfs_payload = b"written over NFS, read over 9P".to_vec();
+    let mut conn = Nfs3ConnectionBuilder::new(TokioConnector, "127.0.0.1", "/")
+        .connect_from_privileged_port(false)
+        .mount_port(nfs_port)
+        .nfs3_port(nfs_port)
+        .mount()
+        .await
+        .expect("nfs mount");
+    let root = conn.root_nfs_fh3();
+    let res = conn
+        .nfs3_client
+        .create(&CREATE3args {
+            where_: diropargs3 {
+                dir: nfs_fh3 {
+                    data: Opaque::owned(root.data.to_vec()),
+                },
+                name: "from-nfs.txt".as_bytes().into(),
+            },
+            how: createhow3::UNCHECKED(sattr3::default()),
+        })
+        .await
+        .expect("create rpc");
+    let fh = match res {
+        CREATE3res::Ok(ok) => match ok.obj {
+            Nfs3Option::Some(fh) => fh,
+            Nfs3Option::None => panic!("no fh"),
+        },
+        CREATE3res::Err((stat, _)) => panic!("create failed: {stat:?}"),
+    };
+    let res = conn
+        .nfs3_client
+        .write(&WRITE3args {
+            file: nfs_fh3 {
+                data: Opaque::owned(fh.data.to_vec()),
+            },
+            offset: 0,
+            count: nfs_payload.len() as u32,
+            stable: stable_how::FILE_SYNC,
+            data: Opaque::borrowed(&nfs_payload),
+        })
+        .await
+        .expect("write rpc");
+    assert!(matches!(res, WRITE3res::Ok(_)));
+
+    // 2. Read it via 9P and write the reply file via 9P.
+    let p9_payload = b"written over 9P, read over NFS".to_vec();
+    let nfs_payload_clone = nfs_payload.clone();
+    let p9_payload_clone = p9_payload.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut c = P9c::connect(p9_port);
+        c.attach(0, "", "/t/v", 0);
+        c.walk(0, 1, &["from-nfs.txt"]);
+        c.lopen(1, 0);
+        let stat = c.getattr(1);
+        assert_eq!(stat.size, nfs_payload_clone.len() as u64, "attr coherence");
+        let got = c.read(1, 0, 4096);
+        assert_eq!(got, nfs_payload_clone, "NFS write must be visible over 9P");
+
+        c.walk(0, 2, &[]);
+        c.lcreate(2, "from-9p.txt", 0o2, 0o644);
+        assert_eq!(
+            c.write(2, 0, &p9_payload_clone) as usize,
+            p9_payload_clone.len()
+        );
+        c.clunk(2);
+    })
+    .await
+    .expect("9p client");
+
+    // 3. Read the 9P-written file via NFS.
+    let res = conn
+        .nfs3_client
+        .lookup(&LOOKUP3args {
+            what: diropargs3 {
+                dir: nfs_fh3 {
+                    data: Opaque::owned(root.data.to_vec()),
+                },
+                name: "from-9p.txt".as_bytes().into(),
+            },
+        })
+        .await
+        .expect("lookup rpc");
+    let fh2 = match res {
+        LOOKUP3res::Ok(ok) => {
+            match ok.obj_attributes {
+                Nfs3Option::Some(attr) => assert_eq!(
+                    attr.size,
+                    p9_payload.len() as u64,
+                    "attr coherence NFS-side"
+                ),
+                Nfs3Option::None => panic!("lookup returned no attrs"),
+            }
+            ok.object
+        }
+        LOOKUP3res::Err((stat, _)) => panic!("lookup failed: {stat:?}"),
+    };
+    let res = conn
+        .nfs3_client
+        .read(&READ3args {
+            file: nfs_fh3 {
+                data: Opaque::owned(fh2.data.to_vec()),
+            },
+            offset: 0,
+            count: 4096,
+        })
+        .await
+        .expect("read rpc");
+    match res {
+        READ3res::Ok(ok) => assert_eq!(
+            ok.data.as_ref(),
+            &p9_payload[..],
+            "9P write must be visible over NFS"
+        ),
+        READ3res::Err((stat, _)) => panic!("read failed: {stat:?}"),
+    }
+    conn.unmount().await.expect("unmount");
+
+    let report = volume.fsck().await.expect("fsck");
+    assert!(report.is_clean(), "{:?}", report.problems);
+}

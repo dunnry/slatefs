@@ -39,13 +39,28 @@ pub struct CacheConfig {
     pub disk_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportProtocol {
+    #[default]
+    Nfs,
+    P9,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExportConfig {
     pub tenant: String,
     pub volume: String,
-    /// `ip:port` for this export's NFS+mount listener, e.g. `127.0.0.1:12049`.
+    /// `ip:port` for this export's listener, e.g. `127.0.0.1:12049`.
     pub listen: String,
+    /// Wire protocol for this export (one listener per export, DD-10).
+    #[serde(default)]
+    pub protocol: ExportProtocol,
+    /// 9P only: bearer token clients must present in `uname` at Tattach
+    /// (DD-10). Unset ⇒ open export (use network isolation).
+    #[serde(default)]
+    pub p9_token: Option<String>,
     /// Identity squash policy (DD-10). AUTH_SYS uids are unauthenticated
     /// assertions — pair `none`/`root_squash` with network-level tenant
     /// isolation per the plan.

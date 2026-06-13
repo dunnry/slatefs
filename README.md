@@ -67,6 +67,22 @@ scan through every FS surface, wrong-DEK fail-closed, warm-restart reads
 with **zero** object-store GETs, and a read-latency bench harness (warm
 128 KiB p99 ≈ 60 µs on a local store in release).
 
+**Phase 4 in progress** (9P2000.L frontend): the §9.3 spike picked the
+2025-revived `rs9p` (BSD-3-Clause; typed per-fid state, full 9P2000.L
+coverage, public codec reused for wire tests) over writing our own —
+vendored into `crates/rs9p` with two `[slatefs patch]`s (portable statvfs
+for macOS builds; Rreaddir decode treated the byte-length prefix as an
+entry count). `slatefs-9p` implements the full op surface on the shared
+`Vfs` with per-connection bearer-token auth at `Tattach`
+(`mount -t 9p -o trans=tcp,version=9p2000.L,uname=<token>,aname=/t/v`).
+Verified: in-process wire tests, **cross-protocol coherence** (one volume
+served over NFS and 9P simultaneously, writes visible both ways,
+attr-coherent), and a real kernel v9fs mount exercising I/O, hardlinks,
+xattrs, and readdir (`scripts/p9-kernel-mount-test.sh`, in CI). The
+daemon now shares one `Volume` across all exports of the same
+tenant/volume (single SlateDB writer, DD-5). Remaining: pjdfstest over
+9P, QEMU virtio-9p smoke, rustls.
+
 > Testing against kernel NFS clients: always mount with
 > `soft,intr,timeo=…` and bound every command touching the mountpoint
 > with a timeout — a `hard,nointr` mount to a misbehaving dev server

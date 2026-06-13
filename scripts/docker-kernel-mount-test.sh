@@ -29,7 +29,7 @@ docker run --rm --privileged \
         # Snapshot the harness scripts: /src is a live bind mount and a host
         # edit mid-run would corrupt a script bash is still reading.
         cp -r /src/scripts /tmp/scripts
-        apt-get update -qq >/dev/null && apt-get install -y -qq nfs-common >/dev/null
+        apt-get update -qq >/dev/null && apt-get install -y -qq nfs-common attr >/dev/null
         cargo build -q -p slatefs-daemon -p slatefs-cli
 
         STORE=$(mktemp -d)
@@ -44,6 +44,12 @@ tenant = "t1"
 volume = "v1"
 listen = "127.0.0.1:12049"
 squash = "none"
+[[exports]]
+tenant = "t1"
+volume = "v1"
+listen = "127.0.0.1:12050"
+protocol = "p9"
+p9_token = "sekrit"
 EOF
         /target/debug/slatefs -c /tmp/slatefs.toml tenant create t1
         /target/debug/slatefs -c /tmp/slatefs.toml volume create t1 v1

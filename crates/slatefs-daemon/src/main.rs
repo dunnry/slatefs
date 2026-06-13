@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
-use slatefs_core::config::Config;
+use slatefs_core::config::{Config, ExportProtocol};
 use slatefs_core::control::ControlPlane;
 use slatefs_core::crypto::kms;
 use slatefs_core::store;
@@ -61,61 +61,107 @@ async fn main() -> anyhow::Result<()> {
 
     let mut volumes = Vec::new();
     let mut servers = tokio::task::JoinSet::new();
-    let share_count = config.exports.len();
+    // One Volume per (tenant, volume) — a SlateDB has exactly one writer
+    // (DD-5), and several exports (e.g. NFS + 9P, plan §9.4) share it.
+    let mut open_volumes: std::collections::HashMap<(String, String), Arc<Volume>> =
+        std::collections::HashMap::new();
+    let distinct: std::collections::HashSet<(String, String)> = config
+        .exports
+        .iter()
+        .map(|e| (e.tenant.clone(), e.volume.clone()))
+        .collect();
+    let share_count = distinct.len();
     for (export, record, dek) in planned {
-        let mut caches =
-            VolumeCaches::from_config(&config.cache, &export.tenant, &export.volume, share_count);
-        let recorder = Arc::new(slatefs_core::metrics::AggregatingRecorder::default());
-        caches.recorder = Some(Arc::clone(&recorder));
-        let volume = Volume::open_with_caches(&record, dek, Arc::clone(&object_store), &caches)
-            .await
-            .with_context(|| format!("opening volume {}/{}", export.tenant, export.volume))?;
+        let key = (export.tenant.clone(), export.volume.clone());
+        let volume = match open_volumes.get(&key) {
+            Some(v) => Arc::clone(v),
+            None => {
+                let mut caches = VolumeCaches::from_config(
+                    &config.cache,
+                    &export.tenant,
+                    &export.volume,
+                    share_count,
+                );
+                let recorder = Arc::new(slatefs_core::metrics::AggregatingRecorder::default());
+                caches.recorder = Some(Arc::clone(&recorder));
+                let volume =
+                    Volume::open_with_caches(&record, dek, Arc::clone(&object_store), &caches)
+                        .await
+                        .with_context(|| {
+                            format!("opening volume {}/{}", export.tenant, export.volume)
+                        })?;
 
-        // Cache hit-rate visibility (plan §13 / Phase 3 AC): log the
-        // cache-related engine metrics periodically per volume.
-        {
-            let (tenant, volume_name) = (export.tenant.clone(), export.volume.clone());
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
-                tick.tick().await; // skip the immediate tick
-                loop {
-                    tick.tick().await;
-                    let stats: Vec<String> = recorder
-                        .snapshot()
-                        .into_iter()
-                        .filter(|(name, value)| name.contains("cache") && *value != 0.0)
-                        .map(|(name, value)| format!("{name}={value}"))
-                        .collect();
-                    if !stats.is_empty() {
-                        tracing::info!(
-                            tenant,
-                            volume = volume_name,
-                            "cache metrics: {}",
-                            stats.join(" ")
-                        );
+                // Cache hit-rate visibility (plan §13 / Phase 3 AC): log the
+                // cache-related engine metrics periodically per volume.
+                let (tenant, volume_name) = (export.tenant.clone(), export.volume.clone());
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                    tick.tick().await; // skip the immediate tick
+                    loop {
+                        tick.tick().await;
+                        let stats: Vec<String> = recorder
+                            .snapshot()
+                            .into_iter()
+                            .filter(|(name, value)| name.contains("cache") && *value != 0.0)
+                            .map(|(name, value)| format!("{name}={value}"))
+                            .collect();
+                        if !stats.is_empty() {
+                            tracing::info!(
+                                tenant,
+                                volume = volume_name,
+                                "cache metrics: {}",
+                                stats.join(" ")
+                            );
+                        }
                     }
-                }
-            });
-        }
-        volumes.push(Arc::clone(&volume));
-
-        let policy = SquashPolicy {
-            mode: export.squash,
-            anon_uid: export.anon_uid,
-            anon_gid: export.anon_gid,
+                });
+                volumes.push(Arc::clone(&volume));
+                open_volumes.insert(key, Arc::clone(&volume));
+                volume
+            }
         };
-        let listener = slatefs_nfs::bind_export(volume, fh_key.clone(), policy, &export.listen)
-            .await
-            .with_context(|| format!("binding {}", export.listen))?;
-        tracing::info!(
-            tenant = export.tenant,
-            volume = export.volume,
-            listen = export.listen,
-            port = listener.get_listen_port(),
-            "export ready; mount with: mount -t nfs -o vers=3,nolock,tcp,port={p},mountport={p} <host>:/ <dir>",
-            p = listener.get_listen_port(),
-        );
-        servers.spawn(async move { listener.handle_forever().await });
+
+        match export.protocol {
+            ExportProtocol::Nfs => {
+                let policy = SquashPolicy {
+                    mode: export.squash,
+                    anon_uid: export.anon_uid,
+                    anon_gid: export.anon_gid,
+                };
+                let listener =
+                    slatefs_nfs::bind_export(volume, fh_key.clone(), policy, &export.listen)
+                        .await
+                        .with_context(|| format!("binding {}", export.listen))?;
+                tracing::info!(
+                    tenant = export.tenant,
+                    volume = export.volume,
+                    listen = export.listen,
+                    port = listener.get_listen_port(),
+                    "export ready; mount with: mount -t nfs -o vers=3,nolock,tcp,port={p},mountport={p} <host>:/ <dir>",
+                    p = listener.get_listen_port(),
+                );
+                servers.spawn(async move { listener.handle_forever().await });
+            }
+            ExportProtocol::P9 => {
+                let export_name = format!("/{}/{}", export.tenant, export.volume);
+                let listen = export.listen.clone();
+                let token = export.p9_token.clone();
+                tracing::info!(
+                    tenant = export.tenant,
+                    volume = export.volume,
+                    listen = export.listen,
+                    "export ready; mount with: mount -t 9p -o trans=tcp,version=9p2000.L,port=<port>{} <host> <dir>",
+                    if token.is_some() {
+                        ",uname=<token>"
+                    } else {
+                        ""
+                    },
+                );
+                servers.spawn(async move {
+                    slatefs_9p::serve_export(volume, export_name, token, &listen).await
+                });
+            }
+        }
     }
 
     tokio::select! {
