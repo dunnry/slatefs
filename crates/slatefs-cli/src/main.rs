@@ -107,10 +107,14 @@ enum QuotaCmd {
         bytes_hard: Option<String>,
         #[arg(long, value_name = "N|none")]
         bytes_soft: Option<String>,
+        #[arg(long, value_name = "UNIX_TS|none")]
+        bytes_grace_until: Option<String>,
         #[arg(long, value_name = "N|none")]
         inodes_hard: Option<String>,
         #[arg(long, value_name = "N|none")]
         inodes_soft: Option<String>,
+        #[arg(long, value_name = "UNIX_TS|none")]
+        inodes_grace_until: Option<String>,
     },
 }
 
@@ -368,13 +372,17 @@ async fn run(
             volume,
             bytes_hard,
             bytes_soft,
+            bytes_grace_until,
             inodes_hard,
             inodes_soft,
+            inodes_grace_until,
         }) => {
             if bytes_hard.is_none()
                 && bytes_soft.is_none()
+                && bytes_grace_until.is_none()
                 && inodes_hard.is_none()
                 && inodes_soft.is_none()
+                && inodes_grace_until.is_none()
             {
                 anyhow::bail!("provide at least one quota flag");
             }
@@ -386,11 +394,17 @@ async fn run(
             if let Some(raw) = bytes_soft {
                 quota.bytes.soft = parse_quota_value(raw)?;
             }
+            if let Some(raw) = bytes_grace_until {
+                quota.bytes.grace_until = parse_quota_value(raw)?;
+            }
             if let Some(raw) = inodes_hard {
                 quota.inodes.hard = parse_quota_value(raw)?;
             }
             if let Some(raw) = inodes_soft {
                 quota.inodes.soft = parse_quota_value(raw)?;
+            }
+            if let Some(raw) = inodes_grace_until {
+                quota.inodes.grace_until = parse_quota_value(raw)?;
             }
             let record = control.set_volume_quota(tenant, volume, quota).await?;
             print_quota(tenant, volume, record.quota);

@@ -7,10 +7,13 @@ mod common;
 use std::sync::Arc;
 
 use common::{TEST_CHUNK, fresh_volume, fresh_volume_on, test_kms};
-use slatefs_core::control::ControlPlane;
+use slatefs_core::config::Compression;
+use slatefs_core::control::{ControlPlane, QuotaLimit, QuotaLimits};
+use slatefs_core::crypto::Cipher;
 use slatefs_core::meta::inode::{FileKind, ROOT_INO};
+use slatefs_core::store;
 use slatefs_core::vfs::{Credentials, FsError, OpenMode, SetAttrs, TimeSet, Vfs};
-use slatefs_core::{store, volume};
+use slatefs_core::volume::{self, CreateVolumeOptions};
 
 fn root() -> Credentials {
     Credentials::root()
@@ -555,6 +558,71 @@ async fn quota_enforced_exactly_and_statfs() {
 
     let report = v.fsck().await.unwrap();
     assert!(report.is_clean(), "{:?}", report.problems);
+}
+
+#[tokio::test]
+async fn expired_soft_quota_grace_enforced() {
+    let object_store = store::resolve_root("memory:///").unwrap();
+    let control = ControlPlane::open(Arc::clone(&object_store), test_kms())
+        .await
+        .unwrap();
+    control.create_tenant("t", None).await.unwrap();
+    let record = volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "v",
+        CreateVolumeOptions {
+            cipher: Cipher::Aes256Gcm,
+            chunk_size: TEST_CHUNK,
+            compression: Compression::Lz4,
+            quota: QuotaLimits {
+                bytes: QuotaLimit {
+                    soft: Some(TEST_CHUNK as u64),
+                    grace_until: Some(0),
+                    ..Default::default()
+                },
+                inodes: QuotaLimit {
+                    soft: Some(2),
+                    grace_until: Some(0),
+                    ..Default::default()
+                },
+            },
+            note: None,
+        },
+    )
+    .await
+    .unwrap();
+    let dek = control.unwrap_volume_dek(&record).await.unwrap();
+    control.close().await.unwrap();
+    let v = volume::Volume::open(&record, dek, object_store)
+        .await
+        .unwrap();
+
+    // Root inode counts as 1, so one file reaches the expired soft inode
+    // limit exactly; the next inode allocation crosses it and fails.
+    let f = v
+        .create(&root(), ROOT_INO, b"f0", 0o644, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        v.create(&root(), ROOT_INO, b"f1", 0o644, true)
+            .await
+            .unwrap_err(),
+        FsError::QuotaExceeded
+    );
+
+    // Exactly the soft byte limit fits; crossing it after the expired grace
+    // deadline fails as EDQUOT.
+    v.write(&root(), f.ino, 0, &vec![1u8; TEST_CHUNK as usize])
+        .await
+        .unwrap();
+    assert_eq!(
+        v.write(&root(), f.ino, TEST_CHUNK as u64, &[1u8])
+            .await
+            .unwrap_err(),
+        FsError::QuotaExceeded
+    );
 }
 
 #[tokio::test]

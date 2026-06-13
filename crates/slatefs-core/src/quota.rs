@@ -64,6 +64,28 @@ pub fn billed_chunk_bytes(size: u64, chunk_start: u64, value_len: usize) -> u64 
     (value_len as u64).min(size.saturating_sub(chunk_start))
 }
 
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn exceeds_limit(usage: i64, limit: &crate::control::QuotaLimit, now: u64) -> bool {
+    if let Some(hard) = limit.hard
+        && usage > hard as i64
+    {
+        return true;
+    }
+    if let (Some(soft), Some(grace_until)) = (limit.soft, limit.grace_until)
+        && usage > soft as i64
+        && now >= grace_until
+    {
+        return true;
+    }
+    false
+}
+
 /// In-memory authoritative usage + limits for one mounted volume.
 pub struct QuotaTracker {
     bytes: AtomicI64,
@@ -92,22 +114,18 @@ impl QuotaTracker {
     }
 
     /// Reserve usage before building the mutation batch. Returns `EDQUOT` if
-    /// a hard limit would be exceeded. Negative deltas (frees) always
-    /// succeed. Call [`QuotaTracker::release`] if the commit fails.
+    /// a hard limit would be exceeded, or if an expired soft-limit grace
+    /// window would be exceeded. Negative deltas (frees) always succeed. Call
+    /// [`QuotaTracker::release`] if the commit fails.
     pub fn reserve(&self, bytes_delta: i64, inode_delta: i64) -> Result<(), FsError> {
+        let now = now_unix();
         let new_bytes = self.bytes.fetch_add(bytes_delta, Ordering::Relaxed) + bytes_delta;
-        if bytes_delta > 0
-            && let Some(hard) = self.limits.bytes.hard
-            && new_bytes > hard as i64
-        {
+        if bytes_delta > 0 && exceeds_limit(new_bytes, &self.limits.bytes, now) {
             self.bytes.fetch_sub(bytes_delta, Ordering::Relaxed);
             return Err(FsError::QuotaExceeded);
         }
         let new_inodes = self.inodes.fetch_add(inode_delta, Ordering::Relaxed) + inode_delta;
-        if inode_delta > 0
-            && let Some(hard) = self.limits.inodes.hard
-            && new_inodes > hard as i64
-        {
+        if inode_delta > 0 && exceeds_limit(new_inodes, &self.limits.inodes, now) {
             self.inodes.fetch_sub(inode_delta, Ordering::Relaxed);
             self.bytes.fetch_sub(bytes_delta, Ordering::Relaxed);
             return Err(FsError::QuotaExceeded);
@@ -124,9 +142,11 @@ impl QuotaTracker {
     /// Over-limit check for ops that don't change accounted usage but are
     /// still quota-gated (xattr set, plan §12).
     pub fn check_not_over(&self) -> Result<(), FsError> {
-        if let Some(hard) = self.limits.bytes.hard
-            && self.bytes.load(Ordering::Relaxed) > hard as i64
-        {
+        if exceeds_limit(
+            self.bytes.load(Ordering::Relaxed),
+            &self.limits.bytes,
+            now_unix(),
+        ) {
             return Err(FsError::QuotaExceeded);
         }
         Ok(())
@@ -151,6 +171,26 @@ mod tests {
             },
             inodes: QuotaLimit {
                 hard: inodes,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn soft_limits(
+        bytes_soft: Option<u64>,
+        bytes_grace_until: Option<u64>,
+        inode_soft: Option<u64>,
+        inode_grace_until: Option<u64>,
+    ) -> QuotaLimits {
+        QuotaLimits {
+            bytes: QuotaLimit {
+                soft: bytes_soft,
+                grace_until: bytes_grace_until,
+                ..Default::default()
+            },
+            inodes: QuotaLimit {
+                soft: inode_soft,
+                grace_until: inode_grace_until,
                 ..Default::default()
             },
         }
@@ -195,6 +235,28 @@ mod tests {
         assert_eq!(q.usage(), (100, 2));
         q.release(100, 2);
         assert_eq!(q.usage(), (0, 0));
+    }
+
+    #[test]
+    fn expired_soft_limits_enforce_after_grace() {
+        let q = QuotaTracker::new(0, 0, soft_limits(Some(100), Some(0), Some(2), Some(0)));
+        q.reserve(100, 2).unwrap();
+        assert!(matches!(q.reserve(1, 0), Err(FsError::QuotaExceeded)));
+        assert!(matches!(q.reserve(0, 1), Err(FsError::QuotaExceeded)));
+        assert_eq!(q.usage(), (100, 2));
+        q.reserve(-1, -1).unwrap();
+        assert_eq!(q.usage(), (99, 1));
+    }
+
+    #[test]
+    fn active_soft_grace_allows_until_deadline() {
+        let q = QuotaTracker::new(
+            0,
+            0,
+            soft_limits(Some(100), Some(u64::MAX), Some(2), Some(u64::MAX)),
+        );
+        q.reserve(101, 3).unwrap();
+        assert_eq!(q.usage(), (101, 3));
     }
 
     #[test]
