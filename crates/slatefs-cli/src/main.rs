@@ -1,5 +1,5 @@
-//! `slatefs` — management CLI (plan §13): keygen, tenant lifecycle, volume
-//! create/info/list/fsck, and quota metadata.
+//! `slatefs` — management CLI (plan §13): keygen, key rotation, tenant
+//! lifecycle, volume create/info/list/fsck, and quota metadata.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,6 +38,8 @@ enum Command {
         out: Option<PathBuf>,
     },
     #[command(subcommand)]
+    Key(KeyCmd),
+    #[command(subcommand)]
     Tenant(TenantCmd),
     #[command(subcommand)]
     Volume(VolumeCmd),
@@ -47,6 +49,12 @@ enum Command {
     Snapshot(SnapshotCmd),
     #[command(subcommand)]
     Clone(CloneCmd),
+}
+
+#[derive(Subcommand)]
+enum KeyCmd {
+    /// Rotate a tenant KEK and rewrap its active volume DEKs.
+    RotateKek { tenant: String },
 }
 
 #[derive(Subcommand)]
@@ -364,6 +372,10 @@ async fn run(
 ) -> anyhow::Result<()> {
     match command {
         Command::Keygen { .. } => unreachable!("handled before control-plane open"),
+        Command::Key(KeyCmd::RotateKek { tenant }) => {
+            let count = control.rotate_tenant_kek(tenant).await?;
+            println!("rotated tenant KEK for {tenant}; rewrapped {count} volume DEKs");
+        }
         Command::Tenant(TenantCmd::Create { name, display_name }) => {
             let record = control.create_tenant(name, display_name.clone()).await?;
             println!(

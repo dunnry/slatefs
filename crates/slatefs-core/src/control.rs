@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use slatedb::object_store::{ObjectStore, PutMode, PutOptions};
-use slatedb::{Db, Settings};
+use slatedb::{Db, Settings, WriteBatch};
 
 use crate::config::Compression;
 use crate::crypto::kms::{Kms, contexts};
@@ -296,6 +296,59 @@ impl ControlPlane {
         self.kms
             .unwrap(&tenant.wrapped_kek, &contexts::tenant_kek(&tenant.name))
             .await
+    }
+
+    /// Rotate one tenant KEK by rewrapping every active volume DEK.
+    ///
+    /// Data blocks are not rewritten: volume DEKs remain stable, and only the
+    /// encrypted DEK envelopes in the control plane change.
+    pub async fn rotate_tenant_kek(&self, name: &str) -> Result<usize> {
+        store::validate_name("tenant name", name)?;
+        let mut tenant = self.get_tenant(name).await?;
+        if tenant.state == TenantState::Deleting {
+            return Err(Error::invalid(
+                "tenant state",
+                format!("tenant {name:?} is Deleting and cannot be rotated"),
+            ));
+        }
+
+        let old_kek = self.unwrap_tenant_kek(&tenant).await?;
+        let new_kek = Secret32::generate();
+        let mut volumes = self.list_volumes(name).await?;
+        let mut rewrapped = 0usize;
+        for volume in &mut volumes {
+            if volume.state == VolumeState::Deleting {
+                continue;
+            }
+            if volume.wrapped_dek.is_empty() {
+                return Err(Error::invalid(
+                    "volume key",
+                    format!(
+                        "volume {}/{} has been crypto-shredded",
+                        volume.tenant, volume.name
+                    ),
+                ));
+            }
+            let context = contexts::volume_dek(&volume.tenant, &volume.name);
+            let dek = crate::crypto::aead::unwrap_key(&old_kek, &context, &volume.wrapped_dek)?;
+            volume.wrapped_dek = crate::crypto::aead::wrap_key(&new_kek, &context, &dek)?;
+            rewrapped += 1;
+        }
+        tenant.wrapped_kek = self.kms.wrap(&new_kek, &contexts::tenant_kek(name)).await?;
+
+        let mut batch = WriteBatch::new();
+        batch.put(
+            tenant_key(name).as_bytes(),
+            encode_versioned(TENANT_RECORD_VERSION, &tenant)?,
+        );
+        for volume in &volumes {
+            batch.put(
+                volume_key(&volume.tenant, &volume.name).as_bytes(),
+                encode_versioned(VOLUME_RECORD_VERSION, volume)?,
+            );
+        }
+        self.db.write(batch).await?;
+        Ok(rewrapped)
     }
 
     // ---- volumes (control records; mkfs/open live in volume.rs) ----

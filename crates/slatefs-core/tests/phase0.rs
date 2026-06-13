@@ -211,6 +211,40 @@ async fn phase0_round_trip(object_store: Arc<dyn ObjectStore>) {
         .expect("volume info after quota set");
     assert_eq!(info.record.quota, quota);
 
+    // Key rotation: rewrap the volume DEK under a fresh tenant KEK without
+    // rewriting volume data.
+    let before_tenant = control
+        .get_tenant("t1")
+        .await
+        .expect("tenant before rotate");
+    let before_volume = control
+        .get_volume("t1", "v1")
+        .await
+        .expect("volume before rotate");
+    assert_eq!(
+        control
+            .rotate_tenant_kek("t1")
+            .await
+            .expect("rotate tenant kek"),
+        1
+    );
+    let after_tenant = control.get_tenant("t1").await.expect("tenant after rotate");
+    let after_volume = control
+        .get_volume("t1", "v1")
+        .await
+        .expect("volume after rotate");
+    assert_ne!(before_tenant.wrapped_kek, after_tenant.wrapped_kek);
+    assert_ne!(before_volume.wrapped_dek, after_volume.wrapped_dek);
+    let dek = control
+        .unwrap_volume_dek(&after_volume)
+        .await
+        .expect("volume dek after rotate");
+    let vol = volume::Volume::open(&after_volume, dek, Arc::clone(&object_store))
+        .await
+        .expect("open after rotate");
+    assert!(vol.fsck().await.expect("fsck after rotate").is_clean());
+    vol.shutdown().await.expect("close after rotate");
+
     // Phase 6 snapshot CLI foundation: durable checkpoints can be created,
     // listed, name-filtered, and deleted for a quiesced volume.
     let snapshot = volume::create_snapshot(

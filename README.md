@@ -122,7 +122,9 @@ with `--snapshot <id>`. Clones get distinct fsids and independent writes, but
 they intentionally share source SSTs, so deleting a source volume is refused
 while active clones point at it. `[[exports]] snapshot = "<checkpoint-id>"`
 serves that checkpoint through the normal NFS or 9P frontend as a read-only
-mount; live writes after the checkpoint are not visible there.
+mount; live writes after the checkpoint are not visible there. `slatefs key
+rotate-kek <tenant>` rotates that tenant's KEK by rewrapping active volume DEKs
+in the control plane; volume data blocks are not rewritten.
 
 > Testing against kernel NFS clients: always mount with
 > `soft,intr,timeo=…` and bound every command touching the mountpoint
