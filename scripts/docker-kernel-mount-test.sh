@@ -24,6 +24,8 @@ docker run --rm --privileged \
     -e FAILOVER_PRIMARY_METRICS_PORT -e FAILOVER_TAKEOVER_METRICS_PORT \
     -e PERF_NFS_PORT -e PERF_METRICS_PORT -e FIO_RUNTIME -e FIO_SIZE \
     -e FIO_JOBS -e FIO_BS_LIST -e FIO_RW_LIST -e META_OPS -e PERF_REPORT \
+    -e QEMU_BIN -e QEMU_KERNEL -e QEMU_TIMEOUT -e QEMU_INSTALL_DEPS \
+    -e BUSYBOX -e SLATEFS_P9_PORT -e SLATEFS_P9_TOKEN -e SLATEFS_P9_ANAME \
     -v "$PWD":/src:ro \
     -v slatefs-cargo-registry:/usr/local/cargo/registry \
     -v slatefs-target-linux:/target \

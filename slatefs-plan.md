@@ -493,7 +493,7 @@ metrics exported; restart with warm NVMe cache serves first reads without object
 Codec (frame fuzz tests + recorded-frame golden tests), server, fid table, attach auth, TLS.
 **AC**: Linux `mount -t 9p -o trans=tcp,version=9p2000.L,msize=1048576` works; pjdfstest over 9P
 passes (own exclusion list); cross-protocol test — write NFS / read 9P and inverse, same server —
-byte-identical, attr-coherent; QEMU virtio-9p smoke test.
+byte-identical, attr-coherent; QEMU guest 9P TCP smoke test.
 
 ### Phase 5 — Multi-tenant hardening & quotas UX
 Rate limits, IP allowlists, fh HMAC, suspend/delete with crypto-shred, statfs/df accuracy,
@@ -512,6 +512,9 @@ Perf harness: [docs/performance.md](docs/performance.md) and
 [scripts/fio-over-nfs.sh](scripts/fio-over-nfs.sh).
 Dashboard: [monitoring/slatefs-grafana-dashboard.json](monitoring/slatefs-grafana-dashboard.json).
 Security review: [docs/security-review.md](docs/security-review.md).
+Client support matrix and QEMU guest smoke:
+[docs/client-support.md](docs/client-support.md),
+[scripts/qemu-p9-tcp-smoke.sh](scripts/qemu-p9-tcp-smoke.sh).
 **AC**: failover under fio load < 10s with zero corruption (fsx continues clean post-failover);
 documented perf table vs targets; runbook covers outage/fence/restore/key-rotation drills;
 snapshot mount of a live volume reads consistently while writes continue.
