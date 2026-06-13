@@ -62,6 +62,7 @@ aws-config = { version = "1", default-features = false, features = ["behavior-ve
 aws-sdk-kms = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
 zeroize = { version = "1", features = ["derive"] }
 hex = "0.4"
+uuid = "1"
 
 # Test-only
 tempfile = "3"

@@ -6,8 +6,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use slatedb::admin::AdminBuilder;
+use slatedb::config::{CheckpointOptions, CheckpointScope};
 use slatedb::object_store::ObjectStore;
-use slatedb::{Db, DbReader, Settings, WriteBatch};
+use slatedb::{Checkpoint, Db, DbReader, Settings, WriteBatch};
 
 use crate::attrcache::AttrCache;
 use crate::config::{CacheConfig, Compression, VolumeDefaults};
@@ -91,6 +93,25 @@ impl VolumeCaches {
 pub struct VolumeInfo {
     pub record: VolumeRecord,
     pub superblock: Superblock,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotInfo {
+    pub id: String,
+    pub manifest_id: u64,
+    pub name: Option<String>,
+    pub create_time: String,
+    pub expire_time: Option<String>,
+}
+
+fn snapshot_info(checkpoint: Checkpoint) -> SnapshotInfo {
+    SnapshotInfo {
+        id: checkpoint.id.to_string(),
+        manifest_id: checkpoint.manifest_id,
+        name: checkpoint.name,
+        create_time: checkpoint.create_time.to_rfc3339(),
+        expire_time: checkpoint.expire_time.map(|t| t.to_rfc3339()),
+    }
 }
 
 /// Create a volume: commit the control record (state `Creating`), mkfs the
@@ -360,6 +381,98 @@ pub async fn scrub_volume(
     result
 }
 
+/// Create a durable SlateDB checkpoint for a quiesced volume. This opens the
+/// volume as writer so SlateDB can flush before checkpointing; do not run it
+/// against a volume currently served by `slatefsd`.
+pub async fn create_snapshot(
+    control: &ControlPlane,
+    object_store: Arc<dyn ObjectStore>,
+    tenant_name: &str,
+    volume_name: &str,
+    name: Option<String>,
+) -> Result<SnapshotInfo> {
+    let record = control.get_volume(tenant_name, volume_name).await?;
+    if record.state != VolumeState::Active {
+        return Err(Error::invalid(
+            "volume state",
+            format!(
+                "{tenant_name}/{volume_name} is {:?}, not Active",
+                record.state
+            ),
+        ));
+    }
+    let dek = control.unwrap_volume_dek(&record).await?;
+    let path = store::volume_db_path(&record.tenant, &record.name);
+    let volume = Volume::open(&record, dek, Arc::clone(&object_store)).await?;
+    let created = volume.create_checkpoint(name).await?;
+    volume.shutdown().await?;
+
+    let admin = AdminBuilder::new(path, object_store).build();
+    admin
+        .list_checkpoints(None)
+        .await?
+        .into_iter()
+        .find(|checkpoint| checkpoint.id == created.id)
+        .map(snapshot_info)
+        .ok_or_else(|| {
+            Error::invalid(
+                "snapshot",
+                format!("created checkpoint {} was not listed", created.id),
+            )
+        })
+}
+
+pub async fn list_snapshots(
+    control: &ControlPlane,
+    object_store: Arc<dyn ObjectStore>,
+    tenant_name: &str,
+    volume_name: &str,
+    name_filter: Option<&str>,
+) -> Result<Vec<SnapshotInfo>> {
+    let record = control.get_volume(tenant_name, volume_name).await?;
+    if record.state != VolumeState::Active {
+        return Err(Error::invalid(
+            "volume state",
+            format!(
+                "{tenant_name}/{volume_name} is {:?}, not Active",
+                record.state
+            ),
+        ));
+    }
+    let path = store::volume_db_path(&record.tenant, &record.name);
+    let admin = AdminBuilder::new(path, object_store).build();
+    Ok(admin
+        .list_checkpoints(name_filter)
+        .await?
+        .into_iter()
+        .map(snapshot_info)
+        .collect())
+}
+
+pub async fn delete_snapshot(
+    control: &ControlPlane,
+    object_store: Arc<dyn ObjectStore>,
+    tenant_name: &str,
+    volume_name: &str,
+    id: &str,
+) -> Result<()> {
+    let record = control.get_volume(tenant_name, volume_name).await?;
+    if record.state != VolumeState::Active {
+        return Err(Error::invalid(
+            "volume state",
+            format!(
+                "{tenant_name}/{volume_name} is {:?}, not Active",
+                record.state
+            ),
+        ));
+    }
+    let id = uuid::Uuid::parse_str(id)
+        .map_err(|e| Error::invalid("snapshot id", format!("{id:?}: {e}")))?;
+    let path = store::volume_db_path(&record.tenant, &record.name);
+    let admin = AdminBuilder::new(path, object_store).build();
+    admin.delete_checkpoint(id).await.map_err(Error::from)
+}
+
 // ---- the mounted volume ----
 
 #[derive(Default)]
@@ -517,6 +630,21 @@ impl Volume {
     /// Fsck plus counter rewrite when drift is found (`fsck --recount`).
     pub async fn fsck_recount(&self) -> Result<crate::fsck::FsckReport> {
         crate::fsck::recount(&self.db, self.chunk_size, &self.names).await
+    }
+
+    async fn create_checkpoint(
+        &self,
+        name: Option<String>,
+    ) -> std::result::Result<slatedb::CheckpointCreateResult, slatedb::Error> {
+        self.db
+            .create_checkpoint(
+                CheckpointScope::All,
+                &CheckpointOptions {
+                    name,
+                    ..CheckpointOptions::default()
+                },
+            )
+            .await
     }
 }
 

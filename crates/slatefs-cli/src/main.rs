@@ -43,6 +43,8 @@ enum Command {
     Volume(VolumeCmd),
     #[command(subcommand)]
     Quota(QuotaCmd),
+    #[command(subcommand)]
+    Snapshot(SnapshotCmd),
 }
 
 #[derive(Subcommand)]
@@ -151,6 +153,32 @@ enum QuotaCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum SnapshotCmd {
+    /// Create a durable checkpoint. Volume must not be actively served.
+    Create {
+        tenant: String,
+        volume: String,
+        /// Optional operator-visible snapshot name.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List volume snapshots.
+    List {
+        tenant: String,
+        volume: String,
+        /// Filter by snapshot name.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Delete a snapshot by checkpoint id.
+    Delete {
+        tenant: String,
+        volume: String,
+        id: String,
+    },
+}
+
 fn parse_compression(s: &str) -> Result<config::Compression, String> {
     match s {
         "none" => Ok(config::Compression::None),
@@ -242,6 +270,17 @@ fn print_fsck_report(report: &slatefs_core::fsck::FsckReport) {
     for p in &report.problems {
         println!("PROBLEM: {p}");
     }
+}
+
+fn print_snapshot(snapshot: &volume::SnapshotInfo) {
+    println!(
+        "{}\tmanifest={}\tcreated={}\texpires={}\tname={}",
+        snapshot.id,
+        snapshot.manifest_id,
+        snapshot.create_time,
+        snapshot.expire_time.as_deref().unwrap_or("-"),
+        snapshot.name.as_deref().unwrap_or("-")
+    );
 }
 
 #[tokio::main]
@@ -524,6 +563,36 @@ async fn run(
             let record = control.set_volume_quota(tenant, volume, quota).await?;
             print_quota(tenant, volume, record.quota);
             println!("note: new limits apply when the volume is next opened for serving");
+        }
+        Command::Snapshot(SnapshotCmd::Create {
+            tenant,
+            volume: volume_name,
+            name,
+        }) => {
+            let snapshot =
+                volume::create_snapshot(control, object_store, tenant, volume_name, name.clone())
+                    .await?;
+            print_snapshot(&snapshot);
+        }
+        Command::Snapshot(SnapshotCmd::List {
+            tenant,
+            volume: volume_name,
+            name,
+        }) => {
+            for snapshot in
+                volume::list_snapshots(control, object_store, tenant, volume_name, name.as_deref())
+                    .await?
+            {
+                print_snapshot(&snapshot);
+            }
+        }
+        Command::Snapshot(SnapshotCmd::Delete {
+            tenant,
+            volume: volume_name,
+            id,
+        }) => {
+            volume::delete_snapshot(control, object_store, tenant, volume_name, id).await?;
+            println!("deleted snapshot {id} from {tenant}/{volume_name}");
         }
     }
     Ok(())

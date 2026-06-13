@@ -179,6 +179,52 @@ async fn phase0_round_trip(object_store: Arc<dyn ObjectStore>) {
         .expect("volume info after quota set");
     assert_eq!(info.record.quota, quota);
 
+    // Phase 6 snapshot CLI foundation: durable checkpoints can be created,
+    // listed, name-filtered, and deleted for a quiesced volume.
+    let snapshot = volume::create_snapshot(
+        &control,
+        Arc::clone(&object_store),
+        "t1",
+        "v1",
+        Some("baseline".to_string()),
+    )
+    .await
+    .expect("create snapshot");
+    assert_eq!(snapshot.name.as_deref(), Some("baseline"));
+    let snapshots = volume::list_snapshots(&control, Arc::clone(&object_store), "t1", "v1", None)
+        .await
+        .expect("list snapshots");
+    assert!(
+        snapshots.iter().any(|s| s.id == snapshot.id),
+        "created snapshot should be listed"
+    );
+    let named = volume::list_snapshots(
+        &control,
+        Arc::clone(&object_store),
+        "t1",
+        "v1",
+        Some("baseline"),
+    )
+    .await
+    .expect("list named snapshots");
+    assert_eq!(named.len(), 1);
+    assert_eq!(named[0].id, snapshot.id);
+    volume::delete_snapshot(
+        &control,
+        Arc::clone(&object_store),
+        "t1",
+        "v1",
+        &snapshot.id,
+    )
+    .await
+    .expect("delete snapshot");
+    assert!(
+        volume::list_snapshots(&control, Arc::clone(&object_store), "t1", "v1", None)
+            .await
+            .expect("list snapshots after delete")
+            .is_empty()
+    );
+
     // Phase 5 delete/crypto-shred: current control-plane state drops wrapped
     // keys and refuses future mount resolution.
     control

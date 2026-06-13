@@ -112,6 +112,12 @@ a volume is opened, so changed limits apply on the next serve/open cycle.
 deleting, drop wrapped keys from the current control-plane state, and delete
 the affected volume object-store prefixes.
 
+**Phase 6 started** (snapshots/clones, HA, performance, GA polish):
+`slatefs snapshot create|list|delete` manages SlateDB checkpoints for a volume.
+The current create path opens the volume as the writer so SlateDB can flush
+before checkpointing; do not run it against a volume currently served by
+`slatefsd`. Read-only snapshot exports and writable clones remain follow-ups.
+
 > Testing against kernel NFS clients: always mount with
 > `soft,intr,timeo=…` and bound every command touching the mountpoint
 > with a timeout — a `hard,nointr` mount to a misbehaving dev server
