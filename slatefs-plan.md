@@ -512,6 +512,8 @@ Perf harness: [docs/performance.md](docs/performance.md) and
 [scripts/fio-over-nfs.sh](scripts/fio-over-nfs.sh).
 Dashboard: [monitoring/slatefs-grafana-dashboard.json](monitoring/slatefs-grafana-dashboard.json).
 Security review: [docs/security-review.md](docs/security-review.md).
+Failover drill with optional fio load and a <10s timing gate:
+[scripts/nfs-failover-drill.sh](scripts/nfs-failover-drill.sh).
 Client support matrix and QEMU guest smoke:
 [docs/client-support.md](docs/client-support.md),
 [scripts/qemu-p9-tcp-smoke.sh](scripts/qemu-p9-tcp-smoke.sh).

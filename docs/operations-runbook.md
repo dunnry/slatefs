@@ -30,7 +30,18 @@ scripts/docker-kernel-mount-test.sh scripts/nfs-failover-drill.sh
 
 The drill writes a durable marker through a real kernel NFS client, starts a takeover daemon on a
 second port, forces the stale daemon to observe SlateDB fencing, remounts to the takeover export,
-checks `/metrics`, and runs `slatefs volume scrub`.
+checks the measured failover window against `FAILOVER_MAX_SECONDS` (default: `10`), checks
+`/metrics`, and runs `slatefs volume scrub`.
+
+To exercise the Phase 6 fio-load target:
+
+```sh
+SKIP_SMOKE=1 \
+FAILOVER_LOAD_MODE=fio \
+FAILOVER_FIO_RUNTIME=30 \
+FAILOVER_FIO_SIZE=256m \
+scripts/docker-kernel-mount-test.sh scripts/nfs-failover-drill.sh
+```
 
 ## Object Store Outage
 

@@ -28,6 +28,24 @@ For a quick local smoke, lower `FIO_RUNTIME`, `FIO_SIZE`, and `META_OPS`.
 Bench numbers are only comparable when the object store, cache settings,
 kernel NFS client, host CPU, and Docker/VM environment are held fixed.
 
+## Failover Timing
+
+The failover drill can run a fio workload against the primary NFS mount while
+the takeover daemon fences it:
+
+```sh
+SKIP_SMOKE=1 \
+FAILOVER_LOAD_MODE=fio \
+FAILOVER_FIO_RUNTIME=30 \
+FAILOVER_FIO_SIZE=256m \
+FAILOVER_MAX_SECONDS=10 \
+scripts/docker-kernel-mount-test.sh scripts/nfs-failover-drill.sh
+```
+
+The script measures from takeover daemon start to the first verified durable
+write on the remounted takeover export, then fails if the window is above
+`FAILOVER_MAX_SECONDS`.
+
 ## Target Table
 
 The GA target table should be filled from a dedicated bench host. Do not treat

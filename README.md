@@ -139,7 +139,8 @@ the starter Grafana dashboard lives in
 [monitoring/slatefs-grafana-dashboard.json](monitoring/slatefs-grafana-dashboard.json);
 outage, fence, restore, and key-rotation drills live in
 [docs/operations-runbook.md](docs/operations-runbook.md), with an automated
-NFS takeover drill in [scripts/nfs-failover-drill.sh](scripts/nfs-failover-drill.sh).
+NFS takeover drill in [scripts/nfs-failover-drill.sh](scripts/nfs-failover-drill.sh)
+that can run under fio load and enforces the Phase 6 failover-time target.
 The live snapshot mount drill is
 [scripts/live-snapshot-over-nfs.sh](scripts/live-snapshot-over-nfs.sh).
 The NFS fio performance matrix is documented in

@@ -3,9 +3,10 @@
 #
 # Runs inside the privileged container from docker-kernel-mount-test.sh. The
 # first daemon owns the live volume, a kernel NFS client writes durable data,
-# then a second daemon opens the same volume on another port and fences the
-# stale writer. The client remounts to the takeover daemon and verifies the
-# durable marker, live metrics, and read-only scrub.
+# then a configurable client load runs while a second daemon opens the same
+# volume on another port and fences the stale writer. The client remounts to
+# the takeover daemon and verifies the durable marker, takeover time, live
+# metrics, and read-only scrub.
 set -euo pipefail
 
 CONFIG="${SLATEFS_CONFIG:?set SLATEFS_CONFIG}"
@@ -15,6 +16,14 @@ PRIMARY_PORT="${FAILOVER_PRIMARY_PORT:-12052}"
 TAKEOVER_PORT="${FAILOVER_TAKEOVER_PORT:-12053}"
 PRIMARY_METRICS_PORT="${FAILOVER_PRIMARY_METRICS_PORT:-13052}"
 TAKEOVER_METRICS_PORT="${FAILOVER_TAKEOVER_METRICS_PORT:-13053}"
+LOAD_MODE="${FAILOVER_LOAD_MODE:-loop}"
+LOAD_WARMUP="${FAILOVER_LOAD_WARMUP:-1}"
+MAX_FAILOVER_SECONDS="${FAILOVER_MAX_SECONDS:-10}"
+FIO_RUNTIME="${FAILOVER_FIO_RUNTIME:-30}"
+FIO_SIZE="${FAILOVER_FIO_SIZE:-64m}"
+FIO_JOBS="${FAILOVER_FIO_JOBS:-1}"
+FIO_BS="${FAILOVER_FIO_BS:-128k}"
+FIO_RW="${FAILOVER_FIO_RW:-randwrite}"
 BIN="${CARGO_TARGET_DIR:-target}/${BIN_OVERRIDE:-debug}"
 
 if [ "$(id -u)" = "0" ]; then SUDO=""; else SUDO="${SUDO:-sudo}"; fi
@@ -24,6 +33,7 @@ PRIMARY_CONFIG="$WORK/primary.toml"
 TAKEOVER_CONFIG="$WORK/takeover.toml"
 PRIMARY_LOG="$WORK/primary.log"
 TAKEOVER_LOG="$WORK/takeover.log"
+FIO_LOG="$WORK/fio-load.log"
 PRIMARY_MNT="$WORK/mnt-primary"
 TAKEOVER_MNT="$WORK/mnt-takeover"
 PRIMARY_PID=""
@@ -34,9 +44,10 @@ mkdir -p "$PRIMARY_MNT" "$TAKEOVER_MNT"
 
 cleanup() {
     set +e
+    [ -n "${LOAD_PID:-}" ] && kill "$LOAD_PID" 2>/dev/null
+    [ -n "${LOAD_PID:-}" ] && wait "$LOAD_PID" 2>/dev/null
     $SUDO umount -f "$PRIMARY_MNT" 2>/dev/null
     $SUDO umount -f "$TAKEOVER_MNT" 2>/dev/null
-    [ -n "${LOAD_PID:-}" ] && kill "$LOAD_PID" 2>/dev/null
     [ -n "${PRIMARY_PID:-}" ] && kill "$PRIMARY_PID" 2>/dev/null
     [ -n "${TAKEOVER_PID:-}" ] && kill "$TAKEOVER_PID" 2>/dev/null
     rm -rf "$WORK"
@@ -123,6 +134,106 @@ scrape_metrics() {
     "
 }
 
+ensure_fio() {
+    if [ -x /usr/bin/fio ]; then
+        return 0
+    fi
+    $SUDO apt-get update -qq >/dev/null
+    $SUDO apt-get install -y -qq fio >/dev/null
+}
+
+fio_bin() {
+    if [ -x /usr/bin/fio ]; then
+        echo /usr/bin/fio
+    else
+        command -v fio
+    fi
+}
+
+start_load() {
+    case "$LOAD_MODE" in
+        none)
+            echo "== client load disabled"
+            return 0
+            ;;
+        loop)
+            echo "== starting small client write load"
+            run $SUDO mkdir -p "$PRIMARY_MNT/live-load"
+            (
+                i=0
+                while :; do
+                    printf "load-%06d\n" "$i" |
+                        timeout 5 $SUDO tee "$PRIMARY_MNT/live-load/$i.txt" >/dev/null ||
+                        exit 0
+                    i=$((i + 1))
+                    sleep 0.05
+                done
+            ) &
+            LOAD_PID=$!
+            ;;
+        fio)
+            ensure_fio
+            local fio
+            fio="$(fio_bin)"
+            echo "== starting fio client load: rw=$FIO_RW bs=$FIO_BS size=$FIO_SIZE jobs=$FIO_JOBS"
+            run $SUDO mkdir -p "$PRIMARY_MNT/fio-load"
+            $SUDO "$fio" \
+                --name=failover-load \
+                --directory="$PRIMARY_MNT/fio-load" \
+                --filename=load.dat \
+                --rw="$FIO_RW" \
+                --bs="$FIO_BS" \
+                --size="$FIO_SIZE" \
+                --runtime="$FIO_RUNTIME" \
+                --time_based=1 \
+                --ioengine=sync \
+                --numjobs="$FIO_JOBS" \
+                --group_reporting=1 \
+                --fallocate=none \
+                --end_fsync=1 \
+                --output="$FIO_LOG" \
+                >/dev/null 2>&1 &
+            LOAD_PID=$!
+            ;;
+        *)
+            echo "unknown FAILOVER_LOAD_MODE=$LOAD_MODE (none|loop|fio)"
+            exit 1
+            ;;
+    esac
+    sleep "$LOAD_WARMUP"
+}
+
+stop_load() {
+    if [ -n "${LOAD_PID:-}" ]; then
+        kill "$LOAD_PID" 2>/dev/null || true
+        wait "$LOAD_PID" 2>/dev/null || true
+        LOAD_PID=""
+    fi
+}
+
+signal_load_stop() {
+    if [ -n "${LOAD_PID:-}" ]; then
+        kill "$LOAD_PID" 2>/dev/null || true
+    fi
+}
+
+now_ns() {
+    date +%s%N
+}
+
+elapsed_seconds() {
+    awk -v start="$1" -v end="$2" 'BEGIN { printf "%.3f", (end - start) / 1000000000 }'
+}
+
+assert_failover_target() {
+    local elapsed="$1"
+    awk -v elapsed="$elapsed" -v max="$MAX_FAILOVER_SECONDS" 'BEGIN { exit !(elapsed <= max) }' || {
+        echo "failover took ${elapsed}s, exceeding ${MAX_FAILOVER_SECONDS}s target"
+        [ -s "$FIO_LOG" ] && tail -60 "$FIO_LOG" || true
+        exit 1
+    }
+}
+
 write_config "$PRIMARY_CONFIG" "$PRIMARY_PORT" "$PRIMARY_METRICS_PORT"
 write_config "$TAKEOVER_CONFIG" "$TAKEOVER_PORT" "$TAKEOVER_METRICS_PORT"
 
@@ -139,20 +250,10 @@ $SUDO mount -t nfs \
 echo "== writing durable marker on primary"
 write_file "$PRIMARY_MNT/durable-before-failover.txt" "durable-before-failover"
 run sync "$PRIMARY_MNT/durable-before-failover.txt"
-run $SUDO mkdir "$PRIMARY_MNT/live-load"
-
-echo "== starting small client write load"
-(
-    i=0
-    while :; do
-        printf "load-%06d\n" "$i" | timeout 5 $SUDO tee "$PRIMARY_MNT/live-load/$i.txt" >/dev/null || exit 0
-        i=$((i + 1))
-        sleep 0.05
-    done
-) &
-LOAD_PID=$!
+start_load
 
 echo "== starting takeover slatefsd on $TAKEOVER_PORT"
+FAILOVER_START_NS="$(now_ns)"
 "$BIN/slatefsd" -c "$TAKEOVER_CONFIG" >>"$TAKEOVER_LOG" 2>&1 &
 TAKEOVER_PID=$!
 wait_port "$TAKEOVER_PORT" "$TAKEOVER_LOG"
@@ -168,8 +269,7 @@ set -e
 }
 
 wait_exit "$PRIMARY_PID" "$PRIMARY_LOG"
-wait "$LOAD_PID" 2>/dev/null || true
-LOAD_PID=""
+signal_load_stop
 grep -q "volume fenced; dropping daemon exports" "$PRIMARY_LOG" || {
     echo "primary daemon did not log the fencing transition"
     tail -100 "$PRIMARY_LOG" || true
@@ -187,6 +287,11 @@ run cmp <(printf "durable-before-failover\n") "$TAKEOVER_MNT/durable-before-fail
 write_file "$TAKEOVER_MNT/after-failover.txt" "after-failover"
 run sync "$TAKEOVER_MNT/after-failover.txt"
 run cmp <(printf "after-failover\n") "$TAKEOVER_MNT/after-failover.txt"
+FAILOVER_END_NS="$(now_ns)"
+FAILOVER_SECONDS="$(elapsed_seconds "$FAILOVER_START_NS" "$FAILOVER_END_NS")"
+echo "== failover window: ${FAILOVER_SECONDS}s (target <= ${MAX_FAILOVER_SECONDS}s)"
+assert_failover_target "$FAILOVER_SECONDS"
+stop_load
 
 echo "== verifying takeover metrics and scrub"
 wait_port "$TAKEOVER_METRICS_PORT" "$TAKEOVER_LOG"
