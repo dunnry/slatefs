@@ -53,6 +53,8 @@ Signal:
 
 - Protocol clients see retries or `EIO`.
 - Daemon logs show object-store or SlateDB unavailable errors.
+- `/metrics` reports `slatefs_volume_degraded{tenant="...",volume="..."} 1` or
+  `slatefs_storage_errors_total{tenant="...",volume="..."} > 0`.
 
 Immediate action:
 

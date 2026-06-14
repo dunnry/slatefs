@@ -68,8 +68,4 @@ impl Error {
             reason: reason.into(),
         }
     }
-
-    pub(crate) fn is_fenced(&self) -> bool {
-        matches!(self, Error::SlateDb(error) if is_fenced_slatedb_error(error))
-    }
 }

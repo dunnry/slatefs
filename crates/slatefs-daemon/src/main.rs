@@ -84,6 +84,16 @@ fn render_daemon_metrics(targets: &[MetricsTarget]) -> String {
                     labels,
                     if volume.is_dead() { 1.0 } else { 0.0 },
                 ));
+                samples.push(PrometheusSample::new(
+                    "slatefs_volume_degraded",
+                    labels,
+                    if volume.is_degraded() { 1.0 } else { 0.0 },
+                ));
+                samples.push(PrometheusSample::new(
+                    "slatefs_storage_errors_total",
+                    labels,
+                    volume.storage_errors() as f64,
+                ));
                 let block_labels = [
                     ("tenant", tenant.as_str()),
                     ("volume", volume_name.as_str()),
@@ -687,6 +697,20 @@ mod tests {
             .write(&creds, file.ino, 0, b"baseline")
             .await
             .unwrap();
+        let writable_metrics = render_daemon_metrics(&[MetricsTarget::Writable {
+            tenant: "t".to_string(),
+            volume_name: "v".to_string(),
+            recorder: Arc::new(AggregatingRecorder::default()),
+            volume: Arc::clone(&volume),
+        }]);
+        assert!(
+            writable_metrics.contains("slatefs_volume_degraded{tenant=\"t\",volume=\"v\"} 0"),
+            "{writable_metrics}"
+        );
+        assert!(
+            writable_metrics.contains("slatefs_storage_errors_total{tenant=\"t\",volume=\"v\"} 0"),
+            "{writable_metrics}"
+        );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

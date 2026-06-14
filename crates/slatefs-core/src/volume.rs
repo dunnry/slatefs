@@ -4,7 +4,7 @@
 //! manager, quota tracker, inode allocator, name codec, and open-file table.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use slatedb::admin::AdminBuilder;
@@ -780,6 +780,8 @@ pub struct Volume {
     pub(crate) superblock: Superblock,
     block_metrics: BlockTransformMetrics,
     dead: AtomicBool,
+    degraded: AtomicBool,
+    storage_errors: AtomicU64,
     dead_notify: Notify,
     pub(crate) names: NameCodec,
     pub(crate) locks: LockManager,
@@ -862,6 +864,8 @@ impl Volume {
             superblock,
             block_metrics,
             dead: AtomicBool::new(false),
+            degraded: AtomicBool::new(false),
+            storage_errors: AtomicU64::new(0),
             dead_notify: Notify::new(),
             names: NameCodec::new(dek),
             locks: LockManager::default(),
@@ -886,6 +890,16 @@ impl Volume {
         self.dead.load(Ordering::Acquire)
     }
 
+    /// Whether the volume has observed non-fencing storage errors since open.
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Acquire)
+    }
+
+    /// Count of non-fencing SlateDB/object-store errors observed since open.
+    pub fn storage_errors(&self) -> u64 {
+        self.storage_errors.load(Ordering::Relaxed)
+    }
+
     pub fn block_decode_failures(&self) -> u64 {
         self.block_metrics.decode_failures()
     }
@@ -908,6 +922,25 @@ impl Volume {
         }
     }
 
+    fn mark_degraded(&self, error: &str) {
+        let errors = self.storage_errors.fetch_add(1, Ordering::Relaxed) + 1;
+        if !self.degraded.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                fsid = %format!("{:016x}", self.superblock.fsid),
+                storage_errors = errors,
+                error = %error,
+                "volume degraded after storage error"
+            );
+        } else {
+            tracing::debug!(
+                fsid = %format!("{:016x}", self.superblock.fsid),
+                storage_errors = errors,
+                error = %error,
+                "volume storage error while degraded"
+            );
+        }
+    }
+
     pub async fn wait_dead(&self) {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
         while !self.is_dead() {
@@ -921,6 +954,21 @@ impl Volume {
     pub(crate) fn note_storage_error(&self, error: &slatedb::Error) {
         if is_fenced_slatedb_error(error) {
             self.mark_fenced();
+        } else {
+            self.mark_degraded(&error.to_string());
+        }
+    }
+
+    pub(crate) fn note_core_error(&self, error: &Error) {
+        match error {
+            Error::SlateDb(error) => self.note_storage_error(error),
+            Error::ObjectStore(_) | Error::Crypto(_) | Error::Codec(_) | Error::Io(_) => {
+                self.mark_degraded(&error.to_string());
+            }
+            Error::NotFound { .. }
+            | Error::AlreadyExists { .. }
+            | Error::Invalid { .. }
+            | Error::Config(_) => {}
         }
     }
 
@@ -953,9 +1001,7 @@ impl Volume {
                 Ok(value)
             }
             Err(error) => {
-                if error.is_fenced() {
-                    self.mark_fenced();
-                }
+                self.note_core_error(&error);
                 Err(FsError::from(error))
             }
         }

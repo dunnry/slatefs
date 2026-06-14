@@ -152,6 +152,12 @@ async fn fenced_writer_marks_volume_dead() {
         FsError::Io
     );
     assert!(stale.is_dead(), "stale writer should latch dead");
+    assert!(!stale.is_degraded(), "fencing should be dead, not degraded");
+    assert_eq!(
+        stale.storage_errors(),
+        0,
+        "fencing should not count as a storage outage"
+    );
     tokio::time::timeout(std::time::Duration::from_secs(1), wait_dead)
         .await
         .expect("dead waiter should wake")

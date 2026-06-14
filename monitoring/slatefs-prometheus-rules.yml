@@ -27,3 +27,12 @@ groups:
         annotations:
           summary: "SlateFS block decode failures on {{ $labels.tenant }}/{{ $labels.volume }}"
           description: "A SlateDB block failed AEAD verification. Treat this as possible wrong-key, corruption, tampering, or object-store rollback and stop serving the affected volume."
+
+      - alert: SlateFSVolumeDegraded
+        expr: slatefs_volume_degraded == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SlateFS volume {{ $labels.tenant }}/{{ $labels.volume }} has storage errors"
+          description: "The daemon observed non-fencing SlateDB/object-store errors for this writable volume. Check object-store reachability, credentials, and recent storage-error logs."
