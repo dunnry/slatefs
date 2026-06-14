@@ -118,3 +118,19 @@ After rotation:
 1. Reopen or restart one non-critical export for the tenant.
 2. Run `slatefs volume scrub <tenant> <volume>`.
 3. Keep the old master KMS material recoverable until the new wraps have been verified.
+
+## Clock Discipline
+
+SlateDB fencing, WAL timing, and cache/TTL behavior assume a sane wall clock.
+Run the daemon on hosts with NTP or an equivalent time-sync service enabled
+(`chrony`, `systemd-timesyncd`, or platform time sync), and alert on sustained
+clock drift before serving production exports.
+
+If clock drift is suspected:
+
+1. Drain or stop the affected `slatefsd` process.
+2. Repair host time sync and confirm the clock is stable.
+3. Restart exports and run `slatefs volume scrub <tenant> <volume>` on affected volumes.
+
+Filesystem timestamps may reflect host skew, but they are not used as ordering
+authority for metadata correctness.

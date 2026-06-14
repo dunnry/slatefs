@@ -225,7 +225,7 @@ slatefs/
 │   ├── slatefs-nfs/            # NFSv3 frontend (adapter: Vfs -> nfsserve-family trait)
 │   ├── slatefs-9p/             # 9P2000.L codec + server + adapter (Vfs -> fid table)
 │   ├── slatefs-daemon/         # main bin: config (TOML), listeners, metrics, lifecycle
-│   └── slatefs-cli/            # mgmt: tenant/volume/quota/key/snapshot/fsck/stats
+│   └── slatefs-cli/            # mgmt: tenant/volume/quota/key/snapshot/clone
 └── tests/                      # integration & compliance harnesses (privileged, see §16)
 ```
 
@@ -554,7 +554,8 @@ dedup, DEK rotation via clone, per-tenant qos classes, multi-region.
 6. **Readdir on huge directories** (millions of entries) — schema supports streaming scans;
    guard with readdir pagination tests at 10M entries in Phase 1.
 7. **Clock requirements** — SlateDB monotonic clock + TTL semantics assume sane wall clock;
-   document NTP requirement; FS timestamps tolerate skew (no ordering dependency).
+   the operations runbook documents NTP/clock-drift requirements. FS timestamps tolerate skew
+   (no ordering dependency).
 8. **Shallow-clone online readers** — SlateDB `DbReader` currently misses the external-SST path
    resolver used by writer opens. SlateFS wraps read-only clone scrubs and snapshot exports with
    an ancestor SST fallback store so online reads work; remove that shim when the reader resolver
