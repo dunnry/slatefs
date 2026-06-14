@@ -39,12 +39,14 @@ FAILOVER_LOAD_MODE=fio \
 FAILOVER_FIO_RUNTIME=30 \
 FAILOVER_FIO_SIZE=256m \
 FAILOVER_MAX_SECONDS=10 \
+FAILOVER_FSX_OPS=50000 \
 scripts/docker-kernel-mount-test.sh scripts/nfs-failover-drill.sh
 ```
 
 The script measures from takeover daemon start to the first verified durable
 write on the remounted takeover export, then fails if the window is above
-`FAILOVER_MAX_SECONDS`.
+`FAILOVER_MAX_SECONDS`. When `FAILOVER_FSX_OPS` is set, it also runs `fsx` on
+the takeover mount after the failover to catch post-takeover corruption.
 
 ## Target Table
 

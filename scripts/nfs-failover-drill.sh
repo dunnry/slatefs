@@ -24,6 +24,9 @@ FIO_SIZE="${FAILOVER_FIO_SIZE:-64m}"
 FIO_JOBS="${FAILOVER_FIO_JOBS:-1}"
 FIO_BS="${FAILOVER_FIO_BS:-128k}"
 FIO_RW="${FAILOVER_FIO_RW:-randwrite}"
+FSX_OPS="${FAILOVER_FSX_OPS:-0}"
+FSX_SEED="${FAILOVER_FSX_SEED:-13}"
+FSX_TIMEOUT="${FAILOVER_FSX_TIMEOUT:-120}"
 BIN="${CARGO_TARGET_DIR:-target}/${BIN_OVERRIDE:-debug}"
 
 if [ "$(id -u)" = "0" ]; then SUDO=""; else SUDO="${SUDO:-sudo}"; fi
@@ -148,6 +151,39 @@ fio_bin() {
     else
         command -v fio
     fi
+}
+
+ensure_fsx() {
+    if [ -x /tmp/xfstests/ltp/fsx ]; then
+        return 0
+    fi
+    echo "== building fsx verifier (xfstests)"
+    $SUDO apt-get update -qq >/dev/null
+    $SUDO apt-get install -y -qq git autoconf automake gcc make libtool pkg-config \
+        libacl1-dev libattr1-dev libaio-dev uuid-dev xfslibs-dev >/dev/null
+    rm -rf /tmp/xfstests
+    git clone -q --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git /tmp/xfstests
+    (cd /tmp/xfstests && make -j"$(nproc)" >/dev/null 2>&1) || true
+    [ -x /tmp/xfstests/ltp/fsx ] || {
+        echo "fsx failed to build"
+        exit 1
+    }
+}
+
+run_post_failover_fsx() {
+    if [ "$FSX_OPS" -le 0 ]; then
+        return 0
+    fi
+    ensure_fsx
+    echo "== fsx post-failover verifier: $FSX_OPS ops"
+    timeout "$FSX_TIMEOUT" /tmp/xfstests/ltp/fsx \
+        -q \
+        -S "$FSX_SEED" \
+        -N "$FSX_OPS" \
+        "$TAKEOVER_MNT/fsx-post-failover" || {
+            echo "FSX FAILED after failover"
+            exit 1
+        }
 }
 
 start_load() {
@@ -302,6 +338,7 @@ scrape_metrics "$TAKEOVER_METRICS_PORT" |
         exit 1
     }
 "$BIN/slatefs" -c "$TAKEOVER_CONFIG" volume scrub "$TENANT" "$VOLUME"
+run_post_failover_fsx
 
 echo "== unmount"
 $SUDO umount "$TAKEOVER_MNT"

@@ -40,8 +40,12 @@ SKIP_SMOKE=1 \
 FAILOVER_LOAD_MODE=fio \
 FAILOVER_FIO_RUNTIME=30 \
 FAILOVER_FIO_SIZE=256m \
+FAILOVER_FSX_OPS=50000 \
 scripts/docker-kernel-mount-test.sh scripts/nfs-failover-drill.sh
 ```
+
+`FAILOVER_FSX_OPS` is disabled by default for quick local smokes. When set, the drill builds
+xfstests inside the container and runs `fsx` on the takeover mount after the timed failover.
 
 ## Object Store Outage
 
