@@ -518,6 +518,7 @@ Client support matrix and QEMU guest smoke:
 Served-volume snapshots use `slatefs snapshot create --live <tenant> <volume>`,
 which calls the loopback daemon admin endpoint so checkpoints are created by
 the live writer instead of taking a second writer lease.
+Kernel-client live snapshot drill: [scripts/live-snapshot-over-nfs.sh](scripts/live-snapshot-over-nfs.sh).
 **AC**: failover under fio load < 10s with zero corruption (fsx continues clean post-failover);
 documented perf table vs targets; runbook covers outage/fence/restore/key-rotation drills;
 snapshot mount of a live volume reads consistently while writes continue.

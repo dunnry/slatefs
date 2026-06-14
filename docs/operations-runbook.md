@@ -66,6 +66,17 @@ The CLI prints the checkpoint id for the snapshot export. The underlying daemon
 request is `POST /snapshot/<tenant>/<volume>?name=<snapshot-name>` on
 `[admin].listen`.
 
+Automated drill:
+
+```sh
+SKIP_SMOKE=1 scripts/docker-kernel-mount-test.sh scripts/live-snapshot-over-nfs.sh
+```
+
+The drill writes through a live kernel NFS mount, creates a live snapshot
+through the CLI/admin endpoint, serves the checkpoint on a second NFS mount,
+verifies read-only point-in-time contents, and checks the snapshot decode
+failure metric.
+
 For a writable restore workspace:
 
 1. Create a clone: `slatefs clone create <tenant> <source-volume> <clone-volume> --snapshot <checkpoint-id>`.
