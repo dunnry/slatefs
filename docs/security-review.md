@@ -31,7 +31,7 @@ or behavior changes are preferred until a GA contract exists.
 | SR-2 | Medium | NFSv3 AUTH_SYS identities are unauthenticated uid/gid assertions. | Accepted by DD-10. Use per-export source allowlists, squash policy, and network isolation. |
 | SR-3 | Low | Xattr names are plaintext key suffixes and can appear in SST first/last-key metadata. Xattr values are encrypted. | Documented v1 exception. Future hardening can SIV-encrypt xattr names like filenames. |
 | SR-4 | Low | Object-store rollback/history replay is out of scope; SlateDB fencing protects live single-writer integrity, not malicious bucket rollback. | Documented out of scope. Use bucket versioning, object lock, audit logs, and cloud IAM controls in production. |
-| SR-5 | Low | `slatefs_block_decode_failures_total` currently covers served writable volumes. Control-plane and snapshot-reader decode failures still fail closed and log, but are not counted by that per-volume metric. | Accept for current Phase 6 alerting. Revisit when snapshot/control-plane metrics targets are added. |
+| SR-5 | Low | `slatefs_block_decode_failures_total` covers served writable volumes and snapshot exports. Control-plane decode failures still fail closed and log, but are not counted by that per-volume metric. | Accept for current Phase 6 alerting. Revisit when control-plane metrics targets are added. |
 
 ## Verification Run
 

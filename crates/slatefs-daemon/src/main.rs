@@ -32,11 +32,19 @@ struct Args {
 }
 
 #[derive(Clone)]
-struct MetricsTarget {
-    tenant: String,
-    volume_name: String,
-    recorder: Arc<AggregatingRecorder>,
-    volume: Arc<Volume>,
+enum MetricsTarget {
+    Writable {
+        tenant: String,
+        volume_name: String,
+        recorder: Arc<AggregatingRecorder>,
+        volume: Arc<Volume>,
+    },
+    Snapshot {
+        tenant: String,
+        volume_name: String,
+        snapshot_id: String,
+        volume: Arc<SnapshotVolume>,
+    },
 }
 
 type AdminTargets = Arc<HashMap<(String, String), Arc<Volume>>>;
@@ -60,21 +68,52 @@ fn tenant_rate_limiter(
 fn render_daemon_metrics(targets: &[MetricsTarget]) -> String {
     let mut samples = Vec::new();
     for target in targets {
-        let labels = [
-            ("tenant", target.tenant.as_str()),
-            ("volume", target.volume_name.as_str()),
-        ];
-        samples.push(PrometheusSample::new(
-            "slatefs_volume_dead",
-            labels,
-            if target.volume.is_dead() { 1.0 } else { 0.0 },
-        ));
-        samples.push(PrometheusSample::new(
-            "slatefs_block_decode_failures_total",
-            labels,
-            target.volume.block_decode_failures() as f64,
-        ));
-        samples.extend(target.recorder.prometheus_samples(&labels));
+        match target {
+            MetricsTarget::Writable {
+                tenant,
+                volume_name,
+                recorder,
+                volume,
+            } => {
+                let labels = [
+                    ("tenant", tenant.as_str()),
+                    ("volume", volume_name.as_str()),
+                ];
+                samples.push(PrometheusSample::new(
+                    "slatefs_volume_dead",
+                    labels,
+                    if volume.is_dead() { 1.0 } else { 0.0 },
+                ));
+                let block_labels = [
+                    ("tenant", tenant.as_str()),
+                    ("volume", volume_name.as_str()),
+                    ("snapshot", "-"),
+                ];
+                samples.push(PrometheusSample::new(
+                    "slatefs_block_decode_failures_total",
+                    block_labels,
+                    volume.block_decode_failures() as f64,
+                ));
+                samples.extend(recorder.prometheus_samples(&labels));
+            }
+            MetricsTarget::Snapshot {
+                tenant,
+                volume_name,
+                snapshot_id,
+                volume,
+            } => {
+                let labels = [
+                    ("tenant", tenant.as_str()),
+                    ("volume", volume_name.as_str()),
+                    ("snapshot", snapshot_id.as_str()),
+                ];
+                samples.push(PrometheusSample::new(
+                    "slatefs_block_decode_failures_total",
+                    labels,
+                    volume.block_decode_failures() as f64,
+                ));
+            }
+        }
     }
     render_prometheus(&samples)
 }
@@ -307,6 +346,12 @@ async fn main() -> anyhow::Result<()> {
                                     export.tenant, export.volume
                                 )
                             })?;
+                    metrics_targets.push(MetricsTarget::Snapshot {
+                        tenant: export.tenant.clone(),
+                        volume_name: export.volume.clone(),
+                        snapshot_id: snapshot.clone(),
+                        volume: Arc::clone(&snapshot_volume),
+                    });
                     snapshot_volumes.push(Arc::clone(&snapshot_volume));
                     snapshot_volume
                 } else {
@@ -350,7 +395,7 @@ async fn main() -> anyhow::Result<()> {
                             // cache-related engine metrics periodically per volume.
                             let (tenant, volume_name) =
                                 (export.tenant.clone(), export.volume.clone());
-                            metrics_targets.push(MetricsTarget {
+                            metrics_targets.push(MetricsTarget::Writable {
                                 tenant: tenant.clone(),
                                 volume_name: volume_name.clone(),
                                 recorder: Arc::clone(&recorder),
@@ -646,6 +691,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes.as_ref(), b"baseline");
+        let metrics = render_daemon_metrics(&[MetricsTarget::Snapshot {
+            tenant: "t".to_string(),
+            volume_name: "v".to_string(),
+            snapshot_id: snapshot_id.clone(),
+            volume: Arc::clone(&snapshot),
+        }]);
+        assert!(
+            metrics.contains(&format!(
+                "slatefs_block_decode_failures_total{{tenant=\"t\",volume=\"v\",snapshot=\"{snapshot_id}\"}} 0"
+            )),
+            "{metrics}"
+        );
         snapshot.shutdown().await.unwrap();
         volume.shutdown().await.unwrap();
         control.close().await.unwrap();

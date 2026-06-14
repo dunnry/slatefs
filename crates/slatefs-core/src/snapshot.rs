@@ -13,7 +13,7 @@ use slatedb::object_store::ObjectStore;
 use crate::control::{QuotaLimits, VolumeRecord, VolumeState};
 use crate::crypto::Secret32;
 use crate::crypto::names::NameCodec;
-use crate::crypto::transformer::SlateBlockTransformer;
+use crate::crypto::transformer::{BlockTransformMetrics, SlateBlockTransformer};
 use crate::error::{Error, Result};
 use crate::locks::{LockRange, RangeLock, RangeLockTable};
 use crate::meta::dirent::{Dirent, DirentIdx};
@@ -39,6 +39,7 @@ pub struct SnapshotVolume {
     names: NameCodec,
     chunk_size: u64,
     quota: QuotaLimits,
+    block_metrics: BlockTransformMetrics,
     handles: Mutex<HandleTable>,
     range_locks: RangeLockTable,
 }
@@ -58,12 +59,14 @@ impl SnapshotVolume {
         }
         let checkpoint = uuid::Uuid::parse_str(snapshot_id)
             .map_err(|e| Error::invalid("snapshot id", format!("{snapshot_id:?}: {e}")))?;
+        let block_metrics = BlockTransformMetrics::default();
         let path = store::volume_db_path(&record.tenant, &record.name);
         let reader = DbReader::builder(path, object_store)
             .with_checkpoint_id(checkpoint)
-            .with_block_transformer(Arc::new(SlateBlockTransformer::new(
+            .with_block_transformer(Arc::new(SlateBlockTransformer::with_metrics(
                 record.cipher,
                 dek.clone(),
+                block_metrics.clone(),
             )))
             .with_merge_operator(Arc::new(CounterMergeOperator))
             .build()
@@ -101,9 +104,14 @@ impl SnapshotVolume {
             chunk_size: superblock.chunk_size as u64,
             names: NameCodec::new(dek),
             quota: record.quota,
+            block_metrics,
             handles: Mutex::new(HandleTable::default()),
             range_locks: RangeLockTable::default(),
         }))
+    }
+
+    pub fn block_decode_failures(&self) -> u64 {
+        self.block_metrics.decode_failures()
     }
 
     pub async fn shutdown(&self) -> Result<()> {
