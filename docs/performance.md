@@ -59,3 +59,33 @@ Docker Desktop or laptop file-store results as product targets.
 | Cold read p99 | object-store latency + decode | DD-4 cache model |
 | Failover under client load | < 10 s | Phase 6 acceptance criteria |
 | Metadata create/stat/unlink | bench-host baseline | fio harness metadata smoke |
+
+## Multi-Volume Overhead
+
+DD-1 calls for measuring one-DB-per-volume overhead at 100 idle volumes plus 20
+hot volumes. Run the harness through the same privileged Docker wrapper:
+
+```sh
+SKIP_SMOKE=1 \
+scripts/docker-kernel-mount-test.sh scripts/multi-volume-overhead.sh
+```
+
+The script creates `MULTI_IDLE_VOLUMES` idle volumes and `MULTI_HOT_VOLUMES` hot
+volumes, starts a one-export baseline daemon, then starts a daemon with all
+exports open. It mounts the hot subset through kernel NFS, writes and stats test
+files concurrently, and emits a markdown report with:
+
+- baseline/all-export/after-workload daemon RSS;
+- approximate KiB per additional open volume;
+- object-store/cache-related Prometheus metric deltas and per-second rates.
+
+For a quick local smoke:
+
+```sh
+SKIP_SMOKE=1 \
+MULTI_IDLE_VOLUMES=2 \
+MULTI_HOT_VOLUMES=1 \
+MULTI_OPS_PER_VOLUME=2 \
+MULTI_FILE_KIB=4 \
+scripts/docker-kernel-mount-test.sh scripts/multi-volume-overhead.sh
+```

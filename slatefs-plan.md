@@ -512,6 +512,8 @@ Perf harness: [docs/performance.md](docs/performance.md) and
 [scripts/fio-over-nfs.sh](scripts/fio-over-nfs.sh).
 Dashboard: [monitoring/slatefs-grafana-dashboard.json](monitoring/slatefs-grafana-dashboard.json).
 Security review: [docs/security-review.md](docs/security-review.md).
+Multi-volume overhead harness for DD-1:
+[scripts/multi-volume-overhead.sh](scripts/multi-volume-overhead.sh).
 Failover drill with optional fio load, a <10s timing gate, and post-takeover fsx:
 [scripts/nfs-failover-drill.sh](scripts/nfs-failover-drill.sh).
 Client support matrix and QEMU guest smoke:
