@@ -239,15 +239,11 @@ echo "== verifying clone writes do not affect live volume"
 run cmp <(printf "latest\n") "$LIVE_MNT/live.txt"
 run cmp <(printf "live-only\n") "$LIVE_MNT/live-only.txt"
 run test ! -e "$LIVE_MNT/clone-only.txt"
-
-echo "== stopping clone export for offline fsck"
-$SUDO umount "$CLONE_MNT"
-kill "$CLONE_PID"
-wait "$CLONE_PID" 2>/dev/null || true
-CLONE_PID=""
-"$BIN/slatefs" -c "$CLONE_CONFIG" volume fsck "$TENANT" "$CLONE_VOLUME"
+echo "== verifying online clone scrub"
+"$BIN/slatefs" -c "$CLONE_CONFIG" volume scrub "$TENANT" "$CLONE_VOLUME"
 
 echo "== unmount"
+$SUDO umount "$CLONE_MNT"
 $SUDO umount "$SNAPSHOT_MNT"
 $SUDO umount "$LIVE_MNT"
 echo "live snapshot and clone restore over NFS PASSED"

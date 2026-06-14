@@ -454,6 +454,13 @@ async fn phase0_round_trip(object_store: Arc<dyn ObjectStore>) {
         read_root_file(&control, Arc::clone(&object_store), &source, b"file").await,
         b"latest!!"
     );
+    let clone_scrub = volume::scrub_volume(&control, Arc::clone(&object_store), "tclone", "latest")
+        .await
+        .expect("scrub mutated shallow clone");
+    assert!(
+        clone_scrub.is_clean(),
+        "mutated shallow clone should scrub clean: {clone_scrub:?}"
+    );
     assert!(matches!(
         control.delete_volume("tclone", "src").await,
         Err(Error::Invalid { .. })

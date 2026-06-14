@@ -91,15 +91,15 @@ The drill writes through a live kernel NFS mount, creates a live snapshot
 through the CLI/admin endpoint, serves the checkpoint on a second NFS mount,
 verifies read-only point-in-time contents, checks the snapshot decode failure
 metric, creates a writable clone from the same checkpoint, mounts the clone,
-verifies clone writes do not affect the live volume, stops the clone export,
-and validates the clone with offline `slatefs volume fsck`.
+verifies clone writes do not affect the live volume, and validates the clone
+with online `slatefs volume scrub`.
 
 For a writable restore workspace:
 
 1. Create a clone: `slatefs clone create <tenant> <source-volume> <clone-volume> --snapshot <checkpoint-id>`.
 2. Export the clone as a normal writable volume.
 3. Run a read/write smoke through the clone mount.
-4. Stop the clone export and validate with `slatefs volume fsck <tenant> <clone-volume>`.
+4. Validate with `slatefs volume scrub <tenant> <clone-volume>`.
 
 ## Key Rotation
 

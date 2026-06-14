@@ -6,13 +6,22 @@
 //! <root>/volumes/<t>/<v>    one SlateDB per volume (DD-1)
 //! ```
 
+use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use bytes::Bytes;
 use futures::TryStreamExt;
+use futures::stream::BoxStream;
+use slatedb::object_store::path::Path as ObjPath;
+use slatedb::object_store::{
+    Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
+};
 // Re-exported so frontends/CLI don't need a direct slatedb dependency just to
 // hold a store handle.
 pub use slatedb::object_store::ObjectStore;
-use slatedb::object_store::path::Path as ObjPath;
 
 use crate::error::{Error, Result};
 
@@ -37,6 +46,153 @@ pub fn volume_db_path(tenant: &str, volume: &str) -> String {
 
 pub fn volume_db_prefix(tenant: &str, volume: &str) -> ObjPath {
     ObjPath::from(volume_db_path(tenant, volume))
+}
+
+/// Temporary SlateDB 0.13 reader shim for shallow clones.
+///
+/// `Db::builder` installs a `PathResolver` with `external_ssts` from the
+/// manifest, but `DbReader::builder` currently constructs a plain table store.
+/// Until that upstream reader path is fixed, read-only operations on a clone
+/// can ask for parent-owned SSTs under the clone prefix. Retry those missing
+/// compacted SST reads under ancestor prefixes without affecting writes,
+/// manifests, WAL, listings, or non-clone volumes.
+pub fn clone_parent_read_fallback_store(
+    inner: Arc<dyn ObjectStore>,
+    clone_tenant: &str,
+    clone_volume: &str,
+    parent_prefixes: Vec<String>,
+) -> Arc<dyn ObjectStore> {
+    Arc::new(CloneParentReadFallbackStore {
+        inner,
+        clone_prefix: volume_db_path(clone_tenant, clone_volume),
+        parent_prefixes,
+    })
+}
+
+#[derive(Debug)]
+struct CloneParentReadFallbackStore {
+    inner: Arc<dyn ObjectStore>,
+    clone_prefix: String,
+    parent_prefixes: Vec<String>,
+}
+
+impl CloneParentReadFallbackStore {
+    fn remap_compacted_ssts(&self, location: &ObjPath) -> Option<Vec<ObjPath>> {
+        let raw: String = location.clone().into();
+        let suffix = raw.strip_prefix(&self.clone_prefix)?.strip_prefix('/')?;
+        if !suffix.starts_with("compacted/") {
+            return None;
+        }
+        Some(
+            self.parent_prefixes
+                .iter()
+                .map(|prefix| ObjPath::from(format!("{prefix}/{suffix}")))
+                .collect(),
+        )
+    }
+}
+
+impl fmt::Display for CloneParentReadFallbackStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "clone-parent-read-fallback({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for CloneParentReadFallbackStore {
+    async fn put_opts(
+        &self,
+        location: &ObjPath,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> ObjectStoreResult<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &ObjPath,
+        opts: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &ObjPath,
+        options: GetOptions,
+    ) -> ObjectStoreResult<GetResult> {
+        match self.inner.get_opts(location, options.clone()).await {
+            Ok(result) => Ok(result),
+            Err(error @ ObjectStoreError::NotFound { .. }) => {
+                match self.remap_compacted_ssts(location) {
+                    Some(parent_locations) => {
+                        let mut last_not_found = error;
+                        for parent_location in parent_locations {
+                            match self.inner.get_opts(&parent_location, options.clone()).await {
+                                Ok(result) => return Ok(result),
+                                Err(error @ ObjectStoreError::NotFound { .. }) => {
+                                    last_not_found = error;
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Err(last_not_found)
+                    }
+                    None => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn get_range(&self, location: &ObjPath, range: Range<u64>) -> ObjectStoreResult<Bytes> {
+        let options = GetOptions {
+            range: Some(range.into()),
+            ..Default::default()
+        };
+        self.get_opts(location, options).await?.bytes().await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &ObjPath,
+        ranges: &[Range<u64>],
+    ) -> ObjectStoreResult<Vec<Bytes>> {
+        let mut out = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            out.push(self.get_range(location, range.clone()).await?);
+        }
+        Ok(out)
+    }
+
+    async fn head(&self, location: &ObjPath) -> ObjectStoreResult<ObjectMeta> {
+        let options = GetOptions {
+            head: true,
+            ..Default::default()
+        };
+        Ok(self.get_opts(location, options).await?.meta)
+    }
+
+    async fn delete(&self, location: &ObjPath) -> ObjectStoreResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&ObjPath>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&ObjPath>) -> ObjectStoreResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &ObjPath, to: &ObjPath) -> ObjectStoreResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &ObjPath, to: &ObjPath) -> ObjectStoreResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
 }
 
 pub async fn delete_prefix(object_store: &Arc<dyn ObjectStore>, prefix: &ObjPath) -> Result<usize> {

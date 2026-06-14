@@ -577,9 +577,20 @@ pub async fn scrub_volume(
     let record = control.get_volume(tenant_name, volume_name).await?;
     let dek = control.unwrap_volume_dek(&record).await?;
     let names = NameCodec::new(dek.clone());
+    let clone_parent_prefixes = clone_parent_prefixes(control, &record).await?;
+    let reader_store = if clone_parent_prefixes.is_empty() {
+        Arc::clone(&object_store)
+    } else {
+        store::clone_parent_read_fallback_store(
+            Arc::clone(&object_store),
+            &record.tenant,
+            &record.name,
+            clone_parent_prefixes,
+        )
+    };
 
     let path = store::volume_db_path(&record.tenant, &record.name);
-    let reader = DbReader::builder(path, object_store)
+    let reader = DbReader::builder(path, reader_store)
         .with_block_transformer(Arc::new(SlateBlockTransformer::new(record.cipher, dek)))
         .with_merge_operator(Arc::new(CounterMergeOperator))
         .build()
@@ -606,6 +617,29 @@ pub async fn scrub_volume(
 
     reader.close().await?;
     result
+}
+
+async fn clone_parent_prefixes(
+    control: &ControlPlane,
+    record: &VolumeRecord,
+) -> Result<Vec<String>> {
+    let mut prefixes = Vec::new();
+    let mut next = record.clone_parent.clone();
+    for _ in 0..32 {
+        let Some(parent) = next else {
+            return Ok(prefixes);
+        };
+        prefixes.push(store::volume_db_path(&parent.tenant, &parent.volume));
+        let parent_record = control.get_volume(&parent.tenant, &parent.volume).await?;
+        next = parent_record.clone_parent;
+    }
+    Err(Error::invalid(
+        "clone ancestry",
+        format!(
+            "{}/{} has a cycle or too many ancestors",
+            record.tenant, record.name
+        ),
+    ))
 }
 
 /// Create a durable SlateDB checkpoint for a quiesced volume. This opens the

@@ -550,8 +550,9 @@ dedup, DEK rotation via clone, per-tenant qos classes, multi-region.
 7. **Clock requirements** — SlateDB monotonic clock + TTL semantics assume sane wall clock;
    document NTP requirement; FS timestamps tolerate skew (no ordering dependency).
 8. **Shallow-clone online readers** — SlateDB `DbReader` currently misses the external-SST path
-   resolver used by writer opens, so online scrub of shallow clones can fail after clone writes.
-   Keep writable-restore validation on offline `fsck` until the reader resolver is fixed upstream.
+   resolver used by writer opens. SlateFS wraps read-only clone scrubs with an ancestor SST
+   fallback store so online scrub works; remove that shim when the reader resolver is fixed
+   upstream.
 9. **ZeroFS license** before reading its source (§0).
 
 ---
