@@ -5,6 +5,8 @@ A multi-tenant POSIX filesystem served over **NFSv3** and **9P2000.L**, with
 durable backend), compression + encryption at rest, and tiered local caches.
 
 Design and roadmap: [slatefs-plan.md](slatefs-plan.md).
+Architecture docs: [docs/architecture.md](docs/architecture.md) and
+[docs/deployment-architecture.md](docs/deployment-architecture.md).
 
 ## Status
 
