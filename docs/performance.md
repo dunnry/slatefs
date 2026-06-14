@@ -7,6 +7,35 @@ in-process shortcut. The fio sweep lives in:
 scripts/fio-over-nfs.sh
 ```
 
+For the production-like Azure Blob path, use:
+
+```sh
+AZURE_SUBSCRIPTION_ID=0a1ca07f-76d3-4739-b946-58d39524082f \
+scripts/azure-prodtest.sh all
+```
+
+That harness creates a fresh East US 2 rig by default: one Blob-backed storage
+account, one kernel-NFS client VM, two daemon VMs, local Prometheus/Grafana
+through an SSH metrics tunnel, and then deallocates all VMs at the end of the
+run. It leaves the resource group, storage account, and collected artifacts in
+place for inspection. Use `AZURE_PRODTEST_FIO_RUNTIME`,
+`AZURE_PRODTEST_FIO_SIZE`, and `AZURE_PRODTEST_FIO_JOBS` to scale the fio
+matrix.
+
+For a quota-friendly harness smoke, skip the unused takeover VM and use a
+smaller VM size:
+
+```sh
+AZURE_PRODTEST_CREATE_DAEMON2=0 \
+AZURE_PRODTEST_VM_SIZE=Standard_D2ds_v5 \
+AZURE_PRODTEST_FIO_RUNTIME=1 \
+AZURE_PRODTEST_FIO_SIZE=16m \
+AZURE_PRODTEST_FIO_BS_LIST=4k \
+AZURE_PRODTEST_FIO_RW_LIST=write \
+AZURE_PRODTEST_META_OPS=1 \
+scripts/azure-prodtest.sh all
+```
+
 Run it through the existing privileged Docker harness:
 
 ```sh
@@ -136,6 +165,41 @@ targets.
 
 The same run completed the metadata smoke with 1500 create/stat/unlink cycles
 in 57.798 seconds (26.0 ops/s).
+
+## Azure Blob Cross-VM Evidence
+
+On 2026-06-14, a three-VM East US 2 Azure rig completed the cross-VM fio matrix
+against Azure Blob storage. The rig used a dedicated client VM mounting NFSv3
+from a dedicated daemon VM over the private VNet, with `FIO_RUNTIME=30`,
+`FIO_SIZE=512m`, `FIO_JOBS=4`, `FIO_PREFILL_BS=4k`,
+`FIO_PREFILL_FSYNC=0`, the bounded `[slatedb]` settings above, and the disk
+cache open-file cap at 256. The storage account was Standard LRS block blob;
+premium block blobs were not used. Sequential read rows are
+kernel-client-visible measurements and can include Linux NFS page cache
+effects.
+
+The run first exposed two production-like bugs: an empty SlateDB scan range in
+sequential read-ahead and unbounded disk-cache file handles under Blob-backed
+write load. Both fixes landed before the final matrix below.
+
+| workload | block | IOPS | MiB/s | mean ms | p99 ms |
+|---|---:|---:|---:|---:|---:|
+| read | 4k | 563364 | 2200.6 | 0.007 | 0.253 |
+| write | 4k | 70511 | 275.4 | 0.040 | 0.012 |
+| randread | 4k | 38653 | 151.0 | 0.102 | 0.494 |
+| randwrite | 4k | 13391 | 52.3 | 0.252 | 0.013 |
+| read | 128k | 13368 | 1671.0 | 0.292 | 1.253 |
+| write | 128k | 925 | 115.6 | 4.220 | 5.276 |
+| randread | 128k | 23213 | 2901.6 | 0.161 | 0.799 |
+| randwrite | 128k | 491 | 61.4 | 7.146 | 0.100 |
+| read | 1m | 3895 | 3895.1 | 1.015 | 3.424 |
+| write | 1m | 109 | 109.3 | 33.970 | 189.792 |
+| randread | 1m | 4311 | 4311.5 | 0.841 | 4.293 |
+| randwrite | 1m | 89 | 89.1 | 36.530 | 19.268 |
+
+The same run completed the metadata smoke with 1500 create/stat/unlink cycles
+in 101.142 seconds (14.8 ops/s). The Azure VMs were deallocated after artifact
+collection.
 
 ## Multi-Volume Overhead
 

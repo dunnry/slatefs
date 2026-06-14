@@ -147,7 +147,10 @@ The live snapshot mount drill is
 mounts a writable clone restored from the checkpoint.
 The NFS fio performance matrix is documented in
 [docs/performance.md](docs/performance.md) and runnable via
-[scripts/fio-over-nfs.sh](scripts/fio-over-nfs.sh).
+[scripts/fio-over-nfs.sh](scripts/fio-over-nfs.sh). The production-like Azure
+Blob cross-VM harness is [scripts/azure-prodtest.sh](scripts/azure-prodtest.sh);
+it provisions a fresh rig, runs the matrix, starts local Prometheus/Grafana,
+collects artifacts, and deallocates VMs by default.
 The Phase 6 security review is recorded in
 [docs/security-review.md](docs/security-review.md).
 The current pre-GA on-disk format and explicit no-backwards-compatibility
