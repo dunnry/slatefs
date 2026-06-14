@@ -190,7 +190,8 @@ Every mutating batch includes `merge(q/usage/bytes, Δi64)` / `merge(q/usage/ino
 counters can never drift from a crash (same atomic commit). Enforcement reads an authoritative
 in-memory counter (loaded at volume mount, updated synchronously — valid because single writer)
 and rejects with `EDQUOT`/`ENOSPC` *before* building the batch. An offline
-`slatefs fsck --recount` rebuilds counters by scan; a scheduled scrub compares and alerts.
+`slatefs volume fsck --recount <tenant> <volume>` rebuilds counters by scan; an online
+`slatefs volume scrub <tenant> <volume>` compares and alerts.
 
 **DD-10: Tenant→export mapping per protocol.**
 NFSv3 auth is AUTH_SYS (uid/gid assertions, no cryptographic identity). Tenancy therefore binds to
@@ -420,8 +421,9 @@ that NFSv3 clients without NLM see locks only via 9P-side enforcement.
   files shouldn't bill for holes… **Decision**: bill `bytes_used = Σ allocated chunk bytes`
   (sparse-friendly, predictable: a hole costs 0, a 1-byte chunk costs chunk overhead is invisible
   — we bill `min(size − chunk_start, chunk_size)` per *existing* chunk). fsck recomputes the same.
-- `slatefs fsck --recount` (offline per volume) and an online scrub (DbReader on latest state,
-  compare, alert on drift > 0) — drift should be impossible (atomic merges) so any drift is a bug.
+- `slatefs volume fsck --recount <tenant> <volume>` (offline per volume) and
+  `slatefs volume scrub <tenant> <volume>` (DbReader on latest state, compare, alert on drift > 0)
+  — drift should be impossible (atomic merges) so any drift is a bug.
 
 ---
 
@@ -438,9 +440,11 @@ that NFSv3 clients without NLM see locks only via 9P-side enforcement.
 - Metrics (Prometheus): per-op latency histograms per protocol, cache hit ratios (slatedb
   `with_metrics_recorder` + `CachedObjectStore` part-hit stats), quota usage, flush latency,
   fencing events, AEAD failures (security signal!).
-- `slatefs` CLI: `tenant …`, `volume create|mkfs|delete|mount-info`, `quota set|show`,
-  `key rotate-kek`, `snapshot create|list|delete` (SlateDB checkpoints), `clone` (CloneBuilder →
-  new writable volume, instant, shares SSTs), `fsck`, `stats`.
+- `slatefs` CLI: `tenant create|suspend|resume|delete|list|rate`,
+  `volume create|info|list|fsck|scrub|delete`, `quota set|show`,
+  `key rotate-kek`, `snapshot create|list|delete` (SlateDB checkpoints), and
+  `clone create` (CloneBuilder → new writable volume, instant, shares SSTs). Runtime stats are
+  exposed through the daemon `/metrics` endpoint.
 - Snapshots: `Db::create_checkpoint` per volume; expose read-only mounts of snapshots via
   `DbReader::with_checkpoint` volumes (read-only exports). Clones for dev/test workflows.
 
