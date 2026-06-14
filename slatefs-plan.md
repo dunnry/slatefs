@@ -520,7 +520,8 @@ Client support matrix and QEMU guest smoke:
 Served-volume snapshots use `slatefs snapshot create --live <tenant> <volume>`,
 which calls the loopback daemon admin endpoint so checkpoints are created by
 the live writer instead of taking a second writer lease.
-Kernel-client live snapshot drill: [scripts/live-snapshot-over-nfs.sh](scripts/live-snapshot-over-nfs.sh).
+Kernel-client live snapshot + writable clone restore drill:
+[scripts/live-snapshot-over-nfs.sh](scripts/live-snapshot-over-nfs.sh).
 **AC**: failover under fio load < 10s with zero corruption (fsx continues clean post-failover);
 documented perf table vs targets; runbook covers outage/fence/restore/key-rotation drills;
 snapshot mount of a live volume reads consistently while writes continue.
@@ -548,7 +549,10 @@ dedup, DEK rotation via clone, per-tenant qos classes, multi-region.
    guard with readdir pagination tests at 10M entries in Phase 1.
 7. **Clock requirements** — SlateDB monotonic clock + TTL semantics assume sane wall clock;
    document NTP requirement; FS timestamps tolerate skew (no ordering dependency).
-8. **ZeroFS license** before reading its source (§0).
+8. **Shallow-clone online readers** — SlateDB `DbReader` currently misses the external-SST path
+   resolver used by writer opens, so online scrub of shallow clones can fail after clone writes.
+   Keep writable-restore validation on offline `fsck` until the reader resolver is fixed upstream.
+9. **ZeroFS license** before reading its source (§0).
 
 ---
 

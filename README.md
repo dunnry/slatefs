@@ -143,7 +143,8 @@ NFS takeover drill in [scripts/nfs-failover-drill.sh](scripts/nfs-failover-drill
 that can run under fio load, enforce the Phase 6 failover-time target, and
 optionally run fsx after takeover.
 The live snapshot mount drill is
-[scripts/live-snapshot-over-nfs.sh](scripts/live-snapshot-over-nfs.sh).
+[scripts/live-snapshot-over-nfs.sh](scripts/live-snapshot-over-nfs.sh); it also
+mounts a writable clone restored from the checkpoint.
 The NFS fio performance matrix is documented in
 [docs/performance.md](docs/performance.md) and runnable via
 [scripts/fio-over-nfs.sh](scripts/fio-over-nfs.sh).

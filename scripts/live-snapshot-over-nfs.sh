@@ -4,15 +4,19 @@
 # Runs inside the privileged container from docker-kernel-mount-test.sh. A
 # live slatefsd writer serves a kernel NFS mount, the CLI creates a checkpoint
 # through the daemon admin endpoint, then a second daemon serves that checkpoint
-# as a read-only snapshot export while writes continue on the live mount.
+# as a read-only snapshot export while writes continue on the live mount. The
+# same checkpoint is also cloned into a writable restore volume and mounted
+# through a third kernel NFS client.
 set -euo pipefail
 
 CONFIG="${SLATEFS_CONFIG:?set SLATEFS_CONFIG}"
 TENANT="${SLATEFS_TENANT:-t1}"
 VOLUME="${SLATEFS_VOLUME:-v1}"
+CLONE_VOLUME="${LIVE_SNAPSHOT_CLONE_VOLUME:-${VOLUME}_restore}"
 LIVE_PORT="${LIVE_SNAPSHOT_PORT:-12056}"
 ADMIN_PORT="${LIVE_SNAPSHOT_ADMIN_PORT:-13056}"
 SNAPSHOT_PORT="${LIVE_SNAPSHOT_SNAPSHOT_PORT:-12057}"
+CLONE_PORT="${LIVE_SNAPSHOT_CLONE_PORT:-12058}"
 METRICS_PORT="${LIVE_SNAPSHOT_METRICS_PORT:-13057}"
 BIN="${CARGO_TARGET_DIR:-target}/${BIN_OVERRIDE:-debug}"
 
@@ -21,22 +25,28 @@ if [ "$(id -u)" = "0" ]; then SUDO=""; else SUDO="${SUDO:-sudo}"; fi
 WORK="$(mktemp -d)"
 LIVE_CONFIG="$WORK/live.toml"
 SNAPSHOT_CONFIG="$WORK/snapshot.toml"
+CLONE_CONFIG="$WORK/clone.toml"
 LIVE_LOG="$WORK/live.log"
 SNAPSHOT_LOG="$WORK/snapshot.log"
+CLONE_LOG="$WORK/clone.log"
 LIVE_MNT="$WORK/mnt-live"
 SNAPSHOT_MNT="$WORK/mnt-snapshot"
+CLONE_MNT="$WORK/mnt-clone"
 LIVE_PID=""
 SNAPSHOT_PID=""
+CLONE_PID=""
 SNAPSHOT_ID=""
 
-mkdir -p "$LIVE_MNT" "$SNAPSHOT_MNT"
+mkdir -p "$LIVE_MNT" "$SNAPSHOT_MNT" "$CLONE_MNT"
 
 cleanup() {
     set +e
     $SUDO umount -f "$LIVE_MNT" 2>/dev/null
     $SUDO umount -f "$SNAPSHOT_MNT" 2>/dev/null
+    $SUDO umount -f "$CLONE_MNT" 2>/dev/null
     [ -n "${LIVE_PID:-}" ] && kill "$LIVE_PID" 2>/dev/null
     [ -n "${SNAPSHOT_PID:-}" ] && kill "$SNAPSHOT_PID" 2>/dev/null
+    [ -n "${CLONE_PID:-}" ] && kill "$CLONE_PID" 2>/dev/null
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -78,6 +88,18 @@ tenant = "$TENANT"
 volume = "$VOLUME"
 snapshot = "$SNAPSHOT_ID"
 listen = "127.0.0.1:$SNAPSHOT_PORT"
+squash = "none"
+EOF
+}
+
+write_clone_config() {
+    base_config > "$CLONE_CONFIG"
+    cat >> "$CLONE_CONFIG" <<EOF
+
+[[exports]]
+tenant = "$TENANT"
+volume = "$CLONE_VOLUME"
+listen = "127.0.0.1:$CLONE_PORT"
 squash = "none"
 EOF
 }
@@ -186,7 +208,46 @@ scrape_metrics "$METRICS_PORT" |
         exit 1
     }
 
+echo "== creating writable clone from live snapshot"
+"$BIN/slatefs" -c "$LIVE_CONFIG" clone create "$TENANT" "$VOLUME" "$CLONE_VOLUME" \
+    --snapshot "$SNAPSHOT_ID" \
+    --note "kernel live snapshot restore clone"
+
+write_clone_config
+
+echo "== starting clone slatefsd on $CLONE_PORT"
+"$BIN/slatefsd" -c "$CLONE_CONFIG" >>"$CLONE_LOG" 2>&1 &
+CLONE_PID=$!
+wait_port "$CLONE_PORT" "$CLONE_LOG"
+
+echo "== mounting clone export"
+$SUDO mount -t nfs \
+    -o "vers=3,tcp,nolock,soft,timeo=20,retrans=3,port=$CLONE_PORT,mountport=$CLONE_PORT" \
+    127.0.0.1:/ "$CLONE_MNT"
+
+echo "== verifying clone starts from snapshot and is writable"
+run cmp <(printf "baseline\n") "$CLONE_MNT/live.txt"
+run test ! -e "$CLONE_MNT/live-only.txt"
+write_file "$CLONE_MNT/live.txt" "clone-edited"
+write_file "$CLONE_MNT/clone-only.txt" "clone-only"
+run sync "$CLONE_MNT/live.txt"
+run sync "$CLONE_MNT/clone-only.txt"
+run cmp <(printf "clone-edited\n") "$CLONE_MNT/live.txt"
+run cmp <(printf "clone-only\n") "$CLONE_MNT/clone-only.txt"
+
+echo "== verifying clone writes do not affect live volume"
+run cmp <(printf "latest\n") "$LIVE_MNT/live.txt"
+run cmp <(printf "live-only\n") "$LIVE_MNT/live-only.txt"
+run test ! -e "$LIVE_MNT/clone-only.txt"
+
+echo "== stopping clone export for offline fsck"
+$SUDO umount "$CLONE_MNT"
+kill "$CLONE_PID"
+wait "$CLONE_PID" 2>/dev/null || true
+CLONE_PID=""
+"$BIN/slatefs" -c "$CLONE_CONFIG" volume fsck "$TENANT" "$CLONE_VOLUME"
+
 echo "== unmount"
 $SUDO umount "$SNAPSHOT_MNT"
 $SUDO umount "$LIVE_MNT"
-echo "live snapshot over NFS PASSED"
+echo "live snapshot and clone restore over NFS PASSED"
