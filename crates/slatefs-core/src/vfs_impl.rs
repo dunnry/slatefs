@@ -31,6 +31,7 @@ const NOMINAL_INODES: u64 = 1 << 32;
 const STATFS_BSIZE: u32 = 4096;
 
 const MAX_XATTR_VALUE: usize = 64 * 1024;
+const READAHEAD_WINDOW_CHUNKS: u32 = 8;
 
 /// Relatime window (plan §10): persist atime on read only if it lags mtime
 /// or is older than this.
@@ -69,6 +70,28 @@ fn access(creds: &Credentials, inode: &Inode, want: u32) -> FsResult<()> {
     } else {
         Err(FsError::AccessDenied)
     }
+}
+
+fn readahead_scan_bounds(
+    prefetched_to: u32,
+    cur_chunk: u32,
+    last_file_chunk: u32,
+) -> Option<(u32, u32)> {
+    let wanted = cur_chunk
+        .saturating_add(READAHEAD_WINDOW_CHUNKS)
+        .min(last_file_chunk);
+
+    // Refill only when the stream gets near the prefetched horizon.
+    if prefetched_to >= wanted || prefetched_to > cur_chunk.saturating_add(2) {
+        return None;
+    }
+
+    let from = prefetched_to.max(cur_chunk).saturating_add(1);
+    if from > wanted {
+        return None;
+    }
+
+    Some((from, wanted.saturating_add(1)))
 }
 
 /// Sticky-bit deletion rule (plan §9.1): in a sticky directory only the
@@ -144,7 +167,6 @@ impl Volume {
     /// a background task scans upcoming chunk keys, pulling their blocks
     /// through the (plaintext, tier-1) block cache.
     fn plan_readahead(&self, ino: u64, offset: u64, end: u64, size: u64) {
-        const WINDOW_CHUNKS: u32 = 8;
         if end == 0 || end >= size {
             return;
         }
@@ -161,21 +183,19 @@ impl Volume {
             return;
         }
         let last_file_chunk = data::chunk_of(size - 1, self.chunk_size);
-        let wanted = cur_chunk.saturating_add(WINDOW_CHUNKS).min(last_file_chunk);
-        // Refill only when the stream gets near the prefetched horizon.
-        if st.prefetched_to >= wanted || st.prefetched_to > cur_chunk.saturating_add(2) {
+        let Some((from, to_exclusive)) =
+            readahead_scan_bounds(st.prefetched_to, cur_chunk, last_file_chunk)
+        else {
             return;
-        }
-        let from = st.prefetched_to.max(cur_chunk) + 1;
-        st.prefetched_to = wanted;
+        };
+        st.prefetched_to = to_exclusive - 1;
         drop(map);
 
         let db = self.db.clone();
         tokio::spawn(async move {
             let options =
                 slatedb::config::ScanOptions::default().with_read_ahead_bytes(1024 * 1024);
-            let range = keys::chunk(ino, from).to_vec()
-                ..keys::chunk(ino, wanted.saturating_add(1)).to_vec();
+            let range = keys::chunk(ino, from).to_vec()..keys::chunk(ino, to_exclusive).to_vec();
             if let Ok(mut iter) = db.scan_with_options::<Vec<u8>, _>(range, &options).await {
                 while let Ok(Some(_)) = iter.next().await {}
             }
@@ -1423,5 +1443,28 @@ impl Vfs for Volume {
                 },
             )
             .map(|l| (l.range.start, l.range.end, l.exclusive)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::readahead_scan_bounds;
+
+    #[test]
+    fn readahead_scan_bounds_prefetches_next_chunks() {
+        assert_eq!(readahead_scan_bounds(0, 0, 10), Some((1, 9)));
+        assert_eq!(readahead_scan_bounds(2, 3, 5), Some((4, 6)));
+    }
+
+    #[test]
+    fn readahead_scan_bounds_skips_empty_tail_window() {
+        assert_eq!(readahead_scan_bounds(0, 0, 0), None);
+        assert_eq!(readahead_scan_bounds(0, 3, 3), None);
+        assert_eq!(readahead_scan_bounds(2, 3, 3), None);
+    }
+
+    #[test]
+    fn readahead_scan_bounds_waits_until_near_horizon() {
+        assert_eq!(readahead_scan_bounds(9, 6, 10), None);
     }
 }

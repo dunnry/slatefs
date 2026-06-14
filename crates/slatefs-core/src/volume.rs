@@ -33,6 +33,8 @@ use crate::quota::{self, CounterMergeOperator, QuotaTracker};
 use crate::store;
 use crate::vfs::{FsError, FsResult, OpenMode};
 
+const DEFAULT_DISK_CACHE_OPEN_FILES: usize = 256;
+
 /// Parameters fixed at volume creation. `cipher` must already be resolved
 /// (no `Auto` here): the choice is recorded in the volume format and must not
 /// vary by which node happens to open the volume (DD-8).
@@ -76,6 +78,8 @@ pub struct VolumeCaches {
     pub disk_root: Option<std::path::PathBuf>,
     /// Tier-2 budget for this volume, in bytes.
     pub disk_bytes: Option<u64>,
+    /// Tier-2 open file budget for this volume.
+    pub disk_max_open_files: Option<usize>,
     /// SlateDB write-buffer and compaction settings for this volume.
     pub slatedb: SlateDbConfig,
     /// Engine metrics sink (cache hit rates, flush latency, …).
@@ -99,6 +103,7 @@ impl VolumeCaches {
                 .as_ref()
                 .map(|root| root.join(tenant).join(volume)),
             disk_bytes: cache.disk_bytes.map(|b| (b / n).max(64 * 1024 * 1024)),
+            disk_max_open_files: cache.disk_max_open_files,
             slatedb: slatedb.clone(),
             recorder: None,
         }
@@ -492,6 +497,9 @@ async fn open_volume_db_with_transform_metrics(
         (Some(root), _) => ObjectStoreCacheOptions {
             root_folder: Some(root.clone()),
             max_cache_size_bytes: caches.disk_bytes.map(|b| b as usize),
+            max_open_file_handles: caches
+                .disk_max_open_files
+                .unwrap_or(DEFAULT_DISK_CACHE_OPEN_FILES),
             preload_disk_cache_on_startup: Some(PreloadLevel::L0Sst),
             ..ObjectStoreCacheOptions::default()
         },

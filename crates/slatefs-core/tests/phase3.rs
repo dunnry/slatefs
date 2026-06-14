@@ -241,6 +241,7 @@ async fn warm_disk_cache_restart_avoids_store_gets() {
         memory_bytes: Some(32 * 1024 * 1024),
         disk_root: Some(cache_dir.path().join("t/v")),
         disk_bytes: Some(256 * 1024 * 1024),
+        disk_max_open_files: None,
         slatedb: Default::default(),
         recorder: None,
     };
@@ -343,6 +344,7 @@ async fn bench_read_latency() {
         memory_bytes: Some(256 * 1024 * 1024),
         disk_root: Some(cache_dir.path().join("bench/v")),
         disk_bytes: Some(1024 * 1024 * 1024),
+        disk_max_open_files: None,
         slatedb: Default::default(),
         recorder: None,
     };

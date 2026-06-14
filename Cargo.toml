@@ -24,7 +24,7 @@ slatefs-9p = { path = "crates/slatefs-9p" }
 
 # Storage engine. Pinned against the API surface verified in slatefs-plan.md §0;
 # re-verify the BlockTransformer/DbBuilder contract before bumping.
-slatedb = { version = "0.13.1", features = ["lz4", "zstd", "foyer"] }
+slatedb = { version = "0.13.1", features = ["azure", "lz4", "zstd", "foyer"] }
 
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"

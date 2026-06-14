@@ -51,6 +51,9 @@ pub struct CacheConfig {
     pub disk_path: Option<std::path::PathBuf>,
     /// Total disk-cache budget in bytes across volumes.
     pub disk_bytes: Option<u64>,
+    /// Maximum open files the disk cache may keep per volume.
+    /// Unset ⇒ SlateFS uses a conservative per-volume default.
+    pub disk_max_open_files: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -442,6 +445,11 @@ impl Config {
                 "metrics.listen must be an ip:port listener or omitted".into(),
             ));
         }
+        if self.cache.disk_max_open_files == Some(0) {
+            return Err(Error::Config(
+                "cache.disk_max_open_files must be greater than 0".into(),
+            ));
+        }
         self.slatedb.validate()?;
         if let Some(listen) = &self.admin.listen {
             if listen.is_empty() {
@@ -584,6 +592,26 @@ mod tests {
             "max_unflushed_bytes = 268435456",
             "max_unflushed_bytes = 1024",
         );
+        assert!(Config::parse(&invalid).is_err());
+    }
+
+    #[test]
+    fn cache_disk_max_open_files_parse_and_validate() {
+        let raw = r#"
+            [object_store]
+            url = "memory:///"
+
+            [kms]
+            provider = "static"
+            key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+            [cache]
+            disk_max_open_files = 512
+        "#;
+        let config = Config::parse(raw).unwrap();
+        assert_eq!(config.cache.disk_max_open_files, Some(512));
+
+        let invalid = raw.replace("disk_max_open_files = 512", "disk_max_open_files = 0");
         assert!(Config::parse(&invalid).is_err());
     }
 
