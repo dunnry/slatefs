@@ -619,7 +619,9 @@ pub async fn scrub_volume(
     result
 }
 
-async fn clone_parent_prefixes(
+/// Return object-store DB prefixes for a clone's parent chain, nearest parent
+/// first.
+pub async fn clone_parent_prefixes(
     control: &ControlPlane,
     record: &VolumeRecord,
 ) -> Result<Vec<String>> {

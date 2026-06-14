@@ -349,6 +349,7 @@ async fn phase0_round_trip(object_store: Arc<dyn ObjectStore>) {
         snapshot_dek,
         Arc::clone(&object_store),
         &baseline.id,
+        Vec::new(),
     )
     .await
     .expect("open read-only snapshot");
@@ -445,6 +446,10 @@ async fn phase0_round_trip(object_store: Arc<dyn ObjectStore>) {
         .await
         .expect("write latest clone");
     latest_vol.flush().await.expect("flush latest clone");
+    let clone_snapshot = latest_vol
+        .create_live_snapshot(Some("clone-latest".to_string()))
+        .await
+        .expect("snapshot mutated clone");
     latest_vol.shutdown().await.expect("close latest clone");
     assert_eq!(
         read_root_file(&control, Arc::clone(&object_store), &latest_clone, b"file").await,
@@ -454,6 +459,42 @@ async fn phase0_round_trip(object_store: Arc<dyn ObjectStore>) {
         read_root_file(&control, Arc::clone(&object_store), &source, b"file").await,
         b"latest!!"
     );
+    let clone_snapshot_dek = control
+        .unwrap_volume_dek(&latest_clone)
+        .await
+        .expect("latest clone snapshot dek");
+    let clone_parent_prefixes = volume::clone_parent_prefixes(&control, &latest_clone)
+        .await
+        .expect("latest clone parent prefixes");
+    let clone_snapshot_vol = SnapshotVolume::open(
+        &latest_clone,
+        clone_snapshot_dek,
+        Arc::clone(&object_store),
+        &clone_snapshot.id,
+        clone_parent_prefixes,
+    )
+    .await
+    .expect("open mutated clone snapshot");
+    let clone_snapshot_file = clone_snapshot_vol
+        .lookup(&root(), ROOT_INO, b"file")
+        .await
+        .expect("lookup mutated clone snapshot file");
+    assert_eq!(
+        clone_snapshot_vol
+            .read(
+                &root(),
+                clone_snapshot_file.ino,
+                0,
+                clone_snapshot_file.size as u32,
+            )
+            .await
+            .expect("read mutated clone snapshot"),
+        b"clone!!!".as_slice()
+    );
+    clone_snapshot_vol
+        .shutdown()
+        .await
+        .expect("close mutated clone snapshot");
     let clone_scrub = volume::scrub_volume(&control, Arc::clone(&object_store), "tclone", "latest")
         .await
         .expect("scrub mutated shallow clone");

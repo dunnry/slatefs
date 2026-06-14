@@ -45,11 +45,16 @@ pub struct SnapshotVolume {
 }
 
 impl SnapshotVolume {
+    /// Open a read-only snapshot with explicit clone ancestor prefixes.
+    ///
+    /// `parent_prefixes` must be ordered from nearest parent to oldest
+    /// ancestor. Pass an empty vector for volumes that are not clones.
     pub async fn open(
         record: &VolumeRecord,
         dek: Secret32,
         object_store: Arc<dyn ObjectStore>,
         snapshot_id: &str,
+        parent_prefixes: Vec<String>,
     ) -> Result<Arc<SnapshotVolume>> {
         if record.state != VolumeState::Active {
             return Err(Error::invalid(
@@ -61,7 +66,17 @@ impl SnapshotVolume {
             .map_err(|e| Error::invalid("snapshot id", format!("{snapshot_id:?}: {e}")))?;
         let block_metrics = BlockTransformMetrics::default();
         let path = store::volume_db_path(&record.tenant, &record.name);
-        let reader = DbReader::builder(path, object_store)
+        let reader_store = if parent_prefixes.is_empty() {
+            object_store
+        } else {
+            store::clone_parent_read_fallback_store(
+                object_store,
+                &record.tenant,
+                &record.name,
+                parent_prefixes,
+            )
+        };
+        let reader = DbReader::builder(path, reader_store)
             .with_checkpoint_id(checkpoint)
             .with_block_transformer(Arc::new(SlateBlockTransformer::with_metrics(
                 record.cipher,

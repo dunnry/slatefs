@@ -18,7 +18,7 @@ use slatefs_core::rate::{RateLimiter, RateLimits};
 use slatefs_core::snapshot::SnapshotVolume;
 use slatefs_core::store;
 use slatefs_core::vfs::Vfs;
-use slatefs_core::volume::{Volume, VolumeCaches};
+use slatefs_core::volume::{self, Volume, VolumeCaches};
 use slatefs_nfs::{NFSTcp, SquashPolicy};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -340,7 +340,14 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         let tenant = control.get_tenant(&export.tenant).await?;
         let dek = control.unwrap_volume_dek(&record).await?;
-        planned.push((export.clone(), record, dek, tenant.rate_limits));
+        let clone_parent_prefixes = volume::clone_parent_prefixes(&control, &record).await?;
+        planned.push((
+            export.clone(),
+            record,
+            dek,
+            tenant.rate_limits,
+            clone_parent_prefixes,
+        ));
     }
     control.close().await.context("closing control-plane DB")?;
 
@@ -361,7 +368,7 @@ async fn main() -> anyhow::Result<()> {
         .map(|e| (e.tenant.clone(), e.volume.clone()))
         .collect();
     let share_count = distinct.len();
-    for (export, record, dek, rate_limits) in planned {
+    for (export, record, dek, rate_limits, clone_parent_prefixes) in planned {
         let key = (
             export.tenant.clone(),
             export.volume.clone(),
@@ -373,15 +380,20 @@ async fn main() -> anyhow::Result<()> {
             Some(v) => Arc::clone(v),
             None => {
                 let backend: Arc<dyn Vfs> = if let Some(snapshot) = &export.snapshot {
-                    let snapshot_volume =
-                        SnapshotVolume::open(&record, dek, Arc::clone(&object_store), snapshot)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "opening snapshot {snapshot} for {}/{}",
-                                    export.tenant, export.volume
-                                )
-                            })?;
+                    let snapshot_volume = SnapshotVolume::open(
+                        &record,
+                        dek,
+                        Arc::clone(&object_store),
+                        snapshot,
+                        clone_parent_prefixes,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "opening snapshot {snapshot} for {}/{}",
+                            export.tenant, export.volume
+                        )
+                    })?;
                     metrics_targets.push(MetricsTarget::Snapshot {
                         tenant: export.tenant.clone(),
                         volume_name: export.volume.clone(),
@@ -719,6 +731,7 @@ mod tests {
             snapshot_dek,
             Arc::clone(&object_store),
             &snapshot_id,
+            Vec::new(),
         )
         .await
         .unwrap();

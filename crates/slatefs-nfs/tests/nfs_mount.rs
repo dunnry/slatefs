@@ -370,6 +370,7 @@ async fn snapshot_export_is_read_only_and_point_in_time() {
         snapshot_dek,
         Arc::clone(&object_store),
         &snapshot.id,
+        Vec::new(),
     )
     .await
     .expect("open snapshot volume");
