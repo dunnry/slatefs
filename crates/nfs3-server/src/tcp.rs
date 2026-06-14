@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::context::RPCContext;
@@ -15,6 +15,11 @@ use crate::transaction_tracker::{Cleaner, TransactionTracker};
 use crate::units::KIBIBYTE;
 use crate::vfs::adapters::ReadOnlyAdapter;
 use crate::vfs::{NfsFileSystem, NfsReadFileSystem};
+
+// [slatefs patch] Bound per-connection RPC handler fan-out. When the backing
+// store applies write backpressure, this makes TCP reads slow down instead of
+// spawning unbounded request work and eventually returning RPC SYSTEM_ERR.
+const MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION: usize = 1024;
 
 /// A NFS Tcp Connection Handler
 pub struct NFSTcpListener<T: NfsFileSystem + 'static> {
@@ -53,8 +58,9 @@ where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
     T: NfsFileSystem + 'static,
 {
+    let request_permits = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION));
     let (mut message_handler, mut socksend, mut msgrecvchan) =
-        SocketMessageHandler::new(context.clone());
+        SocketMessageHandler::new(context.clone(), request_permits);
 
     tokio::spawn(async move {
         loop {
@@ -233,8 +239,13 @@ impl<T: NfsFileSystem + 'static> NFSTcpListener<T> {
 
     fn new_transaction_tracker() -> Arc<TransactionTracker> {
         const TRANSACTION_LIFETIME: Duration = Duration::from_secs(60);
-        const MAX_ACTIVE_TRANSACTIONS: u16 = 256;
-        const TRANSACTION_TRIM_THRESHOLD: usize = 2048;
+        // [slatefs patch] Kernel NFS clients can keep deep WRITE backlogs while
+        // the backing store is flushing or compacting. Returning RPC SYSTEM_ERR
+        // here surfaces as EIO to user workloads, so keep enough per-client
+        // headroom for large streaming writes and let the socket/OS apply the
+        // harder backpressure.
+        const MAX_ACTIVE_TRANSACTIONS: u16 = 4096;
+        const TRANSACTION_TRIM_THRESHOLD: usize = 16384;
 
         Arc::new(TransactionTracker::new(
             TRANSACTION_LIFETIME,

@@ -9,7 +9,7 @@ use nfs3_types::rpc::{
 use nfs3_types::xdr_codec::{Pack, Unpack};
 use nfs3_types::{nfs3 as nfs, portmap};
 use tokio::io::{AsyncWriteExt, DuplexStream};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{error, info, trace, warn};
 
 use crate::context::RPCContext;
@@ -159,6 +159,7 @@ pub struct SocketMessageHandler<T: NfsFileSystem + 'static> {
     socket_receive_channel: DuplexStream,
     reply_send_channel: mpsc::UnboundedSender<SocketMessageType>,
     context: RPCContext<T>,
+    request_permits: std::sync::Arc<Semaphore>,
 }
 
 impl<T> SocketMessageHandler<T>
@@ -168,6 +169,7 @@ where
     /// Creates a new `SocketMessageHandler` with the receiver for queued message replies
     pub fn new(
         context: RPCContext<T>,
+        request_permits: std::sync::Arc<Semaphore>,
     ) -> (
         Self,
         DuplexStream,
@@ -181,6 +183,7 @@ where
                 socket_receive_channel: sockrecv,
                 reply_send_channel: msgsend,
                 context,
+                request_permits,
             },
             socksend,
             msgrecv,
@@ -202,9 +205,11 @@ where
                 }
             };
 
+            let permit = self.request_permits.clone().acquire_owned().await?;
             let context = self.context.clone();
             let send = self.reply_send_channel.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 let result = handle_rpc_message(context, message).await;
 
                 match result {

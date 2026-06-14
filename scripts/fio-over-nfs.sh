@@ -17,7 +17,11 @@ FIO_SIZE="${FIO_SIZE:-64m}"
 FIO_JOBS="${FIO_JOBS:-1}"
 FIO_BS_LIST="${FIO_BS_LIST:-4k 128k 1m}"
 FIO_RW_LIST="${FIO_RW_LIST:-read write randread randwrite}"
+FIO_PREFILL_BS="${FIO_PREFILL_BS:-1m}"
 META_OPS="${META_OPS:-500}"
+FIO_CMD_TIMEOUT="${FIO_CMD_TIMEOUT:-600}"
+FIO_NFS_TIMEO="${FIO_NFS_TIMEO:-600}"
+FIO_NFS_RETRANS="${FIO_NFS_RETRANS:-3}"
 
 if [ "$(id -u)" = "0" ]; then SUDO=""; else SUDO="${SUDO:-sudo}"; fi
 
@@ -33,10 +37,16 @@ DAEMON_PID=""
 mkdir -p "$MNT"
 
 cleanup() {
+    local status=$?
     set +e
+    if [ "$status" -ne 0 ]; then
+        echo "== slatefsd log tail"
+        tail -120 "$LOG" 2>/dev/null || true
+    fi
     $SUDO umount -f "$MNT" 2>/dev/null
     [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null
     rm -rf "$WORK"
+    exit "$status"
 }
 trap cleanup EXIT
 
@@ -77,7 +87,7 @@ wait_port() {
 }
 
 run() {
-    timeout 120 "$@"
+    timeout "$FIO_CMD_TIMEOUT" "$@"
 }
 
 ensure_tools() {
@@ -100,6 +110,13 @@ metric_kind() {
         read|randread) echo read ;;
         write|randwrite) echo write ;;
         *) echo "unknown fio rw mode: $1" >&2; exit 1 ;;
+    esac
+}
+
+needs_read_source() {
+    case " $FIO_RW_LIST " in
+        *" read "*|*" randread "*) return 0 ;;
+        *) return 1 ;;
     esac
 }
 
@@ -129,7 +146,9 @@ render_report() {
         echo "- runtime: ${FIO_RUNTIME}s"
         echo "- size per job: $FIO_SIZE"
         echo "- jobs: $FIO_JOBS"
-        echo "- mount: kernel NFSv3, soft,timeo=20,retrans=3"
+        echo "- read-source prefill block size: $FIO_PREFILL_BS"
+        echo "- command timeout: ${FIO_CMD_TIMEOUT}s"
+        echo "- mount: kernel NFSv3, soft,timeo=$FIO_NFS_TIMEO,retrans=$FIO_NFS_RETRANS"
         echo
         echo "| workload | block | IOPS | MiB/s | mean ms | p99 ms |"
         echo "|---|---:|---:|---:|---:|---:|"
@@ -153,7 +172,7 @@ wait_port "$PORT"
 
 echo "== mounting NFS export"
 $SUDO mount -t nfs \
-    -o "vers=3,tcp,nolock,soft,timeo=20,retrans=3,port=$PORT,mountport=$PORT" \
+    -o "vers=3,tcp,nolock,soft,timeo=$FIO_NFS_TIMEO,retrans=$FIO_NFS_RETRANS,port=$PORT,mountport=$PORT" \
     127.0.0.1:/ "$MNT"
 run $SUDO mkdir -p "$BENCH_DIR"
 
@@ -161,18 +180,20 @@ run $SUDO mkdir -p "$BENCH_DIR"
 
 for bs in $FIO_BS_LIST; do
     prep="$BENCH_DIR/prep-$bs.dat"
-    echo "== prefill $bs read source"
-    run "$FIO" \
-        --name="prep-$bs" \
-        --filename="$prep" \
-        --rw=write \
-        --bs="$bs" \
-        --size="$FIO_SIZE" \
-        --ioengine=sync \
-        --numjobs=1 \
-        --fallocate=none \
-        --end_fsync=1 \
-        --output=/dev/null
+    if needs_read_source; then
+        echo "== prefill $bs read source with $FIO_PREFILL_BS writes"
+        run "$FIO" \
+            --name="prep-$bs" \
+            --filename="$prep" \
+            --rw=write \
+            --bs="$FIO_PREFILL_BS" \
+            --size="$FIO_SIZE" \
+            --ioengine=sync \
+            --numjobs=1 \
+            --fallocate=none \
+            --end_fsync=1 \
+            --output=/dev/null
+    fi
 
     for rw in $FIO_RW_LIST; do
         json="$WORK/$rw-$bs.json"
