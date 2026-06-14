@@ -11,13 +11,22 @@ Run it through the existing privileged Docker harness:
 
 ```sh
 SKIP_SMOKE=1 \
+BIN_OVERRIDE=release \
 FIO_RUNTIME=30 \
 FIO_SIZE=1g \
 FIO_JOBS=4 \
 scripts/docker-kernel-mount-test.sh scripts/fio-over-nfs.sh
 ```
 
-The script emits a markdown table with the Phase 6 matrix:
+`BIN_OVERRIDE=release` makes the Docker wrapper build release binaries and makes
+the fio script run them from the shared Cargo target directory. The Docker
+wrapper also writes a bounded `[slatedb]` section for the generated test config:
+16 MiB L0 SSTs, 256 MiB max unflushed bytes, 64 total L0 SSTs, 16 overlapping
+L0 SSTs per key, two L0 flush workers, and two compaction workers/fetch tasks.
+Override the `SLATEDB_*` environment variables in
+[scripts/docker-kernel-mount-test.sh](../scripts/docker-kernel-mount-test.sh)
+for larger bench hosts. The script emits a markdown table with the Phase 6
+matrix:
 
 - sequential read and write;
 - random read and write;
@@ -28,11 +37,29 @@ For a quick local smoke, lower `FIO_RUNTIME`, `FIO_SIZE`, and `META_OPS`.
 Bench numbers are only comparable when the object store, cache settings,
 kernel NFS client, host CPU, and Docker/VM environment are held fixed.
 Slow environments can raise `FIO_CMD_TIMEOUT`; the default is 600 seconds per
-fio/prefill command. Read-source prefill uses `FIO_PREFILL_BS` (default 1 MiB)
-so the 4 KiB read row does not spend the setup phase issuing tiny writes. The
-fio harness also defaults to a longer kernel NFS soft-mount timeout
+fio/prefill command. Read-source prefill uses `FIO_PREFILL_BS` (default 4 KiB);
+larger values can speed setup on stronger clients but may stress kernel NFS
+writeback on small VMs. Prefill defaults to `FIO_PREFILL_FSYNC=0` because the
+write workload rows already exercise durable `end_fsync=1`; forcing an extra
+durable prefill can dominate the read rows on small NFS clients. The fio harness
+also defaults to a longer kernel NFS soft-mount timeout
 (`FIO_NFS_TIMEO=600`, `FIO_NFS_RETRANS=3`) so slow setup I/O does not collapse
 into client-side `EIO`.
+
+For direct host runs outside the Docker wrapper, add an explicit `[slatedb]`
+section to the config used by `SLATEFS_CONFIG` when running write-heavy fio:
+
+```toml
+[slatedb]
+l0_sst_size_bytes = 16777216
+max_unflushed_bytes = 268435456
+l0_max_ssts = 64
+l0_max_ssts_per_key = 16
+l0_flush_parallelism = 2
+compaction_max_sst_size_bytes = 67108864
+compaction_max_concurrent = 2
+compaction_max_fetch_tasks = 2
+```
 
 ## Failover Timing
 
@@ -81,6 +108,34 @@ The full 1 GiB Phase 6 fio matrix should run on a dedicated Linux bench host.
 Local Docker completed the early rows but then hit container local file-store
 compaction/backpressure and kernel NFS soft-mount retransmit behavior during
 later prefill work.
+
+## Nested VM Release Evidence
+
+On 2026-06-14, a 2 vCPU / 3.8 GiB Ubuntu Azure VM (`nested-vm`) completed the
+full release fio matrix through the kernel NFSv3 client with `FIO_RUNTIME=30`,
+`FIO_SIZE=1g`, `FIO_JOBS=4`, `FIO_PREFILL_BS=4k`,
+`FIO_PREFILL_FSYNC=0`, and the bounded `[slatedb]` settings above. Sequential
+read rows are kernel-client-visible measurements and can include Linux NFS page
+cache effects; use colder read modes for future object-store read-latency
+targets.
+
+| workload | block | IOPS | MiB/s | mean ms | p99 ms |
+|---|---:|---:|---:|---:|---:|
+| read | 4k | 309584 | 1209.3 | 0.012 | 0.510 |
+| write | 4k | 99254 | 387.7 | 0.035 | 0.010 |
+| randread | 4k | 12887 | 50.3 | 0.308 | 1.253 |
+| randwrite | 4k | 1194 | 4.7 | 2.522 | 0.009 |
+| read | 128k | 7849 | 981.2 | 0.498 | 2.310 |
+| write | 128k | 128 | 16.0 | 30.959 | 6.062 |
+| randread | 128k | 8741 | 1092.6 | 0.447 | 2.834 |
+| randwrite | 128k | 254 | 31.8 | 15.304 | 379.585 |
+| read | 1m | 1359 | 1359.3 | 2.863 | 8.978 |
+| write | 1m | 83 | 83.1 | 47.606 | 952.107 |
+| randread | 1m | 1048 | 1047.6 | 3.747 | 13.959 |
+| randwrite | 1m | 29 | 28.6 | 135.589 | 3808.428 |
+
+The same run completed the metadata smoke with 1500 create/stat/unlink cycles
+in 57.798 seconds (26.0 ops/s).
 
 ## Multi-Volume Overhead
 

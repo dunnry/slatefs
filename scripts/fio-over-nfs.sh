@@ -17,7 +17,8 @@ FIO_SIZE="${FIO_SIZE:-64m}"
 FIO_JOBS="${FIO_JOBS:-1}"
 FIO_BS_LIST="${FIO_BS_LIST:-4k 128k 1m}"
 FIO_RW_LIST="${FIO_RW_LIST:-read write randread randwrite}"
-FIO_PREFILL_BS="${FIO_PREFILL_BS:-1m}"
+FIO_PREFILL_BS="${FIO_PREFILL_BS:-4k}"
+FIO_PREFILL_FSYNC="${FIO_PREFILL_FSYNC:-0}"
 META_OPS="${META_OPS:-500}"
 FIO_CMD_TIMEOUT="${FIO_CMD_TIMEOUT:-600}"
 FIO_NFS_TIMEO="${FIO_NFS_TIMEO:-600}"
@@ -147,6 +148,7 @@ render_report() {
         echo "- size per job: $FIO_SIZE"
         echo "- jobs: $FIO_JOBS"
         echo "- read-source prefill block size: $FIO_PREFILL_BS"
+        echo "- read-source prefill end_fsync: $FIO_PREFILL_FSYNC"
         echo "- command timeout: ${FIO_CMD_TIMEOUT}s"
         echo "- mount: kernel NFSv3, soft,timeo=$FIO_NFS_TIMEO,retrans=$FIO_NFS_RETRANS"
         echo
@@ -175,6 +177,7 @@ $SUDO mount -t nfs \
     -o "vers=3,tcp,nolock,soft,timeo=$FIO_NFS_TIMEO,retrans=$FIO_NFS_RETRANS,port=$PORT,mountport=$PORT" \
     127.0.0.1:/ "$MNT"
 run $SUDO mkdir -p "$BENCH_DIR"
+run $SUDO chown "$(id -u):$(id -g)" "$BENCH_DIR"
 
 : > "$RESULTS_TSV"
 
@@ -191,7 +194,7 @@ for bs in $FIO_BS_LIST; do
             --ioengine=sync \
             --numjobs=1 \
             --fallocate=none \
-            --end_fsync=1 \
+            --end_fsync="$FIO_PREFILL_FSYNC" \
             --output=/dev/null
     fi
 

@@ -14,7 +14,7 @@ use slatedb::{Checkpoint, Db, DbReader, Settings, WriteBatch};
 use tokio::sync::Notify;
 
 use crate::attrcache::AttrCache;
-use crate::config::{CacheConfig, Compression, VolumeDefaults};
+use crate::config::{CacheConfig, Compression, SlateDbConfig, VolumeDefaults};
 use crate::control::{
     CloneParent, ControlPlane, QuotaLimits, TenantState, VolumeRecord, VolumeState, now_unix,
 };
@@ -76,6 +76,8 @@ pub struct VolumeCaches {
     pub disk_root: Option<std::path::PathBuf>,
     /// Tier-2 budget for this volume, in bytes.
     pub disk_bytes: Option<u64>,
+    /// SlateDB write-buffer and compaction settings for this volume.
+    pub slatedb: SlateDbConfig,
     /// Engine metrics sink (cache hit rates, flush latency, …).
     pub recorder: Option<Arc<crate::metrics::AggregatingRecorder>>,
 }
@@ -84,6 +86,7 @@ impl VolumeCaches {
     /// Split the deployment-wide budgets across `share_count` open volumes.
     pub fn from_config(
         cache: &CacheConfig,
+        slatedb: &SlateDbConfig,
         tenant: &str,
         volume: &str,
         share_count: usize,
@@ -96,6 +99,7 @@ impl VolumeCaches {
                 .as_ref()
                 .map(|root| root.join(tenant).join(volume)),
             disk_bytes: cache.disk_bytes.map(|b| (b / n).max(64 * 1024 * 1024)),
+            slatedb: slatedb.clone(),
             recorder: None,
         }
     }
@@ -498,12 +502,13 @@ async fn open_volume_db_with_transform_metrics(
         Some(metrics) => SlateBlockTransformer::with_metrics(record.cipher, dek, metrics),
         None => SlateBlockTransformer::new(record.cipher, dek),
     };
+    let settings = caches.slatedb.apply_to_settings(Settings {
+        compression_codec: record.compression.to_slatedb(),
+        object_store_cache_options,
+        ..Settings::default()
+    });
     let mut builder = Db::builder(path, object_store)
-        .with_settings(Settings {
-            compression_codec: record.compression.to_slatedb(),
-            object_store_cache_options,
-            ..Settings::default()
-        })
+        .with_settings(settings)
         .with_block_transformer(Arc::new(transformer))
         .with_merge_operator(Arc::new(CounterMergeOperator));
     // Tier 1: in-RAM plaintext block cache, byte-weighted.

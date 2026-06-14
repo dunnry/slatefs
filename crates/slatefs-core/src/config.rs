@@ -29,6 +29,9 @@ pub struct Config {
     /// docs/threat-model.md).
     #[serde(default)]
     pub cache: CacheConfig,
+    /// SlateDB write-buffer and compaction settings for served volume DBs.
+    #[serde(default)]
+    pub slatedb: SlateDbConfig,
     /// Optional Prometheus text endpoint served by `slatefsd`.
     #[serde(default)]
     pub metrics: MetricsConfig,
@@ -48,6 +51,88 @@ pub struct CacheConfig {
     pub disk_path: Option<std::path::PathBuf>,
     /// Total disk-cache budget in bytes across volumes.
     pub disk_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SlateDbConfig {
+    /// Memtable size threshold for flushing immutable L0 SSTs.
+    pub l0_sst_size_bytes: usize,
+    /// Maximum unflushed WAL/memtable bytes before writer backpressure.
+    pub max_unflushed_bytes: usize,
+    /// Maximum total L0 SSTs before L0 flush backpressure.
+    pub l0_max_ssts: usize,
+    /// Maximum overlapping L0 SSTs for any key.
+    pub l0_max_ssts_per_key: usize,
+    /// Parallel workers for immutable memtable flushes.
+    pub l0_flush_parallelism: usize,
+    /// Maximum compacted SST size.
+    pub compaction_max_sst_size_bytes: usize,
+    /// Maximum concurrent compactions.
+    pub compaction_max_concurrent: usize,
+    /// Maximum concurrent compaction fetch tasks.
+    pub compaction_max_fetch_tasks: usize,
+}
+
+impl Default for SlateDbConfig {
+    fn default() -> Self {
+        let settings = slatedb::config::Settings::default();
+        let compactor = settings.compactor_options.unwrap_or_default();
+        Self {
+            l0_sst_size_bytes: settings.l0_sst_size_bytes,
+            max_unflushed_bytes: settings.max_unflushed_bytes,
+            l0_max_ssts: settings.l0_max_ssts,
+            l0_max_ssts_per_key: settings.l0_max_ssts_per_key,
+            l0_flush_parallelism: settings.l0_flush_parallelism,
+            compaction_max_sst_size_bytes: compactor.max_sst_size,
+            compaction_max_concurrent: compactor.max_concurrent_compactions,
+            compaction_max_fetch_tasks: compactor.max_fetch_tasks,
+        }
+    }
+}
+
+impl SlateDbConfig {
+    pub fn apply_to_settings(
+        &self,
+        mut settings: slatedb::config::Settings,
+    ) -> slatedb::config::Settings {
+        settings.l0_sst_size_bytes = self.l0_sst_size_bytes;
+        settings.max_unflushed_bytes = self.max_unflushed_bytes;
+        settings.l0_max_ssts = self.l0_max_ssts;
+        settings.l0_max_ssts_per_key = self.l0_max_ssts_per_key;
+        settings.l0_flush_parallelism = self.l0_flush_parallelism;
+        let mut compactor = settings.compactor_options.unwrap_or_default();
+        compactor.max_sst_size = self.compaction_max_sst_size_bytes;
+        compactor.max_concurrent_compactions = self.compaction_max_concurrent;
+        compactor.max_fetch_tasks = self.compaction_max_fetch_tasks;
+        settings.compactor_options = Some(compactor);
+        settings
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.l0_sst_size_bytes == 0 {
+            return Err(Error::Config(
+                "slatedb.l0_sst_size_bytes must be greater than 0".into(),
+            ));
+        }
+        if self.max_unflushed_bytes < self.l0_sst_size_bytes {
+            return Err(Error::Config(
+                "slatedb.max_unflushed_bytes must be >= slatedb.l0_sst_size_bytes".into(),
+            ));
+        }
+        if self.l0_max_ssts == 0
+            || self.l0_max_ssts_per_key == 0
+            || self.l0_flush_parallelism == 0
+            || self.compaction_max_sst_size_bytes == 0
+            || self.compaction_max_concurrent == 0
+            || self.compaction_max_fetch_tasks == 0
+        {
+            return Err(Error::Config(
+                "slatedb numeric limits and parallelism values must be greater than 0".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -357,6 +442,7 @@ impl Config {
                 "metrics.listen must be an ip:port listener or omitted".into(),
             ));
         }
+        self.slatedb.validate()?;
         if let Some(listen) = &self.admin.listen {
             if listen.is_empty() {
                 return Err(Error::Config(
@@ -467,6 +553,38 @@ mod tests {
             listen = "0.0.0.0:12081"
         "#;
         assert!(Config::parse(raw).is_err());
+    }
+
+    #[test]
+    fn slatedb_settings_parse_and_validate() {
+        let raw = r#"
+            [object_store]
+            url = "memory:///"
+
+            [kms]
+            provider = "static"
+            key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+            [slatedb]
+            l0_sst_size_bytes = 16777216
+            max_unflushed_bytes = 268435456
+            l0_max_ssts = 64
+            l0_max_ssts_per_key = 16
+            l0_flush_parallelism = 2
+            compaction_max_sst_size_bytes = 67108864
+            compaction_max_concurrent = 2
+            compaction_max_fetch_tasks = 2
+        "#;
+        let config = Config::parse(raw).unwrap();
+        assert_eq!(config.slatedb.l0_sst_size_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.slatedb.max_unflushed_bytes, 256 * 1024 * 1024);
+        assert_eq!(config.slatedb.l0_max_ssts, 64);
+
+        let invalid = raw.replace(
+            "max_unflushed_bytes = 268435456",
+            "max_unflushed_bytes = 1024",
+        );
+        assert!(Config::parse(&invalid).is_err());
     }
 
     #[test]

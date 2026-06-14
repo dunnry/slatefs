@@ -419,6 +419,7 @@ async fn main() -> anyhow::Result<()> {
                         None => {
                             let mut caches = VolumeCaches::from_config(
                                 &config.cache,
+                                &config.slatedb,
                                 &export.tenant,
                                 &export.volume,
                                 share_count,

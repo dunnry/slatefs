@@ -22,6 +22,18 @@ chunk_size = 131072          # 128 KiB (DD-6); power of two in [4KiB, 4MiB]
 compression = "lz4"          # none | lz4 | zstd — applied by SlateDB before encryption
 cipher = "auto"              # auto | aes256gcm | xchacha20poly1305
 
+# SlateDB write-buffer/compaction knobs. The defaults come from SlateDB; these
+# example values are useful for write-heavy fio on small bench VMs.
+# [slatedb]
+# l0_sst_size_bytes = 16777216
+# max_unflushed_bytes = 268435456
+# l0_max_ssts = 64
+# l0_max_ssts_per_key = 16
+# l0_flush_parallelism = 2
+# compaction_max_sst_size_bytes = 67108864
+# compaction_max_concurrent = 2
+# compaction_max_fetch_tasks = 2
+
 # Prometheus text endpoint for daemon/export metrics.
 # [metrics]
 # listen = "127.0.0.1:12080"

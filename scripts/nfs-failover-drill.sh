@@ -176,7 +176,7 @@ run_post_failover_fsx() {
     fi
     ensure_fsx
     echo "== fsx post-failover verifier: $FSX_OPS ops"
-    timeout "$FSX_TIMEOUT" /tmp/xfstests/ltp/fsx \
+    timeout "$FSX_TIMEOUT" $SUDO /tmp/xfstests/ltp/fsx \
         -q \
         -S "$FSX_SEED" \
         -N "$FSX_OPS" \

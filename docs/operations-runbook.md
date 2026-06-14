@@ -44,6 +44,12 @@ FAILOVER_FSX_OPS=50000 \
 scripts/docker-kernel-mount-test.sh scripts/nfs-failover-drill.sh
 ```
 
+On 2026-06-14, a direct Linux run on the `nested-vm` Azure VM completed this
+fio-load drill with `FAILOVER_FIO_RUNTIME=30`, `FAILOVER_FIO_SIZE=256m`,
+`FAILOVER_FIO_BS=128k`, and `FAILOVER_FSX_OPS=50000`. The measured failover
+window was 0.743 seconds against the 10 second gate; post-takeover scrub was
+clean and `fsx` completed all 50000 operations.
+
 `FAILOVER_FSX_OPS` is disabled by default for quick local smokes. When set, the drill builds
 xfstests inside the container and runs `fsx` on the takeover mount after the timed failover.
 
