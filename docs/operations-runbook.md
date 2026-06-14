@@ -56,13 +56,15 @@ Use snapshots for point-in-time read access first:
 
 The current CLI snapshot-create path takes the writer lease; do not run it
 against a volume actively served by `slatefsd`. For served volumes, use the
-loopback-only daemon admin endpoint:
+loopback-only daemon admin endpoint through the CLI:
 
 ```sh
-curl -X POST 'http://127.0.0.1:12081/snapshot/<tenant>/<volume>?name=<snapshot-name>'
+slatefs -c /etc/slatefs/slatefs.toml snapshot create --live <tenant> <volume> --name <snapshot-name>
 ```
 
-The response includes `id=<checkpoint-id>` for the snapshot export.
+The CLI prints the checkpoint id for the snapshot export. The underlying daemon
+request is `POST /snapshot/<tenant>/<volume>?name=<snapshot-name>` on
+`[admin].listen`.
 
 For a writable restore workspace:
 

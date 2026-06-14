@@ -12,6 +12,8 @@ use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::rate::RateLimits;
 use slatefs_core::volume::{self, CreateVolumeOptions};
 use slatefs_core::{config, store};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 #[derive(Parser)]
 #[command(name = "slatefs", version, about = "SlateFS management CLI")]
@@ -165,13 +167,16 @@ enum QuotaCmd {
 
 #[derive(Subcommand)]
 enum SnapshotCmd {
-    /// Create a durable checkpoint. Volume must not be actively served.
+    /// Create a durable checkpoint. Use --live for a served volume.
     Create {
         tenant: String,
         volume: String,
         /// Optional operator-visible snapshot name.
         #[arg(long)]
         name: Option<String>,
+        /// Ask slatefsd's loopback admin endpoint to snapshot the live writer.
+        #[arg(long)]
+        live: bool,
     },
     /// List volume snapshots.
     List {
@@ -307,6 +312,81 @@ fn print_snapshot(snapshot: &volume::SnapshotInfo) {
         snapshot.expire_time.as_deref().unwrap_or("-"),
         snapshot.name.as_deref().unwrap_or("-")
     );
+}
+
+#[derive(Debug, Clone)]
+struct LiveSnapshotResponse {
+    id: String,
+    manifest_id: u64,
+    name: Option<String>,
+}
+
+fn percent_encode_query_value(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        let safe = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
+        if safe {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+async fn create_live_snapshot_via_admin(
+    listen: &str,
+    tenant: &str,
+    volume: &str,
+    name: Option<&str>,
+) -> anyhow::Result<LiveSnapshotResponse> {
+    let mut path = format!("/snapshot/{tenant}/{volume}");
+    if let Some(name) = name {
+        path.push_str("?name=");
+        path.push_str(&percent_encode_query_value(name));
+    }
+    let mut stream = TcpStream::connect(listen)
+        .await
+        .with_context(|| format!("connecting to slatefsd admin endpoint at {listen}"))?;
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {listen}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.shutdown().await?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await?;
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("malformed admin response"))?;
+    let status = head.lines().next().unwrap_or_default();
+    if !status.starts_with("HTTP/1.1 200 ") {
+        let detail = body.trim();
+        let detail = if detail.is_empty() { status } else { detail };
+        anyhow::bail!("admin snapshot request failed: {detail}");
+    }
+
+    let id = body
+        .lines()
+        .find_map(|line| line.strip_prefix("id="))
+        .ok_or_else(|| anyhow::anyhow!("admin response did not include snapshot id"))?
+        .to_string();
+    let manifest_id = body
+        .lines()
+        .find_map(|line| line.strip_prefix("manifest="))
+        .ok_or_else(|| anyhow::anyhow!("admin response did not include manifest id"))?
+        .parse::<u64>()
+        .context("parsing admin manifest id")?;
+    let name = body
+        .lines()
+        .find_map(|line| line.strip_prefix("name="))
+        .filter(|value| *value != "-")
+        .map(str::to_string);
+    Ok(LiveSnapshotResponse {
+        id,
+        manifest_id,
+        name,
+    })
 }
 
 #[tokio::main]
@@ -598,11 +678,39 @@ async fn run(
             tenant,
             volume: volume_name,
             name,
+            live,
         }) => {
-            let snapshot =
-                volume::create_snapshot(control, object_store, tenant, volume_name, name.clone())
-                    .await?;
-            print_snapshot(&snapshot);
+            if *live {
+                let listen = config.admin.listen.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("snapshot create --live requires [admin].listen")
+                })?;
+                let created =
+                    create_live_snapshot_via_admin(listen, tenant, volume_name, name.as_deref())
+                        .await?;
+                let snapshot =
+                    volume::list_snapshots(control, object_store, tenant, volume_name, None)
+                        .await?
+                        .into_iter()
+                        .find(|snapshot| snapshot.id == created.id)
+                        .unwrap_or(volume::SnapshotInfo {
+                            id: created.id,
+                            manifest_id: created.manifest_id,
+                            create_time: "-".to_string(),
+                            expire_time: None,
+                            name: created.name,
+                        });
+                print_snapshot(&snapshot);
+            } else {
+                let snapshot = volume::create_snapshot(
+                    control,
+                    object_store,
+                    tenant,
+                    volume_name,
+                    name.clone(),
+                )
+                .await?;
+                print_snapshot(&snapshot);
+            }
         }
         Command::Snapshot(SnapshotCmd::List {
             tenant,

@@ -119,8 +119,8 @@ the affected volume object-store prefixes.
 The CLI create path opens the volume as the writer so SlateDB can flush before
 checkpointing; do not run it against a volume currently served by `slatefsd`.
 For served volumes, configure loopback-only `[admin].listen` on `slatefsd` and
-call `POST /snapshot/<tenant>/<volume>?name=<name>` to checkpoint through the
-live writer.
+use `slatefs snapshot create --live <tenant> <volume>` to checkpoint through
+the live writer.
 `slatefs clone create <tenant> <source-volume> <clone-volume>`
 creates an instant writable same-tenant clone, optionally from a checkpoint
 with `--snapshot <id>`. Clones get distinct fsids and independent writes, but

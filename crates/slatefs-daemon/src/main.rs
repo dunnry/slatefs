@@ -196,12 +196,48 @@ fn parse_admin_snapshot_path(path: &str) -> Result<(String, String, Option<Strin
     if tenant.is_empty() || volume.is_empty() || segments.next().is_some() {
         return Err("expected /snapshot/<tenant>/<volume>");
     }
-    let name = query
-        .split('&')
-        .filter_map(|part| part.strip_prefix("name="))
-        .find(|value| !value.is_empty())
-        .map(str::to_string);
+    let mut name = None;
+    for part in query.split('&') {
+        let Some(raw) = part.strip_prefix("name=") else {
+            continue;
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        name = Some(percent_decode(raw)?);
+        break;
+    }
     Ok((tenant.to_string(), volume.to_string(), name))
+}
+
+fn percent_decode(raw: &str) -> Result<String, &'static str> {
+    let mut out = Vec::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err("invalid percent encoding");
+            }
+            let hi = hex_value(bytes[i + 1]).ok_or("invalid percent encoding")?;
+            let lo = hex_value(bytes[i + 2]).ok_or("invalid percent encoding")?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| "invalid utf-8 in percent encoding")
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 async fn handle_admin_connection(
@@ -597,15 +633,16 @@ mod tests {
     #[test]
     fn parses_admin_snapshot_path() {
         assert_eq!(
-            parse_admin_snapshot_path("/snapshot/t/v?name=baseline").unwrap(),
+            parse_admin_snapshot_path("/snapshot/t/v?name=baseline%20one").unwrap(),
             (
                 "t".to_string(),
                 "v".to_string(),
-                Some("baseline".to_string())
+                Some("baseline one".to_string())
             )
         );
         assert!(parse_admin_snapshot_path("/metrics").is_err());
         assert!(parse_admin_snapshot_path("/snapshot/t").is_err());
+        assert!(parse_admin_snapshot_path("/snapshot/t/v?name=%zz").is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
