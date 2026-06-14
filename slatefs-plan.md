@@ -515,9 +515,9 @@ Security review: [docs/security-review.md](docs/security-review.md).
 Client support matrix and QEMU guest smoke:
 [docs/client-support.md](docs/client-support.md),
 [scripts/qemu-p9-tcp-smoke.sh](scripts/qemu-p9-tcp-smoke.sh).
-Served-volume snapshots use the loopback daemon admin endpoint
-`POST /snapshot/<tenant>/<volume>?name=<name>` so checkpoints are created by the
-live writer instead of taking a second writer lease.
+Served-volume snapshots use `slatefs snapshot create --live <tenant> <volume>`,
+which calls the loopback daemon admin endpoint so checkpoints are created by
+the live writer instead of taking a second writer lease.
 **AC**: failover under fio load < 10s with zero corruption (fsx continues clean post-failover);
 documented perf table vs targets; runbook covers outage/fence/restore/key-rotation drills;
 snapshot mount of a live volume reads consistently while writes continue.
