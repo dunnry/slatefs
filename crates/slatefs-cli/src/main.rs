@@ -7,7 +7,10 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use slatefs_core::config::Config;
-use slatefs_core::control::{ControlPlane, QuotaLimits};
+use slatefs_core::control::{
+    ControlPlane, DaemonMetrics, DaemonNodeRecord, DaemonNodeState, QuotaLimits,
+    VolumePlacementRecord,
+};
 use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::rate::RateLimits;
 use slatefs_core::volume::{self, CreateVolumeOptions};
@@ -51,6 +54,8 @@ enum Command {
     Snapshot(SnapshotCmd),
     #[command(subcommand)]
     Clone(CloneCmd),
+    #[command(subcommand)]
+    Fleet(FleetCmd),
 }
 
 #[derive(Subcommand)]
@@ -210,6 +215,151 @@ enum CloneCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum FleetCmd {
+    #[command(subcommand)]
+    Node(FleetNodeCmd),
+    #[command(subcommand)]
+    Volume(FleetVolumeCmd),
+    /// Mark nodes stale when their last heartbeat is older than the timeout.
+    Health {
+        #[arg(long, default_value_t = 60)]
+        heartbeat_timeout_secs: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum FleetNodeCmd {
+    /// Register or update a daemon node that can own volumes.
+    Register {
+        id: String,
+        #[arg(long)]
+        advertise_endpoint: Option<String>,
+        #[arg(long)]
+        admin_endpoint: Option<String>,
+        #[arg(long)]
+        metrics_endpoint: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        capacity_weight: u32,
+    },
+    /// Record the node's latest health and load snapshot.
+    Heartbeat {
+        id: String,
+        #[arg(long, default_value = "healthy", value_parser = parse_daemon_state)]
+        state: DaemonNodeState,
+        #[arg(long, default_value_t = 0)]
+        writable_volumes: u32,
+        #[arg(long, default_value_t = 0)]
+        read_replicas: u32,
+        #[arg(long, default_value_t = 0)]
+        snapshot_exports: u32,
+        #[arg(long, default_value_t = 0)]
+        request_ops_per_second: u64,
+        #[arg(long, default_value_t = 0)]
+        request_bytes_per_second: u64,
+        #[arg(long, default_value_t = 0)]
+        storage_errors: u64,
+        #[arg(long, default_value_t = 0)]
+        degraded_volumes: u32,
+    },
+    /// List registered daemon nodes and their last reported load.
+    List,
+}
+
+#[derive(Subcommand)]
+enum FleetVolumeCmd {
+    /// Show one volume's placement, stable endpoints, and read pools.
+    Placement { tenant: String, volume: String },
+    /// List all volume placements.
+    List,
+    /// Assign or move a volume to a specific node, or the lowest-load node.
+    Assign {
+        tenant: String,
+        volume: String,
+        #[arg(long)]
+        node: Option<String>,
+    },
+    #[command(subcommand)]
+    Endpoint(FleetEndpointCmd),
+    /// Promote a standby after the current primary node failed.
+    Promote {
+        tenant: String,
+        volume: String,
+        #[arg(long)]
+        failed_node: String,
+    },
+    /// Start draining a writable volume away from its current primary.
+    Drain {
+        tenant: String,
+        volume: String,
+        #[arg(long)]
+        target_node: Option<String>,
+    },
+    /// Complete a previously-started drain and move stable endpoints.
+    CompleteDrain { tenant: String, volume: String },
+    #[command(subcommand)]
+    Replica(FleetReplicaCmd),
+    #[command(subcommand)]
+    SnapshotPool(FleetSnapshotPoolCmd),
+}
+
+#[derive(Subcommand)]
+enum FleetEndpointCmd {
+    /// Set or update a stable client-facing endpoint for a volume.
+    Set {
+        tenant: String,
+        volume: String,
+        #[arg(long, default_value = "default")]
+        name: String,
+        #[arg(long, default_value = "nfs", value_parser = parse_export_protocol)]
+        protocol: config::ExportProtocol,
+        #[arg(long)]
+        address: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum FleetReplicaCmd {
+    /// Add or refresh a read replica placement for a volume.
+    Add {
+        tenant: String,
+        volume: String,
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        lag_seconds: Option<u64>,
+    },
+    /// Remove a read replica placement from a volume.
+    Remove {
+        tenant: String,
+        volume: String,
+        #[arg(long)]
+        node: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum FleetSnapshotPoolCmd {
+    /// Set the pool of nodes allowed to serve snapshots for a volume.
+    Set {
+        tenant: String,
+        volume: String,
+        #[arg(long, default_value = "default")]
+        name: String,
+        #[arg(long = "node", required = true)]
+        nodes: Vec<String>,
+        #[arg(long, default_value_t = 128)]
+        max_exports: u32,
+    },
+    /// Remove a snapshot-serving pool.
+    Remove {
+        tenant: String,
+        volume: String,
+        #[arg(long, default_value = "default")]
+        name: String,
+    },
+}
+
 fn parse_compression(s: &str) -> Result<config::Compression, String> {
     match s {
         "none" => Ok(config::Compression::None),
@@ -226,6 +376,26 @@ fn parse_cipher(s: &str) -> Result<config::CipherChoice, String> {
         "xchacha20poly1305" => Ok(config::CipherChoice::XChaCha20Poly1305),
         _ => Err(format!(
             "unknown cipher {s:?} (auto|aes256gcm|xchacha20poly1305)"
+        )),
+    }
+}
+
+fn parse_export_protocol(s: &str) -> Result<config::ExportProtocol, String> {
+    match s {
+        "nfs" => Ok(config::ExportProtocol::Nfs),
+        "p9" => Ok(config::ExportProtocol::P9),
+        _ => Err(format!("unknown protocol {s:?} (nfs|p9)")),
+    }
+}
+
+fn parse_daemon_state(s: &str) -> Result<DaemonNodeState, String> {
+    match s {
+        "healthy" => Ok(DaemonNodeState::Healthy),
+        "draining" => Ok(DaemonNodeState::Draining),
+        "unhealthy" => Ok(DaemonNodeState::Unhealthy),
+        "offline" => Ok(DaemonNodeState::Offline),
+        _ => Err(format!(
+            "unknown daemon state {s:?} (healthy|draining|unhealthy|offline)"
         )),
     }
 }
@@ -312,6 +482,93 @@ fn print_snapshot(snapshot: &volume::SnapshotInfo) {
         snapshot.expire_time.as_deref().unwrap_or("-"),
         snapshot.name.as_deref().unwrap_or("-")
     );
+}
+
+fn protocol_name(protocol: config::ExportProtocol) -> &'static str {
+    match protocol {
+        config::ExportProtocol::Nfs => "nfs",
+        config::ExportProtocol::P9 => "p9",
+    }
+}
+
+fn print_daemon_node(node: &DaemonNodeRecord) {
+    println!(
+        "{}\t{:?}\tcapacity={}\theartbeat={}\twritable={}\tread_replicas={}\tsnapshots={}\tops/s={}\tbytes/s={}\tstorage_errors={}\tdegraded={}\tadvertise={}\tadmin={}\tmetrics={}",
+        node.id,
+        node.state,
+        node.capacity_weight,
+        node.last_heartbeat_at
+            .map(|ts| ts.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        node.metrics.open_writable_volumes,
+        node.metrics.open_read_replicas,
+        node.metrics.open_snapshot_exports,
+        node.metrics.request_ops_per_second,
+        node.metrics.request_bytes_per_second,
+        node.metrics.storage_errors,
+        node.metrics.degraded_volumes,
+        node.advertise_endpoint.as_deref().unwrap_or("-"),
+        node.admin_endpoint.as_deref().unwrap_or("-"),
+        node.metrics_endpoint.as_deref().unwrap_or("-")
+    );
+}
+
+fn print_volume_placement(placement: &VolumePlacementRecord) {
+    println!("placement:   {}/{}", placement.tenant, placement.volume);
+    println!("state:       {:?}", placement.state);
+    println!(
+        "primary:     {}",
+        placement.primary_node.as_deref().unwrap_or("-")
+    );
+    println!(
+        "standbys:    {}",
+        if placement.standby_nodes.is_empty() {
+            "-".to_string()
+        } else {
+            placement.standby_nodes.join(",")
+        }
+    );
+    println!("generation:  {}", placement.generation);
+    if let Some(drain) = &placement.drain {
+        println!(
+            "drain:       {} -> {} started={} completed={}",
+            drain.from_node,
+            drain.to_node,
+            drain.started_at,
+            drain
+                .completed_at
+                .map(|ts| ts.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        );
+    }
+    for endpoint in &placement.stable_endpoints {
+        println!(
+            "endpoint:    {}\t{}\taddress={}\ttarget={}\tgeneration={}",
+            endpoint.name,
+            protocol_name(endpoint.protocol),
+            endpoint.address,
+            endpoint.target_node.as_deref().unwrap_or("-"),
+            endpoint.generation
+        );
+    }
+    for replica in &placement.read_replicas {
+        println!(
+            "replica:     node={}\tlag_seconds={}",
+            replica.node_id,
+            replica
+                .lag_seconds
+                .map(|lag| lag.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        );
+    }
+    for pool in &placement.snapshot_pools {
+        println!(
+            "snapshot_pool: {}\tnodes={}\tmax_exports={}",
+            pool.name,
+            pool.node_ids.join(","),
+            pool.max_exports
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -761,6 +1018,196 @@ async fn run(
                 record.cipher,
                 record.chunk_size
             );
+        }
+        Command::Fleet(FleetCmd::Node(command)) => match command {
+            FleetNodeCmd::Register {
+                id,
+                advertise_endpoint,
+                admin_endpoint,
+                metrics_endpoint,
+                capacity_weight,
+            } => {
+                let node = control
+                    .register_daemon_node(
+                        id,
+                        advertise_endpoint.clone(),
+                        admin_endpoint.clone(),
+                        metrics_endpoint.clone(),
+                        *capacity_weight,
+                    )
+                    .await?;
+                print_daemon_node(&node);
+            }
+            FleetNodeCmd::Heartbeat {
+                id,
+                state,
+                writable_volumes,
+                read_replicas,
+                snapshot_exports,
+                request_ops_per_second,
+                request_bytes_per_second,
+                storage_errors,
+                degraded_volumes,
+            } => {
+                let node = control
+                    .heartbeat_daemon_node(
+                        id,
+                        *state,
+                        DaemonMetrics {
+                            open_writable_volumes: *writable_volumes,
+                            open_read_replicas: *read_replicas,
+                            open_snapshot_exports: *snapshot_exports,
+                            request_ops_per_second: *request_ops_per_second,
+                            request_bytes_per_second: *request_bytes_per_second,
+                            storage_errors: *storage_errors,
+                            degraded_volumes: *degraded_volumes,
+                        },
+                    )
+                    .await?;
+                print_daemon_node(&node);
+            }
+            FleetNodeCmd::List => {
+                for node in control.list_daemon_nodes().await? {
+                    print_daemon_node(&node);
+                }
+            }
+        },
+        Command::Fleet(FleetCmd::Volume(command)) => match command {
+            FleetVolumeCmd::Placement { tenant, volume } => {
+                let placement = control.get_volume_placement(tenant, volume).await?;
+                print_volume_placement(&placement);
+            }
+            FleetVolumeCmd::List => {
+                for placement in control.list_volume_placements().await? {
+                    println!(
+                        "{}/{}\t{:?}\tprimary={}\tstandbys={}\tgeneration={}",
+                        placement.tenant,
+                        placement.volume,
+                        placement.state,
+                        placement.primary_node.as_deref().unwrap_or("-"),
+                        if placement.standby_nodes.is_empty() {
+                            "-".to_string()
+                        } else {
+                            placement.standby_nodes.join(",")
+                        },
+                        placement.generation
+                    );
+                }
+            }
+            FleetVolumeCmd::Assign {
+                tenant,
+                volume,
+                node,
+            } => {
+                let placement = match node {
+                    Some(node) => control.assign_volume_to_node(tenant, volume, node).await?,
+                    None => {
+                        control
+                            .assign_volume_to_low_load_node(tenant, volume)
+                            .await?
+                    }
+                };
+                print_volume_placement(&placement);
+            }
+            FleetVolumeCmd::Endpoint(FleetEndpointCmd::Set {
+                tenant,
+                volume,
+                name,
+                protocol,
+                address,
+            }) => {
+                let placement = control
+                    .set_volume_stable_endpoint(tenant, volume, name, *protocol, address.clone())
+                    .await?;
+                print_volume_placement(&placement);
+            }
+            FleetVolumeCmd::Promote {
+                tenant,
+                volume,
+                failed_node,
+            } => {
+                let placement = control
+                    .promote_standby_on_failure(tenant, volume, failed_node)
+                    .await?;
+                print_volume_placement(&placement);
+            }
+            FleetVolumeCmd::Drain {
+                tenant,
+                volume,
+                target_node,
+            } => {
+                let placement = control
+                    .start_volume_drain(tenant, volume, target_node.as_deref())
+                    .await?;
+                print_volume_placement(&placement);
+                println!("note: start the target daemon/export, then run complete-drain");
+            }
+            FleetVolumeCmd::CompleteDrain { tenant, volume } => {
+                let placement = control.complete_volume_drain(tenant, volume).await?;
+                print_volume_placement(&placement);
+            }
+            FleetVolumeCmd::Replica(command) => match command {
+                FleetReplicaCmd::Add {
+                    tenant,
+                    volume,
+                    node,
+                    lag_seconds,
+                } => {
+                    let placement = control
+                        .add_read_replica(tenant, volume, node, *lag_seconds)
+                        .await?;
+                    print_volume_placement(&placement);
+                }
+                FleetReplicaCmd::Remove {
+                    tenant,
+                    volume,
+                    node,
+                } => {
+                    let placement = control.remove_read_replica(tenant, volume, node).await?;
+                    print_volume_placement(&placement);
+                }
+            },
+            FleetVolumeCmd::SnapshotPool(command) => match command {
+                FleetSnapshotPoolCmd::Set {
+                    tenant,
+                    volume,
+                    name,
+                    nodes,
+                    max_exports,
+                } => {
+                    let placement = control
+                        .set_snapshot_serving_pool(
+                            tenant,
+                            volume,
+                            name,
+                            nodes.clone(),
+                            *max_exports,
+                        )
+                        .await?;
+                    print_volume_placement(&placement);
+                }
+                FleetSnapshotPoolCmd::Remove {
+                    tenant,
+                    volume,
+                    name,
+                } => {
+                    let placement = control
+                        .remove_snapshot_serving_pool(tenant, volume, name)
+                        .await?;
+                    print_volume_placement(&placement);
+                }
+            },
+        },
+        Command::Fleet(FleetCmd::Health {
+            heartbeat_timeout_secs,
+        }) => {
+            let stale = control
+                .mark_stale_daemon_nodes(*heartbeat_timeout_secs)
+                .await?;
+            for node in &stale {
+                print_daemon_node(node);
+            }
+            println!("stale_nodes_marked={}", stale.len());
         }
     }
     Ok(())

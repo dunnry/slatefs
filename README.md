@@ -136,6 +136,12 @@ in the control plane; volume data blocks are not rewritten. Optional
 SlateDB cache/flush samples per writable volume and `slatefs_volume_dead`.
 `[admin].listen = "127.0.0.1:port"` exposes loopback-only daemon admin actions
 such as live-writer snapshot creation.
+The control plane now also stores fleet placement: daemon node health/load,
+per-volume primary ownership, standby lists, stable endpoints, drain/rebalance
+state, read replicas, and snapshot-serving pools. `slatefs fleet node ...` and
+`slatefs fleet volume ...` register nodes, heartbeat metrics, assign new
+volumes to the lowest-load healthy daemon, promote standbys after failure, and
+move stable endpoints when a drained volume is opened elsewhere.
 Starter alert rules live in [monitoring/slatefs-prometheus-rules.yml](monitoring/slatefs-prometheus-rules.yml);
 the starter Grafana dashboard lives in
 [monitoring/slatefs-grafana-dashboard.json](monitoring/slatefs-grafana-dashboard.json);

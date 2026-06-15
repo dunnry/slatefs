@@ -64,10 +64,12 @@ flowchart TB
     graf --> prom
 ```
 
-Only one daemon should actively serve a writable volume at a time. Standby
-daemons can be prepared with the same config and object-store root, then started
-or promoted during failover. SlateDB fencing prevents two active writers from
-continuing to serve the same volume safely.
+Only one daemon should actively serve a writable volume at a time. The control
+plane records which daemon is primary for each writable volume, which daemons
+are standbys, and which stable client-facing endpoints currently target the
+primary. SlateDB fencing is still the last line of defense if two active writers
+race, but operators should make placement changes through `slatefs fleet ...`
+so endpoint movement and ownership stay durable.
 
 ## Object Store Layout
 
@@ -114,18 +116,64 @@ defense-in-depth gate.
 Linux kernel v9fs over plaintext TCP should run inside a tenant-isolated network
 or tunnel.
 
-## Active/Standby HA
+## Fleet Placement And Active/Standby HA
 
-The current HA model is active/standby per writable volume:
+The fleet control layer is active/standby per writable volume:
 
-1. Active daemon serves the volume and owns the SlateDB writer lease.
-2. Standby daemon has the same object-store root, KMS config, exports, and cache
-   sizing, but is not serving that writable volume.
-3. On failover, move the VIP/DNS/service target and start the standby daemon.
-4. The standby opens the same volume, advances the writer epoch, replays WAL,
-   and serves with the same fsid.
-5. The stale daemon observes fencing, marks the volume dead, and drops exports.
-6. Run a client read/write smoke and `slatefs volume scrub`.
+1. Register daemon nodes with capacity and operator-visible endpoints.
+2. Heartbeat health and load snapshots from each node or controller poller.
+3. Volume creation assigns placement to the lowest-load healthy node when fleet
+   nodes are registered.
+4. Stable per-volume endpoints point at the current primary node by generation.
+5. On failure, promote a healthy standby; the endpoint target moves to the
+   promoted node and the failed node is marked unhealthy.
+6. For planned movement, drain a volume, open it on the target node, then
+   complete the drain to move primary ownership and stable endpoints.
+7. For read-heavy workloads, add read replicas or snapshot-serving pools; they
+   are placement records, not multi-writer state.
+
+Example operator flow:
+
+```sh
+slatefs -c /etc/slatefs/slatefs.toml fleet node register daemon-a \
+  --advertise-endpoint 10.42.0.10:2049 \
+  --metrics-endpoint 10.42.0.10:13052 \
+  --capacity-weight 1
+slatefs -c /etc/slatefs/slatefs.toml fleet node register daemon-b \
+  --advertise-endpoint 10.42.0.11:2049 \
+  --metrics-endpoint 10.42.0.11:13052 \
+  --capacity-weight 1
+
+slatefs -c /etc/slatefs/slatefs.toml fleet node heartbeat daemon-a \
+  --writable-volumes 2 --request-ops-per-second 4000
+slatefs -c /etc/slatefs/slatefs.toml fleet node heartbeat daemon-b \
+  --writable-volumes 0 --request-ops-per-second 1000
+
+slatefs -c /etc/slatefs/slatefs.toml volume create prod v2
+slatefs -c /etc/slatefs/slatefs.toml fleet volume endpoint set prod v2 \
+  --name default --protocol nfs --address nfs://prod-v2.example.internal/
+
+# Unplanned failure of the current primary:
+slatefs -c /etc/slatefs/slatefs.toml fleet volume promote prod v2 \
+  --failed-node daemon-a
+
+# Planned movement:
+slatefs -c /etc/slatefs/slatefs.toml fleet volume drain prod v2 \
+  --target-node daemon-b
+# Start/open the target daemon export, then:
+slatefs -c /etc/slatefs/slatefs.toml fleet volume complete-drain prod v2
+
+# Read-heavy adjuncts:
+slatefs -c /etc/slatefs/slatefs.toml fleet volume replica add prod v2 \
+  --node daemon-b --lag-seconds 5
+slatefs -c /etc/slatefs/slatefs.toml fleet volume snapshot-pool set prod v2 \
+  --name reporting --node daemon-a --node daemon-b --max-exports 64
+```
+
+`slatefs fleet health --heartbeat-timeout-secs 60` marks healthy/draining nodes
+unhealthy when their last heartbeat is stale. Daemons still use SlateDB writer
+fencing at open time: a stale primary that keeps running will observe fencing,
+mark the volume dead locally, and drop exports.
 
 The automated drill is:
 

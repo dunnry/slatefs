@@ -212,6 +212,14 @@ pub async fn create_volume(
 
     record.state = VolumeState::Active;
     control.put_volume(&record).await?;
+    if let Some(placement) = control.ensure_volume_placement(&record).await? {
+        tracing::info!(
+            tenant = tenant_name,
+            volume = volume_name,
+            primary = placement.primary_node.as_deref().unwrap_or("-"),
+            "volume placement assigned"
+        );
+    }
     tracing::info!(
         tenant = tenant_name,
         volume = volume_name,

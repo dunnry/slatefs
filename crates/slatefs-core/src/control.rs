@@ -4,13 +4,14 @@
 //! as a raw object at `<root>/control.dek` (it can't live inside the DB it
 //! unlocks).
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use slatedb::object_store::{ObjectStore, PutMode, PutOptions};
 use slatedb::{Db, Settings, WriteBatch};
 
-use crate::config::Compression;
+use crate::config::{Compression, ExportProtocol};
 use crate::crypto::kms::{Kms, contexts};
 use crate::crypto::transformer::SlateBlockTransformer;
 use crate::crypto::{Cipher, Secret32};
@@ -22,6 +23,8 @@ use crate::store;
 const CONTROL_KEYFILE_VERSION: u8 = 1;
 const TENANT_RECORD_VERSION: u8 = 1;
 const VOLUME_RECORD_VERSION: u8 = 1;
+const DAEMON_NODE_RECORD_VERSION: u8 = 1;
+const VOLUME_PLACEMENT_RECORD_VERSION: u8 = 1;
 
 /// Contents of `<root>/control.dek`. The cipher is recorded here (not chosen
 /// per process) so every node opens the control DB with the same AEAD.
@@ -105,12 +108,149 @@ pub struct VolumeRecord {
     pub created_at: u64,
 }
 
+/// Health state last reported for a serving daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DaemonNodeState {
+    Healthy,
+    Draining,
+    Unhealthy,
+    Offline,
+}
+
+impl DaemonNodeState {
+    fn is_placeable(self) -> bool {
+        matches!(self, DaemonNodeState::Healthy)
+    }
+}
+
+/// Controller-visible daemon load snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonMetrics {
+    pub open_writable_volumes: u32,
+    pub open_read_replicas: u32,
+    pub open_snapshot_exports: u32,
+    pub request_ops_per_second: u64,
+    pub request_bytes_per_second: u64,
+    pub storage_errors: u64,
+    pub degraded_volumes: u32,
+}
+
+/// Durable record for one SlateFS daemon that can own writable volumes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonNodeRecord {
+    pub id: String,
+    pub state: DaemonNodeState,
+    /// Operator-facing endpoint for this daemon, usually a private address or
+    /// service name. Per-volume stable endpoints below point at node ids.
+    pub advertise_endpoint: Option<String>,
+    /// Optional loopback/admin endpoint as seen by the controller.
+    pub admin_endpoint: Option<String>,
+    /// Optional Prometheus scrape endpoint.
+    pub metrics_endpoint: Option<String>,
+    /// Relative capacity for placement. A node with weight 2 can carry about
+    /// twice as much balanced load as a node with weight 1.
+    pub capacity_weight: u32,
+    pub metrics: DaemonMetrics,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub last_heartbeat_at: Option<u64>,
+}
+
+/// Stable client-facing endpoint for a volume. Moving a volume changes only
+/// the target node and generation; clients keep using the same address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StableEndpointRecord {
+    pub name: String,
+    pub protocol: ExportProtocol,
+    pub address: String,
+    pub target_node: Option<String>,
+    pub generation: u64,
+    pub updated_at: u64,
+}
+
+/// Read-only replica placement for read-heavy volumes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadReplicaRecord {
+    pub node_id: String,
+    pub lag_seconds: Option<u64>,
+    pub updated_at: u64,
+}
+
+/// Pool of daemons allowed to serve snapshots for one volume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotServingPoolRecord {
+    pub name: String,
+    pub node_ids: Vec<String>,
+    pub max_exports: u32,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VolumePlacementState {
+    Unassigned,
+    Active,
+    Draining,
+}
+
+/// In-progress or recently completed drain/rebalance operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeDrainRecord {
+    pub from_node: String,
+    pub to_node: String,
+    pub started_at: u64,
+    pub completed_at: Option<u64>,
+}
+
+/// Durable placement state for one volume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumePlacementRecord {
+    pub tenant: String,
+    pub volume: String,
+    pub state: VolumePlacementState,
+    pub primary_node: Option<String>,
+    pub standby_nodes: Vec<String>,
+    pub stable_endpoints: Vec<StableEndpointRecord>,
+    pub read_replicas: Vec<ReadReplicaRecord>,
+    pub snapshot_pools: Vec<SnapshotServingPoolRecord>,
+    pub drain: Option<VolumeDrainRecord>,
+    pub generation: u64,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+impl VolumePlacementRecord {
+    fn unassigned(tenant: &str, volume: &str, now: u64) -> Self {
+        Self {
+            tenant: tenant.to_string(),
+            volume: volume.to_string(),
+            state: VolumePlacementState::Unassigned,
+            primary_node: None,
+            standby_nodes: Vec::new(),
+            stable_endpoints: Vec::new(),
+            read_replicas: Vec::new(),
+            snapshot_pools: Vec::new(),
+            drain: None,
+            generation: 1,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
 fn tenant_key(name: &str) -> String {
     format!("t/{name}")
 }
 
 fn volume_key(tenant: &str, volume: &str) -> String {
     format!("v/{tenant}/{volume}")
+}
+
+fn daemon_node_key(id: &str) -> String {
+    format!("dn/{id}")
+}
+
+fn volume_placement_key(tenant: &str, volume: &str) -> String {
+    format!("vp/{tenant}/{volume}")
 }
 
 pub fn now_unix() -> u64 {
@@ -419,6 +559,7 @@ impl ControlPlane {
         record.state = VolumeState::Deleting;
         record.wrapped_dek.clear();
         self.put_volume(&record).await?;
+        self.delete_volume_placement(tenant, volume).await?;
         let objects_deleted = self.delete_volume_objects(tenant, volume).await?;
         tracing::info!(
             tenant,
@@ -440,6 +581,7 @@ impl ControlPlane {
             volume.state = VolumeState::Deleting;
             volume.wrapped_dek.clear();
             self.put_volume(&volume).await?;
+            self.delete_volume_placement(name, &volume.name).await?;
         }
         tenant.state = TenantState::Deleting;
         tenant.wrapped_kek.clear();
@@ -523,6 +665,675 @@ impl ControlPlane {
         Ok(record)
     }
 
+    // ---- fleet placement (nodes, stable endpoints, failover, drain) ----
+
+    pub async fn register_daemon_node(
+        &self,
+        id: &str,
+        advertise_endpoint: Option<String>,
+        admin_endpoint: Option<String>,
+        metrics_endpoint: Option<String>,
+        capacity_weight: u32,
+    ) -> Result<DaemonNodeRecord> {
+        store::validate_name("daemon node id", id)?;
+        validate_capacity_weight(capacity_weight)?;
+
+        let now = now_unix();
+        let record = match self.try_get_daemon_node(id).await? {
+            Some(mut record) => {
+                record.advertise_endpoint = advertise_endpoint;
+                record.admin_endpoint = admin_endpoint;
+                record.metrics_endpoint = metrics_endpoint;
+                record.capacity_weight = capacity_weight;
+                record.updated_at = now;
+                record
+            }
+            None => DaemonNodeRecord {
+                id: id.to_string(),
+                state: DaemonNodeState::Healthy,
+                advertise_endpoint,
+                admin_endpoint,
+                metrics_endpoint,
+                capacity_weight,
+                metrics: DaemonMetrics::default(),
+                created_at: now,
+                updated_at: now,
+                last_heartbeat_at: Some(now),
+            },
+        };
+        self.put_daemon_node(&record).await?;
+        Ok(record)
+    }
+
+    pub async fn try_get_daemon_node(&self, id: &str) -> Result<Option<DaemonNodeRecord>> {
+        match self.db.get(daemon_node_key(id).as_bytes()).await? {
+            Some(bytes) => Ok(Some(decode_versioned(DAEMON_NODE_RECORD_VERSION, &bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_daemon_node(&self, id: &str) -> Result<DaemonNodeRecord> {
+        self.try_get_daemon_node(id)
+            .await?
+            .ok_or_else(|| Error::not_found("daemon node", id))
+    }
+
+    pub async fn put_daemon_node(&self, record: &DaemonNodeRecord) -> Result<()> {
+        self.db
+            .put(
+                daemon_node_key(&record.id).as_bytes(),
+                encode_versioned(DAEMON_NODE_RECORD_VERSION, record)?,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_daemon_nodes(&self) -> Result<Vec<DaemonNodeRecord>> {
+        let mut iter = self.db.scan_prefix(b"dn/".as_slice()).await?;
+        let mut nodes: Vec<DaemonNodeRecord> = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            nodes.push(decode_versioned(DAEMON_NODE_RECORD_VERSION, &kv.value)?);
+        }
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(nodes)
+    }
+
+    pub async fn record_daemon_health_at(
+        &self,
+        id: &str,
+        state: DaemonNodeState,
+        metrics: DaemonMetrics,
+        observed_at: u64,
+    ) -> Result<DaemonNodeRecord> {
+        store::validate_name("daemon node id", id)?;
+        let now = now_unix();
+        let mut record = self
+            .try_get_daemon_node(id)
+            .await?
+            .unwrap_or_else(|| DaemonNodeRecord {
+                id: id.to_string(),
+                state,
+                advertise_endpoint: None,
+                admin_endpoint: None,
+                metrics_endpoint: None,
+                capacity_weight: 1,
+                metrics: DaemonMetrics::default(),
+                created_at: now,
+                updated_at: now,
+                last_heartbeat_at: None,
+            });
+        record.state = state;
+        record.metrics = metrics;
+        record.last_heartbeat_at = Some(observed_at);
+        record.updated_at = now;
+        self.put_daemon_node(&record).await?;
+        Ok(record)
+    }
+
+    pub async fn heartbeat_daemon_node(
+        &self,
+        id: &str,
+        state: DaemonNodeState,
+        metrics: DaemonMetrics,
+    ) -> Result<DaemonNodeRecord> {
+        self.record_daemon_health_at(id, state, metrics, now_unix())
+            .await
+    }
+
+    pub async fn mark_stale_daemon_nodes(
+        &self,
+        heartbeat_timeout_secs: u64,
+    ) -> Result<Vec<DaemonNodeRecord>> {
+        if heartbeat_timeout_secs == 0 {
+            return Err(Error::invalid(
+                "heartbeat timeout",
+                "timeout must be greater than 0",
+            ));
+        }
+
+        let now = now_unix();
+        let mut stale = Vec::new();
+        for mut node in self.list_daemon_nodes().await? {
+            if matches!(
+                node.state,
+                DaemonNodeState::Healthy | DaemonNodeState::Draining
+            ) {
+                let observed = node.last_heartbeat_at.unwrap_or(node.created_at);
+                if now.saturating_sub(observed) > heartbeat_timeout_secs {
+                    node.state = DaemonNodeState::Unhealthy;
+                    node.updated_at = now;
+                    self.put_daemon_node(&node).await?;
+                    stale.push(node);
+                }
+            }
+        }
+        Ok(stale)
+    }
+
+    pub async fn try_get_volume_placement(
+        &self,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<Option<VolumePlacementRecord>> {
+        match self
+            .db
+            .get(volume_placement_key(tenant, volume).as_bytes())
+            .await?
+        {
+            Some(bytes) => Ok(Some(decode_versioned(
+                VOLUME_PLACEMENT_RECORD_VERSION,
+                &bytes,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_volume_placement(
+        &self,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<VolumePlacementRecord> {
+        self.try_get_volume_placement(tenant, volume)
+            .await?
+            .ok_or_else(|| Error::not_found("volume placement", format!("{tenant}/{volume}")))
+    }
+
+    pub async fn put_volume_placement(&self, record: &VolumePlacementRecord) -> Result<()> {
+        self.db
+            .put(
+                volume_placement_key(&record.tenant, &record.volume).as_bytes(),
+                encode_versioned(VOLUME_PLACEMENT_RECORD_VERSION, record)?,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_volume_placements(&self) -> Result<Vec<VolumePlacementRecord>> {
+        let mut iter = self.db.scan_prefix(b"vp/".as_slice()).await?;
+        let mut placements: Vec<VolumePlacementRecord> = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            placements.push(decode_versioned(
+                VOLUME_PLACEMENT_RECORD_VERSION,
+                &kv.value,
+            )?);
+        }
+        placements.sort_by(|a, b| {
+            a.tenant
+                .cmp(&b.tenant)
+                .then_with(|| a.volume.cmp(&b.volume))
+        });
+        Ok(placements)
+    }
+
+    pub async fn delete_volume_placement(&self, tenant: &str, volume: &str) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.delete(volume_placement_key(tenant, volume).into_bytes());
+        self.db.write(batch).await?;
+        Ok(())
+    }
+
+    pub async fn assign_volume_to_low_load_node(
+        &self,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<VolumePlacementRecord> {
+        let node_id = self.choose_low_load_node(&[]).await?;
+        self.assign_volume_to_node(tenant, volume, &node_id).await
+    }
+
+    pub async fn ensure_volume_placement(
+        &self,
+        record: &VolumeRecord,
+    ) -> Result<Option<VolumePlacementRecord>> {
+        if let Some(existing) = self
+            .try_get_volume_placement(&record.tenant, &record.name)
+            .await?
+        {
+            return Ok(Some(existing));
+        }
+        if self.list_daemon_nodes().await?.is_empty() {
+            return Ok(None);
+        }
+        let node_id = match self.choose_low_load_node(&[]).await {
+            Ok(node_id) => node_id,
+            Err(Error::Invalid { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        self.assign_volume_to_node(&record.tenant, &record.name, &node_id)
+            .await
+            .map(Some)
+    }
+
+    pub async fn assign_volume_to_node(
+        &self,
+        tenant: &str,
+        volume: &str,
+        node_id: &str,
+    ) -> Result<VolumePlacementRecord> {
+        self.get_mountable_volume(tenant, volume).await?;
+        let node = self.get_daemon_node(node_id).await?;
+        if !node.state.is_placeable() {
+            return Err(Error::invalid(
+                "daemon node state",
+                format!("node {node_id:?} is {:?}, not Healthy", node.state),
+            ));
+        }
+
+        let now = now_unix();
+        let mut placement = self
+            .try_get_volume_placement(tenant, volume)
+            .await?
+            .unwrap_or_else(|| VolumePlacementRecord::unassigned(tenant, volume, now));
+        placement.primary_node = Some(node_id.to_string());
+        placement.state = VolumePlacementState::Active;
+        placement.drain = None;
+        placement.generation = placement.generation.saturating_add(1);
+        placement.updated_at = now;
+        placement.standby_nodes = self.standby_nodes_for(node_id).await?;
+        move_stable_endpoints(&mut placement, Some(node_id), now);
+        self.put_volume_placement(&placement).await?;
+        Ok(placement)
+    }
+
+    pub async fn set_volume_stable_endpoint(
+        &self,
+        tenant: &str,
+        volume: &str,
+        name: &str,
+        protocol: ExportProtocol,
+        address: String,
+    ) -> Result<VolumePlacementRecord> {
+        self.get_volume(tenant, volume).await?;
+        store::validate_name("endpoint name", name)?;
+        if address.trim().is_empty() {
+            return Err(Error::invalid(
+                "endpoint address",
+                "address must not be empty",
+            ));
+        }
+
+        let now = now_unix();
+        let mut placement = self
+            .try_get_volume_placement(tenant, volume)
+            .await?
+            .unwrap_or_else(|| VolumePlacementRecord::unassigned(tenant, volume, now));
+        let primary = placement.primary_node.clone();
+        match placement
+            .stable_endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.name == name)
+        {
+            Some(endpoint) => {
+                endpoint.protocol = protocol;
+                endpoint.address = address;
+                endpoint.target_node = primary;
+                endpoint.generation = endpoint.generation.saturating_add(1);
+                endpoint.updated_at = now;
+            }
+            None => placement.stable_endpoints.push(StableEndpointRecord {
+                name: name.to_string(),
+                protocol,
+                address,
+                target_node: primary,
+                generation: 1,
+                updated_at: now,
+            }),
+        }
+        placement.updated_at = now;
+        self.put_volume_placement(&placement).await?;
+        Ok(placement)
+    }
+
+    pub async fn promote_standby_on_failure(
+        &self,
+        tenant: &str,
+        volume: &str,
+        failed_node: &str,
+    ) -> Result<VolumePlacementRecord> {
+        let now = now_unix();
+        let mut placement = self.get_volume_placement(tenant, volume).await?;
+        if placement.primary_node.as_deref() != Some(failed_node) {
+            return Err(Error::invalid(
+                "failed primary",
+                format!(
+                    "volume {tenant}/{volume} primary is {:?}, not {failed_node:?}",
+                    placement.primary_node
+                ),
+            ));
+        }
+
+        if let Some(mut failed) = self.try_get_daemon_node(failed_node).await? {
+            failed.state = DaemonNodeState::Unhealthy;
+            failed.updated_at = now;
+            self.put_daemon_node(&failed).await?;
+        }
+
+        let promoted = if let Some(standby) = self.first_healthy_standby(&placement).await? {
+            standby
+        } else {
+            match self.choose_low_load_node(&[failed_node]).await {
+                Ok(node_id) => node_id,
+                Err(Error::Invalid { .. }) => {
+                    return Err(Error::invalid(
+                        "standby promotion",
+                        format!("no healthy standby or replacement for {tenant}/{volume}"),
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        placement
+            .standby_nodes
+            .retain(|candidate| candidate != &promoted && candidate != failed_node);
+        placement.primary_node = Some(promoted.clone());
+        placement.state = VolumePlacementState::Active;
+        placement.drain = None;
+        placement.generation = placement.generation.saturating_add(1);
+        placement.updated_at = now;
+        let mut standbys = self.standby_nodes_for(&promoted).await?;
+        standbys.retain(|candidate| candidate != failed_node);
+        placement.standby_nodes = standbys;
+        move_stable_endpoints(&mut placement, Some(&promoted), now);
+        self.put_volume_placement(&placement).await?;
+        Ok(placement)
+    }
+
+    pub async fn start_volume_drain(
+        &self,
+        tenant: &str,
+        volume: &str,
+        target_node: Option<&str>,
+    ) -> Result<VolumePlacementRecord> {
+        let mut placement = self.get_volume_placement(tenant, volume).await?;
+        let from_node = placement.primary_node.clone().ok_or_else(|| {
+            Error::invalid(
+                "volume placement",
+                format!("volume {tenant}/{volume} has no primary node"),
+            )
+        })?;
+        let to_node = match target_node {
+            Some(node_id) => {
+                let node = self.get_daemon_node(node_id).await?;
+                if !node.state.is_placeable() {
+                    return Err(Error::invalid(
+                        "drain target",
+                        format!("node {node_id:?} is {:?}, not Healthy", node.state),
+                    ));
+                }
+                node_id.to_string()
+            }
+            None => self.choose_low_load_node(&[&from_node]).await?,
+        };
+        if from_node == to_node {
+            return Err(Error::invalid(
+                "drain target",
+                "target node must differ from current primary",
+            ));
+        }
+
+        let now = now_unix();
+        placement.state = VolumePlacementState::Draining;
+        placement.drain = Some(VolumeDrainRecord {
+            from_node,
+            to_node,
+            started_at: now,
+            completed_at: None,
+        });
+        placement.updated_at = now;
+        self.put_volume_placement(&placement).await?;
+        Ok(placement)
+    }
+
+    pub async fn complete_volume_drain(
+        &self,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<VolumePlacementRecord> {
+        let now = now_unix();
+        let mut placement = self.get_volume_placement(tenant, volume).await?;
+        let mut drain = placement.drain.clone().ok_or_else(|| {
+            Error::invalid(
+                "volume drain",
+                format!("volume {tenant}/{volume} is not draining"),
+            )
+        })?;
+        let target = self.get_daemon_node(&drain.to_node).await?;
+        if !target.state.is_placeable() {
+            return Err(Error::invalid(
+                "drain target",
+                format!("node {:?} is {:?}, not Healthy", target.id, target.state),
+            ));
+        }
+
+        placement.primary_node = Some(drain.to_node.clone());
+        placement.state = VolumePlacementState::Active;
+        drain.completed_at = Some(now);
+        placement.drain = Some(drain.clone());
+        placement.generation = placement.generation.saturating_add(1);
+        placement.updated_at = now;
+        let mut standbys = self.standby_nodes_for(&drain.to_node).await?;
+        if !standbys.contains(&drain.from_node) {
+            standbys.push(drain.from_node);
+        }
+        placement.standby_nodes = standbys;
+        move_stable_endpoints(&mut placement, Some(&drain.to_node), now);
+        self.put_volume_placement(&placement).await?;
+        Ok(placement)
+    }
+
+    pub async fn add_read_replica(
+        &self,
+        tenant: &str,
+        volume: &str,
+        node_id: &str,
+        lag_seconds: Option<u64>,
+    ) -> Result<VolumePlacementRecord> {
+        self.get_volume(tenant, volume).await?;
+        let node = self.get_daemon_node(node_id).await?;
+        if !node.state.is_placeable() {
+            return Err(Error::invalid(
+                "read replica node",
+                format!("node {node_id:?} is {:?}, not Healthy", node.state),
+            ));
+        }
+
+        let now = now_unix();
+        let mut placement = self
+            .try_get_volume_placement(tenant, volume)
+            .await?
+            .unwrap_or_else(|| VolumePlacementRecord::unassigned(tenant, volume, now));
+        if let Some(replica) = placement
+            .read_replicas
+            .iter_mut()
+            .find(|replica| replica.node_id == node_id)
+        {
+            replica.lag_seconds = lag_seconds;
+            replica.updated_at = now;
+        } else {
+            placement.read_replicas.push(ReadReplicaRecord {
+                node_id: node_id.to_string(),
+                lag_seconds,
+                updated_at: now,
+            });
+        }
+        placement.updated_at = now;
+        self.put_volume_placement(&placement).await?;
+        Ok(placement)
+    }
+
+    pub async fn remove_read_replica(
+        &self,
+        tenant: &str,
+        volume: &str,
+        node_id: &str,
+    ) -> Result<VolumePlacementRecord> {
+        let now = now_unix();
+        let mut placement = self.get_volume_placement(tenant, volume).await?;
+        placement
+            .read_replicas
+            .retain(|replica| replica.node_id != node_id);
+        placement.updated_at = now;
+        self.put_volume_placement(&placement).await?;
+        Ok(placement)
+    }
+
+    pub async fn set_snapshot_serving_pool(
+        &self,
+        tenant: &str,
+        volume: &str,
+        name: &str,
+        node_ids: Vec<String>,
+        max_exports: u32,
+    ) -> Result<VolumePlacementRecord> {
+        self.get_volume(tenant, volume).await?;
+        store::validate_name("snapshot pool name", name)?;
+        if node_ids.is_empty() {
+            return Err(Error::invalid(
+                "snapshot pool",
+                "at least one node is required",
+            ));
+        }
+        if max_exports == 0 {
+            return Err(Error::invalid(
+                "snapshot pool",
+                "max_exports must be greater than 0",
+            ));
+        }
+        let mut unique = HashSet::new();
+        for node_id in &node_ids {
+            if !unique.insert(node_id.clone()) {
+                return Err(Error::invalid(
+                    "snapshot pool",
+                    format!("duplicate node {node_id:?}"),
+                ));
+            }
+            let node = self.get_daemon_node(node_id).await?;
+            if !node.state.is_placeable() {
+                return Err(Error::invalid(
+                    "snapshot pool node",
+                    format!("node {node_id:?} is {:?}, not Healthy", node.state),
+                ));
+            }
+        }
+
+        let now = now_unix();
+        let mut placement = self
+            .try_get_volume_placement(tenant, volume)
+            .await?
+            .unwrap_or_else(|| VolumePlacementRecord::unassigned(tenant, volume, now));
+        if let Some(pool) = placement
+            .snapshot_pools
+            .iter_mut()
+            .find(|pool| pool.name == name)
+        {
+            pool.node_ids = node_ids;
+            pool.max_exports = max_exports;
+            pool.updated_at = now;
+        } else {
+            placement.snapshot_pools.push(SnapshotServingPoolRecord {
+                name: name.to_string(),
+                node_ids,
+                max_exports,
+                updated_at: now,
+            });
+        }
+        placement.updated_at = now;
+        self.put_volume_placement(&placement).await?;
+        Ok(placement)
+    }
+
+    pub async fn remove_snapshot_serving_pool(
+        &self,
+        tenant: &str,
+        volume: &str,
+        name: &str,
+    ) -> Result<VolumePlacementRecord> {
+        let now = now_unix();
+        let mut placement = self.get_volume_placement(tenant, volume).await?;
+        placement.snapshot_pools.retain(|pool| pool.name != name);
+        placement.updated_at = now;
+        self.put_volume_placement(&placement).await?;
+        Ok(placement)
+    }
+
+    async fn choose_low_load_node(&self, excluded: &[&str]) -> Result<String> {
+        let nodes = self.list_daemon_nodes().await?;
+        let excluded: HashSet<&str> = excluded.iter().copied().collect();
+        if nodes.is_empty() {
+            return Err(Error::invalid(
+                "fleet placement",
+                "no daemon nodes are registered",
+            ));
+        }
+
+        let assignment_counts = self.primary_assignment_counts().await?;
+        nodes
+            .into_iter()
+            .filter(|node| node.state.is_placeable())
+            .filter(|node| !excluded.contains(node.id.as_str()))
+            .map(|node| {
+                let assigned = assignment_counts.get(&node.id).copied().unwrap_or(0);
+                let score = node_load_score(&node, assigned);
+                (score, node.id)
+            })
+            .min_by(|(score_a, id_a), (score_b, id_b)| {
+                score_a.cmp(score_b).then_with(|| id_a.cmp(id_b))
+            })
+            .map(|(_, id)| id)
+            .ok_or_else(|| Error::invalid("fleet placement", "no healthy daemon nodes available"))
+    }
+
+    async fn standby_nodes_for(&self, primary_node: &str) -> Result<Vec<String>> {
+        let assignment_counts = self.primary_assignment_counts().await?;
+        let mut candidates: Vec<_> = self
+            .list_daemon_nodes()
+            .await?
+            .into_iter()
+            .filter(|node| node.state.is_placeable() && node.id != primary_node)
+            .map(|node| {
+                let assigned = assignment_counts.get(&node.id).copied().unwrap_or(0);
+                let score = node_load_score(&node, assigned);
+                (score, node.id)
+            })
+            .collect();
+        candidates.sort_by(|(score_a, id_a), (score_b, id_b)| {
+            score_a.cmp(score_b).then_with(|| id_a.cmp(id_b))
+        });
+        Ok(candidates.into_iter().map(|(_, id)| id).collect())
+    }
+
+    async fn first_healthy_standby(
+        &self,
+        placement: &VolumePlacementRecord,
+    ) -> Result<Option<String>> {
+        for standby in &placement.standby_nodes {
+            if self
+                .try_get_daemon_node(standby)
+                .await?
+                .is_some_and(|node| node.state.is_placeable())
+            {
+                return Ok(Some(standby.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn primary_assignment_counts(&self) -> Result<HashMap<String, u32>> {
+        let mut counts = HashMap::new();
+        for placement in self.list_volume_placements().await? {
+            if !matches!(
+                placement.state,
+                VolumePlacementState::Active | VolumePlacementState::Draining
+            ) {
+                continue;
+            }
+            if let Some(node_id) = placement.primary_node {
+                *counts.entry(node_id).or_insert(0) += 1;
+            }
+        }
+        Ok(counts)
+    }
+
     /// Unwrap a volume's DEK: master KMS → tenant KEK → volume DEK (DD-8).
     pub async fn unwrap_volume_dek(&self, record: &VolumeRecord) -> Result<Secret32> {
         if record.wrapped_dek.is_empty() {
@@ -590,6 +1401,47 @@ fn validate_rate_limit(kind: &'static str, limit: Option<u64>) -> Result<()> {
 fn validate_rate_limits(limits: &RateLimits) -> Result<()> {
     validate_rate_limit("ops rate limit", limits.ops_per_second)?;
     validate_rate_limit("bytes rate limit", limits.bytes_per_second)
+}
+
+fn validate_capacity_weight(capacity_weight: u32) -> Result<()> {
+    if capacity_weight == 0 {
+        return Err(Error::invalid(
+            "daemon node capacity",
+            "capacity_weight must be greater than 0",
+        ));
+    }
+    Ok(())
+}
+
+fn node_load_score(node: &DaemonNodeRecord, assigned_primary_volumes: u32) -> u128 {
+    let metrics = node.metrics;
+    let writable = assigned_primary_volumes.max(metrics.open_writable_volumes) as u128;
+    let read = metrics.open_read_replicas as u128;
+    let snapshots = metrics.open_snapshot_exports as u128;
+    let request_ops = metrics.request_ops_per_second as u128;
+    let request_kib = (metrics.request_bytes_per_second / 1024) as u128;
+    let storage_errors = metrics.storage_errors as u128;
+    let degraded = metrics.degraded_volumes as u128;
+    let raw = writable * 1_000_000
+        + read * 250_000
+        + snapshots * 100_000
+        + request_ops
+        + request_kib
+        + storage_errors * 10_000
+        + degraded * 500_000;
+    raw / node.capacity_weight.max(1) as u128
+}
+
+fn move_stable_endpoints(
+    placement: &mut VolumePlacementRecord,
+    target_node: Option<&str>,
+    now: u64,
+) {
+    for endpoint in &mut placement.stable_endpoints {
+        endpoint.target_node = target_node.map(str::to_string);
+        endpoint.generation = endpoint.generation.saturating_add(1);
+        endpoint.updated_at = now;
+    }
 }
 
 fn decode_tenant_record(bytes: &[u8]) -> Result<TenantRecord> {

@@ -42,6 +42,13 @@ cipher = "auto"              # auto | aes256gcm | xchacha20poly1305
 # [admin]
 # listen = "127.0.0.1:12081"
 
+# Fleet placement is stored in the encrypted control DB, not in this config.
+# Register and heartbeat daemon nodes with:
+#   slatefs fleet node register daemon-a --advertise-endpoint 10.0.0.10:2049
+#   slatefs fleet node heartbeat daemon-a --writable-volumes 0
+# Assignments, stable endpoints, failover, drains, read replicas, and
+# snapshot-serving pools are managed with `slatefs fleet volume ...`.
+
 # Example export:
 # [[exports]]
 # tenant = "t1"
