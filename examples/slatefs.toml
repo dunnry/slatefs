@@ -46,6 +46,8 @@ cipher = "auto"              # auto | aes256gcm | xchacha20poly1305
 
 # Control-plane exports are reconciled live by slatefsd. Static [[exports]]
 # below are still supported as immutable bootstrap/compatibility exports.
+# The same poll interval also reloads served-volume quota limits, tenant rate
+# limits, and enforces per-volume snapshot retention policies.
 # [export_control]
 # poll_interval_secs = 30
 
@@ -76,3 +78,8 @@ cipher = "auto"              # auto | aes256gcm | xchacha20poly1305
 #   slatefs export add exp1 --tenant t1 --volume v1 --listen 127.0.0.1:12049
 #   slatefs export list
 #   slatefs export disable exp1
+
+# Manage per-volume snapshot retention with:
+#   slatefs snapshot retention set t1 v1 --keep-last 24 --max-age 604800
+#   slatefs snapshot retention show t1 v1
+# Named snapshots are not exempt; active clone parent volumes are skipped.

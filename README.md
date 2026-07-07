@@ -120,8 +120,10 @@ Quota limits are operator-manageable with `slatefs quota
 show|set`, including hard limits and soft limits that become enforcing after
 their grace deadline expires. `slatefs volume scrub` runs the structural checker
 through a read-only SlateDB reader, so it can compare counters/recount while the
-volume is being served. Live quota enforcement still uses the limits loaded when
-a volume is opened, so changed limits apply on the next serve/open cycle.
+volume is being served. `slatefsd` also reloads changed tenant rate limits and
+served-volume quota limits on the `[export_control].poll_interval_secs` loop:
+rate buckets are resized in place, and quota changes apply on the next mutation
+check without reopening the volume.
 `slatefs tenant delete --yes` and `slatefs volume delete --yes` mark records
 deleting, drop wrapped keys from the current control-plane state, and delete
 the affected volume object-store prefixes.
@@ -139,7 +141,16 @@ with `--snapshot <id>`. Clones get distinct fsids and independent writes, but
 they intentionally share source SSTs, so deleting a source volume is refused
 while active clones point at it. `[[exports]] snapshot = "<checkpoint-id>"`
 serves that checkpoint through the normal NFS or 9P frontend as a read-only
-mount; live writes after the checkpoint are not visible there. `slatefs key
+mount; live writes after the checkpoint are not visible there. `slatefs snapshot
+retention show|set <tenant> <volume> [--keep-last N] [--max-age SECS] [--clear]`
+stores a per-volume retention policy in the control plane. `slatefsd` enforces
+policies on the same poll loop family by deleting checkpoints beyond
+`keep_last` (newest kept) or older than `max_age`; named snapshots are not
+exempt. If a volume is the parent of an active clone, retention skips that
+source volume because the current control record does not identify SlateDB's
+per-clone pin checkpoint IDs precisely enough to delete safely. Deletions write
+`SnapshotRetentionDelete` audit records and increment
+`slatefs_snapshots_retention_deleted_total{tenant,volume}`. `slatefs key
 rotate-kek <tenant>` rotates that tenant's KEK by rewrapping active volume DEKs
 in the control plane; volume data blocks are not rewritten. Optional
 `[metrics].listen = "ip:port"` exposes Prometheus text at `/metrics`, including
@@ -166,6 +177,8 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}` | Volume detail. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshot?name=` | v1 live-writer snapshot alias. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshots` | Checkpoint inventory with `limit`, `page_token`, and optional `name`. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshot-retention` | Snapshot retention policy; named snapshots are not exempt. |
+| `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshot-retention` | Set nullable `keep_last` and/or `max_age_secs`, or `{"clear":true}`. |
 | `GET` | `/admin/v1/nodes` | Daemon node inventory with `limit` and `page_token`. |
 
 Every admin response includes `X-Request-Id`; callers may provide it or the

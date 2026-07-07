@@ -952,6 +952,14 @@ impl Volume {
         self.quota.hard_limits()
     }
 
+    pub fn quota_limits(&self) -> QuotaLimits {
+        self.quota.limits()
+    }
+
+    pub fn set_quota_limits(&self, limits: QuotaLimits) -> bool {
+        self.quota.set_limits(limits)
+    }
+
     pub fn quota_rejections(&self) -> u64 {
         self.quota.rejections()
     }

@@ -13,6 +13,7 @@
 //! real length even after sparse growth; chunks orphaned beyond `size` by an
 //! interrupted truncate bill zero until reaped.
 
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use bytes::Bytes;
@@ -91,7 +92,7 @@ pub struct QuotaTracker {
     bytes: AtomicI64,
     inodes: AtomicI64,
     rejections: AtomicU64,
-    limits: QuotaLimits,
+    limits: RwLock<QuotaLimits>,
 }
 
 impl QuotaTracker {
@@ -100,7 +101,7 @@ impl QuotaTracker {
             bytes: AtomicI64::new(bytes),
             inodes: AtomicI64::new(inodes),
             rejections: AtomicU64::new(0),
-            limits,
+            limits: RwLock::new(limits),
         }
     }
 
@@ -111,12 +112,22 @@ impl QuotaTracker {
         )
     }
 
-    pub fn limits(&self) -> &QuotaLimits {
-        &self.limits
+    pub fn limits(&self) -> QuotaLimits {
+        *self.limits.read().expect("quota limits poisoned")
     }
 
     pub fn hard_limits(&self) -> (Option<u64>, Option<u64>) {
-        (self.limits.bytes.hard, self.limits.inodes.hard)
+        let limits = self.limits();
+        (limits.bytes.hard, limits.inodes.hard)
+    }
+
+    pub fn set_limits(&self, limits: QuotaLimits) -> bool {
+        let mut current = self.limits.write().expect("quota limits poisoned");
+        if *current == limits {
+            return false;
+        }
+        *current = limits;
+        true
     }
 
     pub fn rejections(&self) -> u64 {
@@ -129,14 +140,15 @@ impl QuotaTracker {
     /// [`QuotaTracker::release`] if the commit fails.
     pub fn reserve(&self, bytes_delta: i64, inode_delta: i64) -> Result<(), FsError> {
         let now = now_unix();
+        let limits = self.limits();
         let new_bytes = self.bytes.fetch_add(bytes_delta, Ordering::Relaxed) + bytes_delta;
-        if bytes_delta > 0 && exceeds_limit(new_bytes, &self.limits.bytes, now) {
+        if bytes_delta > 0 && exceeds_limit(new_bytes, &limits.bytes, now) {
             self.bytes.fetch_sub(bytes_delta, Ordering::Relaxed);
             self.rejections.fetch_add(1, Ordering::Relaxed);
             return Err(FsError::QuotaExceeded);
         }
         let new_inodes = self.inodes.fetch_add(inode_delta, Ordering::Relaxed) + inode_delta;
-        if inode_delta > 0 && exceeds_limit(new_inodes, &self.limits.inodes, now) {
+        if inode_delta > 0 && exceeds_limit(new_inodes, &limits.inodes, now) {
             self.inodes.fetch_sub(inode_delta, Ordering::Relaxed);
             self.bytes.fetch_sub(bytes_delta, Ordering::Relaxed);
             self.rejections.fetch_add(1, Ordering::Relaxed);
@@ -154,9 +166,10 @@ impl QuotaTracker {
     /// Over-limit check for ops that don't change accounted usage but are
     /// still quota-gated (xattr set, plan §12).
     pub fn check_not_over(&self) -> Result<(), FsError> {
+        let limits = self.limits();
         if exceeds_limit(
             self.bytes.load(Ordering::Relaxed),
-            &self.limits.bytes,
+            &limits.bytes,
             now_unix(),
         ) {
             self.rejections.fetch_add(1, Ordering::Relaxed);
@@ -278,5 +291,16 @@ mod tests {
         let q = QuotaTracker::new(500, 5, limits(Some(100), Some(2)));
         q.reserve(-400, -3).unwrap();
         assert_eq!(q.usage(), (100, 2));
+    }
+
+    #[test]
+    fn live_limit_updates_affect_next_reservation() {
+        let q = QuotaTracker::new(0, 0, limits(Some(100), None));
+        q.reserve(80, 0).unwrap();
+        assert!(q.set_limits(limits(Some(80), None)));
+        assert!(matches!(q.reserve(1, 0), Err(FsError::QuotaExceeded)));
+        assert!(q.set_limits(limits(Some(81), None)));
+        q.reserve(1, 0).unwrap();
+        assert_eq!(q.usage(), (81, 0));
     }
 }

@@ -5,7 +5,7 @@
 //! control DB while the daemon runs) → open volumes → one listener per export
 //! (DD-10).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,13 +15,15 @@ use anyhow::Context;
 use clap::Parser;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use slatedb::admin::AdminBuilder;
 use slatedb::object_store::ObjectStore;
 use slatefs_core::config::{
     AdminConfig, AtimeMode, ClientAddrRule, Config, ExportConfig, ExportProtocol, SquashMode,
 };
 use slatefs_core::control::{
     AuditAction, AuditActor, AuditOutcome, AuditPlane, AuditQuery, AuditRecord, AuditScope,
-    ControlPlane, ControlReader, ExportRecord, TenantRecord, VolumePlacementRecord, VolumeRecord,
+    ControlPlane, ControlReader, ExportRecord, SnapshotRetentionPolicy, TenantRecord,
+    VolumePlacementRecord, VolumeRecord,
 };
 use slatefs_core::crypto::kms;
 use slatefs_core::metrics::{AggregatingRecorder, PrometheusSample, render_prometheus};
@@ -96,6 +98,7 @@ struct DesiredExport {
 struct ExportMetrics {
     active: Arc<Mutex<HashMap<(ExportProtocol, ExportSource), usize>>>,
     reconcile_failures: Arc<AtomicU64>,
+    snapshot_retention_deleted: Arc<Mutex<HashMap<(String, String), u64>>>,
 }
 
 impl ExportMetrics {
@@ -112,6 +115,19 @@ impl ExportMetrics {
 
     fn failure(&self) {
         self.reconcile_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot_retention_deleted(&self, tenant: &str, volume: &str, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let mut deleted = self
+            .snapshot_retention_deleted
+            .lock()
+            .expect("snapshot retention metrics poisoned");
+        *deleted
+            .entry((tenant.to_string(), volume.to_string()))
+            .or_insert(0) += count;
     }
 
     fn active_total(&self) -> usize {
@@ -143,6 +159,17 @@ impl ExportMetrics {
             std::iter::empty::<(&str, &str)>(),
             self.reconcile_failures.load(Ordering::Relaxed) as f64,
         ));
+        let deleted = self
+            .snapshot_retention_deleted
+            .lock()
+            .expect("snapshot retention metrics poisoned");
+        for ((tenant, volume), value) in deleted.iter() {
+            samples.push(PrometheusSample::new(
+                "slatefs_snapshots_retention_deleted_total",
+                [("tenant", tenant.as_str()), ("volume", volume.as_str())],
+                *value as f64,
+            ));
+        }
         samples
     }
 }
@@ -661,6 +688,17 @@ impl ExportPatchRequest {
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotRetentionPatchRequest {
+    #[serde(default)]
+    keep_last: Option<Option<u32>>,
+    #[serde(default)]
+    max_age_secs: Option<Option<u64>>,
+    #[serde(default)]
+    clear: bool,
+}
+
 fn default_enabled_json() -> bool {
     true
 }
@@ -1092,6 +1130,22 @@ fn quota_limits_json(record: &VolumeRecord) -> Value {
     })
 }
 
+fn snapshot_retention_json(policy: Option<&SnapshotRetentionPolicy>) -> Value {
+    policy
+        .map(|policy| {
+            json!({
+                "tenant": policy.tenant,
+                "volume": policy.volume,
+                "keep_last": policy.keep_last,
+                "max_age_secs": policy.max_age_secs,
+                "updated_at": policy.updated_at,
+                "named_snapshots_exempt": false,
+                "active_clone_parent_behavior": "skip_volume",
+            })
+        })
+        .unwrap_or(Value::Null)
+}
+
 fn placement_json(placement: Option<VolumePlacementRecord>) -> Result<Value, AdminError> {
     placement
         .map(|placement| {
@@ -1367,6 +1421,76 @@ async fn list_snapshots_response(
     Ok(AdminHttpResponse::json(
         200,
         json!({ "snapshots": snapshots, "next_page_token": next }),
+    ))
+}
+
+async fn get_snapshot_retention_response(
+    state: &AdminState,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let reader = state.control_reader()?;
+    reader
+        .get_volume(tenant, volume)
+        .await
+        .map_err(core_error)?;
+    let policy = reader
+        .try_get_snapshot_retention_policy(tenant, volume)
+        .await
+        .map_err(core_error)?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "retention": snapshot_retention_json(policy.as_ref()) }),
+    ))
+}
+
+async fn patch_snapshot_retention_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let body: SnapshotRetentionPatchRequest = parse_json_body(request)?;
+    if body.clear && (body.keep_last.is_some() || body.max_age_secs.is_some()) {
+        return Err(bad_request(
+            "clear cannot be combined with keep_last or max_age_secs",
+        ));
+    }
+    if !body.clear && body.keep_last.is_none() && body.max_age_secs.is_none() {
+        return Err(bad_request(
+            "provide keep_last, max_age_secs, or clear=true",
+        ));
+    }
+
+    let control = state.control_writer().await?;
+    let policy = if body.clear {
+        control
+            .clear_snapshot_retention_policy(tenant, volume)
+            .await
+            .map_err(core_error)?;
+        None
+    } else {
+        let current = control
+            .try_get_snapshot_retention_policy(tenant, volume)
+            .await
+            .map_err(core_error)?;
+        let keep_last = body
+            .keep_last
+            .unwrap_or_else(|| current.as_ref().and_then(|policy| policy.keep_last));
+        let max_age_secs = body
+            .max_age_secs
+            .unwrap_or_else(|| current.as_ref().and_then(|policy| policy.max_age_secs));
+        Some(
+            control
+                .set_snapshot_retention_policy(tenant, volume, keep_last, max_age_secs)
+                .await
+                .map_err(core_error)?,
+        )
+    };
+    control.close().await.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "retention": snapshot_retention_json(policy.as_ref()) }),
     ))
 }
 
@@ -1713,6 +1837,30 @@ async fn route_admin_request(
             ],
         ) => list_snapshots_response(state, request, tenant, volume).await,
         (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "snapshot-retention",
+            ],
+        ) => get_snapshot_retention_response(state, tenant, volume).await,
+        (
+            "PATCH",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "snapshot-retention",
+            ],
+        ) => patch_snapshot_retention_response(state, request, tenant, volume).await,
+        (
             "POST",
             [
                 "admin",
@@ -1870,6 +2018,189 @@ async fn clone_parent_prefixes_from_reader(
     ))
 }
 
+#[derive(Debug)]
+struct RetentionDeletedSnapshot {
+    id: String,
+    manifest_id: u64,
+    name: Option<String>,
+    reasons: Vec<&'static str>,
+}
+
+fn checkpoint_age_secs(checkpoint: &slatedb::Checkpoint, now: u64) -> Option<u64> {
+    let created = checkpoint.create_time.timestamp();
+    (created >= 0).then(|| now.saturating_sub(created as u64))
+}
+
+async fn active_clone_parent_volumes(
+    reader: &ControlReader,
+) -> anyhow::Result<HashSet<(String, String)>> {
+    let mut parents = HashSet::new();
+    for tenant in reader.list_tenants().await? {
+        for volume in reader.list_volumes(&tenant.name).await? {
+            if let Some(parent) = volume.clone_parent
+                && !matches!(volume.state, slatefs_core::control::VolumeState::Deleting)
+            {
+                parents.insert((parent.tenant, parent.volume));
+            }
+        }
+    }
+    Ok(parents)
+}
+
+async fn enforce_retention_for_policy(
+    object_store: Arc<dyn ObjectStore>,
+    record: &VolumeRecord,
+    policy: &SnapshotRetentionPolicy,
+) -> anyhow::Result<Vec<RetentionDeletedSnapshot>> {
+    let path = store::volume_db_path(&record.tenant, &record.name);
+    let admin = AdminBuilder::new(path, object_store).build();
+    let mut checkpoints = admin.list_checkpoints(None).await?;
+    checkpoints.sort_by(|a, b| {
+        b.create_time
+            .cmp(&a.create_time)
+            .then_with(|| b.manifest_id.cmp(&a.manifest_id))
+            .then_with(|| b.id.cmp(&a.id))
+    });
+
+    let now = slatefs_core::control::now_unix();
+    let mut deleted = Vec::new();
+    for (idx, checkpoint) in checkpoints.into_iter().enumerate() {
+        let mut reasons = Vec::new();
+        if policy
+            .keep_last
+            .is_some_and(|keep_last| idx >= keep_last as usize)
+        {
+            reasons.push("keep_last");
+        }
+        if policy.max_age_secs.is_some_and(|max_age| {
+            checkpoint_age_secs(&checkpoint, now).is_some_and(|age| age > max_age)
+        }) {
+            reasons.push("max_age");
+        }
+        if reasons.is_empty() {
+            continue;
+        }
+        admin.delete_checkpoint(checkpoint.id).await?;
+        deleted.push(RetentionDeletedSnapshot {
+            id: checkpoint.id.to_string(),
+            manifest_id: checkpoint.manifest_id,
+            name: checkpoint.name,
+            reasons,
+        });
+    }
+    Ok(deleted)
+}
+
+fn snapshot_retention_audit_record(
+    tenant: &str,
+    volume: &str,
+    deleted: &RetentionDeletedSnapshot,
+) -> AuditRecord {
+    let mut record = AuditRecord::new(
+        AuditActor {
+            plane: AuditPlane::Admin,
+            source_ip: None,
+            client_agent: Some("slatefsd snapshot-retention".to_string()),
+        },
+        AuditAction::SnapshotRetentionDelete,
+        AuditScope {
+            tenant: Some(tenant.to_string()),
+            volume: Some(volume.to_string()),
+            node: None,
+        },
+        format!("snapshot-retention-{}", uuid::Uuid::new_v4()),
+        AuditOutcome::Success,
+    );
+    record.details.insert(
+        "snapshot_id".to_string(),
+        slatefs_core::control::AuditDetailValue::String(deleted.id.clone()),
+    );
+    record.details.insert(
+        "manifest_id".to_string(),
+        slatefs_core::control::AuditDetailValue::U64(deleted.manifest_id),
+    );
+    record.details.insert(
+        "name".to_string(),
+        deleted
+            .name
+            .as_ref()
+            .map(|name| slatefs_core::control::AuditDetailValue::String(name.clone()))
+            .unwrap_or(slatefs_core::control::AuditDetailValue::Null),
+    );
+    record.details.insert(
+        "reasons".to_string(),
+        slatefs_core::control::AuditDetailValue::Array(
+            deleted
+                .reasons
+                .iter()
+                .map(|reason| slatefs_core::control::AuditDetailValue::String((*reason).into()))
+                .collect(),
+        ),
+    );
+    record
+}
+
+async fn enforce_snapshot_retention(
+    reader: &ControlReader,
+    object_store: Arc<dyn ObjectStore>,
+    kms: Arc<dyn kms::Kms>,
+    metrics: ExportMetrics,
+) -> anyhow::Result<()> {
+    let policies = reader.list_snapshot_retention_policies().await?;
+    if policies.is_empty() {
+        return Ok(());
+    }
+    let clone_parent_volumes = active_clone_parent_volumes(reader).await?;
+    let mut audit_records = Vec::new();
+
+    for policy in policies {
+        if clone_parent_volumes.contains(&(policy.tenant.clone(), policy.volume.clone())) {
+            tracing::warn!(
+                tenant = policy.tenant.as_str(),
+                volume = policy.volume.as_str(),
+                "snapshot retention skipped: active clone parent checkpoints are not individually detectable"
+            );
+            continue;
+        }
+        let Some(record) = reader
+            .try_get_volume(&policy.tenant, &policy.volume)
+            .await?
+        else {
+            continue;
+        };
+        if !matches!(record.state, slatefs_core::control::VolumeState::Active) {
+            continue;
+        }
+        let deleted =
+            enforce_retention_for_policy(Arc::clone(&object_store), &record, &policy).await?;
+        if deleted.is_empty() {
+            continue;
+        }
+        metrics.snapshot_retention_deleted(&policy.tenant, &policy.volume, deleted.len() as u64);
+        tracing::info!(
+            tenant = policy.tenant.as_str(),
+            volume = policy.volume.as_str(),
+            deleted = deleted.len(),
+            "snapshot retention deleted checkpoints"
+        );
+        audit_records.extend(
+            deleted
+                .iter()
+                .map(|deleted| {
+                    snapshot_retention_audit_record(&policy.tenant, &policy.volume, deleted)
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    if !audit_records.is_empty() {
+        let control = ControlPlane::open(object_store, kms).await?;
+        control.append_audit_records(audit_records).await?;
+        control.close().await?;
+    }
+    Ok(())
+}
+
 impl ExportManager {
     fn new(
         object_store: Arc<dyn ObjectStore>,
@@ -2001,7 +2332,7 @@ impl ExportManager {
         }
 
         let (backend_key, volume, rate_limits) = self.backend_for(reader, &desired.config).await?;
-        let rate_limiter = self.rate_limiter_for(desired.config.tenant.clone(), rate_limits);
+        let rate_limiter = Some(self.rate_limiter_for(desired.config.tenant.clone(), rate_limits));
         let bind_result = match desired.config.protocol {
             ExportProtocol::Nfs => {
                 let policy = SquashPolicy {
@@ -2238,12 +2569,10 @@ impl ExportManager {
         Ok((backend_key, vfs, tenant.rate_limits))
     }
 
-    fn rate_limiter_for(&mut self, tenant: String, limits: RateLimits) -> Option<Arc<RateLimiter>> {
-        if limits.is_unlimited() {
-            return None;
-        }
+    fn rate_limiter_for(&mut self, tenant: String, limits: RateLimits) -> Arc<RateLimiter> {
         if let Some(limiter) = self.rate_limiters.get(&tenant) {
-            return Some(Arc::clone(limiter));
+            limiter.set_limits(limits);
+            return Arc::clone(limiter);
         }
         let limiter = Arc::new(RateLimiter::new(limits));
         self.rate_limiters
@@ -2255,7 +2584,52 @@ impl ExportManager {
                 tenant,
                 limiter: Arc::clone(&limiter),
             });
-        Some(limiter)
+        limiter
+    }
+
+    async fn reload_live_limits(&mut self, reader: &ControlReader) -> anyhow::Result<()> {
+        for tenant in reader.list_tenants().await? {
+            if let Some(limiter) = self.rate_limiters.get(&tenant.name)
+                && limiter.set_limits(tenant.rate_limits)
+            {
+                tracing::info!(
+                    tenant = tenant.name,
+                    ops_per_second = ?tenant.rate_limits.ops_per_second,
+                    bytes_per_second = ?tenant.rate_limits.bytes_per_second,
+                    "tenant rate limits reloaded"
+                );
+            }
+        }
+
+        let open_writable = self
+            .open_backends
+            .iter()
+            .filter_map(|((tenant, volume, snapshot), backend)| {
+                if snapshot.is_some() {
+                    return None;
+                }
+                backend
+                    .writable
+                    .as_ref()
+                    .map(|writable| (tenant.clone(), volume.clone(), Arc::clone(writable)))
+            })
+            .collect::<Vec<_>>();
+
+        for (tenant, volume_name, volume) in open_writable {
+            let Some(record) = reader.try_get_volume(&tenant, &volume_name).await? else {
+                continue;
+            };
+            if volume.set_quota_limits(record.quota) {
+                tracing::info!(
+                    tenant,
+                    volume = volume_name,
+                    bytes_hard = ?record.quota.bytes.hard,
+                    inodes_hard = ?record.quota.inodes.hard,
+                    "volume quota limits reloaded"
+                );
+            }
+        }
+        Ok(())
     }
 
     async fn stop_export(&mut self, key: &ExportKey) {
@@ -2412,17 +2786,34 @@ async fn main() -> anyhow::Result<()> {
     let watcher_metrics = export_metrics.clone();
     let poll_interval = Duration::from_secs(config.export_control.poll_interval_secs);
     servers.spawn(async move {
-        let reader = ControlReader::open(watcher_store, watcher_kms)
+        let reader = ControlReader::open(Arc::clone(&watcher_store), Arc::clone(&watcher_kms))
             .await
             .map_err(std::io::Error::other)?;
         let mut tick = tokio::time::interval(poll_interval);
         tick.tick().await;
         loop {
             tick.tick().await;
-            let mut manager = watcher_manager.lock().await;
-            if let Err(error) = manager.reconcile(&reader).await {
+            {
+                let mut manager = watcher_manager.lock().await;
+                if let Err(error) = manager.reconcile(&reader).await {
+                    watcher_metrics.failure();
+                    tracing::error!("export reconcile failed: {error:#}");
+                }
+                if let Err(error) = manager.reload_live_limits(&reader).await {
+                    watcher_metrics.failure();
+                    tracing::error!("live limit reload failed: {error:#}");
+                }
+            }
+            if let Err(error) = enforce_snapshot_retention(
+                &reader,
+                Arc::clone(&watcher_store),
+                Arc::clone(&watcher_kms),
+                watcher_metrics.clone(),
+            )
+            .await
+            {
                 watcher_metrics.failure();
-                tracing::error!("export reconcile failed: {error:#}");
+                tracing::error!("snapshot retention enforcement failed: {error:#}");
             }
         }
     });
@@ -2481,7 +2872,7 @@ mod tests {
     use slatefs_core::config::Compression;
     use slatefs_core::control::{
         AuditAction, AuditActor, AuditOutcome, AuditPlane, AuditRecord, AuditScope, ControlPlane,
-        DaemonMetrics, DaemonNodeState, QuotaLimits,
+        DaemonMetrics, DaemonNodeState, QuotaLimit, QuotaLimits,
     };
     use slatefs_core::crypto::kms::{Kms, StaticKms};
     use slatefs_core::crypto::{Cipher, Secret32};
@@ -3225,6 +3616,431 @@ mod tests {
             "conflicting control export should be skipped and counted"
         );
         manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn export_manager_reloads_live_quota_and_rate_limits() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([12; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        control
+            .set_tenant_rate_limits(
+                "t",
+                RateLimits {
+                    ops_per_second: Some(1),
+                    bytes_per_second: None,
+                },
+            )
+            .await
+            .unwrap();
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        let fh_key = control.server_fh_key().await.unwrap();
+        control
+            .create_export(nfs_export("exp-live", "127.0.0.1:0"))
+            .await
+            .unwrap();
+        control.close().await.unwrap();
+
+        let config = test_config(Vec::new());
+        let metrics = ExportMetrics::default();
+        let mut manager = ExportManager::new(
+            Arc::clone(&object_store),
+            fh_key,
+            &config,
+            config_export_records(&config.exports),
+            metrics,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        manager.reconcile(&reader).await.unwrap();
+        let volume = manager
+            .open_backends
+            .get(&("t".to_string(), "v".to_string(), None))
+            .and_then(|backend| backend.writable.as_ref())
+            .cloned()
+            .expect("writable backend");
+        let limiter = manager
+            .rate_limiters
+            .get("t")
+            .cloned()
+            .expect("tenant limiter");
+        assert_eq!(limiter.limits().ops_per_second, Some(1));
+
+        let creds = Credentials::root();
+        let file = volume
+            .create(&creds, ROOT_INO, b"file", 0o644, true)
+            .await
+            .unwrap();
+        volume
+            .write(&creds, file.ino, 0, b"12345678")
+            .await
+            .unwrap();
+
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control
+            .set_volume_quota(
+                "t",
+                "v",
+                QuotaLimits {
+                    bytes: QuotaLimit {
+                        hard: Some(8),
+                        ..Default::default()
+                    },
+                    inodes: QuotaLimit::default(),
+                },
+            )
+            .await
+            .unwrap();
+        control
+            .set_tenant_rate_limits(
+                "t",
+                RateLimits {
+                    ops_per_second: Some(10),
+                    bytes_per_second: Some(1024),
+                },
+            )
+            .await
+            .unwrap();
+        control.close().await.unwrap();
+
+        let fresh_reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        manager.reload_live_limits(&fresh_reader).await.unwrap();
+        assert_eq!(volume.quota_hard_limits().0, Some(8));
+        assert_eq!(
+            limiter.limits(),
+            RateLimits {
+                ops_per_second: Some(10),
+                bytes_per_second: Some(1024),
+            }
+        );
+        assert!(matches!(
+            volume.write(&creds, file.ino, 8, b"x").await,
+            Err(slatefs_core::vfs::FsError::QuotaExceeded)
+        ));
+
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control
+            .set_volume_quota(
+                "t",
+                "v",
+                QuotaLimits {
+                    bytes: QuotaLimit {
+                        hard: Some(9),
+                        ..Default::default()
+                    },
+                    inodes: QuotaLimit::default(),
+                },
+            )
+            .await
+            .unwrap();
+        control.close().await.unwrap();
+        let fresh_reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        manager.reload_live_limits(&fresh_reader).await.unwrap();
+        volume.write(&creds, file.ino, 8, b"x").await.unwrap();
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_retention_deletes_audits_and_leaves_policyless_volumes() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([13; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "untouched",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        let _old_named = slatefs_core::volume::create_snapshot(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            Some("named-old".to_string()),
+        )
+        .await
+        .unwrap();
+        let _middle = slatefs_core::volume::create_snapshot(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            None,
+        )
+        .await
+        .unwrap();
+        let newest = slatefs_core::volume::create_snapshot(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            Some("newest".to_string()),
+        )
+        .await
+        .unwrap();
+        let untouched = slatefs_core::volume::create_snapshot(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "untouched",
+            None,
+        )
+        .await
+        .unwrap();
+        control
+            .set_snapshot_retention_policy("t", "v", Some(1), None)
+            .await
+            .unwrap();
+        control.close().await.unwrap();
+
+        let reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        let metrics = ExportMetrics::default();
+        enforce_snapshot_retention(
+            &reader,
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            metrics.clone(),
+        )
+        .await
+        .unwrap();
+        reader.close().await.unwrap();
+
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        let remaining = slatefs_core::volume::list_snapshots(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, newest.id);
+        let untouched_remaining = slatefs_core::volume::list_snapshots(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "untouched",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(untouched_remaining.len(), 1);
+        assert_eq!(untouched_remaining[0].id, untouched.id);
+
+        let (records, _) = control
+            .list_audit(AuditQuery {
+                tenant: Some("t"),
+                volume: Some("v"),
+                action: Some(AuditAction::SnapshotRetentionDelete),
+                newest_first: false,
+                ..AuditQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        let rendered = render_daemon_metrics_with_exports(&[], &metrics);
+        assert!(
+            rendered
+                .contains("slatefs_snapshots_retention_deleted_total{tenant=\"t\",volume=\"v\"} 2"),
+            "{rendered}"
+        );
+        control.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_retention_skips_active_clone_parent_volume() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([14; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "src",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        let parent_snapshot = slatefs_core::volume::create_snapshot(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "src",
+            Some("parent".to_string()),
+        )
+        .await
+        .unwrap();
+        slatefs_core::volume::clone_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "src",
+            "clone",
+            slatefs_core::volume::CloneVolumeOptions {
+                source_snapshot_id: Some(parent_snapshot.id.clone()),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+        control
+            .set_snapshot_retention_policy("t", "src", Some(0), None)
+            .await
+            .unwrap();
+        control.close().await.unwrap();
+
+        let reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        enforce_snapshot_retention(
+            &reader,
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            ExportMetrics::default(),
+        )
+        .await
+        .unwrap();
+        reader.close().await.unwrap();
+
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        let remaining = slatefs_core::volume::list_snapshots(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "src",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            remaining
+                .iter()
+                .any(|snapshot| snapshot.id == parent_snapshot.id),
+            "source checkpoint must be retained while an active clone points at this volume"
+        );
+        let (records, _) = control
+            .list_audit(AuditQuery {
+                tenant: Some("t"),
+                volume: Some("src"),
+                action: Some(AuditAction::SnapshotRetentionDelete),
+                newest_first: false,
+                ..AuditQuery::default()
+            })
+            .await
+            .unwrap();
+        assert!(records.is_empty());
+        control.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_v1_snapshot_retention_get_patch_and_clear() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([15; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        control.close().await.unwrap();
+
+        let state = available_admin_state(
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            HashMap::new(),
+            None,
+        )
+        .await;
+        let patch = admin_exchange(
+            Arc::clone(&state),
+            b"PATCH /admin/v1/tenants/t/volumes/v/snapshot-retention HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 42\r\n\r\n{\"keep_last\":2,\"max_age_secs\":3600}",
+        )
+        .await;
+        assert_eq!(response_status(&patch), 200, "{patch}");
+        let patch_body: Value = serde_json::from_str(response_body(&patch)).unwrap();
+        assert_eq!(patch_body["retention"]["keep_last"], 2);
+        assert_eq!(patch_body["retention"]["max_age_secs"], 3600);
+        assert_eq!(patch_body["retention"]["named_snapshots_exempt"], false);
+
+        let fresh_state = available_admin_state(
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            HashMap::new(),
+            None,
+        )
+        .await;
+        let get = admin_exchange(
+            Arc::clone(&fresh_state),
+            b"GET /admin/v1/tenants/t/volumes/v/snapshot-retention HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&get), 200, "{get}");
+        let get_body: Value = serde_json::from_str(response_body(&get)).unwrap();
+        assert_eq!(get_body["retention"]["keep_last"], 2);
+
+        let clear = admin_exchange(
+            fresh_state,
+            b"PATCH /admin/v1/tenants/t/volumes/v/snapshot-retention HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 14\r\n\r\n{\"clear\":true}",
+        )
+        .await;
+        assert_eq!(response_status(&clear), 200, "{clear}");
+        let clear_body: Value = serde_json::from_str(response_body(&clear)).unwrap();
+        assert!(clear_body["retention"].is_null());
     }
 
     #[test]

@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use slatefs_core::config::{ClientAddrRule, Config};
 use slatefs_core::control::{
     ControlPlane, DaemonMetrics, DaemonNodeRecord, DaemonNodeState, ExportRecord, QuotaLimits,
-    VolumePlacementRecord,
+    SnapshotRetentionPolicy, VolumePlacementRecord,
 };
 use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::rate::RateLimits;
@@ -198,6 +198,29 @@ enum SnapshotCmd {
         tenant: String,
         volume: String,
         id: String,
+    },
+    /// Show or set per-volume snapshot retention.
+    #[command(subcommand)]
+    Retention(SnapshotRetentionCmd),
+}
+
+#[derive(Subcommand)]
+enum SnapshotRetentionCmd {
+    /// Show a volume's snapshot retention policy.
+    Show { tenant: String, volume: String },
+    /// Set or clear a volume's snapshot retention policy.
+    Set {
+        tenant: String,
+        volume: String,
+        /// Keep this many newest checkpoints. Named snapshots are not exempt.
+        #[arg(long)]
+        keep_last: Option<u32>,
+        /// Delete checkpoints older than this age in seconds.
+        #[arg(long)]
+        max_age: Option<u64>,
+        /// Clear the retention policy.
+        #[arg(long)]
+        clear: bool,
     },
 }
 
@@ -601,6 +624,23 @@ fn print_snapshot(snapshot: &volume::SnapshotInfo) {
     );
 }
 
+fn print_snapshot_retention(tenant: &str, volume: &str, policy: Option<&SnapshotRetentionPolicy>) {
+    println!("snapshot_retention: {tenant}/{volume}");
+    match policy {
+        Some(policy) => {
+            println!(
+                "keep_last:    {}",
+                format_limit(policy.keep_last.map(u64::from))
+            );
+            println!("max_age_secs: {}", format_limit(policy.max_age_secs));
+            println!("updated_at:   {}", policy.updated_at);
+            println!("named_snapshots_exempt: false");
+            println!("active_clone_parent_behavior: skip_volume");
+        }
+        None => println!("policy:       none"),
+    }
+}
+
 fn protocol_name(protocol: config::ExportProtocol) -> &'static str {
     match protocol {
         config::ExportProtocol::Nfs => "nfs",
@@ -943,7 +983,9 @@ async fn run(
                 }
                 let record = control.set_tenant_rate_limits(name, limits).await?;
                 print_rate_limits(&record.name, record.rate_limits);
-                println!("note: new limits apply when tenant exports are next served");
+                println!(
+                    "note: slatefsd reloads tenant rate limits on the export-control poll interval"
+                );
             }
         },
         Command::Tenant(TenantCmd::List) => {
@@ -1110,7 +1152,9 @@ async fn run(
             }
             let record = control.set_volume_quota(tenant, volume, quota).await?;
             print_quota(tenant, volume, record.quota);
-            println!("note: new limits apply when the volume is next opened for serving");
+            println!(
+                "note: slatefsd reloads served-volume quota limits on the export-control poll interval"
+            );
         }
         Command::Snapshot(SnapshotCmd::Create {
             tenant,
@@ -1170,6 +1214,43 @@ async fn run(
             volume::delete_snapshot(control, object_store, tenant, volume_name, id).await?;
             println!("deleted snapshot {id} from {tenant}/{volume_name}");
         }
+        Command::Snapshot(SnapshotCmd::Retention(command)) => match command {
+            SnapshotRetentionCmd::Show {
+                tenant,
+                volume: volume_name,
+            } => {
+                control.get_volume(tenant, volume_name).await?;
+                let policy = control
+                    .try_get_snapshot_retention_policy(tenant, volume_name)
+                    .await?;
+                print_snapshot_retention(tenant, volume_name, policy.as_ref());
+            }
+            SnapshotRetentionCmd::Set {
+                tenant,
+                volume: volume_name,
+                keep_last,
+                max_age,
+                clear,
+            } => {
+                if *clear {
+                    if keep_last.is_some() || max_age.is_some() {
+                        anyhow::bail!("--clear cannot be combined with --keep-last or --max-age");
+                    }
+                    control
+                        .clear_snapshot_retention_policy(tenant, volume_name)
+                        .await?;
+                    print_snapshot_retention(tenant, volume_name, None);
+                } else {
+                    if keep_last.is_none() && max_age.is_none() {
+                        anyhow::bail!("provide --keep-last, --max-age, or --clear");
+                    }
+                    let policy = control
+                        .set_snapshot_retention_policy(tenant, volume_name, *keep_last, *max_age)
+                        .await?;
+                    print_snapshot_retention(tenant, volume_name, Some(&policy));
+                }
+            }
+        },
         Command::Clone(CloneCmd::Create {
             tenant,
             source_volume,

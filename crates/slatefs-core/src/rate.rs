@@ -30,13 +30,13 @@ impl RateLimits {
 
 #[derive(Debug)]
 pub struct RateLimiter {
-    limits: RateLimits,
     rejections: AtomicU64,
     state: Mutex<State>,
 }
 
 #[derive(Debug)]
 struct State {
+    limits: RateLimits,
     ops: Bucket,
     bytes: Bucket,
 }
@@ -51,9 +51,9 @@ impl RateLimiter {
     pub fn new(limits: RateLimits) -> RateLimiter {
         let now = Instant::now();
         RateLimiter {
-            limits,
             rejections: AtomicU64::new(0),
             state: Mutex::new(State {
+                limits,
                 ops: Bucket::new(limits.ops_per_second, now),
                 bytes: Bucket::new(limits.bytes_per_second, now),
             }),
@@ -61,7 +61,28 @@ impl RateLimiter {
     }
 
     pub fn limits(&self) -> RateLimits {
-        self.limits
+        self.state.lock().expect("rate limiter poisoned").limits
+    }
+
+    /// Replace this tenant's limits without replacing the limiter object
+    /// already held by protocol frontends.
+    pub fn set_limits(&self, limits: RateLimits) -> bool {
+        let now = Instant::now();
+        let mut state = self.state.lock().expect("rate limiter poisoned");
+        if state.limits == limits {
+            return false;
+        }
+        let old = state.limits;
+        state.ops.refill(old.ops_per_second, now);
+        state.bytes.refill(old.bytes_per_second, now);
+        state
+            .ops
+            .resize(old.ops_per_second, limits.ops_per_second, now);
+        state
+            .bytes
+            .resize(old.bytes_per_second, limits.bytes_per_second, now);
+        state.limits = limits;
+        true
     }
 
     pub fn rejections(&self) -> u64 {
@@ -76,21 +97,22 @@ impl RateLimiter {
 
     fn check_at(&self, bytes: u64, now: Instant) -> Result<(), FsError> {
         let mut state = self.state.lock().expect("rate limiter poisoned");
-        state.ops.refill(self.limits.ops_per_second, now);
-        state.bytes.refill(self.limits.bytes_per_second, now);
+        let limits = state.limits;
+        state.ops.refill(limits.ops_per_second, now);
+        state.bytes.refill(limits.bytes_per_second, now);
 
-        if !state.ops.can_consume(self.limits.ops_per_second, 1) {
+        if !state.ops.can_consume(limits.ops_per_second, 1) {
             self.rejections.fetch_add(1, Ordering::Relaxed);
             return Err(FsError::WouldBlock);
         }
-        if bytes > 0 && !state.bytes.can_consume(self.limits.bytes_per_second, bytes) {
+        if bytes > 0 && !state.bytes.can_consume(limits.bytes_per_second, bytes) {
             self.rejections.fetch_add(1, Ordering::Relaxed);
             return Err(FsError::WouldBlock);
         }
 
-        state.ops.consume(self.limits.ops_per_second, 1);
+        state.ops.consume(limits.ops_per_second, 1);
         if bytes > 0 {
-            state.bytes.consume(self.limits.bytes_per_second, bytes);
+            state.bytes.consume(limits.bytes_per_second, bytes);
         }
         Ok(())
     }
@@ -123,6 +145,15 @@ impl Bucket {
         if limit.is_some() {
             self.tokens -= amount as f64;
         }
+    }
+
+    fn resize(&mut self, old: Option<u64>, new: Option<u64>, now: Instant) {
+        self.tokens = match (old, new) {
+            (_, None) => 0.0,
+            (None, Some(limit)) => limit as f64,
+            (Some(_), Some(limit)) => self.tokens.min(limit as f64),
+        };
+        self.updated = now;
     }
 }
 
@@ -170,5 +201,32 @@ mod tests {
         for _ in 0..100 {
             assert!(limiter.check_at(u64::MAX, t0).is_ok());
         }
+    }
+
+    #[test]
+    fn set_limits_resizes_existing_buckets() {
+        let limiter = RateLimiter::new(RateLimits::default());
+        assert!(limiter.set_limits(RateLimits {
+            ops_per_second: Some(1),
+            bytes_per_second: None,
+        }));
+        assert_eq!(
+            limiter.limits(),
+            RateLimits {
+                ops_per_second: Some(1),
+                bytes_per_second: None,
+            }
+        );
+        assert!(limiter.check_at(0, Instant::now()).is_ok());
+        assert!(matches!(
+            limiter.check_at(0, Instant::now()),
+            Err(FsError::WouldBlock)
+        ));
+
+        assert!(limiter.set_limits(RateLimits {
+            ops_per_second: Some(10),
+            bytes_per_second: None,
+        }));
+        assert_eq!(limiter.limits().ops_per_second, Some(10));
     }
 }

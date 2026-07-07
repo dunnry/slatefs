@@ -31,6 +31,7 @@ const DAEMON_NODE_RECORD_VERSION: u8 = 1;
 const VOLUME_PLACEMENT_RECORD_VERSION: u8 = 1;
 const EXPORT_RECORD_VERSION: u8 = 1;
 const AUDIT_RECORD_VERSION: u8 = 1;
+const SNAPSHOT_RETENTION_RECORD_VERSION: u8 = 1;
 const MAX_AUDIT_DETAILS_BYTES: usize = 128 * 1024;
 const MAX_AUDIT_PAGE_LIMIT: usize = 1_000;
 
@@ -92,6 +93,16 @@ pub struct QuotaLimit {
 pub struct QuotaLimits {
     pub bytes: QuotaLimit,
     pub inodes: QuotaLimit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRetentionPolicy {
+    pub tenant: String,
+    pub volume: String,
+    pub keep_last: Option<u32>,
+    pub max_age_secs: Option<u64>,
+    /// Unix seconds.
+    pub updated_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,6 +333,7 @@ pub enum AuditAction {
     VolumeDelete,
     SnapshotCreate,
     SnapshotDelete,
+    SnapshotRetentionDelete,
     PlacementAssign,
     PlacementMove,
     PlacementClaim,
@@ -347,6 +359,7 @@ impl AuditAction {
             "VolumeDelete" => Self::VolumeDelete,
             "SnapshotCreate" => Self::SnapshotCreate,
             "SnapshotDelete" => Self::SnapshotDelete,
+            "SnapshotRetentionDelete" => Self::SnapshotRetentionDelete,
             "PlacementAssign" => Self::PlacementAssign,
             "PlacementMove" => Self::PlacementMove,
             "PlacementClaim" => Self::PlacementClaim,
@@ -514,6 +527,10 @@ fn volume_placement_key(tenant: &str, volume: &str) -> String {
 
 fn export_key(id: &str) -> String {
     format!("e/{id}")
+}
+
+fn snapshot_retention_key(tenant: &str, volume: &str) -> String {
+    format!("sr/{tenant}/{volume}")
 }
 
 pub fn now_unix() -> u64 {
@@ -889,6 +906,7 @@ impl ControlPlane {
         record.state = VolumeState::Deleting;
         record.wrapped_dek.clear();
         self.put_volume(&record).await?;
+        self.clear_snapshot_retention_policy(tenant, volume).await?;
         self.delete_volume_placement(tenant, volume).await?;
         let objects_deleted = self.delete_volume_objects(tenant, volume).await?;
         tracing::info!(
@@ -911,6 +929,8 @@ impl ControlPlane {
             volume.state = VolumeState::Deleting;
             volume.wrapped_dek.clear();
             self.put_volume(&volume).await?;
+            self.clear_snapshot_retention_policy(name, &volume.name)
+                .await?;
             self.delete_volume_placement(name, &volume.name).await?;
         }
         tenant.state = TenantState::Deleting;
@@ -993,6 +1013,107 @@ impl ControlPlane {
         record.quota = quota;
         self.put_volume(&record).await?;
         Ok(record)
+    }
+
+    // ---- per-volume snapshot retention ----
+
+    pub async fn put_snapshot_retention_policy(
+        &self,
+        policy: &SnapshotRetentionPolicy,
+    ) -> Result<()> {
+        validate_snapshot_retention_policy(policy)?;
+        self.get_volume(&policy.tenant, &policy.volume).await?;
+        self.db
+            .put(
+                snapshot_retention_key(&policy.tenant, &policy.volume).as_bytes(),
+                encode_versioned(SNAPSHOT_RETENTION_RECORD_VERSION, policy)?,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_snapshot_retention_policy(
+        &self,
+        tenant: &str,
+        volume: &str,
+        keep_last: Option<u32>,
+        max_age_secs: Option<u64>,
+    ) -> Result<SnapshotRetentionPolicy> {
+        let mut policy = SnapshotRetentionPolicy {
+            tenant: tenant.to_string(),
+            volume: volume.to_string(),
+            keep_last,
+            max_age_secs,
+            updated_at: now_unix(),
+        };
+        validate_snapshot_retention_policy(&policy)?;
+        self.get_volume(tenant, volume).await?;
+        if let Some(existing) = self
+            .try_get_snapshot_retention_policy(tenant, volume)
+            .await?
+        {
+            policy.updated_at = now_unix().max(existing.updated_at);
+        }
+        self.put_snapshot_retention_policy(&policy).await?;
+        Ok(policy)
+    }
+
+    pub async fn try_get_snapshot_retention_policy(
+        &self,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<Option<SnapshotRetentionPolicy>> {
+        match self
+            .db
+            .get(snapshot_retention_key(tenant, volume).as_bytes())
+            .await?
+        {
+            Some(bytes) => Ok(Some(decode_snapshot_retention_policy(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_snapshot_retention_policy(
+        &self,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<SnapshotRetentionPolicy> {
+        self.try_get_snapshot_retention_policy(tenant, volume)
+            .await?
+            .ok_or_else(|| {
+                Error::not_found("snapshot retention policy", format!("{tenant}/{volume}"))
+            })
+    }
+
+    pub async fn clear_snapshot_retention_policy(
+        &self,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<Option<SnapshotRetentionPolicy>> {
+        self.get_volume(tenant, volume).await?;
+        let existing = self
+            .try_get_snapshot_retention_policy(tenant, volume)
+            .await?;
+        if existing.is_some() {
+            let mut batch = WriteBatch::new();
+            batch.delete(snapshot_retention_key(tenant, volume).into_bytes());
+            self.db.write(batch).await?;
+        }
+        Ok(existing)
+    }
+
+    pub async fn list_snapshot_retention_policies(&self) -> Result<Vec<SnapshotRetentionPolicy>> {
+        let mut iter = self.db.scan_prefix(b"sr/".as_slice(), ..).await?;
+        let mut policies = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            policies.push(decode_snapshot_retention_policy(&kv.value)?);
+        }
+        policies.sort_by(|a, b| {
+            a.tenant
+                .cmp(&b.tenant)
+                .then_with(|| a.volume.cmp(&b.volume))
+        });
+        Ok(policies)
     }
 
     // ---- exports (control-plane managed live export definitions) ----
@@ -1899,6 +2020,35 @@ impl ControlReader {
         Ok(volumes)
     }
 
+    pub async fn try_get_snapshot_retention_policy(
+        &self,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<Option<SnapshotRetentionPolicy>> {
+        match self
+            .db
+            .get(snapshot_retention_key(tenant, volume).as_bytes())
+            .await?
+        {
+            Some(bytes) => Ok(Some(decode_snapshot_retention_policy(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn list_snapshot_retention_policies(&self) -> Result<Vec<SnapshotRetentionPolicy>> {
+        let mut iter = self.db.scan_prefix(b"sr/".as_slice(), ..).await?;
+        let mut policies = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            policies.push(decode_snapshot_retention_policy(&kv.value)?);
+        }
+        policies.sort_by(|a, b| {
+            a.tenant
+                .cmp(&b.tenant)
+                .then_with(|| a.volume.cmp(&b.volume))
+        });
+        Ok(policies)
+    }
+
     pub async fn list_daemon_nodes(&self) -> Result<Vec<DaemonNodeRecord>> {
         let mut iter = self.db.scan_prefix(b"dn/".as_slice(), ..).await?;
         let mut nodes = Vec::new();
@@ -1990,6 +2140,18 @@ fn validate_limit(kind: &'static str, limit: &QuotaLimit) -> Result<()> {
 fn validate_quota_limits(quota: &QuotaLimits) -> Result<()> {
     validate_limit("bytes quota", &quota.bytes)?;
     validate_limit("inodes quota", &quota.inodes)
+}
+
+fn validate_snapshot_retention_policy(policy: &SnapshotRetentionPolicy) -> Result<()> {
+    store::validate_name("tenant name", &policy.tenant)?;
+    store::validate_name("volume name", &policy.volume)?;
+    if policy.keep_last.is_none() && policy.max_age_secs.is_none() {
+        return Err(Error::invalid(
+            "snapshot retention policy",
+            "keep_last or max_age_secs is required",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_rate_limit(kind: &'static str, limit: Option<u64>) -> Result<()> {
@@ -2089,6 +2251,10 @@ fn decode_volume_placement_record(bytes: &[u8]) -> Result<VolumePlacementRecord>
 
 fn decode_export_record(bytes: &[u8]) -> Result<ExportRecord> {
     decode_versioned(EXPORT_RECORD_VERSION, bytes)
+}
+
+fn decode_snapshot_retention_policy(bytes: &[u8]) -> Result<SnapshotRetentionPolicy> {
+    decode_versioned(SNAPSHOT_RETENTION_RECORD_VERSION, bytes)
 }
 
 fn decode_audit_record(bytes: &[u8]) -> Result<AuditRecord> {
