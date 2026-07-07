@@ -106,7 +106,17 @@ resolution fail closed until resumed. Per-export source-IP allowlists
 (`allowed_clients = ["127.0.0.1", "10.0.0.0/8"]`) are enforced by both NFS and
 9P before request decoding. Tenant frontend rate limits (`slatefs tenant rate
 show|set`) add shared token buckets for ops/s and request bytes/s across all
-exports of a tenant. Quota limits are operator-manageable with `slatefs quota
+exports of a tenant. Export definitions can now live in the encrypted control
+plane and be managed live with `slatefs export
+add|list|show|update|remove|enable|disable`; static `[[exports]]` TOML entries
+remain supported as immutable bootstrap/compatibility exports. `slatefsd`
+reconciles static config exports plus enabled control-plane exports on startup
+and then polls `[export_control].poll_interval_secs` (default 30). New enabled
+control exports are started, removed/disabled exports are stopped, and the
+last listener using a volume/snapshot closes that backend. A control-plane
+export whose listen address conflicts with an active listener is logged,
+counted, skipped, and retried on the next poll; the daemon does not crash.
+Quota limits are operator-manageable with `slatefs quota
 show|set`, including hard limits and soft limits that become enforcing after
 their grace deadline expires. `slatefs volume scrub` runs the structural checker
 through a read-only SlateDB reader, so it can compare counters/recount while the
@@ -133,7 +143,9 @@ mount; live writes after the checkpoint are not visible there. `slatefs key
 rotate-kek <tenant>` rotates that tenant's KEK by rewrapping active volume DEKs
 in the control plane; volume data blocks are not rewritten. Optional
 `[metrics].listen = "ip:port"` exposes Prometheus text at `/metrics`, including
-SlateDB cache/flush samples per writable volume and `slatefs_volume_dead`.
+SlateDB cache/flush samples per writable volume, `slatefs_volume_dead`,
+`slatefs_exports_active{protocol,source}`, and
+`slatefs_export_reconcile_failures_total`.
 `[admin].listen = "127.0.0.1:port"` exposes the daemon admin listener. It
 keeps the legacy live-writer snapshot route and serves admin API v1:
 
@@ -144,6 +156,11 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/status` | Legacy text status. |
 | `POST` | `/snapshot/{tenant}/{volume}?name=` | Legacy live-writer snapshot. |
 | `GET` | `/admin/v1/audit` | Audit records with `since`, `until`, `tenant`, `volume`, `action`, `limit`, `page_token`, `newest_first`. |
+| `GET` | `/admin/v1/exports` | All exports with `source=config|control`; config exports are read-only. |
+| `GET` | `/admin/v1/exports/{id}` | Export detail. |
+| `POST` | `/admin/v1/exports/{id}` | Create a control-plane export from JSON fields matching TOML exports plus `enabled`. |
+| `PATCH` | `/admin/v1/exports/{id}` | Update a control-plane export; use JSON `null` to clear optional fields. |
+| `DELETE` | `/admin/v1/exports/{id}` | Remove a control-plane export. |
 | `GET` | `/admin/v1/tenants` | Tenant inventory with `limit` and `page_token`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes` | Volume inventory with `limit` and `page_token`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}` | Volume detail. |

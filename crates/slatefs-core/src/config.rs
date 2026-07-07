@@ -23,6 +23,11 @@ pub struct Config {
     /// in the control DB come with the multi-tenant hardening phase.
     #[serde(default)]
     pub exports: Vec<ExportConfig>,
+    /// Live control-plane export reconciliation settings. Static `[[exports]]`
+    /// remain a bootstrap/compatibility path; control-plane exports are polled
+    /// and converged while the daemon is running.
+    #[serde(default)]
+    pub export_control: ExportControlConfig,
     /// Cache tiers (plan §8, DD-4). Budgets are deployment-wide and divided
     /// across open volumes — caches are per-volume by design (a shared
     /// block cache would alias WAL ids across volumes; see
@@ -158,7 +163,22 @@ pub struct AdminConfig {
     pub token_file: Option<std::path::PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ExportControlConfig {
+    /// Control-plane export reconciliation interval in seconds.
+    pub poll_interval_secs: u64,
+}
+
+impl Default for ExportControlConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_secs: 30,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExportProtocol {
     #[default]
@@ -166,7 +186,7 @@ pub enum ExportProtocol {
     P9,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExportConfig {
     pub tenant: String,
@@ -202,10 +222,24 @@ pub struct ExportConfig {
     /// isolation per the plan.
     #[serde(default)]
     pub squash: SquashMode,
+    /// NFS atime update policy requested for this export. The current backend
+    /// applies relatime globally; this field is persisted now so future export
+    /// reconciliation can change policy without changing record shape.
+    #[serde(default)]
+    pub atime: AtimeMode,
     #[serde(default = "default_anon_id")]
     pub anon_uid: u32,
     #[serde(default = "default_anon_id")]
     pub anon_gid: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AtimeMode {
+    #[default]
+    Relatime,
+    Strict,
+    Noatime,
 }
 
 fn default_anon_id() -> u32 {
@@ -488,24 +522,34 @@ impl Config {
                 ));
             }
         }
+        if self.export_control.poll_interval_secs == 0 {
+            return Err(Error::Config(
+                "export_control.poll_interval_secs must be greater than 0".into(),
+            ));
+        }
         for export in &self.exports {
-            let has_tls_cert = export.p9_tls_cert.is_some();
-            let has_tls_key = export.p9_tls_key.is_some();
-            if has_tls_cert != has_tls_key {
-                return Err(Error::Config(format!(
-                    "export {}/{} must set both p9_tls_cert and p9_tls_key, or neither",
-                    export.tenant, export.volume
-                )));
-            }
-            if export.protocol != ExportProtocol::P9 && (has_tls_cert || has_tls_key) {
-                return Err(Error::Config(format!(
-                    "export {}/{} sets 9P TLS fields but protocol is not p9",
-                    export.tenant, export.volume
-                )));
-            }
+            validate_export_config(export)?;
         }
         Ok(())
     }
+}
+
+pub fn validate_export_config(export: &ExportConfig) -> Result<()> {
+    let has_tls_cert = export.p9_tls_cert.is_some();
+    let has_tls_key = export.p9_tls_key.is_some();
+    if has_tls_cert != has_tls_key {
+        return Err(Error::Config(format!(
+            "export {}/{} must set both p9_tls_cert and p9_tls_key, or neither",
+            export.tenant, export.volume
+        )));
+    }
+    if export.protocol != ExportProtocol::P9 && (has_tls_cert || has_tls_key) {
+        return Err(Error::Config(format!(
+            "export {}/{} sets 9P TLS fields but protocol is not p9",
+            export.tenant, export.volume
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -7,17 +7,21 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Parser;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use slatedb::object_store::ObjectStore;
-use slatefs_core::config::{AdminConfig, Config, ExportProtocol};
+use slatefs_core::config::{
+    AdminConfig, AtimeMode, ClientAddrRule, Config, ExportConfig, ExportProtocol, SquashMode,
+};
 use slatefs_core::control::{
-    AuditAction, AuditQuery, ControlPlane, ControlReader, TenantRecord, VolumePlacementRecord,
-    VolumeRecord,
+    AuditAction, AuditActor, AuditOutcome, AuditPlane, AuditQuery, AuditRecord, AuditScope,
+    ControlPlane, ControlReader, ExportRecord, TenantRecord, VolumePlacementRecord, VolumeRecord,
 };
 use slatefs_core::crypto::kms;
 use slatefs_core::metrics::{AggregatingRecorder, PrometheusSample, render_prometheus};
@@ -59,7 +63,117 @@ enum MetricsTarget {
     },
 }
 
-type AdminTargets = Arc<HashMap<(String, String), Arc<Volume>>>;
+type AdminTargets = Arc<Mutex<HashMap<(String, String), Arc<Volume>>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ExportSource {
+    Config,
+    Control,
+}
+
+impl ExportSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            ExportSource::Config => "config",
+            ExportSource::Control => "control",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ExportKey {
+    source: ExportSource,
+    id: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct DesiredExport {
+    key: ExportKey,
+    config: ExportConfig,
+}
+
+#[derive(Clone, Default)]
+struct ExportMetrics {
+    active: Arc<Mutex<HashMap<(ExportProtocol, ExportSource), usize>>>,
+    reconcile_failures: Arc<AtomicU64>,
+}
+
+impl ExportMetrics {
+    fn started(&self, protocol: ExportProtocol, source: ExportSource) {
+        let mut active = self.active.lock().expect("export metrics poisoned");
+        *active.entry((protocol, source)).or_insert(0) += 1;
+    }
+
+    fn stopped(&self, protocol: ExportProtocol, source: ExportSource) {
+        let mut active = self.active.lock().expect("export metrics poisoned");
+        let count = active.entry((protocol, source)).or_insert(0);
+        *count = count.saturating_sub(1);
+    }
+
+    fn failure(&self) {
+        self.reconcile_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn active_total(&self) -> usize {
+        self.active
+            .lock()
+            .expect("export metrics poisoned")
+            .values()
+            .sum()
+    }
+
+    fn samples(&self) -> Vec<PrometheusSample> {
+        let active = self.active.lock().expect("export metrics poisoned");
+        let mut samples = Vec::new();
+        for protocol in [ExportProtocol::Nfs, ExportProtocol::P9] {
+            for source in [ExportSource::Config, ExportSource::Control] {
+                let value = active.get(&(protocol, source)).copied().unwrap_or(0);
+                samples.push(PrometheusSample::new(
+                    "slatefs_exports_active",
+                    [
+                        ("protocol", protocol_label(protocol)),
+                        ("source", source.as_str()),
+                    ],
+                    value as f64,
+                ));
+            }
+        }
+        samples.push(PrometheusSample::new(
+            "slatefs_export_reconcile_failures_total",
+            std::iter::empty::<(&str, &str)>(),
+            self.reconcile_failures.load(Ordering::Relaxed) as f64,
+        ));
+        samples
+    }
+}
+
+struct RunningExport {
+    desired: DesiredExport,
+    backend_key: (String, String, Option<String>),
+    task: tokio::task::JoinHandle<()>,
+}
+
+struct OpenBackend {
+    vfs: Arc<dyn Vfs>,
+    writable: Option<Arc<Volume>>,
+    snapshot: Option<Arc<SnapshotVolume>>,
+    ref_count: usize,
+}
+
+struct ExportManager {
+    object_store: Arc<dyn ObjectStore>,
+    fh_key: slatefs_core::crypto::Secret32,
+    cache: slatefs_core::config::CacheConfig,
+    slatedb: slatefs_core::config::SlateDbConfig,
+    config_exports: Arc<Vec<ConfigExportRecord>>,
+    metrics: ExportMetrics,
+    metrics_targets: Arc<Mutex<Vec<MetricsTarget>>>,
+    admin_targets: AdminTargets,
+    running: HashMap<ExportKey, RunningExport>,
+    open_backends: HashMap<(String, String, Option<String>), OpenBackend>,
+    rate_limiters: HashMap<String, Arc<RateLimiter>>,
+    live_share_count: usize,
+}
 
 const CACHE_TIER_ACCESS_TOTAL: &str = "slatefs_cache_tier_access_total";
 const SLATEDB_DB_CACHE_ACCESS_COUNT: &str = "slatefs_slatedb.db_cache.access_count";
@@ -68,20 +182,11 @@ const SLATEDB_OBJECT_STORE_CACHE_PART_ACCESS_COUNT: &str =
 const SLATEDB_OBJECT_STORE_CACHE_PART_HIT_COUNT: &str =
     "slatefs_slatedb.object_store_cache.part_hit_count";
 
-fn tenant_rate_limiter(
-    limiters: &mut std::collections::HashMap<String, Arc<RateLimiter>>,
-    tenant: String,
-    limits: RateLimits,
-) -> Option<Arc<RateLimiter>> {
-    if limits.is_unlimited() {
-        return None;
+fn protocol_label(protocol: ExportProtocol) -> &'static str {
+    match protocol {
+        ExportProtocol::Nfs => "nfs",
+        ExportProtocol::P9 => "p9",
     }
-    Some(
-        limiters
-            .entry(tenant)
-            .or_insert_with(|| Arc::new(RateLimiter::new(limits)))
-            .clone(),
-    )
 }
 
 fn hard_limit_value(limit: Option<u64>) -> f64 {
@@ -165,7 +270,15 @@ fn cache_tier_samples(
     samples
 }
 
+#[cfg(test)]
 fn render_daemon_metrics(targets: &[MetricsTarget]) -> String {
+    render_daemon_metrics_with_exports(targets, &ExportMetrics::default())
+}
+
+fn render_daemon_metrics_with_exports(
+    targets: &[MetricsTarget],
+    export_metrics: &ExportMetrics,
+) -> String {
     let mut samples = Vec::new();
     for target in targets {
         match target {
@@ -266,6 +379,7 @@ fn render_daemon_metrics(targets: &[MetricsTarget]) -> String {
             }
         }
     }
+    samples.extend(export_metrics.samples());
     render_prometheus(&samples)
 }
 
@@ -301,7 +415,8 @@ async fn write_http_response_with_headers(
 
 async fn handle_metrics_connection(
     mut stream: TcpStream,
-    targets: Vec<MetricsTarget>,
+    targets: Arc<Mutex<Vec<MetricsTarget>>>,
+    export_metrics: ExportMetrics,
 ) -> std::io::Result<()> {
     let mut buf = [0u8; 1024];
     let read = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await;
@@ -322,11 +437,10 @@ async fn handle_metrics_connection(
     let method = request_line.next();
     let path = request_line.next();
     let (status, content_type, body) = if method == Some("GET") && path == Some("/metrics") {
-        (
-            "200 OK",
-            "text/plain; version=0.0.4; charset=utf-8",
-            render_daemon_metrics(&targets),
-        )
+        ("200 OK", "text/plain; version=0.0.4; charset=utf-8", {
+            let targets = targets.lock().expect("metrics targets poisoned").clone();
+            render_daemon_metrics_with_exports(&targets, &export_metrics)
+        })
     } else {
         (
             "404 Not Found",
@@ -338,14 +452,19 @@ async fn handle_metrics_connection(
     write_http_response(&mut stream, status, content_type, body).await
 }
 
-async fn serve_metrics(listen: String, targets: Vec<MetricsTarget>) -> std::io::Result<()> {
+async fn serve_metrics(
+    listen: String,
+    targets: Arc<Mutex<Vec<MetricsTarget>>>,
+    export_metrics: ExportMetrics,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(&listen).await?;
     tracing::info!(listen, "metrics endpoint ready at /metrics");
     loop {
         let (stream, peer) = listener.accept().await?;
-        let targets = targets.clone();
+        let targets = Arc::clone(&targets);
+        let export_metrics = export_metrics.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_metrics_connection(stream, targets).await {
+            if let Err(error) = handle_metrics_connection(stream, targets, export_metrics).await {
                 tracing::debug!(%peer, "metrics scrape failed: {error}");
             }
         });
@@ -369,6 +488,9 @@ struct AdminState {
     targets: AdminTargets,
     control: AdminControl,
     object_store: Arc<dyn ObjectStore>,
+    kms: Arc<dyn kms::Kms>,
+    config_exports: Arc<Vec<ConfigExportRecord>>,
+    export_metrics: ExportMetrics,
     started_at: Instant,
     export_count: usize,
     snapshot_export_count: usize,
@@ -383,6 +505,7 @@ struct AdminHttpRequest {
     headers: HashMap<String, String>,
     request_id: String,
     peer: Option<SocketAddr>,
+    body: String,
 }
 
 struct AdminHttpResponse {
@@ -398,6 +521,154 @@ struct AdminError {
     message: String,
 }
 
+#[derive(Clone)]
+struct ConfigExportRecord {
+    id: String,
+    export: ExportConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportCreateRequest {
+    tenant: String,
+    volume: String,
+    #[serde(default)]
+    snapshot: Option<String>,
+    listen: String,
+    #[serde(default)]
+    allowed_clients: Vec<ClientAddrRule>,
+    #[serde(default)]
+    protocol: ExportProtocol,
+    #[serde(default)]
+    p9_token: Option<String>,
+    #[serde(default)]
+    p9_tls_cert: Option<std::path::PathBuf>,
+    #[serde(default)]
+    p9_tls_key: Option<std::path::PathBuf>,
+    #[serde(default)]
+    squash: SquashMode,
+    #[serde(default)]
+    atime: AtimeMode,
+    #[serde(default = "default_anon_id_json")]
+    anon_uid: u32,
+    #[serde(default = "default_anon_id_json")]
+    anon_gid: u32,
+    #[serde(default = "default_enabled_json")]
+    enabled: bool,
+}
+
+impl ExportCreateRequest {
+    fn into_record(self, id: String) -> ExportRecord {
+        ExportRecord::from_config(
+            id,
+            ExportConfig {
+                tenant: self.tenant,
+                volume: self.volume,
+                snapshot: self.snapshot,
+                listen: self.listen,
+                allowed_clients: self.allowed_clients,
+                protocol: self.protocol,
+                p9_token: self.p9_token,
+                p9_tls_cert: self.p9_tls_cert,
+                p9_tls_key: self.p9_tls_key,
+                squash: self.squash,
+                atime: self.atime,
+                anon_uid: self.anon_uid,
+                anon_gid: self.anon_gid,
+            },
+            self.enabled,
+        )
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportPatchRequest {
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    volume: Option<String>,
+    #[serde(default)]
+    snapshot: Option<Option<String>>,
+    #[serde(default)]
+    listen: Option<String>,
+    #[serde(default)]
+    allowed_clients: Option<Vec<ClientAddrRule>>,
+    #[serde(default)]
+    protocol: Option<ExportProtocol>,
+    #[serde(default)]
+    p9_token: Option<Option<String>>,
+    #[serde(default)]
+    p9_tls_cert: Option<Option<std::path::PathBuf>>,
+    #[serde(default)]
+    p9_tls_key: Option<Option<std::path::PathBuf>>,
+    #[serde(default)]
+    squash: Option<SquashMode>,
+    #[serde(default)]
+    atime: Option<AtimeMode>,
+    #[serde(default)]
+    anon_uid: Option<u32>,
+    #[serde(default)]
+    anon_gid: Option<u32>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+impl ExportPatchRequest {
+    fn apply_to(self, record: &mut ExportRecord) {
+        if let Some(tenant) = self.tenant {
+            record.tenant = tenant;
+        }
+        if let Some(volume) = self.volume {
+            record.volume = volume;
+        }
+        if let Some(snapshot) = self.snapshot {
+            record.snapshot = snapshot;
+        }
+        if let Some(listen) = self.listen {
+            record.listen = listen;
+        }
+        if let Some(allowed_clients) = self.allowed_clients {
+            record.allowed_clients = allowed_clients;
+        }
+        if let Some(protocol) = self.protocol {
+            record.protocol = protocol;
+        }
+        if let Some(p9_token) = self.p9_token {
+            record.p9_token = p9_token;
+        }
+        if let Some(p9_tls_cert) = self.p9_tls_cert {
+            record.p9_tls_cert = p9_tls_cert;
+        }
+        if let Some(p9_tls_key) = self.p9_tls_key {
+            record.p9_tls_key = p9_tls_key;
+        }
+        if let Some(squash) = self.squash {
+            record.squash = squash;
+        }
+        if let Some(atime) = self.atime {
+            record.atime = atime;
+        }
+        if let Some(anon_uid) = self.anon_uid {
+            record.anon_uid = anon_uid;
+        }
+        if let Some(anon_gid) = self.anon_gid {
+            record.anon_gid = anon_gid;
+        }
+        if let Some(enabled) = self.enabled {
+            record.enabled = enabled;
+        }
+    }
+}
+
+fn default_enabled_json() -> bool {
+    true
+}
+
+fn default_anon_id_json() -> u32 {
+    65534
+}
+
 impl AdminState {
     fn control_reader(&self) -> Result<Arc<ControlReader>, AdminError> {
         match &self.control {
@@ -407,6 +678,12 @@ impl AdminState {
                 message: format!("control plane unavailable: {error}"),
             }),
         }
+    }
+
+    async fn control_writer(&self) -> Result<ControlPlane, AdminError> {
+        ControlPlane::open(Arc::clone(&self.object_store), Arc::clone(&self.kms))
+            .await
+            .map_err(core_error)
     }
 }
 
@@ -704,7 +981,8 @@ async fn read_admin_request(
     }
 
     let request = String::from_utf8_lossy(&buf[..n]);
-    let mut lines = request.lines();
+    let (head, body) = request.split_once("\r\n\r\n").unwrap_or((&request, ""));
+    let mut lines = head.lines();
     let request_line = lines
         .next()
         .ok_or_else(|| bad_request("missing request line"))?;
@@ -738,6 +1016,7 @@ async fn read_admin_request(
         headers,
         request_id,
         peer,
+        body: body.to_string(),
     }))
 }
 
@@ -758,7 +1037,10 @@ async fn create_live_snapshot_response(
 ) -> Result<AdminHttpResponse, AdminError> {
     let target = state
         .targets
+        .lock()
+        .expect("admin targets poisoned")
         .get(&(tenant.clone(), volume.clone()))
+        .cloned()
         .ok_or_else(|| not_found(format!("no live writable volume {tenant}/{volume}")))?;
     let snapshot = target
         .create_live_snapshot(name)
@@ -825,6 +1107,8 @@ fn volume_json(
     targets: &AdminTargets,
 ) -> Result<Value, AdminError> {
     let quota_usage = targets
+        .lock()
+        .expect("admin targets poisoned")
         .get(&(record.tenant.clone(), record.name.clone()))
         .map(|volume| {
             let (bytes, inodes) = volume.quota_usage();
@@ -847,6 +1131,93 @@ fn volume_json(
         "placement": placement_json(placement)?,
         "created_at": record.created_at,
     }))
+}
+
+fn export_config_json(id: &str, source: &str, export: &ExportConfig, enabled: bool) -> Value {
+    json!({
+        "id": id,
+        "source": source,
+        "tenant": export.tenant,
+        "volume": export.volume,
+        "snapshot": export.snapshot,
+        "protocol": export.protocol,
+        "listen": export.listen,
+        "allowed_clients": export
+            .allowed_clients
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        "squash": export.squash,
+        "atime": export.atime,
+        "anon_uid": export.anon_uid,
+        "anon_gid": export.anon_gid,
+        "p9_token_set": export.p9_token.is_some(),
+        "p9_tls_cert": export.p9_tls_cert.as_deref().map(|path| path.display().to_string()),
+        "p9_tls_key": export.p9_tls_key.as_deref().map(|path| path.display().to_string()),
+        "enabled": enabled,
+        "read_only": source == "config",
+    })
+}
+
+fn export_record_json(record: &ExportRecord) -> Value {
+    let mut value = export_config_json(&record.id, "control", &record.to_config(), record.enabled);
+    value["created_at"] = json!(record.created_at);
+    value["updated_at"] = json!(record.updated_at);
+    value
+}
+
+fn parse_json_body<T: for<'de> Deserialize<'de>>(
+    request: &AdminHttpRequest,
+) -> Result<T, AdminError> {
+    if request.body.trim().is_empty() {
+        return Err(bad_request("request body must be JSON"));
+    }
+    serde_json::from_str(&request.body)
+        .map_err(|error| bad_request(format!("invalid JSON: {error}")))
+}
+
+fn admin_actor(request: &AdminHttpRequest) -> AuditActor {
+    AuditActor {
+        plane: AuditPlane::Admin,
+        source_ip: request.peer.map(|addr| addr.ip().to_string()),
+        client_agent: request.headers.get("user-agent").cloned(),
+    }
+}
+
+async fn append_export_audit(
+    control: &ControlPlane,
+    request: &AdminHttpRequest,
+    action: AuditAction,
+    record: &ExportRecord,
+) -> Result<(), AdminError> {
+    let mut audit = AuditRecord::new(
+        admin_actor(request),
+        action,
+        AuditScope {
+            tenant: Some(record.tenant.clone()),
+            volume: Some(record.volume.clone()),
+            node: None,
+        },
+        request.request_id.clone(),
+        AuditOutcome::Success,
+    );
+    audit.details.insert(
+        "export_id".to_string(),
+        slatefs_core::control::AuditDetailValue::String(record.id.clone()),
+    );
+    audit.details.insert(
+        "listen".to_string(),
+        slatefs_core::control::AuditDetailValue::String(record.listen.clone()),
+    );
+    audit.details.insert(
+        "enabled".to_string(),
+        slatefs_core::control::AuditDetailValue::Bool(record.enabled),
+    );
+    control
+        .append_audit_record(audit)
+        .await
+        .map_err(core_error)?;
+    Ok(())
 }
 
 async fn list_tenants_response(
@@ -999,6 +1370,131 @@ async fn list_snapshots_response(
     ))
 }
 
+async fn list_exports_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+) -> Result<AdminHttpResponse, AdminError> {
+    let reader = state.control_reader()?;
+    let mut exports = state
+        .config_exports
+        .iter()
+        .map(|record| export_config_json(&record.id, "config", &record.export, true))
+        .collect::<Vec<_>>();
+    exports.extend(
+        reader
+            .list_exports()
+            .await
+            .map_err(core_error)?
+            .into_iter()
+            .map(|record| export_record_json(&record)),
+    );
+    exports.sort_by(|a, b| {
+        a["id"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["id"].as_str().unwrap_or_default())
+    });
+    let limit = page_limit(&request.query)?;
+    let (page, next) = paginate_by(
+        exports,
+        request.query.get("page_token").map(String::as_str),
+        limit,
+        |export| export["id"].as_str().unwrap_or_default().to_string(),
+    );
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "exports": page, "next_page_token": next }),
+    ))
+}
+
+async fn get_export_response(
+    state: &AdminState,
+    id: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    if let Some(record) = state.config_exports.iter().find(|record| record.id == id) {
+        return Ok(AdminHttpResponse::json(
+            200,
+            json!({ "export": export_config_json(&record.id, "config", &record.export, true) }),
+        ));
+    }
+    let reader = state.control_reader()?;
+    let record = reader.get_export(id).await.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "export": export_record_json(&record) }),
+    ))
+}
+
+async fn create_export_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    id: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    if state.config_exports.iter().any(|record| record.id == id) {
+        return Err(AdminError {
+            status: 409,
+            message: format!("export {id:?} is sourced from config and is read-only"),
+        });
+    }
+    let body: ExportCreateRequest = parse_json_body(request)?;
+    let control = state.control_writer().await?;
+    let record = control
+        .create_export(body.into_record(id.to_string()))
+        .await
+        .map_err(core_error)?;
+    append_export_audit(&control, request, AuditAction::ExportCreate, &record).await?;
+    control.close().await.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(
+        201,
+        json!({ "export": export_record_json(&record) }),
+    ))
+}
+
+async fn patch_export_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    id: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    if state.config_exports.iter().any(|record| record.id == id) {
+        return Err(AdminError {
+            status: 409,
+            message: format!("export {id:?} is sourced from config and is read-only"),
+        });
+    }
+    let body: ExportPatchRequest = parse_json_body(request)?;
+    let control = state.control_writer().await?;
+    let mut record = control.get_export(id).await.map_err(core_error)?;
+    body.apply_to(&mut record);
+    let record = control.update_export(record).await.map_err(core_error)?;
+    append_export_audit(&control, request, AuditAction::ExportUpdate, &record).await?;
+    control.close().await.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "export": export_record_json(&record) }),
+    ))
+}
+
+async fn delete_export_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    id: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    if state.config_exports.iter().any(|record| record.id == id) {
+        return Err(AdminError {
+            status: 409,
+            message: format!("export {id:?} is sourced from config and is read-only"),
+        });
+    }
+    let control = state.control_writer().await?;
+    let record = control.remove_export(id).await.map_err(core_error)?;
+    append_export_audit(&control, request, AuditAction::ExportDelete, &record).await?;
+    control.close().await.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "export": export_record_json(&record), "deleted": true }),
+    ))
+}
+
 async fn audit_response(
     state: &AdminState,
     request: &AdminHttpRequest,
@@ -1044,13 +1540,13 @@ async fn audit_response(
 }
 
 fn legacy_status_response(state: &AdminState) -> AdminHttpResponse {
+    let export_count = state.export_metrics.active_total().max(state.export_count);
+    let writable_volumes = state.targets.lock().expect("admin targets poisoned").len();
     AdminHttpResponse::text(
         200,
         format!(
             "status=ok\nexports={}\nwritable_volumes={}\nsnapshot_exports={}\n",
-            state.export_count,
-            state.targets.len(),
-            state.snapshot_export_count
+            export_count, writable_volumes, state.snapshot_export_count
         ),
     )
 }
@@ -1090,20 +1586,20 @@ async fn health_response(state: &AdminState, ready: bool, verbose: bool) -> Admi
             }),
         };
         checks.push(control_check);
-        let dead_writers = state
-            .targets
-            .values()
-            .filter(|volume| volume.is_dead())
-            .count();
-        let exports_ok = state.export_count > 0 && dead_writers == 0;
+        let targets = state.targets.lock().expect("admin targets poisoned");
+        let writable_volumes = targets.len();
+        let dead_writers = targets.values().filter(|volume| volume.is_dead()).count();
+        drop(targets);
+        let export_count = state.export_metrics.active_total().max(state.export_count);
+        let exports_ok = export_count > 0 && dead_writers == 0;
         checks.push(json!({
             "name": "exports_serving",
             "ok": exports_ok,
             "detail": if exports_ok {
                 format!(
                     "exports serving; exports={} writable_volumes={} snapshot_exports={}",
-                    state.export_count,
-                    state.targets.len(),
+                    export_count,
+                    writable_volumes,
                     state.snapshot_export_count
                 )
             } else {
@@ -1119,14 +1615,16 @@ async fn health_response(state: &AdminState, ready: bool, verbose: bool) -> Admi
         "checks": checks,
     });
     if ready && verbose {
+        let writable_volumes = state.targets.lock().expect("admin targets poisoned").len();
         let mut identity = json!({
             "server_version": env!("CARGO_PKG_VERSION"),
             "slatedb_version": SLATEDB_VERSION,
             "control_role": "standalone",
             "uptime_seconds": state.started_at.elapsed().as_secs(),
-            "open_repos": state.targets.len(),
-            "open_volumes": state.targets.len(),
+            "open_repos": writable_volumes,
+            "open_volumes": writable_volumes,
             "snapshot_exports": state.snapshot_export_count,
+            "exports": state.export_metrics.active_total().max(state.export_count),
         });
         if let Some(node_id) = &state.node_id {
             identity["node_id"] = json!(node_id);
@@ -1183,6 +1681,17 @@ async fn route_admin_request(
     let parts = segments.iter().map(String::as_str).collect::<Vec<_>>();
     match (request.method.as_str(), parts.as_slice()) {
         ("GET", ["admin", "v1", "audit"]) => audit_response(state, request).await,
+        ("GET", ["admin", "v1", "exports"]) => list_exports_response(state, request).await,
+        ("GET", ["admin", "v1", "exports", id]) => get_export_response(state, id).await,
+        ("POST", ["admin", "v1", "exports", id]) => {
+            create_export_response(state, request, id).await
+        }
+        ("PATCH", ["admin", "v1", "exports", id]) => {
+            patch_export_response(state, request, id).await
+        }
+        ("DELETE", ["admin", "v1", "exports", id]) => {
+            delete_export_response(state, request, id).await
+        }
         ("GET", ["admin", "v1", "tenants"]) => list_tenants_response(state, request).await,
         ("GET", ["admin", "v1", "tenants", tenant, "volumes"]) => {
             list_volumes_response(state, request, tenant).await
@@ -1324,6 +1833,527 @@ fn load_admin_token(config: &AdminConfig) -> anyhow::Result<Option<String>> {
     }
 }
 
+fn config_export_records(exports: &[ExportConfig]) -> Arc<Vec<ConfigExportRecord>> {
+    Arc::new(
+        exports
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(idx, export)| ConfigExportRecord {
+                id: format!("config-{idx}"),
+                export,
+            })
+            .collect(),
+    )
+}
+
+async fn clone_parent_prefixes_from_reader(
+    reader: &ControlReader,
+    record: &VolumeRecord,
+) -> slatefs_core::Result<Vec<String>> {
+    let mut prefixes = Vec::new();
+    let mut next = record.clone_parent.clone();
+    for _ in 0..32 {
+        let Some(parent) = next else {
+            return Ok(prefixes);
+        };
+        prefixes.push(store::volume_db_path(&parent.tenant, &parent.volume));
+        let parent_record = reader.get_volume(&parent.tenant, &parent.volume).await?;
+        next = parent_record.clone_parent;
+    }
+    Err(slatefs_core::error::Error::invalid(
+        "clone ancestry",
+        format!(
+            "{}/{} has a cycle or too many ancestors",
+            record.tenant, record.name
+        ),
+    ))
+}
+
+impl ExportManager {
+    fn new(
+        object_store: Arc<dyn ObjectStore>,
+        fh_key: slatefs_core::crypto::Secret32,
+        config: &Config,
+        config_exports: Arc<Vec<ConfigExportRecord>>,
+        metrics: ExportMetrics,
+        metrics_targets: Arc<Mutex<Vec<MetricsTarget>>>,
+        admin_targets: AdminTargets,
+    ) -> Self {
+        Self {
+            object_store,
+            fh_key,
+            cache: config.cache.clone(),
+            slatedb: config.slatedb.clone(),
+            config_exports,
+            metrics,
+            metrics_targets,
+            admin_targets,
+            running: HashMap::new(),
+            open_backends: HashMap::new(),
+            rate_limiters: HashMap::new(),
+            live_share_count: 1,
+        }
+    }
+
+    async fn reconcile(&mut self, reader: &ControlReader) -> anyhow::Result<()> {
+        let desired = self.desired_exports(reader).await?;
+        self.live_share_count = desired
+            .iter()
+            .filter(|export| export.config.snapshot.is_none())
+            .map(|export| (export.config.tenant.clone(), export.config.volume.clone()))
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            .max(1);
+        let desired_by_key: HashMap<_, _> = desired
+            .iter()
+            .cloned()
+            .map(|export| (export.key.clone(), export))
+            .collect();
+
+        let finished = self
+            .running
+            .iter()
+            .filter(|(_, running)| running.task.is_finished())
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in finished {
+            tracing::warn!(
+                source = key.source.as_str(),
+                id = key.id,
+                "export listener exited; retrying on next reconcile"
+            );
+            self.metrics.failure();
+            self.stop_export(&key).await;
+        }
+
+        let to_stop = self
+            .running
+            .iter()
+            .filter(|(key, running)| desired_by_key.get(*key) != Some(&running.desired))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in to_stop {
+            self.stop_export(&key).await;
+        }
+
+        for export in desired {
+            if self.running.contains_key(&export.key) {
+                continue;
+            }
+            if let Err(error) = self.start_export(reader, export.clone()).await {
+                self.metrics.failure();
+                tracing::error!(
+                    source = export.key.source.as_str(),
+                    id = export.key.id,
+                    listen = export.config.listen,
+                    "export reconcile skipped export: {error:#}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn desired_exports(&self, reader: &ControlReader) -> anyhow::Result<Vec<DesiredExport>> {
+        let mut desired = self
+            .config_exports
+            .iter()
+            .map(|record| DesiredExport {
+                key: ExportKey {
+                    source: ExportSource::Config,
+                    id: record.id.clone(),
+                },
+                config: record.export.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut control_exports = reader.list_exports().await?;
+        control_exports.sort_by(|a, b| a.id.cmp(&b.id));
+        desired.extend(
+            control_exports
+                .into_iter()
+                .filter(|record| record.enabled)
+                .map(|record| DesiredExport {
+                    key: ExportKey {
+                        source: ExportSource::Control,
+                        id: record.id.clone(),
+                    },
+                    config: record.to_config(),
+                }),
+        );
+        Ok(desired)
+    }
+
+    async fn start_export(
+        &mut self,
+        reader: &ControlReader,
+        desired: DesiredExport,
+    ) -> anyhow::Result<()> {
+        if let Some(conflict) = self.running.values().find(|running| {
+            running.desired.config.listen == desired.config.listen
+                && running.desired.key != desired.key
+        }) {
+            anyhow::bail!(
+                "listen address {} already used by {} export {}",
+                desired.config.listen,
+                conflict.desired.key.source.as_str(),
+                conflict.desired.key.id
+            );
+        }
+
+        let (backend_key, volume, rate_limits) = self.backend_for(reader, &desired.config).await?;
+        let rate_limiter = self.rate_limiter_for(desired.config.tenant.clone(), rate_limits);
+        let bind_result = match desired.config.protocol {
+            ExportProtocol::Nfs => {
+                let policy = SquashPolicy {
+                    mode: desired.config.squash,
+                    anon_uid: desired.config.anon_uid,
+                    anon_gid: desired.config.anon_gid,
+                };
+                let listener = slatefs_nfs::bind_export_with_allowlist_and_rate_limit(
+                    Arc::clone(&volume),
+                    self.fh_key.clone(),
+                    policy,
+                    desired.config.allowed_clients.clone(),
+                    rate_limiter,
+                    &desired.config.listen,
+                )
+                .await;
+                listener.map(|listener| {
+                    let port = listener.get_listen_port();
+                    tracing::info!(
+                        source = desired.key.source.as_str(),
+                        id = desired.key.id,
+                        tenant = desired.config.tenant,
+                        volume = desired.config.volume,
+                        snapshot = desired.config.snapshot.as_deref().unwrap_or("-"),
+                        listen = desired.config.listen,
+                        port,
+                        "NFS export ready"
+                    );
+                    tokio::spawn(async move {
+                        if let Err(error) = listener.handle_forever().await {
+                            tracing::error!("NFS export listener exited: {error}");
+                        }
+                    })
+                })
+            }
+            ExportProtocol::P9 => {
+                let export_name = format!("/{}/{}", desired.config.tenant, desired.config.volume);
+                let tls = match (&desired.config.p9_tls_cert, &desired.config.p9_tls_key) {
+                    (Some(cert), Some(key)) => Some((cert.clone(), key.clone())),
+                    (None, None) => None,
+                    _ => anyhow::bail!(
+                        "9P export {}/{} must set both p9_tls_cert and p9_tls_key, or neither",
+                        desired.config.tenant,
+                        desired.config.volume
+                    ),
+                };
+                let listen = desired.config.listen.clone();
+                let token = desired.config.p9_token.clone();
+                let allowed_clients = desired.config.allowed_clients.clone();
+                match tls {
+                    Some((cert, key)) => slatefs_9p::bind_export_tls_with_allowlist_and_rate_limit(
+                        Arc::clone(&volume),
+                        export_name,
+                        token,
+                        allowed_clients,
+                        rate_limiter,
+                        &listen,
+                        slatefs_9p::TlsIdentity {
+                            cert_path: cert,
+                            key_path: key,
+                        },
+                    )
+                    .await
+                    .map(|listener| {
+                        tracing::info!(
+                            source = desired.key.source.as_str(),
+                            id = desired.key.id,
+                            tenant = desired.config.tenant,
+                            volume = desired.config.volume,
+                            snapshot = desired.config.snapshot.as_deref().unwrap_or("-"),
+                            listen,
+                            "TLS-wrapped 9P export ready"
+                        );
+                        tokio::spawn(async move {
+                            if let Err(error) = listener.handle_forever().await {
+                                tracing::error!("9P TLS export listener exited: {error}");
+                            }
+                        })
+                    }),
+                    None => slatefs_9p::bind_export_with_allowlist_and_rate_limit(
+                        Arc::clone(&volume),
+                        export_name,
+                        token,
+                        allowed_clients,
+                        rate_limiter,
+                        &listen,
+                    )
+                    .await
+                    .map(|listener| {
+                        tracing::info!(
+                            source = desired.key.source.as_str(),
+                            id = desired.key.id,
+                            tenant = desired.config.tenant,
+                            volume = desired.config.volume,
+                            snapshot = desired.config.snapshot.as_deref().unwrap_or("-"),
+                            listen,
+                            "9P export ready"
+                        );
+                        tokio::spawn(async move {
+                            if let Err(error) = listener.handle_forever().await {
+                                tracing::error!("9P export listener exited: {error}");
+                            }
+                        })
+                    }),
+                }
+            }
+        };
+
+        let task = match bind_result {
+            Ok(task) => task,
+            Err(error) => {
+                self.close_backend_if_unused(&backend_key).await;
+                return Err(error).with_context(|| format!("binding {}", desired.config.listen));
+            }
+        };
+        if let Some(backend) = self.open_backends.get_mut(&backend_key) {
+            backend.ref_count += 1;
+        }
+        self.metrics
+            .started(desired.config.protocol, desired.key.source);
+        self.running.insert(
+            desired.key.clone(),
+            RunningExport {
+                desired,
+                backend_key,
+                task,
+            },
+        );
+        Ok(())
+    }
+
+    async fn backend_for(
+        &mut self,
+        reader: &ControlReader,
+        export: &ExportConfig,
+    ) -> anyhow::Result<((String, String, Option<String>), Arc<dyn Vfs>, RateLimits)> {
+        let backend_key = (
+            export.tenant.clone(),
+            export.volume.clone(),
+            export.snapshot.clone(),
+        );
+        let tenant = reader.get_tenant(&export.tenant).await?;
+        if let Some(backend) = self.open_backends.get(&backend_key) {
+            return Ok((backend_key, Arc::clone(&backend.vfs), tenant.rate_limits));
+        }
+
+        let record = reader
+            .get_mountable_volume(&export.tenant, &export.volume)
+            .await?;
+        let dek = reader.unwrap_volume_dek(&record).await?;
+        let clone_parent_prefixes = clone_parent_prefixes_from_reader(reader, &record).await?;
+        let backend: OpenBackend = if let Some(snapshot) = &export.snapshot {
+            let snapshot_volume = SnapshotVolume::open(
+                &record,
+                dek,
+                Arc::clone(&self.object_store),
+                snapshot,
+                clone_parent_prefixes,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "opening snapshot {snapshot} for {}/{}",
+                    export.tenant, export.volume
+                )
+            })?;
+            self.metrics_targets
+                .lock()
+                .expect("metrics targets poisoned")
+                .push(MetricsTarget::Snapshot {
+                    tenant: export.tenant.clone(),
+                    volume_name: export.volume.clone(),
+                    snapshot_id: snapshot.clone(),
+                    volume: Arc::clone(&snapshot_volume),
+                });
+            OpenBackend {
+                vfs: snapshot_volume.clone(),
+                writable: None,
+                snapshot: Some(snapshot_volume),
+                ref_count: 0,
+            }
+        } else {
+            let mut caches = VolumeCaches::from_config(
+                &self.cache,
+                &self.slatedb,
+                &export.tenant,
+                &export.volume,
+                self.live_share_count,
+            );
+            let recorder = Arc::new(AggregatingRecorder::default());
+            caches.recorder = Some(Arc::clone(&recorder));
+            let volume =
+                Volume::open_with_caches(&record, dek, Arc::clone(&self.object_store), &caches)
+                    .await
+                    .with_context(|| {
+                        format!("opening volume {}/{}", export.tenant, export.volume)
+                    })?;
+            let watched = Arc::clone(&volume);
+            let watched_tenant = export.tenant.clone();
+            let watched_volume = export.volume.clone();
+            tokio::spawn(async move {
+                watched.wait_dead().await;
+                tracing::error!(
+                    tenant = watched_tenant,
+                    volume = watched_volume,
+                    "volume fenced; export listeners will fail until reconciled"
+                );
+            });
+            self.metrics_targets
+                .lock()
+                .expect("metrics targets poisoned")
+                .push(MetricsTarget::Writable {
+                    tenant: export.tenant.clone(),
+                    volume_name: export.volume.clone(),
+                    recorder: Arc::clone(&recorder),
+                    volume: Arc::clone(&volume),
+                });
+            self.admin_targets
+                .lock()
+                .expect("admin targets poisoned")
+                .insert(
+                    (export.tenant.clone(), export.volume.clone()),
+                    Arc::clone(&volume),
+                );
+            OpenBackend {
+                vfs: volume.clone(),
+                writable: Some(volume),
+                snapshot: None,
+                ref_count: 0,
+            }
+        };
+        let vfs = Arc::clone(&backend.vfs);
+        self.open_backends.insert(backend_key.clone(), backend);
+        Ok((backend_key, vfs, tenant.rate_limits))
+    }
+
+    fn rate_limiter_for(&mut self, tenant: String, limits: RateLimits) -> Option<Arc<RateLimiter>> {
+        if limits.is_unlimited() {
+            return None;
+        }
+        if let Some(limiter) = self.rate_limiters.get(&tenant) {
+            return Some(Arc::clone(limiter));
+        }
+        let limiter = Arc::new(RateLimiter::new(limits));
+        self.rate_limiters
+            .insert(tenant.clone(), Arc::clone(&limiter));
+        self.metrics_targets
+            .lock()
+            .expect("metrics targets poisoned")
+            .push(MetricsTarget::TenantRateLimiter {
+                tenant,
+                limiter: Arc::clone(&limiter),
+            });
+        Some(limiter)
+    }
+
+    async fn stop_export(&mut self, key: &ExportKey) {
+        let Some(running) = self.running.remove(key) else {
+            return;
+        };
+        running.task.abort();
+        self.metrics
+            .stopped(running.desired.config.protocol, running.desired.key.source);
+        if let Some(backend) = self.open_backends.get_mut(&running.backend_key) {
+            backend.ref_count = backend.ref_count.saturating_sub(1);
+        }
+        self.close_backend_if_unused(&running.backend_key).await;
+        tracing::info!(
+            source = running.desired.key.source.as_str(),
+            id = running.desired.key.id,
+            "export stopped"
+        );
+    }
+
+    async fn close_backend_if_unused(&mut self, backend_key: &(String, String, Option<String>)) {
+        if self
+            .open_backends
+            .get(backend_key)
+            .is_some_and(|backend| backend.ref_count > 0)
+        {
+            return;
+        }
+        let Some(backend) = self.open_backends.remove(backend_key) else {
+            return;
+        };
+        self.remove_metrics_target(backend_key);
+        if let Some(volume) = backend.writable
+            && let Err(error) = volume.shutdown().await
+        {
+            self.admin_targets
+                .lock()
+                .expect("admin targets poisoned")
+                .remove(&(backend_key.0.clone(), backend_key.1.clone()));
+            tracing::error!(
+                tenant = backend_key.0,
+                volume = backend_key.1,
+                "volume shutdown: {error}"
+            );
+        }
+        if backend_key.2.is_none() {
+            self.admin_targets
+                .lock()
+                .expect("admin targets poisoned")
+                .remove(&(backend_key.0.clone(), backend_key.1.clone()));
+        }
+        if let Some(snapshot) = backend.snapshot
+            && let Err(error) = snapshot.shutdown().await
+        {
+            tracing::error!(
+                tenant = backend_key.0,
+                volume = backend_key.1,
+                snapshot = backend_key.2.as_deref().unwrap_or("-"),
+                "snapshot shutdown: {error}"
+            );
+        }
+    }
+
+    fn remove_metrics_target(&self, backend_key: &(String, String, Option<String>)) {
+        let mut targets = self
+            .metrics_targets
+            .lock()
+            .expect("metrics targets poisoned");
+        targets.retain(|target| match target {
+            MetricsTarget::Writable {
+                tenant,
+                volume_name,
+                ..
+            } => {
+                backend_key.2.is_some() || tenant != &backend_key.0 || volume_name != &backend_key.1
+            }
+            MetricsTarget::Snapshot {
+                tenant,
+                volume_name,
+                snapshot_id,
+                ..
+            } => {
+                backend_key.2.as_ref() != Some(snapshot_id)
+                    || tenant != &backend_key.0
+                    || volume_name != &backend_key.1
+            }
+            MetricsTarget::TenantRateLimiter { .. } => true,
+        });
+    }
+
+    async fn shutdown(&mut self) {
+        let keys = self.running.keys().cloned().collect::<Vec<_>>();
+        for key in keys {
+            self.stop_export(&key).await;
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -1335,288 +2365,70 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let config = Config::load(&args.config)
         .with_context(|| format!("loading config from {}", args.config.display()))?;
-    if config.exports.is_empty() {
-        anyhow::bail!(
-            "no [[exports]] configured in {}; nothing to serve",
-            args.config.display()
-        );
-    }
 
     let object_store = store::resolve_root(&config.object_store.url)
         .with_context(|| format!("resolving object store {}", config.object_store.url))?;
     let kms = kms::from_config(&config.kms)?;
     let admin_token = load_admin_token(&config.admin)?;
 
-    // Resolve everything we need from the control plane, then release it.
+    let config_exports = config_export_records(&config.exports);
+    let export_metrics = ExportMetrics::default();
+    let metrics_targets = Arc::new(Mutex::new(Vec::new()));
+    let admin_targets = Arc::new(Mutex::new(HashMap::new()));
+
+    // Initialize deployment-wide server state that needs a writer, then use
+    // read-only control handles for live reconciliation.
     let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
         .await
         .context("opening control-plane DB")?;
     let fh_key = control.server_fh_key().await?;
-    let mut planned = Vec::new();
-    for export in &config.exports {
-        let record = control
-            .get_mountable_volume(&export.tenant, &export.volume)
-            .await?;
-        let tenant = control.get_tenant(&export.tenant).await?;
-        let dek = control.unwrap_volume_dek(&record).await?;
-        let clone_parent_prefixes = volume::clone_parent_prefixes(&control, &record).await?;
-        planned.push((
-            export.clone(),
-            record,
-            dek,
-            tenant.rate_limits,
-            clone_parent_prefixes,
-        ));
-    }
     control.close().await.context("closing control-plane DB")?;
 
-    let mut writable_volumes = Vec::new();
-    let mut snapshot_volumes = Vec::new();
-    let mut metrics_targets = Vec::new();
     let mut servers = tokio::task::JoinSet::new();
-    // One writable Volume per live (tenant, volume) — a SlateDB has exactly
-    // one writer (DD-5). Snapshot exports are read-only DbReader backends
-    // keyed by checkpoint id.
-    let mut open_backends: HashMap<(String, String, Option<String>), Arc<dyn Vfs>> = HashMap::new();
-    let mut open_writers: HashMap<(String, String), Arc<Volume>> = HashMap::new();
-    let mut rate_limiters: HashMap<String, Arc<RateLimiter>> = HashMap::new();
-    let distinct: std::collections::HashSet<(String, String)> = config
-        .exports
-        .iter()
-        .filter(|e| e.snapshot.is_none())
-        .map(|e| (e.tenant.clone(), e.volume.clone()))
-        .collect();
-    let share_count = distinct.len();
-    for (export, record, dek, rate_limits, clone_parent_prefixes) in planned {
-        let key = (
-            export.tenant.clone(),
-            export.volume.clone(),
-            export.snapshot.clone(),
-        );
-        let rate_limiter =
-            tenant_rate_limiter(&mut rate_limiters, export.tenant.clone(), rate_limits);
-        let volume = match open_backends.get(&key) {
-            Some(v) => Arc::clone(v),
-            None => {
-                let backend: Arc<dyn Vfs> = if let Some(snapshot) = &export.snapshot {
-                    let snapshot_volume = SnapshotVolume::open(
-                        &record,
-                        dek,
-                        Arc::clone(&object_store),
-                        snapshot,
-                        clone_parent_prefixes,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "opening snapshot {snapshot} for {}/{}",
-                            export.tenant, export.volume
-                        )
-                    })?;
-                    metrics_targets.push(MetricsTarget::Snapshot {
-                        tenant: export.tenant.clone(),
-                        volume_name: export.volume.clone(),
-                        snapshot_id: snapshot.clone(),
-                        volume: Arc::clone(&snapshot_volume),
-                    });
-                    snapshot_volumes.push(Arc::clone(&snapshot_volume));
-                    snapshot_volume
-                } else {
-                    let writer_key = (export.tenant.clone(), export.volume.clone());
-                    match open_writers.get(&writer_key) {
-                        Some(volume) => Arc::<Volume>::clone(volume),
-                        None => {
-                            let mut caches = VolumeCaches::from_config(
-                                &config.cache,
-                                &config.slatedb,
-                                &export.tenant,
-                                &export.volume,
-                                share_count,
-                            );
-                            let recorder =
-                                Arc::new(slatefs_core::metrics::AggregatingRecorder::default());
-                            caches.recorder = Some(Arc::clone(&recorder));
-                            let volume = Volume::open_with_caches(
-                                &record,
-                                dek,
-                                Arc::clone(&object_store),
-                                &caches,
-                            )
-                            .await
-                            .with_context(|| {
-                                format!("opening volume {}/{}", export.tenant, export.volume)
-                            })?;
-                            let watched = Arc::clone(&volume);
-                            let watched_tenant = export.tenant.clone();
-                            let watched_volume = export.volume.clone();
-                            servers.spawn(async move {
-                                watched.wait_dead().await;
-                                tracing::error!(
-                                    tenant = watched_tenant,
-                                    volume = watched_volume,
-                                    "volume fenced; dropping daemon exports"
-                                );
-                                Err(std::io::Error::other("volume fenced by newer writer"))
-                            });
+    let manager = Arc::new(tokio::sync::Mutex::new(ExportManager::new(
+        Arc::clone(&object_store),
+        fh_key,
+        &config,
+        Arc::clone(&config_exports),
+        export_metrics.clone(),
+        Arc::clone(&metrics_targets),
+        Arc::clone(&admin_targets),
+    )));
 
-                            // Cache hit-rate visibility (plan §13 / Phase 3 AC): log the
-                            // cache-related engine metrics periodically per volume.
-                            let (tenant, volume_name) =
-                                (export.tenant.clone(), export.volume.clone());
-                            metrics_targets.push(MetricsTarget::Writable {
-                                tenant: tenant.clone(),
-                                volume_name: volume_name.clone(),
-                                recorder: Arc::clone(&recorder),
-                                volume: Arc::clone(&volume),
-                            });
-                            tokio::spawn(async move {
-                                let mut tick =
-                                    tokio::time::interval(std::time::Duration::from_secs(60));
-                                tick.tick().await; // skip the immediate tick
-                                loop {
-                                    tick.tick().await;
-                                    let stats: Vec<String> = recorder
-                                        .snapshot()
-                                        .into_iter()
-                                        .filter(|(name, value)| {
-                                            name.contains("cache") && *value != 0.0
-                                        })
-                                        .map(|(name, value)| format!("{name}={value}"))
-                                        .collect();
-                                    if !stats.is_empty() {
-                                        tracing::info!(
-                                            tenant,
-                                            volume = volume_name,
-                                            "cache metrics: {}",
-                                            stats.join(" ")
-                                        );
-                                    }
-                                }
-                            });
-                            writable_volumes.push(Arc::clone(&volume));
-                            open_writers.insert(writer_key, Arc::clone(&volume));
-                            volume
-                        }
-                    }
-                };
-                open_backends.insert(key, Arc::clone(&backend));
-                backend
-            }
-        };
+    let control_reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+        .await
+        .context("opening control-plane reader")?;
+    {
+        let mut manager_guard = manager.lock().await;
+        manager_guard
+            .reconcile(&control_reader)
+            .await
+            .context("initial export reconcile")?;
+    }
 
-        match export.protocol {
-            ExportProtocol::Nfs => {
-                let policy = SquashPolicy {
-                    mode: export.squash,
-                    anon_uid: export.anon_uid,
-                    anon_gid: export.anon_gid,
-                };
-                let listener = slatefs_nfs::bind_export_with_allowlist_and_rate_limit(
-                    volume,
-                    fh_key.clone(),
-                    policy,
-                    export.allowed_clients.clone(),
-                    rate_limiter.clone(),
-                    &export.listen,
-                )
-                .await
-                .with_context(|| format!("binding {}", export.listen))?;
-                tracing::info!(
-                    tenant = export.tenant,
-                    volume = export.volume,
-                    snapshot = export.snapshot.as_deref().unwrap_or("-"),
-                    listen = export.listen,
-                    port = listener.get_listen_port(),
-                    "export ready; mount with: mount -t nfs -o vers=3,nolock,tcp,port={p},mountport={p} <host>:/ <dir>",
-                    p = listener.get_listen_port(),
-                );
-                servers.spawn(async move { listener.handle_forever().await });
-            }
-            ExportProtocol::P9 => {
-                let export_name = format!("/{}/{}", export.tenant, export.volume);
-                let listen = export.listen.clone();
-                let token = export.p9_token.clone();
-                let allowed_clients = export.allowed_clients.clone();
-                let tls = match (&export.p9_tls_cert, &export.p9_tls_key) {
-                    (Some(cert), Some(key)) => Some((cert.clone(), key.clone())),
-                    (None, None) => None,
-                    _ => anyhow::bail!(
-                        "9P export {}/{} must set both p9_tls_cert and p9_tls_key, or neither",
-                        export.tenant,
-                        export.volume
-                    ),
-                };
-                if tls.is_some() {
-                    tracing::info!(
-                        tenant = export.tenant,
-                        volume = export.volume,
-                        snapshot = export.snapshot.as_deref().unwrap_or("-"),
-                        listen = export.listen,
-                        token_required = token.is_some(),
-                        "TLS-wrapped 9P export ready; connect with a TLS-capable 9P client or tunnel"
-                    );
-                } else {
-                    tracing::info!(
-                        tenant = export.tenant,
-                        volume = export.volume,
-                        snapshot = export.snapshot.as_deref().unwrap_or("-"),
-                        listen = export.listen,
-                        "export ready; mount with: mount -t 9p -o trans=tcp,version=9p2000.L,port=<port>{} <host> <dir>",
-                        if token.is_some() {
-                            ",uname=<token>"
-                        } else {
-                            ""
-                        },
-                    );
-                }
-                servers.spawn(async move {
-                    match tls {
-                        Some((cert, key)) => {
-                            slatefs_9p::serve_export_tls_with_allowlist_and_rate_limit(
-                                volume,
-                                export_name,
-                                token,
-                                allowed_clients,
-                                rate_limiter,
-                                &listen,
-                                slatefs_9p::TlsIdentity {
-                                    cert_path: cert,
-                                    key_path: key,
-                                },
-                            )
-                            .await
-                        }
-                        None => {
-                            slatefs_9p::serve_export_with_allowlist_and_rate_limit(
-                                volume,
-                                export_name,
-                                token,
-                                allowed_clients,
-                                rate_limiter,
-                                &listen,
-                            )
-                            .await
-                        }
-                    }
-                });
+    let watcher_manager = Arc::clone(&manager);
+    let watcher_store = Arc::clone(&object_store);
+    let watcher_kms = Arc::clone(&kms);
+    let watcher_metrics = export_metrics.clone();
+    let poll_interval = Duration::from_secs(config.export_control.poll_interval_secs);
+    servers.spawn(async move {
+        let reader = ControlReader::open(watcher_store, watcher_kms)
+            .await
+            .map_err(std::io::Error::other)?;
+        let mut tick = tokio::time::interval(poll_interval);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let mut manager = watcher_manager.lock().await;
+            if let Err(error) = manager.reconcile(&reader).await {
+                watcher_metrics.failure();
+                tracing::error!("export reconcile failed: {error:#}");
             }
         }
-    }
-
-    for (tenant, limiter) in &rate_limiters {
-        metrics_targets.push(MetricsTarget::TenantRateLimiter {
-            tenant: tenant.clone(),
-            limiter: Arc::clone(limiter),
-        });
-    }
+    });
 
     if let Some(listen) = config.admin.listen.clone() {
-        let targets = Arc::new(
-            open_writers
-                .iter()
-                .map(|(key, volume)| (key.clone(), Arc::clone(volume)))
-                .collect(),
-        );
+        let targets = Arc::clone(&admin_targets);
         let control = match ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms)).await {
             Ok(reader) => AdminControl::Available(Arc::new(reader)),
             Err(error) => {
@@ -1628,8 +2440,11 @@ async fn main() -> anyhow::Result<()> {
             targets,
             control,
             object_store: Arc::clone(&object_store),
+            kms: Arc::clone(&kms),
+            config_exports: Arc::clone(&config_exports),
+            export_metrics: export_metrics.clone(),
             started_at: Instant::now(),
-            export_count: config.exports.len(),
+            export_count: export_metrics.active_total(),
             snapshot_export_count: config
                 .exports
                 .iter()
@@ -1642,7 +2457,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some(listen) = config.metrics.listen.clone() {
-        servers.spawn(async move { serve_metrics(listen, metrics_targets).await });
+        servers.spawn(async move { serve_metrics(listen, metrics_targets, export_metrics).await });
     }
 
     tokio::select! {
@@ -1650,21 +2465,12 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("shutting down on SIGINT");
         }
         Some(res) = servers.join_next() => {
-            tracing::error!("an export listener exited unexpectedly: {res:?}");
+            tracing::error!("daemon task exited unexpectedly: {res:?}");
         }
     }
 
     servers.abort_all();
-    for volume in &writable_volumes {
-        if let Err(e) = volume.shutdown().await {
-            tracing::error!("volume shutdown: {e}");
-        }
-    }
-    for snapshot in &snapshot_volumes {
-        if let Err(e) = snapshot.shutdown().await {
-            tracing::error!("snapshot shutdown: {e}");
-        }
-    }
+    manager.lock().await.shutdown().await;
     Ok(())
 }
 
@@ -1700,13 +2506,16 @@ mod tests {
         auth_token: Option<String>,
     ) -> Arc<AdminState> {
         Arc::new(AdminState {
-            targets: Arc::new(targets),
+            targets: Arc::new(Mutex::new(targets)),
             control: AdminControl::Available(Arc::new(
-                ControlReader::open(Arc::clone(&object_store), kms)
+                ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
                     .await
                     .unwrap(),
             )),
             object_store,
+            kms,
+            config_exports: Arc::new(Vec::new()),
+            export_metrics: ExportMetrics::default(),
             started_at: Instant::now(),
             export_count: 1,
             snapshot_export_count: 0,
@@ -1721,9 +2530,12 @@ mod tests {
         auth_token: Option<String>,
     ) -> Arc<AdminState> {
         Arc::new(AdminState {
-            targets: Arc::new(targets),
+            targets: Arc::new(Mutex::new(targets)),
             control: AdminControl::Unavailable("test unavailable".to_string()),
             object_store,
+            kms: Arc::new(StaticKms::new(Secret32::from_bytes([251; 32]))),
+            config_exports: Arc::new(Vec::new()),
+            export_metrics: ExportMetrics::default(),
             started_at: Instant::now(),
             export_count: 1,
             snapshot_export_count: 0,
@@ -2138,6 +2950,281 @@ mod tests {
 
         volume.shutdown().await.unwrap();
         control.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_v1_export_crud_and_audit() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([8; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        control.close().await.unwrap();
+
+        let state = available_admin_state(
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            HashMap::new(),
+            None,
+        )
+        .await;
+        let create = admin_exchange(
+            Arc::clone(&state),
+            b"POST /admin/v1/exports/exp1 HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: export-create\r\nContent-Type: application/json\r\nContent-Length: 108\r\n\r\n{\"tenant\":\"t\",\"volume\":\"v\",\"listen\":\"127.0.0.1:12049\",\"protocol\":\"nfs\",\"allowed_clients\":[\"127.0.0.1\"]}",
+        )
+        .await;
+        assert_eq!(response_status(&create), 201, "{create}");
+        let create_body: Value = serde_json::from_str(response_body(&create)).unwrap();
+        assert_eq!(create_body["export"]["id"], "exp1");
+        assert_eq!(create_body["export"]["source"], "control");
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let list = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/exports HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&list), 200, "{list}");
+        let list_body: Value = serde_json::from_str(response_body(&list)).unwrap();
+        assert_eq!(list_body["exports"][0]["id"], "exp1");
+
+        let patch = admin_exchange(
+            Arc::clone(&state),
+            b"PATCH /admin/v1/exports/exp1 HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: export-update\r\nContent-Type: application/json\r\nContent-Length: 17\r\n\r\n{\"enabled\":false}",
+        )
+        .await;
+        assert_eq!(response_status(&patch), 200, "{patch}");
+        let patch_body: Value = serde_json::from_str(response_body(&patch)).unwrap();
+        assert_eq!(patch_body["export"]["enabled"], false);
+
+        let delete = admin_exchange(
+            state,
+            b"DELETE /admin/v1/exports/exp1 HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: export-delete\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&delete), 200, "{delete}");
+
+        let control = ControlPlane::open(Arc::clone(&object_store), kms)
+            .await
+            .unwrap();
+        let (records, _) = control
+            .list_audit(AuditQuery {
+                action: Some(AuditAction::ExportCreate),
+                newest_first: false,
+                ..AuditQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].request_id, "export-create");
+        assert_eq!(records[0].scope.tenant.as_deref(), Some("t"));
+        control.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_v1_config_exports_are_read_only() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let export = ExportConfig {
+            tenant: "t".to_string(),
+            volume: "v".to_string(),
+            snapshot: None,
+            listen: "127.0.0.1:12049".to_string(),
+            allowed_clients: Vec::new(),
+            protocol: ExportProtocol::Nfs,
+            p9_token: None,
+            p9_tls_cert: None,
+            p9_tls_key: None,
+            squash: Default::default(),
+            atime: Default::default(),
+            anon_uid: 65534,
+            anon_gid: 65534,
+        };
+        let state = Arc::new(AdminState {
+            targets: Arc::new(Mutex::new(HashMap::new())),
+            control: AdminControl::Unavailable("unused".to_string()),
+            object_store,
+            kms: Arc::new(StaticKms::new(Secret32::from_bytes([9; 32]))),
+            config_exports: Arc::new(vec![ConfigExportRecord {
+                id: "config-0".to_string(),
+                export,
+            }]),
+            export_metrics: ExportMetrics::default(),
+            started_at: Instant::now(),
+            export_count: 1,
+            snapshot_export_count: 0,
+            auth_token: None,
+            node_id: None,
+        });
+
+        let get = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/exports/config-0 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&get), 200, "{get}");
+        let get_body: Value = serde_json::from_str(response_body(&get)).unwrap();
+        assert_eq!(get_body["export"]["source"], "config");
+        assert_eq!(get_body["export"]["read_only"], true);
+
+        let patch = admin_exchange(
+            state,
+            b"PATCH /admin/v1/exports/config-0 HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 17\r\n\r\n{\"enabled\":false}",
+        )
+        .await;
+        assert_eq!(response_status(&patch), 409, "{patch}");
+        let patch_body: Value = serde_json::from_str(response_body(&patch)).unwrap();
+        assert_eq!(patch_body["error"]["code"], "conflict");
+    }
+
+    fn test_config(exports: Vec<ExportConfig>) -> Config {
+        let mut config = Config::parse(
+            r#"
+                [object_store]
+                url = "memory:///"
+
+                [kms]
+                provider = "static"
+                key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+                [export_control]
+                poll_interval_secs = 1
+            "#,
+        )
+        .unwrap();
+        config.exports = exports;
+        config
+    }
+
+    fn nfs_export(id: &str, listen: &str) -> ExportRecord {
+        ExportRecord::from_config(
+            id.to_string(),
+            ExportConfig {
+                tenant: "t".to_string(),
+                volume: "v".to_string(),
+                snapshot: None,
+                listen: listen.to_string(),
+                allowed_clients: Vec::new(),
+                protocol: ExportProtocol::Nfs,
+                p9_token: None,
+                p9_tls_cert: None,
+                p9_tls_key: None,
+                squash: Default::default(),
+                atime: Default::default(),
+                anon_uid: 65534,
+                anon_gid: 65534,
+            },
+            true,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn export_manager_starts_and_stops_control_exports() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([10; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        let fh_key = control.server_fh_key().await.unwrap();
+        control
+            .create_export(nfs_export("exp1", "127.0.0.1:0"))
+            .await
+            .unwrap();
+        control.close().await.unwrap();
+
+        let config = test_config(Vec::new());
+        let metrics = ExportMetrics::default();
+        let mut manager = ExportManager::new(
+            Arc::clone(&object_store),
+            fh_key,
+            &config,
+            config_export_records(&config.exports),
+            metrics.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        manager.reconcile(&reader).await.unwrap();
+        assert_eq!(metrics.active_total(), 1);
+
+        let control = ControlPlane::open(Arc::clone(&object_store), kms)
+            .await
+            .unwrap();
+        control.disable_export("exp1").await.unwrap();
+        control.close().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        manager.reconcile(&reader).await.unwrap();
+        assert_eq!(metrics.active_total(), 0);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn export_manager_skips_conflicting_control_export() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([11; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        let fh_key = control.server_fh_key().await.unwrap();
+        control
+            .create_export(nfs_export("conflict", "127.0.0.1:0"))
+            .await
+            .unwrap();
+        control.close().await.unwrap();
+
+        let config = test_config(vec![nfs_export("ignored", "127.0.0.1:0").to_config()]);
+        let metrics = ExportMetrics::default();
+        let mut manager = ExportManager::new(
+            Arc::clone(&object_store),
+            fh_key,
+            &config,
+            config_export_records(&config.exports),
+            metrics.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let reader = ControlReader::open(Arc::clone(&object_store), kms)
+            .await
+            .unwrap();
+        manager.reconcile(&reader).await.unwrap();
+        assert_eq!(metrics.active_total(), 1);
+        assert_eq!(
+            metrics.reconcile_failures.load(Ordering::Relaxed),
+            1,
+            "conflicting control export should be skipped and counted"
+        );
+        manager.shutdown().await;
     }
 
     #[test]

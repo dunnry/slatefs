@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use slatedb::object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use slatedb::{Db, DbReader, Settings, WriteBatch, config::DbReaderOptions};
 
-use crate::config::{Compression, ExportProtocol};
+use crate::config::{
+    AtimeMode, ClientAddrRule, Compression, ExportConfig, ExportProtocol, SquashMode,
+    validate_export_config,
+};
 use crate::crypto::kms::{Kms, contexts};
 use crate::crypto::transformer::SlateBlockTransformer;
 use crate::crypto::{Cipher, Secret32};
@@ -26,6 +29,7 @@ const TENANT_RECORD_VERSION: u8 = 1;
 const VOLUME_RECORD_VERSION: u8 = 1;
 const DAEMON_NODE_RECORD_VERSION: u8 = 1;
 const VOLUME_PLACEMENT_RECORD_VERSION: u8 = 1;
+const EXPORT_RECORD_VERSION: u8 = 1;
 const AUDIT_RECORD_VERSION: u8 = 1;
 const MAX_AUDIT_DETAILS_BYTES: usize = 128 * 1024;
 const MAX_AUDIT_PAGE_LIMIT: usize = 1_000;
@@ -189,6 +193,73 @@ pub struct SnapshotServingPoolRecord {
     pub updated_at: u64,
 }
 
+/// Durable live export definition managed by the control plane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportRecord {
+    pub id: String,
+    pub tenant: String,
+    pub volume: String,
+    pub snapshot: Option<String>,
+    pub protocol: ExportProtocol,
+    pub listen: String,
+    pub allowed_clients: Vec<ClientAddrRule>,
+    pub squash: SquashMode,
+    pub atime: AtimeMode,
+    pub anon_uid: u32,
+    pub anon_gid: u32,
+    pub p9_token: Option<String>,
+    pub p9_tls_cert: Option<std::path::PathBuf>,
+    pub p9_tls_key: Option<std::path::PathBuf>,
+    pub enabled: bool,
+    /// Unix seconds.
+    pub created_at: u64,
+    /// Unix seconds.
+    pub updated_at: u64,
+}
+
+impl ExportRecord {
+    pub fn from_config(id: impl Into<String>, config: ExportConfig, enabled: bool) -> Self {
+        let now = now_unix();
+        Self {
+            id: id.into(),
+            tenant: config.tenant,
+            volume: config.volume,
+            snapshot: config.snapshot,
+            protocol: config.protocol,
+            listen: config.listen,
+            allowed_clients: config.allowed_clients,
+            squash: config.squash,
+            atime: config.atime,
+            anon_uid: config.anon_uid,
+            anon_gid: config.anon_gid,
+            p9_token: config.p9_token,
+            p9_tls_cert: config.p9_tls_cert,
+            p9_tls_key: config.p9_tls_key,
+            enabled,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    pub fn to_config(&self) -> ExportConfig {
+        ExportConfig {
+            tenant: self.tenant.clone(),
+            volume: self.volume.clone(),
+            snapshot: self.snapshot.clone(),
+            listen: self.listen.clone(),
+            allowed_clients: self.allowed_clients.clone(),
+            protocol: self.protocol,
+            p9_token: self.p9_token.clone(),
+            p9_tls_cert: self.p9_tls_cert.clone(),
+            p9_tls_key: self.p9_tls_key.clone(),
+            squash: self.squash,
+            atime: self.atime,
+            anon_uid: self.anon_uid,
+            anon_gid: self.anon_gid,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VolumePlacementState {
     Unassigned,
@@ -257,6 +328,9 @@ pub enum AuditAction {
     NodeRegister,
     NodeDrain,
     NodeRemove,
+    ExportCreate,
+    ExportUpdate,
+    ExportDelete,
     LimitsChange,
     Maintain,
     AuthDenied,
@@ -279,6 +353,9 @@ impl AuditAction {
             "NodeRegister" => Self::NodeRegister,
             "NodeDrain" => Self::NodeDrain,
             "NodeRemove" => Self::NodeRemove,
+            "ExportCreate" => Self::ExportCreate,
+            "ExportUpdate" => Self::ExportUpdate,
+            "ExportDelete" => Self::ExportDelete,
             "LimitsChange" => Self::LimitsChange,
             "Maintain" => Self::Maintain,
             "AuthDenied" => Self::AuthDenied,
@@ -435,6 +512,10 @@ fn volume_placement_key(tenant: &str, volume: &str) -> String {
     format!("vp/{tenant}/{volume}")
 }
 
+fn export_key(id: &str) -> String {
+    format!("e/{id}")
+}
+
 pub fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -452,6 +533,7 @@ pub struct ControlPlane {
 /// Read-only control-plane handle for daemon admin inventory and health checks.
 pub struct ControlReader {
     db: DbReader,
+    kms: Arc<dyn Kms>,
 }
 
 impl ControlPlane {
@@ -911,6 +993,91 @@ impl ControlPlane {
         record.quota = quota;
         self.put_volume(&record).await?;
         Ok(record)
+    }
+
+    // ---- exports (control-plane managed live export definitions) ----
+
+    pub async fn create_export(&self, mut record: ExportRecord) -> Result<ExportRecord> {
+        validate_export_record_fields(&record)?;
+        if self.try_get_export(&record.id).await?.is_some() {
+            return Err(Error::already_exists("export", &record.id));
+        }
+        self.get_volume(&record.tenant, &record.volume).await?;
+        let now = now_unix();
+        record.created_at = now;
+        record.updated_at = now;
+        self.put_export(&record).await?;
+        Ok(record)
+    }
+
+    pub async fn update_export(&self, mut record: ExportRecord) -> Result<ExportRecord> {
+        validate_export_record_fields(&record)?;
+        let existing = self.get_export(&record.id).await?;
+        self.get_volume(&record.tenant, &record.volume).await?;
+        record.created_at = existing.created_at;
+        record.updated_at = now_unix();
+        self.put_export(&record).await?;
+        Ok(record)
+    }
+
+    pub async fn enable_export(&self, id: &str) -> Result<ExportRecord> {
+        self.set_export_enabled(id, true).await
+    }
+
+    pub async fn disable_export(&self, id: &str) -> Result<ExportRecord> {
+        self.set_export_enabled(id, false).await
+    }
+
+    async fn set_export_enabled(&self, id: &str, enabled: bool) -> Result<ExportRecord> {
+        store::validate_name("export id", id)?;
+        let mut record = self.get_export(id).await?;
+        record.enabled = enabled;
+        record.updated_at = now_unix();
+        self.put_export(&record).await?;
+        Ok(record)
+    }
+
+    pub async fn remove_export(&self, id: &str) -> Result<ExportRecord> {
+        store::validate_name("export id", id)?;
+        let record = self.get_export(id).await?;
+        let mut batch = WriteBatch::new();
+        batch.delete(export_key(id).into_bytes());
+        self.db.write(batch).await?;
+        Ok(record)
+    }
+
+    pub async fn put_export(&self, record: &ExportRecord) -> Result<()> {
+        validate_export_record_fields(record)?;
+        self.db
+            .put(
+                export_key(&record.id).as_bytes(),
+                encode_versioned(EXPORT_RECORD_VERSION, record)?,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn try_get_export(&self, id: &str) -> Result<Option<ExportRecord>> {
+        match self.db.get(export_key(id).as_bytes()).await? {
+            Some(bytes) => Ok(Some(decode_export_record(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_export(&self, id: &str) -> Result<ExportRecord> {
+        self.try_get_export(id)
+            .await?
+            .ok_or_else(|| Error::not_found("export", id))
+    }
+
+    pub async fn list_exports(&self) -> Result<Vec<ExportRecord>> {
+        let mut iter = self.db.scan_prefix(b"e/".as_slice(), ..).await?;
+        let mut exports = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            exports.push(decode_export_record(&kv.value)?);
+        }
+        exports.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(exports)
     }
 
     // ---- fleet placement (nodes, stable endpoints, failover, drain) ----
@@ -1629,7 +1796,7 @@ impl ControlReader {
             .with_block_transformer(Arc::new(SlateBlockTransformer::new(cipher, dek)))
             .build()
             .await?;
-        Ok(Self { db })
+        Ok(Self { db, kms })
     }
 
     pub async fn close(&self) -> Result<()> {
@@ -1670,6 +1837,55 @@ impl ControlReader {
         self.try_get_volume(tenant, volume)
             .await?
             .ok_or_else(|| Error::not_found("volume", format!("{tenant}/{volume}")))
+    }
+
+    pub async fn get_mountable_volume(&self, tenant: &str, volume: &str) -> Result<VolumeRecord> {
+        let tenant_record = self.get_tenant(tenant).await?;
+        if tenant_record.state != TenantState::Active {
+            return Err(Error::invalid(
+                "tenant state",
+                format!("tenant {tenant:?} is {:?}, not Active", tenant_record.state),
+            ));
+        }
+        let record = self.get_volume(tenant, volume).await?;
+        if record.state != VolumeState::Active {
+            return Err(Error::invalid(
+                "volume state",
+                format!("volume {tenant}/{volume} is {:?}, not Active", record.state),
+            ));
+        }
+        Ok(record)
+    }
+
+    pub async fn unwrap_tenant_kek(&self, tenant: &TenantRecord) -> Result<Secret32> {
+        if tenant.wrapped_kek.is_empty() {
+            return Err(Error::invalid(
+                "tenant key",
+                format!("tenant {:?} has been crypto-shredded", tenant.name),
+            ));
+        }
+        self.kms
+            .unwrap(&tenant.wrapped_kek, &contexts::tenant_kek(&tenant.name))
+            .await
+    }
+
+    pub async fn unwrap_volume_dek(&self, record: &VolumeRecord) -> Result<Secret32> {
+        if record.wrapped_dek.is_empty() {
+            return Err(Error::invalid(
+                "volume key",
+                format!(
+                    "volume {}/{} has been crypto-shredded",
+                    record.tenant, record.name
+                ),
+            ));
+        }
+        let tenant = self.get_tenant(&record.tenant).await?;
+        let kek = self.unwrap_tenant_kek(&tenant).await?;
+        crate::crypto::aead::unwrap_key(
+            &kek,
+            &contexts::volume_dek(&record.tenant, &record.name),
+            &record.wrapped_dek,
+        )
     }
 
     pub async fn list_volumes(&self, tenant: &str) -> Result<Vec<VolumeRecord>> {
@@ -1720,6 +1936,29 @@ impl ControlReader {
                 .then_with(|| a.volume.cmp(&b.volume))
         });
         Ok(placements)
+    }
+
+    pub async fn try_get_export(&self, id: &str) -> Result<Option<ExportRecord>> {
+        match self.db.get(export_key(id).as_bytes()).await? {
+            Some(bytes) => Ok(Some(decode_export_record(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_export(&self, id: &str) -> Result<ExportRecord> {
+        self.try_get_export(id)
+            .await?
+            .ok_or_else(|| Error::not_found("export", id))
+    }
+
+    pub async fn list_exports(&self) -> Result<Vec<ExportRecord>> {
+        let mut iter = self.db.scan_prefix(b"e/".as_slice(), ..).await?;
+        let mut exports = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            exports.push(decode_export_record(&kv.value)?);
+        }
+        exports.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(exports)
     }
 
     pub async fn list_audit(
@@ -1775,6 +2014,32 @@ fn validate_capacity_weight(capacity_weight: u32) -> Result<()> {
     Ok(())
 }
 
+fn validate_export_record_fields(record: &ExportRecord) -> Result<()> {
+    store::validate_name("export id", &record.id)?;
+    store::validate_name("tenant name", &record.tenant)?;
+    store::validate_name("volume name", &record.volume)?;
+    if record.snapshot.as_deref().is_some_and(str::is_empty) {
+        return Err(Error::invalid(
+            "export snapshot",
+            "snapshot id must not be empty",
+        ));
+    }
+    if record.listen.trim().is_empty() {
+        return Err(Error::invalid(
+            "export listen",
+            "listen address must not be empty",
+        ));
+    }
+    record
+        .listen
+        .parse::<std::net::SocketAddr>()
+        .map_err(|error| Error::invalid("export listen", error.to_string()))?;
+    validate_export_config(&record.to_config()).map_err(|error| match error {
+        Error::Config(message) => Error::invalid("export config", message),
+        error => error,
+    })
+}
+
 fn node_load_score(node: &DaemonNodeRecord, assigned_primary_volumes: u32) -> u128 {
     let metrics = node.metrics;
     let writable = assigned_primary_volumes.max(metrics.open_writable_volumes) as u128;
@@ -1820,6 +2085,10 @@ fn decode_daemon_node_record(bytes: &[u8]) -> Result<DaemonNodeRecord> {
 
 fn decode_volume_placement_record(bytes: &[u8]) -> Result<VolumePlacementRecord> {
     decode_versioned(VOLUME_PLACEMENT_RECORD_VERSION, bytes)
+}
+
+fn decode_export_record(bytes: &[u8]) -> Result<ExportRecord> {
+    decode_versioned(EXPORT_RECORD_VERSION, bytes)
 }
 
 fn decode_audit_record(bytes: &[u8]) -> Result<AuditRecord> {

@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use slatefs_core::config::Config;
+use slatefs_core::config::{ClientAddrRule, Config};
 use slatefs_core::control::{
-    ControlPlane, DaemonMetrics, DaemonNodeRecord, DaemonNodeState, QuotaLimits,
+    ControlPlane, DaemonMetrics, DaemonNodeRecord, DaemonNodeState, ExportRecord, QuotaLimits,
     VolumePlacementRecord,
 };
 use slatefs_core::crypto::kms::{self, LocalAgeKms};
@@ -54,6 +54,8 @@ enum Command {
     Snapshot(SnapshotCmd),
     #[command(subcommand)]
     Clone(CloneCmd),
+    #[command(subcommand)]
+    Export(ExportCmd),
     #[command(subcommand)]
     Fleet(FleetCmd),
 }
@@ -213,6 +215,94 @@ enum CloneCmd {
         #[arg(long)]
         note: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ExportCmd {
+    /// Add a control-plane managed export.
+    Add {
+        id: String,
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        volume: String,
+        #[arg(long)]
+        snapshot: Option<String>,
+        #[arg(long, default_value = "nfs", value_parser = parse_export_protocol)]
+        protocol: config::ExportProtocol,
+        #[arg(long)]
+        listen: String,
+        #[arg(long = "allowed-client", value_parser = parse_client_addr_rule)]
+        allowed_clients: Vec<ClientAddrRule>,
+        #[arg(long, default_value = "all_squash", value_parser = parse_squash_mode)]
+        squash: config::SquashMode,
+        #[arg(long, default_value = "relatime", value_parser = parse_atime_mode)]
+        atime: config::AtimeMode,
+        #[arg(long, default_value_t = 65534)]
+        anon_uid: u32,
+        #[arg(long, default_value_t = 65534)]
+        anon_gid: u32,
+        #[arg(long)]
+        p9_token: Option<String>,
+        #[arg(long)]
+        p9_tls_cert: Option<PathBuf>,
+        #[arg(long)]
+        p9_tls_key: Option<PathBuf>,
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// List control-plane managed exports.
+    List,
+    /// Show one control-plane managed export.
+    Show { id: String },
+    /// Update a control-plane managed export.
+    Update {
+        id: String,
+        #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long)]
+        volume: Option<String>,
+        #[arg(long)]
+        snapshot: Option<String>,
+        #[arg(long)]
+        clear_snapshot: bool,
+        #[arg(long, value_parser = parse_export_protocol)]
+        protocol: Option<config::ExportProtocol>,
+        #[arg(long)]
+        listen: Option<String>,
+        #[arg(long = "allowed-client", value_parser = parse_client_addr_rule)]
+        allowed_clients: Vec<ClientAddrRule>,
+        #[arg(long)]
+        clear_allowed_clients: bool,
+        #[arg(long, value_parser = parse_squash_mode)]
+        squash: Option<config::SquashMode>,
+        #[arg(long, value_parser = parse_atime_mode)]
+        atime: Option<config::AtimeMode>,
+        #[arg(long)]
+        anon_uid: Option<u32>,
+        #[arg(long)]
+        anon_gid: Option<u32>,
+        #[arg(long)]
+        p9_token: Option<String>,
+        #[arg(long)]
+        clear_p9_token: bool,
+        #[arg(long)]
+        p9_tls_cert: Option<PathBuf>,
+        #[arg(long)]
+        clear_p9_tls_cert: bool,
+        #[arg(long)]
+        p9_tls_key: Option<PathBuf>,
+        #[arg(long)]
+        clear_p9_tls_key: bool,
+        #[arg(long)]
+        enabled: Option<bool>,
+    },
+    /// Remove a control-plane managed export.
+    Remove { id: String },
+    /// Enable a control-plane managed export.
+    Enable { id: String },
+    /// Disable a control-plane managed export.
+    Disable { id: String },
 }
 
 #[derive(Subcommand)]
@@ -388,6 +478,33 @@ fn parse_export_protocol(s: &str) -> Result<config::ExportProtocol, String> {
     }
 }
 
+fn parse_squash_mode(s: &str) -> Result<config::SquashMode, String> {
+    match s {
+        "all_squash" => Ok(config::SquashMode::AllSquash),
+        "none" => Ok(config::SquashMode::NoSquash),
+        "root_squash" => Ok(config::SquashMode::RootSquash),
+        "trust_as_root" => Ok(config::SquashMode::TrustAsRoot),
+        _ => Err(format!(
+            "unknown squash mode {s:?} (all_squash|none|root_squash|trust_as_root)"
+        )),
+    }
+}
+
+fn parse_atime_mode(s: &str) -> Result<config::AtimeMode, String> {
+    match s {
+        "relatime" => Ok(config::AtimeMode::Relatime),
+        "strict" => Ok(config::AtimeMode::Strict),
+        "noatime" => Ok(config::AtimeMode::Noatime),
+        _ => Err(format!(
+            "unknown atime mode {s:?} (relatime|strict|noatime)"
+        )),
+    }
+}
+
+fn parse_client_addr_rule(s: &str) -> Result<ClientAddrRule, String> {
+    s.parse()
+}
+
 fn parse_daemon_state(s: &str) -> Result<DaemonNodeState, String> {
     match s {
         "healthy" => Ok(DaemonNodeState::Healthy),
@@ -489,6 +606,70 @@ fn protocol_name(protocol: config::ExportProtocol) -> &'static str {
         config::ExportProtocol::Nfs => "nfs",
         config::ExportProtocol::P9 => "p9",
     }
+}
+
+fn squash_name(squash: config::SquashMode) -> &'static str {
+    match squash {
+        config::SquashMode::AllSquash => "all_squash",
+        config::SquashMode::NoSquash => "none",
+        config::SquashMode::RootSquash => "root_squash",
+        config::SquashMode::TrustAsRoot => "trust_as_root",
+    }
+}
+
+fn atime_name(atime: config::AtimeMode) -> &'static str {
+    match atime {
+        config::AtimeMode::Relatime => "relatime",
+        config::AtimeMode::Strict => "strict",
+        config::AtimeMode::Noatime => "noatime",
+    }
+}
+
+fn print_export(export: &ExportRecord) {
+    println!("export:      {}", export.id);
+    println!("target:      {}/{}", export.tenant, export.volume);
+    println!("snapshot:    {}", export.snapshot.as_deref().unwrap_or("-"));
+    println!("protocol:    {}", protocol_name(export.protocol));
+    println!("listen:      {}", export.listen);
+    println!(
+        "allowed:     {}",
+        if export.allowed_clients.is_empty() {
+            "-".to_string()
+        } else {
+            export
+                .allowed_clients
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+    );
+    println!("squash:      {}", squash_name(export.squash));
+    println!("atime:       {}", atime_name(export.atime));
+    println!("anon:        {}:{}", export.anon_uid, export.anon_gid);
+    println!(
+        "p9_token:    {}",
+        export.p9_token.as_ref().map(|_| "set").unwrap_or("-")
+    );
+    println!(
+        "p9_tls_cert: {}",
+        export
+            .p9_tls_cert
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!(
+        "p9_tls_key:  {}",
+        export
+            .p9_tls_key
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!("enabled:     {}", export.enabled);
+    println!("created_at:  {}", export.created_at);
+    println!("updated_at:  {}", export.updated_at);
 }
 
 fn print_daemon_node(node: &DaemonNodeRecord) {
@@ -1019,6 +1200,160 @@ async fn run(
                 record.chunk_size
             );
         }
+        Command::Export(command) => match command {
+            ExportCmd::Add {
+                id,
+                tenant,
+                volume,
+                snapshot,
+                protocol,
+                listen,
+                allowed_clients,
+                squash,
+                atime,
+                anon_uid,
+                anon_gid,
+                p9_token,
+                p9_tls_cert,
+                p9_tls_key,
+                disabled,
+            } => {
+                let record = ExportRecord::from_config(
+                    id.clone(),
+                    config::ExportConfig {
+                        tenant: tenant.clone(),
+                        volume: volume.clone(),
+                        snapshot: snapshot.clone(),
+                        listen: listen.clone(),
+                        allowed_clients: allowed_clients.clone(),
+                        protocol: *protocol,
+                        p9_token: p9_token.clone(),
+                        p9_tls_cert: p9_tls_cert.clone(),
+                        p9_tls_key: p9_tls_key.clone(),
+                        squash: *squash,
+                        atime: *atime,
+                        anon_uid: *anon_uid,
+                        anon_gid: *anon_gid,
+                    },
+                    !disabled,
+                );
+                let record = control.create_export(record).await?;
+                print_export(&record);
+            }
+            ExportCmd::List => {
+                for export in control.list_exports().await? {
+                    println!(
+                        "{}\t{}\t{}/{}\tsnapshot={}\tlisten={}\tenabled={}",
+                        export.id,
+                        protocol_name(export.protocol),
+                        export.tenant,
+                        export.volume,
+                        export.snapshot.as_deref().unwrap_or("-"),
+                        export.listen,
+                        export.enabled
+                    );
+                }
+            }
+            ExportCmd::Show { id } => {
+                let record = control.get_export(id).await?;
+                print_export(&record);
+            }
+            ExportCmd::Update {
+                id,
+                tenant,
+                volume,
+                snapshot,
+                clear_snapshot,
+                protocol,
+                listen,
+                allowed_clients,
+                clear_allowed_clients,
+                squash,
+                atime,
+                anon_uid,
+                anon_gid,
+                p9_token,
+                clear_p9_token,
+                p9_tls_cert,
+                clear_p9_tls_cert,
+                p9_tls_key,
+                clear_p9_tls_key,
+                enabled,
+            } => {
+                let mut record = control.get_export(id).await?;
+                if let Some(tenant) = tenant {
+                    record.tenant = tenant.clone();
+                }
+                if let Some(volume) = volume {
+                    record.volume = volume.clone();
+                }
+                if *clear_snapshot {
+                    record.snapshot = None;
+                }
+                if let Some(snapshot) = snapshot {
+                    record.snapshot = Some(snapshot.clone());
+                }
+                if let Some(protocol) = protocol {
+                    record.protocol = *protocol;
+                }
+                if let Some(listen) = listen {
+                    record.listen = listen.clone();
+                }
+                if *clear_allowed_clients {
+                    record.allowed_clients.clear();
+                }
+                if !allowed_clients.is_empty() {
+                    record.allowed_clients = allowed_clients.clone();
+                }
+                if let Some(squash) = squash {
+                    record.squash = *squash;
+                }
+                if let Some(atime) = atime {
+                    record.atime = *atime;
+                }
+                if let Some(anon_uid) = anon_uid {
+                    record.anon_uid = *anon_uid;
+                }
+                if let Some(anon_gid) = anon_gid {
+                    record.anon_gid = *anon_gid;
+                }
+                if *clear_p9_token {
+                    record.p9_token = None;
+                }
+                if let Some(p9_token) = p9_token {
+                    record.p9_token = Some(p9_token.clone());
+                }
+                if *clear_p9_tls_cert {
+                    record.p9_tls_cert = None;
+                }
+                if let Some(p9_tls_cert) = p9_tls_cert {
+                    record.p9_tls_cert = Some(p9_tls_cert.clone());
+                }
+                if *clear_p9_tls_key {
+                    record.p9_tls_key = None;
+                }
+                if let Some(p9_tls_key) = p9_tls_key {
+                    record.p9_tls_key = Some(p9_tls_key.clone());
+                }
+                if let Some(enabled) = enabled {
+                    record.enabled = *enabled;
+                }
+                let record = control.update_export(record).await?;
+                print_export(&record);
+            }
+            ExportCmd::Remove { id } => {
+                let record = control.remove_export(id).await?;
+                println!("removed export {}", record.id);
+            }
+            ExportCmd::Enable { id } => {
+                let record = control.enable_export(id).await?;
+                print_export(&record);
+            }
+            ExportCmd::Disable { id } => {
+                let record = control.disable_export(id).await?;
+                print_export(&record);
+            }
+        },
         Command::Fleet(FleetCmd::Node(command)) => match command {
             FleetNodeCmd::Register {
                 id,

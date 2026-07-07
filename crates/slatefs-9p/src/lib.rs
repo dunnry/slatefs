@@ -56,6 +56,82 @@ pub struct TlsIdentity {
     pub key_path: PathBuf,
 }
 
+pub struct P9TcpListener {
+    listener: TcpListener,
+    fs: SlateFs9p,
+    allowed_clients: Vec<ClientAddrRule>,
+}
+
+impl P9TcpListener {
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    pub async fn handle_forever(self) -> std::io::Result<()> {
+        loop {
+            let (stream, peer) = self.listener.accept().await?;
+            if !self.allowed_clients.is_empty()
+                && !self
+                    .allowed_clients
+                    .iter()
+                    .any(|rule| rule.contains(peer.ip()))
+            {
+                tracing::warn!(%peer, "rejected 9P client");
+                continue;
+            }
+            let fs = self.fs.clone();
+            tokio::spawn(async move {
+                if let Err(error) = rs9p::srv::srv_async_stream(fs, stream).await {
+                    tracing::error!(%peer, "9p connection error: {error:?}");
+                }
+            });
+        }
+    }
+}
+
+pub struct P9TlsListener {
+    listener: TcpListener,
+    fs: SlateFs9p,
+    tls: TlsAcceptor,
+    allowed_clients: Vec<ClientAddrRule>,
+}
+
+impl P9TlsListener {
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    pub async fn handle_forever(self) -> std::io::Result<()> {
+        loop {
+            let (stream, peer) = self.listener.accept().await?;
+            if !self.allowed_clients.is_empty()
+                && !self
+                    .allowed_clients
+                    .iter()
+                    .any(|rule| rule.contains(peer.ip()))
+            {
+                tracing::warn!(%peer, "rejected 9P TLS client");
+                continue;
+            }
+
+            let fs = self.fs.clone();
+            let tls = self.tls.clone();
+            tokio::spawn(async move {
+                let stream = match tls.accept(stream).await {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        tracing::warn!(%peer, "9p TLS handshake failed: {error}");
+                        return;
+                    }
+                };
+                if let Err(error) = rs9p::srv::srv_async_stream(fs, stream).await {
+                    tracing::error!(%peer, "9p TLS connection error: {error:?}");
+                }
+            });
+        }
+    }
+}
+
 fn install_rustls_provider() {
     RUSTLS_PROVIDER.call_once(|| {
         let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -102,12 +178,34 @@ pub async fn serve_export_with_allowlist_and_rate_limit(
     rate_limiter: Option<Arc<RateLimiter>>,
     listen: &str,
 ) -> std::io::Result<()> {
-    let fs = SlateFs9p::new_with_rate_limiter(volume, export_name, token, rate_limiter);
-    rs9p::srv::srv_async_tcp_with_client_filter(fs, listen, move |peer| {
-        allowed_clients.is_empty() || allowed_clients.iter().any(|rule| rule.contains(peer.ip()))
-    })
+    bind_export_with_allowlist_and_rate_limit(
+        volume,
+        export_name,
+        token,
+        allowed_clients,
+        rate_limiter,
+        listen,
+    )
+    .await?
+    .handle_forever()
     .await
-    .map_err(|e| std::io::Error::other(format!("9p server: {e}")))
+}
+
+pub async fn bind_export_with_allowlist_and_rate_limit(
+    volume: Arc<dyn Vfs>,
+    export_name: String,
+    token: Option<String>,
+    allowed_clients: Vec<ClientAddrRule>,
+    rate_limiter: Option<Arc<RateLimiter>>,
+    listen: &str,
+) -> std::io::Result<P9TcpListener> {
+    let fs = SlateFs9p::new_with_rate_limiter(volume, export_name, token, rate_limiter);
+    let listener = TcpListener::bind(listen).await?;
+    Ok(P9TcpListener {
+        listener,
+        fs,
+        allowed_clients,
+    })
 }
 
 fn load_tls_config(cert_path: &Path, key_path: &Path) -> std::io::Result<Arc<ServerConfig>> {
@@ -155,6 +253,29 @@ pub async fn serve_export_tls_with_allowlist_and_rate_limit(
     listen: &str,
     identity: TlsIdentity,
 ) -> std::io::Result<()> {
+    bind_export_tls_with_allowlist_and_rate_limit(
+        volume,
+        export_name,
+        token,
+        allowed_clients,
+        rate_limiter,
+        listen,
+        identity,
+    )
+    .await?
+    .handle_forever()
+    .await
+}
+
+pub async fn bind_export_tls_with_allowlist_and_rate_limit(
+    volume: Arc<dyn Vfs>,
+    export_name: String,
+    token: Option<String>,
+    allowed_clients: Vec<ClientAddrRule>,
+    rate_limiter: Option<Arc<RateLimiter>>,
+    listen: &str,
+    identity: TlsIdentity,
+) -> std::io::Result<P9TlsListener> {
     let fs = SlateFs9p::new_with_rate_limiter(volume, export_name, token, rate_limiter);
     let tls = TlsAcceptor::from(load_tls_config(&identity.cert_path, &identity.key_path)?);
     let listener = TcpListener::bind(listen).await?;
@@ -163,29 +284,10 @@ pub async fn serve_export_tls_with_allowlist_and_rate_limit(
         cert = %identity.cert_path.display(),
         "9p TLS listener ready"
     );
-
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        if !allowed_clients.is_empty()
-            && !allowed_clients.iter().any(|rule| rule.contains(peer.ip()))
-        {
-            tracing::warn!(%peer, "rejected 9P TLS client");
-            continue;
-        }
-
-        let fs = fs.clone();
-        let tls = tls.clone();
-        tokio::spawn(async move {
-            let stream = match tls.accept(stream).await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    tracing::warn!(%peer, "9p TLS handshake failed: {error}");
-                    return;
-                }
-            };
-            if let Err(error) = rs9p::srv::srv_async_stream(fs, stream).await {
-                tracing::error!(%peer, "9p TLS connection error: {error:?}");
-            }
-        });
-    }
+    Ok(P9TlsListener {
+        listener,
+        fs,
+        tls,
+        allowed_clients,
+    })
 }

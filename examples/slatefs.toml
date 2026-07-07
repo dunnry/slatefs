@@ -44,6 +44,11 @@ cipher = "auto"              # auto | aes256gcm | xchacha20poly1305
 # token = "replace-me"        # required if listen is not loopback
 # token_file = "/run/slatefs/admin-token"
 
+# Control-plane exports are reconciled live by slatefsd. Static [[exports]]
+# below are still supported as immutable bootstrap/compatibility exports.
+# [export_control]
+# poll_interval_secs = 30
+
 # Fleet placement is stored in the encrypted control DB, not in this config.
 # Register and heartbeat daemon nodes with:
 #   slatefs fleet node register daemon-a --advertise-endpoint 10.0.0.10:2049
@@ -51,14 +56,23 @@ cipher = "auto"              # auto | aes256gcm | xchacha20poly1305
 # Assignments, stable endpoints, failover, drains, read replicas, and
 # snapshot-serving pools are managed with `slatefs fleet volume ...`.
 
-# Example export:
+# Example immutable/bootstrap export:
 # [[exports]]
 # tenant = "t1"
 # volume = "v1"
 # snapshot = "<checkpoint-id>" # optional: serve this checkpoint read-only
 # listen = "127.0.0.1:12049"
 # protocol = "nfs"            # nfs | p9
+# atime = "relatime"          # relatime | strict | noatime (backend currently applies relatime)
+# squash = "all_squash"       # all_squash | none | root_squash | trust_as_root
+# anon_uid = 65534
+# anon_gid = 65534
 # p9_token = "tenant-secret"  # p9 only: bearer token sent as uname
 # p9_tls_cert = "/etc/slatefs/p9.crt" # p9 only: PEM cert chain for TLS-capable clients/tunnels
 # p9_tls_key = "/etc/slatefs/p9.key"  # p9 only: PEM private key
 # allowed_clients = ["127.0.0.1", "10.0.0.0/8"]  # empty/unset allows all
+
+# Manage live control-plane exports with:
+#   slatefs export add exp1 --tenant t1 --volume v1 --listen 127.0.0.1:12049
+#   slatefs export list
+#   slatefs export disable exp1
