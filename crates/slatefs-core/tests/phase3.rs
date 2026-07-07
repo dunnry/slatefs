@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::TryStreamExt;
 use futures::stream::BoxStream;
+use slatedb::object_store::ObjectStoreExt;
 use slatefs_core::crypto::Secret32;
 use slatefs_core::meta::inode::ROOT_INO;
 use slatefs_core::store::{self, ObjectStore};
@@ -188,11 +189,14 @@ impl ObjectStore for CountingStore {
         self.inner.get_opts(location, options).await
     }
 
-    async fn delete(
+    fn delete_stream(
         &self,
-        location: &slatedb::object_store::path::Path,
-    ) -> slatedb::object_store::Result<()> {
-        self.inner.delete(location).await
+        locations: BoxStream<
+            'static,
+            slatedb::object_store::Result<slatedb::object_store::path::Path>,
+        >,
+    ) -> BoxStream<'static, slatedb::object_store::Result<slatedb::object_store::path::Path>> {
+        self.inner.delete_stream(locations)
     }
 
     fn list(
@@ -209,20 +213,13 @@ impl ObjectStore for CountingStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(
+    async fn copy_opts(
         &self,
         from: &slatedb::object_store::path::Path,
         to: &slatedb::object_store::path::Path,
+        options: slatedb::object_store::CopyOptions,
     ) -> slatedb::object_store::Result<()> {
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(
-        &self,
-        from: &slatedb::object_store::path::Path,
-        to: &slatedb::object_store::path::Path,
-    ) -> slatedb::object_store::Result<()> {
-        self.inner.copy_if_not_exists(from, to).await
+        self.inner.copy_opts(from, to, options).await
     }
 }
 

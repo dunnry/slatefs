@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use slatedb::object_store::{ObjectStore, PutMode, PutOptions};
+use slatedb::object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use slatedb::{Db, Settings, WriteBatch};
 
 use crate::config::{Compression, ExportProtocol};
@@ -417,7 +417,7 @@ impl ControlPlane {
     }
 
     pub async fn list_tenants(&self) -> Result<Vec<TenantRecord>> {
-        let mut iter = self.db.scan_prefix(b"t/".as_slice()).await?;
+        let mut iter = self.db.scan_prefix(b"t/".as_slice(), ..).await?;
         let mut tenants = Vec::new();
         while let Some(kv) = iter.next().await? {
             tenants.push(decode_tenant_record(&kv.value)?);
@@ -518,7 +518,7 @@ impl ControlPlane {
 
     pub async fn list_volumes(&self, tenant: &str) -> Result<Vec<VolumeRecord>> {
         let prefix = format!("v/{tenant}/");
-        let mut iter = self.db.scan_prefix(prefix.as_bytes()).await?;
+        let mut iter = self.db.scan_prefix(prefix.as_bytes(), ..).await?;
         let mut volumes = Vec::new();
         while let Some(kv) = iter.next().await? {
             volumes.push(decode_versioned(VOLUME_RECORD_VERSION, &kv.value)?);
@@ -729,7 +729,7 @@ impl ControlPlane {
     }
 
     pub async fn list_daemon_nodes(&self) -> Result<Vec<DaemonNodeRecord>> {
-        let mut iter = self.db.scan_prefix(b"dn/".as_slice()).await?;
+        let mut iter = self.db.scan_prefix(b"dn/".as_slice(), ..).await?;
         let mut nodes: Vec<DaemonNodeRecord> = Vec::new();
         while let Some(kv) = iter.next().await? {
             nodes.push(decode_versioned(DAEMON_NODE_RECORD_VERSION, &kv.value)?);
@@ -849,7 +849,7 @@ impl ControlPlane {
     }
 
     pub async fn list_volume_placements(&self) -> Result<Vec<VolumePlacementRecord>> {
-        let mut iter = self.db.scan_prefix(b"vp/".as_slice()).await?;
+        let mut iter = self.db.scan_prefix(b"vp/".as_slice(), ..).await?;
         let mut placements: Vec<VolumePlacementRecord> = Vec::new();
         while let Some(kv) = iter.next().await? {
             placements.push(decode_versioned(

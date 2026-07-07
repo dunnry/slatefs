@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use slatedb::admin::AdminBuilder;
+use slatedb::admin::{AdminBuilder, CloneSourceSpec};
 use slatedb::config::{CheckpointOptions, CheckpointScope};
 use slatedb::object_store::ObjectStore;
 use slatedb::{Checkpoint, Db, DbReader, Settings, WriteBatch};
@@ -364,8 +364,12 @@ pub async fn clone_volume(
     let source_path = store::volume_db_path(tenant_name, source_volume_name);
     let clone_path = store::volume_db_path(tenant_name, clone_volume_name);
     let admin = AdminBuilder::new(clone_path, Arc::clone(&object_store)).build();
+    let source_spec = match checkpoint {
+        Some(checkpoint) => CloneSourceSpec::with_checkpoint(source_path, checkpoint),
+        None => CloneSourceSpec::new(source_path),
+    };
     admin
-        .create_clone_builder(source_path, checkpoint)
+        .create_clone_builder_from_source(source_spec)
         .build()
         .await
         .map_err(|e| Error::invalid("clone", e.to_string()))?;
@@ -1155,7 +1159,7 @@ pub(crate) async fn reap_orphan_data(db: &Db, ino: u64) -> Result<()> {
 ///   quota and drop the inode first.
 async fn reap_crashed_orphans(db: &Db) -> Result<()> {
     let mut orphans = Vec::new();
-    let mut iter = db.scan_prefix(keys::ORPHAN_PREFIX).await?;
+    let mut iter = db.scan_prefix(keys::ORPHAN_PREFIX, ..).await?;
     while let Some(kv) = iter.next().await? {
         if let Some(ino) = keys::parse_ino(&kv.key) {
             let _ = Orphan::decode(&kv.value)?;

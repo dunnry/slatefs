@@ -14,10 +14,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use futures::stream::BoxStream;
+use slatedb::object_store::parse_url_opts;
 use slatedb::object_store::path::Path as ObjPath;
+use slatedb::object_store::prefix::PrefixStore;
 use slatedb::object_store::{
-    Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
+    CopyOptions, Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload,
+    ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    Result as ObjectStoreResult,
 };
 // Re-exported so frontends/CLI don't need a direct slatedb dependency just to
 // hold a store handle.
@@ -31,7 +34,16 @@ use crate::error::{Error, Result};
 /// Note `memory:///` builds a fresh empty store per call — resolve once per
 /// process and share the `Arc`.
 pub fn resolve_root(url: &str) -> Result<Arc<dyn ObjectStore>> {
-    slatedb::Db::resolve_object_store(url).map_err(Error::from)
+    let parsed = url
+        .try_into()
+        .map_err(|e| Error::Config(format!("invalid object store URL {url:?}: {e}")))?;
+    let env_vars = std::env::vars().map(|(key, value)| (key.to_ascii_lowercase(), value));
+    let (store, prefix) = parse_url_opts(&parsed, env_vars).map_err(Error::from)?;
+    if prefix.as_ref().is_empty() {
+        Ok(Arc::from(store))
+    } else {
+        Ok(Arc::new(PrefixStore::new(store, prefix)))
+    }
 }
 
 pub const CONTROL_DB_PATH: &str = "control";
@@ -146,14 +158,6 @@ impl ObjectStore for CloneParentReadFallbackStore {
         }
     }
 
-    async fn get_range(&self, location: &ObjPath, range: Range<u64>) -> ObjectStoreResult<Bytes> {
-        let options = GetOptions {
-            range: Some(range.into()),
-            ..Default::default()
-        };
-        self.get_opts(location, options).await?.bytes().await
-    }
-
     async fn get_ranges(
         &self,
         location: &ObjPath,
@@ -161,21 +165,20 @@ impl ObjectStore for CloneParentReadFallbackStore {
     ) -> ObjectStoreResult<Vec<Bytes>> {
         let mut out = Vec::with_capacity(ranges.len());
         for range in ranges {
-            out.push(self.get_range(location, range.clone()).await?);
+            let options = GetOptions {
+                range: Some(range.clone().into()),
+                ..Default::default()
+            };
+            out.push(self.get_opts(location, options).await?.bytes().await?);
         }
         Ok(out)
     }
 
-    async fn head(&self, location: &ObjPath) -> ObjectStoreResult<ObjectMeta> {
-        let options = GetOptions {
-            head: true,
-            ..Default::default()
-        };
-        Ok(self.get_opts(location, options).await?.meta)
-    }
-
-    async fn delete(&self, location: &ObjPath) -> ObjectStoreResult<()> {
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<ObjPath>>,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjPath>> {
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&ObjPath>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
@@ -186,12 +189,13 @@ impl ObjectStore for CloneParentReadFallbackStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &ObjPath, to: &ObjPath) -> ObjectStoreResult<()> {
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &ObjPath, to: &ObjPath) -> ObjectStoreResult<()> {
-        self.inner.copy_if_not_exists(from, to).await
+    async fn copy_opts(
+        &self,
+        from: &ObjPath,
+        to: &ObjPath,
+        options: CopyOptions,
+    ) -> ObjectStoreResult<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 }
 

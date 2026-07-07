@@ -7,7 +7,7 @@ use std::ops::RangeBounds;
 
 use bytes::Bytes;
 use slatedb::config::WriteOptions;
-use slatedb::{DbIterator, KeyValue, WriteBatch};
+use slatedb::{ByteRangeBounds, DbIterator, KeyValue, WriteBatch};
 
 use crate::data;
 use crate::locks::{LockRange, RangeLock};
@@ -117,7 +117,7 @@ impl Volume {
     async fn db_scan<K, T>(&self, range: T) -> FsResult<DbIterator>
     where
         K: AsRef<[u8]> + Send,
-        T: RangeBounds<K> + Send,
+        T: RangeBounds<K> + ByteRangeBounds + Send,
     {
         self.ensure_live()?;
         let result = self.db.scan(range).await;
@@ -196,7 +196,7 @@ impl Volume {
             let options =
                 slatedb::config::ScanOptions::default().with_read_ahead_bytes(1024 * 1024);
             let range = keys::chunk(ino, from).to_vec()..keys::chunk(ino, to_exclusive).to_vec();
-            if let Ok(mut iter) = db.scan_with_options::<Vec<u8>, _>(range, &options).await {
+            if let Ok(mut iter) = db.scan_with_options(range, &options).await {
                 while let Ok(Some(_)) = iter.next().await {}
             }
         });

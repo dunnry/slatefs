@@ -63,7 +63,7 @@ trait FsckRead {
 #[async_trait]
 impl FsckRead for Db {
     async fn scan_all_keys(&self) -> Result<DbIterator> {
-        self.scan::<Vec<u8>, _>(..).await.map_err(Into::into)
+        self.scan(..).await.map_err(Into::into)
     }
 
     async fn get_key(&self, key: &'static [u8]) -> Result<Option<Bytes>> {
@@ -74,7 +74,7 @@ impl FsckRead for Db {
 #[async_trait]
 impl FsckRead for DbReader {
     async fn scan_all_keys(&self) -> Result<DbIterator> {
-        self.scan::<Vec<u8>, _>(..).await.map_err(Into::into)
+        self.scan(..).await.map_err(Into::into)
     }
 
     async fn get_key(&self, key: &'static [u8]) -> Result<Option<Bytes>> {

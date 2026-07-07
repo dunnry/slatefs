@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use futures::TryStreamExt;
+use slatedb::object_store::ObjectStoreExt;
 use slatefs_core::config::{Compression, VolumeDefaults};
 use slatefs_core::control::{
     ControlPlane, QuotaLimit, QuotaLimits, TenantState, VolumeRecord, VolumeState,

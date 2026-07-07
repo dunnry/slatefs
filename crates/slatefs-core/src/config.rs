@@ -81,15 +81,16 @@ impl Default for SlateDbConfig {
     fn default() -> Self {
         let settings = slatedb::config::Settings::default();
         let compactor = settings.compactor_options.unwrap_or_default();
+        let worker = compactor.worker.unwrap_or_default();
         Self {
             l0_sst_size_bytes: settings.l0_sst_size_bytes,
             max_unflushed_bytes: settings.max_unflushed_bytes,
             l0_max_ssts: settings.l0_max_ssts,
             l0_max_ssts_per_key: settings.l0_max_ssts_per_key,
             l0_flush_parallelism: settings.l0_flush_parallelism,
-            compaction_max_sst_size_bytes: compactor.max_sst_size,
+            compaction_max_sst_size_bytes: worker.max_sst_size,
             compaction_max_concurrent: compactor.max_concurrent_compactions,
-            compaction_max_fetch_tasks: compactor.max_fetch_tasks,
+            compaction_max_fetch_tasks: worker.max_fetch_tasks,
         }
     }
 }
@@ -105,9 +106,10 @@ impl SlateDbConfig {
         settings.l0_max_ssts_per_key = self.l0_max_ssts_per_key;
         settings.l0_flush_parallelism = self.l0_flush_parallelism;
         let mut compactor = settings.compactor_options.unwrap_or_default();
-        compactor.max_sst_size = self.compaction_max_sst_size_bytes;
         compactor.max_concurrent_compactions = self.compaction_max_concurrent;
-        compactor.max_fetch_tasks = self.compaction_max_fetch_tasks;
+        let worker = compactor.worker.get_or_insert_with(Default::default);
+        worker.max_sst_size = self.compaction_max_sst_size_bytes;
+        worker.max_fetch_tasks = self.compaction_max_fetch_tasks;
         settings.compactor_options = Some(compactor);
         settings
     }
