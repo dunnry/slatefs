@@ -251,6 +251,26 @@ cp examples/slatefs.toml ./slatefs.toml   # edit: keyfile = "./master.key"
 ./target/debug/slatefs -c ./slatefs.toml volume info t1 v1
 ```
 
+## Object Store URLs
+
+SlateFS accepts object_store URLs in `[object_store].url`. For Azure Blob,
+prefer either:
+
+```toml
+url = "https://account.blob.core.windows.net/container/prefix"
+# or, with AZURE_STORAGE_ACCOUNT_NAME plus AZURE_STORAGE_ACCOUNT_KEY/AZURE_STORAGE_ACCESS_KEY:
+url = "az://container/prefix"
+```
+
+For compatibility with older SlateFS deployments, `az://account/container/prefix`
+is also accepted when `account` matches `AZURE_STORAGE_ACCOUNT_NAME`,
+`account_name`, or `AccountName` in `AZURE_STORAGE_CONNECTION_STRING`. In that
+case SlateFS treats the host as the storage account, the first path segment as
+the container, and the remaining path as the root prefix. If no account env var
+is available, SlateFS uses that legacy interpretation only for storage-account-
+shaped hosts with a plausible container segment and an additional prefix
+segment; otherwise object_store's native `az://container/prefix` form wins.
+
 ## Tests
 
 ```sh
