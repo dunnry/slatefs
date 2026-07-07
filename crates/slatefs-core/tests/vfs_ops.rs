@@ -152,6 +152,7 @@ async fn fenced_writer_marks_volume_dead() {
         FsError::Io
     );
     assert!(stale.is_dead(), "stale writer should latch dead");
+    assert_eq!(stale.writer_fencing_events(), 1);
     assert!(!stale.is_degraded(), "fencing should be dead, not degraded");
     assert_eq!(
         stale.storage_errors(),

@@ -36,3 +36,39 @@ groups:
         annotations:
           summary: "SlateFS volume {{ $labels.tenant }}/{{ $labels.volume }} has storage errors"
           description: "The daemon observed non-fencing SlateDB/object-store errors for this writable volume. Check object-store reachability, credentials, and recent storage-error logs."
+
+      - alert: SlateFSQuotaBytesHigh
+        expr: (slatefs_quota_bytes_used / slatefs_quota_bytes_hard_limit) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SlateFS byte quota is high on {{ $labels.tenant }}/{{ $labels.volume }}"
+          description: "Byte quota usage is above 90% of the configured hard limit."
+
+      - alert: SlateFSQuotaInodesHigh
+        expr: (slatefs_quota_inodes_used / slatefs_quota_inodes_hard_limit) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SlateFS inode quota is high on {{ $labels.tenant }}/{{ $labels.volume }}"
+          description: "Inode quota usage is above 90% of the configured hard limit."
+
+      - alert: SlateFSQuotaRejections
+        expr: increase(slatefs_quota_rejections_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SlateFS quota rejections on {{ $labels.tenant }}/{{ $labels.volume }}"
+          description: "The daemon returned EDQUOT for one or more quota-gated operations."
+
+      - alert: SlateFSRateLimitRejections
+        expr: increase(slatefs_rate_limit_rejections_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: info
+        annotations:
+          summary: "SlateFS tenant rate-limit rejections for {{ $labels.tenant }}"
+          description: "The daemon returned EAGAIN because a tenant ops/bytes token bucket was exhausted."

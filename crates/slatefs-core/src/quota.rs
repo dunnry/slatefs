@@ -13,7 +13,7 @@
 //! real length even after sparse growth; chunks orphaned beyond `size` by an
 //! interrupted truncate bill zero until reaped.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use slatedb::{MergeOperator, MergeOperatorError};
@@ -90,6 +90,7 @@ fn exceeds_limit(usage: i64, limit: &crate::control::QuotaLimit, now: u64) -> bo
 pub struct QuotaTracker {
     bytes: AtomicI64,
     inodes: AtomicI64,
+    rejections: AtomicU64,
     limits: QuotaLimits,
 }
 
@@ -98,6 +99,7 @@ impl QuotaTracker {
         QuotaTracker {
             bytes: AtomicI64::new(bytes),
             inodes: AtomicI64::new(inodes),
+            rejections: AtomicU64::new(0),
             limits,
         }
     }
@@ -113,6 +115,14 @@ impl QuotaTracker {
         &self.limits
     }
 
+    pub fn hard_limits(&self) -> (Option<u64>, Option<u64>) {
+        (self.limits.bytes.hard, self.limits.inodes.hard)
+    }
+
+    pub fn rejections(&self) -> u64 {
+        self.rejections.load(Ordering::Relaxed)
+    }
+
     /// Reserve usage before building the mutation batch. Returns `EDQUOT` if
     /// a hard limit would be exceeded, or if an expired soft-limit grace
     /// window would be exceeded. Negative deltas (frees) always succeed. Call
@@ -122,12 +132,14 @@ impl QuotaTracker {
         let new_bytes = self.bytes.fetch_add(bytes_delta, Ordering::Relaxed) + bytes_delta;
         if bytes_delta > 0 && exceeds_limit(new_bytes, &self.limits.bytes, now) {
             self.bytes.fetch_sub(bytes_delta, Ordering::Relaxed);
+            self.rejections.fetch_add(1, Ordering::Relaxed);
             return Err(FsError::QuotaExceeded);
         }
         let new_inodes = self.inodes.fetch_add(inode_delta, Ordering::Relaxed) + inode_delta;
         if inode_delta > 0 && exceeds_limit(new_inodes, &self.limits.inodes, now) {
             self.inodes.fetch_sub(inode_delta, Ordering::Relaxed);
             self.bytes.fetch_sub(bytes_delta, Ordering::Relaxed);
+            self.rejections.fetch_add(1, Ordering::Relaxed);
             return Err(FsError::QuotaExceeded);
         }
         Ok(())
@@ -147,6 +159,7 @@ impl QuotaTracker {
             &self.limits.bytes,
             now_unix(),
         ) {
+            self.rejections.fetch_add(1, Ordering::Relaxed);
             return Err(FsError::QuotaExceeded);
         }
         Ok(())
@@ -231,6 +244,7 @@ mod tests {
         q.reserve(-50, 0).unwrap();
         q.reserve(50, 1).unwrap();
         assert!(matches!(q.reserve(0, 1), Err(FsError::QuotaExceeded)));
+        assert_eq!(q.rejections(), 2);
         // Failed reservation must not leak usage.
         assert_eq!(q.usage(), (100, 2));
         q.release(100, 2);

@@ -39,6 +39,10 @@ enum MetricsTarget {
         recorder: Arc<AggregatingRecorder>,
         volume: Arc<Volume>,
     },
+    TenantRateLimiter {
+        tenant: String,
+        limiter: Arc<RateLimiter>,
+    },
     Snapshot {
         tenant: String,
         volume_name: String,
@@ -48,6 +52,13 @@ enum MetricsTarget {
 }
 
 type AdminTargets = Arc<HashMap<(String, String), Arc<Volume>>>;
+
+const CACHE_TIER_ACCESS_TOTAL: &str = "slatefs_cache_tier_access_total";
+const SLATEDB_DB_CACHE_ACCESS_COUNT: &str = "slatefs_slatedb.db_cache.access_count";
+const SLATEDB_OBJECT_STORE_CACHE_PART_ACCESS_COUNT: &str =
+    "slatefs_slatedb.object_store_cache.part_access_count";
+const SLATEDB_OBJECT_STORE_CACHE_PART_HIT_COUNT: &str =
+    "slatefs_slatedb.object_store_cache.part_hit_count";
 
 fn tenant_rate_limiter(
     limiters: &mut std::collections::HashMap<String, Arc<RateLimiter>>,
@@ -63,6 +74,87 @@ fn tenant_rate_limiter(
             .or_insert_with(|| Arc::new(RateLimiter::new(limits)))
             .clone(),
     )
+}
+
+fn hard_limit_value(limit: Option<u64>) -> f64 {
+    limit.map(|value| value as f64).unwrap_or(f64::INFINITY)
+}
+
+fn sample_label<'a>(sample: &'a PrometheusSample, name: &str) -> Option<&'a str> {
+    sample
+        .labels
+        .iter()
+        .find_map(|(label_name, value)| (label_name == name).then_some(value.as_str()))
+}
+
+fn cache_tier_sample(
+    tenant: &str,
+    volume: &str,
+    tier: &str,
+    result: &str,
+    value: f64,
+) -> PrometheusSample {
+    PrometheusSample::new(
+        CACHE_TIER_ACCESS_TOTAL,
+        [
+            ("tenant", tenant),
+            ("volume", volume),
+            ("tier", tier),
+            ("result", result),
+        ],
+        value,
+    )
+}
+
+fn cache_tier_samples(
+    tenant: &str,
+    volume: &str,
+    engine_samples: &[PrometheusSample],
+) -> Vec<PrometheusSample> {
+    let mut saw_ram = false;
+    let mut ram_hits = 0.0;
+    let mut ram_misses = 0.0;
+    let mut saw_disk_access = false;
+    let mut disk_access = 0.0;
+    let mut disk_hits = 0.0;
+
+    for sample in engine_samples {
+        match sample.name.as_str() {
+            SLATEDB_DB_CACHE_ACCESS_COUNT => {
+                saw_ram = true;
+                match sample_label(sample, "result") {
+                    Some("hit") => ram_hits += sample.value,
+                    Some("miss") => ram_misses += sample.value,
+                    _ => {}
+                }
+            }
+            SLATEDB_OBJECT_STORE_CACHE_PART_ACCESS_COUNT => {
+                saw_disk_access = true;
+                disk_access += sample.value;
+            }
+            SLATEDB_OBJECT_STORE_CACHE_PART_HIT_COUNT => {
+                disk_hits += sample.value;
+            }
+            _ => {}
+        }
+    }
+
+    let mut samples = Vec::new();
+    if saw_ram {
+        samples.push(cache_tier_sample(tenant, volume, "ram", "hit", ram_hits));
+        samples.push(cache_tier_sample(tenant, volume, "ram", "miss", ram_misses));
+    }
+    if saw_disk_access {
+        samples.push(cache_tier_sample(tenant, volume, "disk", "hit", disk_hits));
+        samples.push(cache_tier_sample(
+            tenant,
+            volume,
+            "disk",
+            "miss",
+            (disk_access - disk_hits).max(0.0),
+        ));
+    }
+    samples
 }
 
 fn render_daemon_metrics(targets: &[MetricsTarget]) -> String {
@@ -90,9 +182,41 @@ fn render_daemon_metrics(targets: &[MetricsTarget]) -> String {
                     if volume.is_degraded() { 1.0 } else { 0.0 },
                 ));
                 samples.push(PrometheusSample::new(
+                    "slatefs_writer_fencing_events_total",
+                    labels,
+                    volume.writer_fencing_events() as f64,
+                ));
+                samples.push(PrometheusSample::new(
                     "slatefs_storage_errors_total",
                     labels,
                     volume.storage_errors() as f64,
+                ));
+                let (bytes_used, inodes_used) = volume.quota_usage();
+                let (bytes_limit, inodes_limit) = volume.quota_hard_limits();
+                samples.push(PrometheusSample::new(
+                    "slatefs_quota_bytes_used",
+                    labels,
+                    bytes_used as f64,
+                ));
+                samples.push(PrometheusSample::new(
+                    "slatefs_quota_bytes_hard_limit",
+                    labels,
+                    hard_limit_value(bytes_limit),
+                ));
+                samples.push(PrometheusSample::new(
+                    "slatefs_quota_inodes_used",
+                    labels,
+                    inodes_used as f64,
+                ));
+                samples.push(PrometheusSample::new(
+                    "slatefs_quota_inodes_hard_limit",
+                    labels,
+                    hard_limit_value(inodes_limit),
+                ));
+                samples.push(PrometheusSample::new(
+                    "slatefs_quota_rejections_total",
+                    labels,
+                    volume.quota_rejections() as f64,
                 ));
                 let block_labels = [
                     ("tenant", tenant.as_str()),
@@ -104,7 +228,16 @@ fn render_daemon_metrics(targets: &[MetricsTarget]) -> String {
                     block_labels,
                     volume.block_decode_failures() as f64,
                 ));
-                samples.extend(recorder.prometheus_samples(&labels));
+                let engine_samples = recorder.prometheus_samples(&labels);
+                samples.extend(cache_tier_samples(tenant, volume_name, &engine_samples));
+                samples.extend(engine_samples);
+            }
+            MetricsTarget::TenantRateLimiter { tenant, limiter } => {
+                samples.push(PrometheusSample::new(
+                    "slatefs_rate_limit_rejections_total",
+                    [("tenant", tenant.as_str())],
+                    limiter.rejections() as f64,
+                ));
             }
             MetricsTarget::Snapshot {
                 tenant,
@@ -594,6 +727,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    for (tenant, limiter) in &rate_limiters {
+        metrics_targets.push(MetricsTarget::TenantRateLimiter {
+            tenant: tenant.clone(),
+            limiter: Arc::clone(limiter),
+        });
+    }
+
     if let Some(listen) = config.admin.listen.clone() {
         let targets = Arc::new(
             open_writers
@@ -709,7 +849,31 @@ mod tests {
             "{writable_metrics}"
         );
         assert!(
+            writable_metrics
+                .contains("slatefs_writer_fencing_events_total{tenant=\"t\",volume=\"v\"} 0"),
+            "{writable_metrics}"
+        );
+        assert!(
             writable_metrics.contains("slatefs_storage_errors_total{tenant=\"t\",volume=\"v\"} 0"),
+            "{writable_metrics}"
+        );
+        assert!(
+            writable_metrics.contains("slatefs_quota_bytes_used{tenant=\"t\",volume=\"v\"}"),
+            "{writable_metrics}"
+        );
+        assert!(
+            writable_metrics
+                .contains("slatefs_quota_bytes_hard_limit{tenant=\"t\",volume=\"v\"} +Inf"),
+            "{writable_metrics}"
+        );
+        assert!(
+            writable_metrics
+                .contains("slatefs_quota_inodes_hard_limit{tenant=\"t\",volume=\"v\"} +Inf"),
+            "{writable_metrics}"
+        );
+        assert!(
+            writable_metrics
+                .contains("slatefs_quota_rejections_total{tenant=\"t\",volume=\"v\"} 0"),
             "{writable_metrics}"
         );
 
@@ -781,5 +945,87 @@ mod tests {
         snapshot.shutdown().await.unwrap();
         volume.shutdown().await.unwrap();
         control.close().await.unwrap();
+    }
+
+    #[test]
+    fn renders_tenant_rate_limit_rejections() {
+        let limiter = Arc::new(RateLimiter::new(RateLimits {
+            ops_per_second: Some(0),
+            bytes_per_second: None,
+        }));
+        assert!(limiter.check(0).is_err());
+
+        let metrics = render_daemon_metrics(&[MetricsTarget::TenantRateLimiter {
+            tenant: "t".to_string(),
+            limiter,
+        }]);
+
+        assert!(
+            metrics.contains("slatefs_rate_limit_rejections_total{tenant=\"t\"} 1"),
+            "{metrics}"
+        );
+    }
+
+    #[test]
+    fn derives_cache_tier_hit_miss_counters() {
+        let engine_samples = vec![
+            PrometheusSample::new(
+                SLATEDB_DB_CACHE_ACCESS_COUNT,
+                [
+                    ("tenant", "t"),
+                    ("volume", "v"),
+                    ("entry_kind", "data_block"),
+                    ("result", "hit"),
+                ],
+                3.0,
+            ),
+            PrometheusSample::new(
+                SLATEDB_DB_CACHE_ACCESS_COUNT,
+                [
+                    ("tenant", "t"),
+                    ("volume", "v"),
+                    ("entry_kind", "index"),
+                    ("result", "miss"),
+                ],
+                2.0,
+            ),
+            PrometheusSample::new(
+                SLATEDB_OBJECT_STORE_CACHE_PART_ACCESS_COUNT,
+                [("tenant", "t"), ("volume", "v")],
+                5.0,
+            ),
+            PrometheusSample::new(
+                SLATEDB_OBJECT_STORE_CACHE_PART_HIT_COUNT,
+                [("tenant", "t"), ("volume", "v")],
+                2.0,
+            ),
+        ];
+
+        let metrics = render_prometheus(&cache_tier_samples("t", "v", &engine_samples));
+
+        assert!(
+            metrics.contains(
+                "slatefs_cache_tier_access_total{tenant=\"t\",volume=\"v\",tier=\"ram\",result=\"hit\"} 3"
+            ),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains(
+                "slatefs_cache_tier_access_total{tenant=\"t\",volume=\"v\",tier=\"ram\",result=\"miss\"} 2"
+            ),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains(
+                "slatefs_cache_tier_access_total{tenant=\"t\",volume=\"v\",tier=\"disk\",result=\"hit\"} 2"
+            ),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains(
+                "slatefs_cache_tier_access_total{tenant=\"t\",volume=\"v\",tier=\"disk\",result=\"miss\"} 3"
+            ),
+            "{metrics}"
+        );
     }
 }

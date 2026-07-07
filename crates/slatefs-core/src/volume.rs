@@ -801,6 +801,7 @@ pub struct Volume {
     pub(crate) superblock: Superblock,
     block_metrics: BlockTransformMetrics,
     dead: AtomicBool,
+    fencing_events: AtomicU64,
     degraded: AtomicBool,
     storage_errors: AtomicU64,
     dead_notify: Notify,
@@ -885,6 +886,7 @@ impl Volume {
             superblock,
             block_metrics,
             dead: AtomicBool::new(false),
+            fencing_events: AtomicU64::new(0),
             degraded: AtomicBool::new(false),
             storage_errors: AtomicU64::new(0),
             dead_notify: Notify::new(),
@@ -911,6 +913,11 @@ impl Volume {
         self.dead.load(Ordering::Acquire)
     }
 
+    /// Count of writer-fencing transitions observed since open.
+    pub fn writer_fencing_events(&self) -> u64 {
+        self.fencing_events.load(Ordering::Relaxed)
+    }
+
     /// Whether the volume has observed non-fencing storage errors since open.
     pub fn is_degraded(&self) -> bool {
         self.degraded.load(Ordering::Acquire)
@@ -925,6 +932,18 @@ impl Volume {
         self.block_metrics.decode_failures()
     }
 
+    pub fn quota_usage(&self) -> (i64, i64) {
+        self.quota.usage()
+    }
+
+    pub fn quota_hard_limits(&self) -> (Option<u64>, Option<u64>) {
+        self.quota.hard_limits()
+    }
+
+    pub fn quota_rejections(&self) -> u64 {
+        self.quota.rejections()
+    }
+
     pub(crate) fn ensure_live(&self) -> FsResult<()> {
         if self.is_dead() {
             Err(FsError::Io)
@@ -935,6 +954,7 @@ impl Volume {
 
     fn mark_fenced(&self) {
         if !self.dead.swap(true, Ordering::AcqRel) {
+            self.fencing_events.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
                 fsid = %format!("{:016x}", self.superblock.fsid),
                 "volume fenced by newer SlateDB writer; marking export dead"

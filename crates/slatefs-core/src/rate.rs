@@ -5,6 +5,7 @@
 //! for the serving daemon, not durable filesystem metadata.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,7 @@ impl RateLimits {
 #[derive(Debug)]
 pub struct RateLimiter {
     limits: RateLimits,
+    rejections: AtomicU64,
     state: Mutex<State>,
 }
 
@@ -50,6 +52,7 @@ impl RateLimiter {
         let now = Instant::now();
         RateLimiter {
             limits,
+            rejections: AtomicU64::new(0),
             state: Mutex::new(State {
                 ops: Bucket::new(limits.ops_per_second, now),
                 bytes: Bucket::new(limits.bytes_per_second, now),
@@ -59,6 +62,10 @@ impl RateLimiter {
 
     pub fn limits(&self) -> RateLimits {
         self.limits
+    }
+
+    pub fn rejections(&self) -> u64 {
+        self.rejections.load(Ordering::Relaxed)
     }
 
     /// Try to admit one frontend operation carrying `bytes` request bytes.
@@ -73,9 +80,11 @@ impl RateLimiter {
         state.bytes.refill(self.limits.bytes_per_second, now);
 
         if !state.ops.can_consume(self.limits.ops_per_second, 1) {
+            self.rejections.fetch_add(1, Ordering::Relaxed);
             return Err(FsError::WouldBlock);
         }
         if bytes > 0 && !state.bytes.can_consume(self.limits.bytes_per_second, bytes) {
+            self.rejections.fetch_add(1, Ordering::Relaxed);
             return Err(FsError::WouldBlock);
         }
 
@@ -133,6 +142,7 @@ mod tests {
         assert!(limiter.check_at(0, t0).is_ok());
         assert!(limiter.check_at(0, t0).is_ok());
         assert!(matches!(limiter.check_at(0, t0), Err(FsError::WouldBlock)));
+        assert_eq!(limiter.rejections(), 1);
 
         assert!(
             limiter.check_at(0, t0 + Duration::from_millis(500)).is_ok(),
@@ -150,6 +160,7 @@ mod tests {
         assert!(limiter.check_at(8, t0).is_ok());
         assert!(matches!(limiter.check_at(1, t0), Err(FsError::WouldBlock)));
         assert!(matches!(limiter.check_at(9, t0), Err(FsError::WouldBlock)));
+        assert_eq!(limiter.rejections(), 2);
     }
 
     #[test]
