@@ -3995,6 +3995,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "nfs3_server",
  "serde",
  "serde_json",
  "slatedb",

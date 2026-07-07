@@ -21,9 +21,9 @@ use slatefs_core::config::{
     AdminConfig, AtimeMode, ClientAddrRule, Config, ExportConfig, ExportProtocol, SquashMode,
 };
 use slatefs_core::control::{
-    AuditAction, AuditActor, AuditOutcome, AuditPlane, AuditQuery, AuditRecord, AuditScope,
-    ControlPlane, ControlReader, ExportRecord, SnapshotRetentionPolicy, TenantRecord,
-    VolumePlacementRecord, VolumeRecord,
+    AuditAction, AuditActor, AuditDetailValue, AuditOutcome, AuditPlane, AuditQuery, AuditRecord,
+    AuditScope, ControlPlane, ControlReader, ExportRecord, QuotaLimits, SnapshotRetentionPolicy,
+    TenantRecord, VolumePlacementRecord, VolumeRecord,
 };
 use slatefs_core::crypto::kms;
 use slatefs_core::metrics::{AggregatingRecorder, PrometheusSample, render_prometheus};
@@ -699,6 +699,79 @@ struct SnapshotRetentionPatchRequest {
     clear: bool,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuotaPatchRequest {
+    #[serde(default)]
+    bytes_soft: Option<Option<u64>>,
+    #[serde(default)]
+    bytes_hard: Option<Option<u64>>,
+    #[serde(default, alias = "bytes_grace_until")]
+    bytes_grace: Option<Option<u64>>,
+    #[serde(default)]
+    inodes_soft: Option<Option<u64>>,
+    #[serde(default)]
+    inodes_hard: Option<Option<u64>>,
+    #[serde(default, alias = "inodes_grace_until")]
+    inodes_grace: Option<Option<u64>>,
+}
+
+impl QuotaPatchRequest {
+    fn is_empty(&self) -> bool {
+        self.bytes_soft.is_none()
+            && self.bytes_hard.is_none()
+            && self.bytes_grace.is_none()
+            && self.inodes_soft.is_none()
+            && self.inodes_hard.is_none()
+            && self.inodes_grace.is_none()
+    }
+
+    fn apply_to(self, quota: &mut QuotaLimits) {
+        if let Some(value) = self.bytes_soft {
+            quota.bytes.soft = value;
+        }
+        if let Some(value) = self.bytes_hard {
+            quota.bytes.hard = value;
+        }
+        if let Some(value) = self.bytes_grace {
+            quota.bytes.grace_until = value;
+        }
+        if let Some(value) = self.inodes_soft {
+            quota.inodes.soft = value;
+        }
+        if let Some(value) = self.inodes_hard {
+            quota.inodes.hard = value;
+        }
+        if let Some(value) = self.inodes_grace {
+            quota.inodes.grace_until = value;
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TenantRatePatchRequest {
+    #[serde(default)]
+    ops_per_second: Option<Option<u64>>,
+    #[serde(default)]
+    bytes_per_second: Option<Option<u64>>,
+}
+
+impl TenantRatePatchRequest {
+    fn is_empty(&self) -> bool {
+        self.ops_per_second.is_none() && self.bytes_per_second.is_none()
+    }
+
+    fn apply_to(self, limits: &mut RateLimits) {
+        if let Some(value) = self.ops_per_second {
+            limits.ops_per_second = value;
+        }
+        if let Some(value) = self.bytes_per_second {
+            limits.bytes_per_second = value;
+        }
+    }
+}
+
 fn default_enabled_json() -> bool {
     true
 }
@@ -1130,6 +1203,22 @@ fn quota_limits_json(record: &VolumeRecord) -> Value {
     })
 }
 
+fn quota_json(record: &VolumeRecord, targets: &AdminTargets) -> Value {
+    let quota_usage = targets
+        .lock()
+        .expect("admin targets poisoned")
+        .get(&(record.tenant.clone(), record.name.clone()))
+        .map(|volume| {
+            let (bytes, inodes) = volume.quota_usage();
+            json!({ "bytes": bytes, "inodes": inodes })
+        })
+        .unwrap_or(Value::Null);
+    json!({
+        "limits": quota_limits_json(record),
+        "usage": quota_usage,
+    })
+}
+
 fn snapshot_retention_json(policy: Option<&SnapshotRetentionPolicy>) -> Value {
     policy
         .map(|policy| {
@@ -1160,15 +1249,7 @@ fn volume_json(
     placement: Option<VolumePlacementRecord>,
     targets: &AdminTargets,
 ) -> Result<Value, AdminError> {
-    let quota_usage = targets
-        .lock()
-        .expect("admin targets poisoned")
-        .get(&(record.tenant.clone(), record.name.clone()))
-        .map(|volume| {
-            let (bytes, inodes) = volume.quota_usage();
-            json!({ "bytes": bytes, "inodes": inodes })
-        })
-        .unwrap_or(Value::Null);
+    let quota = quota_json(&record, targets);
     Ok(json!({
         "tenant": record.tenant,
         "name": record.name,
@@ -1177,10 +1258,7 @@ fn volume_json(
         "cipher": record.cipher.to_string(),
         "chunk_size": record.chunk_size,
         "compression": format!("{:?}", record.compression),
-        "quota": {
-            "limits": quota_limits_json(&record),
-            "usage": quota_usage,
-        },
+        "quota": quota,
         "clone_parent": record.clone_parent,
         "placement": placement_json(placement)?,
         "created_at": record.created_at,
@@ -1274,6 +1352,60 @@ async fn append_export_audit(
     Ok(())
 }
 
+async fn append_quota_audit(
+    control: &ControlPlane,
+    request: &AdminHttpRequest,
+    record: &VolumeRecord,
+) -> Result<(), AdminError> {
+    let mut audit = AuditRecord::new(
+        admin_actor(request),
+        AuditAction::QuotaSet,
+        AuditScope {
+            tenant: Some(record.tenant.clone()),
+            volume: Some(record.name.clone()),
+            node: None,
+        },
+        request.request_id.clone(),
+        AuditOutcome::Success,
+    );
+    audit.details.insert(
+        "quota_limits".to_string(),
+        AuditDetailValue::from(quota_limits_json(record)),
+    );
+    control
+        .append_audit_record(audit)
+        .await
+        .map_err(core_error)?;
+    Ok(())
+}
+
+async fn append_tenant_rate_audit(
+    control: &ControlPlane,
+    request: &AdminHttpRequest,
+    record: &TenantRecord,
+) -> Result<(), AdminError> {
+    let mut audit = AuditRecord::new(
+        admin_actor(request),
+        AuditAction::TenantRateSet,
+        AuditScope {
+            tenant: Some(record.name.clone()),
+            volume: None,
+            node: None,
+        },
+        request.request_id.clone(),
+        AuditOutcome::Success,
+    );
+    audit.details.insert(
+        "rate_limits".to_string(),
+        AuditDetailValue::from(rate_limits_json(record)),
+    );
+    control
+        .append_audit_record(audit)
+        .await
+        .map_err(core_error)?;
+    Ok(())
+}
+
 async fn list_tenants_response(
     state: &AdminState,
     request: &AdminHttpRequest,
@@ -1355,6 +1487,65 @@ async fn get_volume_response(
     Ok(AdminHttpResponse::json(
         200,
         json!({ "volume": volume_json(record, placement, &state.targets)? }),
+    ))
+}
+
+async fn patch_volume_quota_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let body: QuotaPatchRequest = parse_json_body(request)?;
+    if body.is_empty() {
+        return Err(bad_request("provide at least one quota field"));
+    }
+
+    let control = state.control_writer().await?;
+    let mut quota = control
+        .get_volume(tenant, volume)
+        .await
+        .map_err(core_error)?
+        .quota;
+    body.apply_to(&mut quota);
+    let record = control
+        .set_volume_quota(tenant, volume, quota)
+        .await
+        .map_err(core_error)?;
+    append_quota_audit(&control, request, &record).await?;
+    control.close().await.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "quota": quota_json(&record, &state.targets) }),
+    ))
+}
+
+async fn patch_tenant_rate_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let body: TenantRatePatchRequest = parse_json_body(request)?;
+    if body.is_empty() {
+        return Err(bad_request("provide ops_per_second or bytes_per_second"));
+    }
+
+    let control = state.control_writer().await?;
+    let mut limits = control
+        .get_tenant(tenant)
+        .await
+        .map_err(core_error)?
+        .rate_limits;
+    body.apply_to(&mut limits);
+    let record = control
+        .set_tenant_rate_limits(tenant, limits)
+        .await
+        .map_err(core_error)?;
+    append_tenant_rate_audit(&control, request, &record).await?;
+    control.close().await.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "rate_limits": rate_limits_json(&record) }),
     ))
 }
 
@@ -1817,11 +2008,17 @@ async fn route_admin_request(
             delete_export_response(state, request, id).await
         }
         ("GET", ["admin", "v1", "tenants"]) => list_tenants_response(state, request).await,
+        ("PATCH", ["admin", "v1", "tenants", tenant, "rate"]) => {
+            patch_tenant_rate_response(state, request, tenant).await
+        }
         ("GET", ["admin", "v1", "tenants", tenant, "volumes"]) => {
             list_volumes_response(state, request, tenant).await
         }
         ("GET", ["admin", "v1", "tenants", tenant, "volumes", volume]) => {
             get_volume_response(state, tenant, volume).await
+        }
+        ("PATCH", ["admin", "v1", "tenants", tenant, "volumes", volume, "quota"]) => {
+            patch_volume_quota_response(state, request, tenant, volume).await
         }
         ("GET", ["admin", "v1", "nodes"]) => list_nodes_response(state, request).await,
         (
@@ -2869,6 +3066,9 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    use nfs3_server::nfs3_types::nfs3::{filename3, nfsstat3, sattr3, stable_how};
+    use nfs3_server::nfs3_types::xdr_codec::Opaque;
+    use nfs3_server::vfs::{NfsFileSystem, NfsReadFileSystem};
     use slatefs_core::config::Compression;
     use slatefs_core::control::{
         AuditAction, AuditActor, AuditOutcome, AuditPlane, AuditRecord, AuditScope, ControlPlane,
@@ -2879,6 +3079,7 @@ mod tests {
     use slatefs_core::meta::inode::ROOT_INO;
     use slatefs_core::snapshot::SnapshotVolume;
     use slatefs_core::vfs::{Credentials, Vfs};
+    use slatefs_nfs::SlateFsNfs;
 
     fn create_opts() -> slatefs_core::volume::CreateVolumeOptions {
         slatefs_core::volume::CreateVolumeOptions {
@@ -2974,6 +3175,31 @@ mod tests {
 
     fn response_body(response: &str) -> &str {
         response.split_once("\r\n\r\n").unwrap().1
+    }
+
+    fn patch_request(path: &str, request_id: &str, body: &str) -> String {
+        format!(
+            "PATCH {path} HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: {request_id}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    async fn poll_live_limits_once(
+        manager: Arc<tokio::sync::Mutex<ExportManager>>,
+        object_store: Arc<dyn ObjectStore>,
+        kms: Arc<dyn Kms>,
+    ) {
+        let mut tick = tokio::time::interval(Duration::from_millis(10));
+        tick.tick().await;
+        tick.tick().await;
+        let reader = ControlReader::open(object_store, kms).await.unwrap();
+        manager
+            .lock()
+            .await
+            .reload_live_limits(&reader)
+            .await
+            .unwrap();
+        reader.close().await.unwrap();
     }
 
     #[test]
@@ -3477,6 +3703,121 @@ mod tests {
         assert_eq!(patch_body["error"]["code"], "conflict");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_v1_quota_and_rate_patch_validate_clear_and_audit() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([33; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        control.close().await.unwrap();
+
+        let state = available_admin_state(
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            HashMap::new(),
+            None,
+        )
+        .await;
+
+        let quota_patch = patch_request(
+            "/admin/v1/tenants/t/volumes/v/quota",
+            "quota-set",
+            r#"{"bytes_soft":512,"bytes_hard":1024,"bytes_grace":123,"inodes_hard":null}"#,
+        );
+        let quota_response = admin_exchange(Arc::clone(&state), quota_patch.as_bytes()).await;
+        assert_eq!(response_status(&quota_response), 200, "{quota_response}");
+        let quota_body: Value = serde_json::from_str(response_body(&quota_response)).unwrap();
+        assert_eq!(quota_body["quota"]["limits"]["bytes"]["soft"], 512);
+        assert_eq!(quota_body["quota"]["limits"]["bytes"]["hard"], 1024);
+        assert_eq!(quota_body["quota"]["limits"]["bytes"]["grace_until"], 123);
+        assert!(quota_body["quota"]["limits"]["inodes"]["hard"].is_null());
+        assert!(quota_body["quota"]["usage"].is_null());
+
+        let rate_patch = patch_request(
+            "/admin/v1/tenants/t/rate",
+            "rate-set",
+            r#"{"ops_per_second":5,"bytes_per_second":null}"#,
+        );
+        let rate_response = admin_exchange(Arc::clone(&state), rate_patch.as_bytes()).await;
+        assert_eq!(response_status(&rate_response), 200, "{rate_response}");
+        let rate_body: Value = serde_json::from_str(response_body(&rate_response)).unwrap();
+        assert_eq!(rate_body["rate_limits"]["ops_per_second"], 5);
+        assert!(rate_body["rate_limits"]["bytes_per_second"].is_null());
+
+        let empty_quota = patch_request("/admin/v1/tenants/t/volumes/v/quota", "quota-empty", "{}");
+        let empty_response = admin_exchange(Arc::clone(&state), empty_quota.as_bytes()).await;
+        assert_eq!(response_status(&empty_response), 400, "{empty_response}");
+        let empty_body: Value = serde_json::from_str(response_body(&empty_response)).unwrap();
+        assert_eq!(empty_body["error"]["code"], "bad_request");
+        assert!(
+            empty_body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("provide at least one quota field")
+        );
+
+        let invalid_rate = patch_request(
+            "/admin/v1/tenants/t/rate",
+            "rate-zero",
+            r#"{"ops_per_second":0}"#,
+        );
+        let invalid_response = admin_exchange(Arc::clone(&state), invalid_rate.as_bytes()).await;
+        assert_eq!(
+            response_status(&invalid_response),
+            400,
+            "{invalid_response}"
+        );
+        let invalid_body: Value = serde_json::from_str(response_body(&invalid_response)).unwrap();
+        assert_eq!(invalid_body["error"]["code"], "bad_request");
+        assert!(
+            invalid_body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("limit must be positive or none")
+        );
+
+        let control = ControlPlane::open(Arc::clone(&object_store), kms)
+            .await
+            .unwrap();
+        let (quota_records, _) = control
+            .list_audit(AuditQuery {
+                action: Some(AuditAction::QuotaSet),
+                newest_first: false,
+                ..AuditQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(quota_records.len(), 1);
+        assert_eq!(quota_records[0].request_id, "quota-set");
+        assert_eq!(quota_records[0].scope.tenant.as_deref(), Some("t"));
+        assert_eq!(quota_records[0].scope.volume.as_deref(), Some("v"));
+
+        let (rate_records, _) = control
+            .list_audit(AuditQuery {
+                action: Some(AuditAction::TenantRateSet),
+                newest_first: false,
+                ..AuditQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rate_records.len(), 1);
+        assert_eq!(rate_records[0].request_id, "rate-set");
+        assert_eq!(rate_records[0].scope.tenant.as_deref(), Some("t"));
+        assert!(rate_records[0].scope.volume.is_none());
+        control.close().await.unwrap();
+    }
+
     fn test_config(exports: Vec<ExportConfig>) -> Config {
         let mut config = Config::parse(
             r#"
@@ -3760,6 +4101,148 @@ mod tests {
         manager.reload_live_limits(&fresh_reader).await.unwrap();
         volume.write(&creds, file.ino, 8, b"x").await.unwrap();
         manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_v1_quota_and_rate_patch_reload_on_watcher_poll() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([31; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        let fh_key = control.server_fh_key().await.unwrap();
+        control
+            .create_export(nfs_export("exp-http-limits", "127.0.0.1:0"))
+            .await
+            .unwrap();
+        control.close().await.unwrap();
+
+        let config = test_config(Vec::new());
+        let admin_targets = Arc::new(Mutex::new(HashMap::new()));
+        let mut manager = ExportManager::new(
+            Arc::clone(&object_store),
+            fh_key,
+            &config,
+            config_export_records(&config.exports),
+            ExportMetrics::default(),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::clone(&admin_targets),
+        );
+        let reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        manager.reconcile(&reader).await.unwrap();
+        reader.close().await.unwrap();
+        let manager = Arc::new(tokio::sync::Mutex::new(manager));
+        let (volume, limiter) = {
+            let manager = manager.lock().await;
+            let volume = manager
+                .open_backends
+                .get(&("t".to_string(), "v".to_string(), None))
+                .and_then(|backend| backend.writable.as_ref())
+                .cloned()
+                .expect("writable backend");
+            let limiter = manager
+                .rate_limiters
+                .get("t")
+                .cloned()
+                .expect("tenant limiter");
+            (volume, limiter)
+        };
+
+        let state = Arc::new(AdminState {
+            targets: Arc::clone(&admin_targets),
+            control: AdminControl::Available(Arc::new(
+                ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+                    .await
+                    .unwrap(),
+            )),
+            object_store: Arc::clone(&object_store),
+            kms: Arc::clone(&kms),
+            config_exports: Arc::new(Vec::new()),
+            export_metrics: ExportMetrics::default(),
+            started_at: Instant::now(),
+            export_count: 1,
+            snapshot_export_count: 0,
+            auth_token: None,
+            node_id: None,
+        });
+
+        let creds = Credentials::root();
+        let file = volume
+            .create(&creds, ROOT_INO, b"file", 0o644, true)
+            .await
+            .unwrap();
+        volume
+            .write(&creds, file.ino, 0, b"12345678")
+            .await
+            .unwrap();
+
+        let quota_patch = patch_request(
+            "/admin/v1/tenants/t/volumes/v/quota",
+            "quota-patch",
+            r#"{"bytes_hard":8}"#,
+        );
+        let quota_response = admin_exchange(Arc::clone(&state), quota_patch.as_bytes()).await;
+        assert_eq!(response_status(&quota_response), 200, "{quota_response}");
+        let quota_body: Value = serde_json::from_str(response_body(&quota_response)).unwrap();
+        assert_eq!(quota_body["quota"]["limits"]["bytes"]["hard"], 8);
+        assert!(
+            quota_body["quota"]["usage"]["bytes"].is_number(),
+            "{quota_body}"
+        );
+
+        let rate_patch = patch_request(
+            "/admin/v1/tenants/t/rate",
+            "rate-patch",
+            r#"{"bytes_per_second":1}"#,
+        );
+        let rate_response = admin_exchange(Arc::clone(&state), rate_patch.as_bytes()).await;
+        assert_eq!(response_status(&rate_response), 200, "{rate_response}");
+        let rate_body: Value = serde_json::from_str(response_body(&rate_response)).unwrap();
+        assert_eq!(rate_body["rate_limits"]["bytes_per_second"], 1);
+
+        poll_live_limits_once(
+            Arc::clone(&manager),
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+        )
+        .await;
+
+        assert_eq!(volume.quota_hard_limits().0, Some(8));
+        assert!(matches!(
+            volume.write(&creds, file.ino, 8, b"x").await,
+            Err(slatefs_core::vfs::FsError::QuotaExceeded)
+        ));
+
+        assert_eq!(limiter.limits().bytes_per_second, Some(1));
+        let nfs_volume: Arc<dyn Vfs> = volume.clone();
+        let nfs = SlateFsNfs::new_with_rate_limiter(
+            nfs_volume,
+            Secret32::from_bytes([32; 32]),
+            SquashPolicy::trust_as_root(),
+            Some(Arc::clone(&limiter)),
+        );
+        let root = nfs.root_dir();
+        let name = filename3(Opaque::borrowed(b"rate-limited"));
+        let (rate_file, _) = nfs.create(&root, &name, sattr3::default()).await.unwrap();
+        let limited = nfs.write(&rate_file, 0, b"xx", stable_how::UNSTABLE).await;
+        assert!(
+            matches!(limited, Err(nfsstat3::NFS3ERR_JUKEBOX)),
+            "expected frontend rate rejection, got {limited:?}"
+        );
+
+        manager.lock().await.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

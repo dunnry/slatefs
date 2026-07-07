@@ -173,8 +173,10 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `PATCH` | `/admin/v1/exports/{id}` | Update a control-plane export; use JSON `null` to clear optional fields. |
 | `DELETE` | `/admin/v1/exports/{id}` | Remove a control-plane export. |
 | `GET` | `/admin/v1/tenants` | Tenant inventory with `limit` and `page_token`. |
+| `PATCH` | `/admin/v1/tenants/{tenant}/rate` | Set nullable `ops_per_second` and/or `bytes_per_second`; `null` means unlimited. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes` | Volume inventory with `limit` and `page_token`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}` | Volume detail. |
+| `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/quota` | Set nullable quota fields: `bytes_soft`, `bytes_hard`, `bytes_grace`, `inodes_soft`, `inodes_hard`, `inodes_grace`; returns limits and live usage. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshot?name=` | v1 live-writer snapshot alias. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshots` | Checkpoint inventory with `limit`, `page_token`, and optional `name`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshot-retention` | Snapshot retention policy; named snapshots are not exempt. |
