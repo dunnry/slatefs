@@ -14,8 +14,10 @@
 #   SLATEFS_NBD_VOLUME      block volume name (default: b1)
 #   SLATEFS_NBD_SIZE_BYTES  virtual size (default: 536870912, 512 MiB)
 #   SLATEFS_NBD_CHUNK_SIZE  block volume chunk size (default: 4096)
+#   SLATEFS_NBD_BLOCK_SIZE  nbd-client block size (default: 4096)
 #   SLATEFS_NBD_PORT        NBD listen port (default: 12059)
 #   SLATEFS_NBD_ADMIN_PORT  admin listen port for allocated_bytes (default: 13059)
+#   SLATEFS_NBD_METRICS_PORT metrics listen port for NBD request counters (default: 14059)
 #   SLATEFS_NBD_TRIM_MIB    file size for TRIM proof in MiB (default: 32)
 #   FSSTRESS_*              if set, build/run a small fsstress pass
 #   FIO_*                   if set, use fio for the crash-drill load
@@ -30,8 +32,10 @@ TENANT="${SLATEFS_NBD_TENANT:-${SLATEFS_TENANT:-t1}}"
 VOLUME="${SLATEFS_NBD_VOLUME:-b1}"
 SIZE_BYTES="${SLATEFS_NBD_SIZE_BYTES:-536870912}"
 CHUNK_SIZE="${SLATEFS_NBD_CHUNK_SIZE:-4096}"
+NBD_BLOCK_SIZE="${SLATEFS_NBD_BLOCK_SIZE:-4096}"
 PORT="${SLATEFS_NBD_PORT:-12059}"
 ADMIN_PORT="${SLATEFS_NBD_ADMIN_PORT:-13059}"
+METRICS_PORT="${SLATEFS_NBD_METRICS_PORT:-14059}"
 NBD_CLIENT_TIMEOUT="${SLATEFS_NBD_CLIENT_TIMEOUT:-60}"
 TRIM_MIB="${SLATEFS_NBD_TRIM_MIB:-32}"
 CRASH_WARMUP="${SLATEFS_NBD_CRASH_WARMUP:-2}"
@@ -193,6 +197,9 @@ write_nbd_config() {
 [admin]
 listen = "127.0.0.1:$ADMIN_PORT"
 
+[metrics]
+listen = "127.0.0.1:$METRICS_PORT"
+
 [[exports]]
 tenant = "$TENANT"
 volume = "$VOLUME"
@@ -258,11 +265,12 @@ wait_port() {
 }
 
 start_daemon() {
-    echo "== starting slatefsd on NBD $PORT admin $ADMIN_PORT"
+    echo "== starting slatefsd on NBD $PORT admin $ADMIN_PORT metrics $METRICS_PORT"
     "$DAEMON" -c "$CONFIG" >>"$LOG" 2>&1 &
     DAEMON_PID=$!
     wait_port "$PORT"
     wait_port "$ADMIN_PORT"
+    wait_port "$METRICS_PORT"
 }
 
 ensure_nbd_nodes() {
@@ -333,8 +341,12 @@ wait_device_size() {
 
 attach_nbd() {
     select_free_nbd
-    echo "== attaching $EXPORT_NAME to $NBD_DEV"
-    local common_args=(127.0.0.1 "$PORT" "$NBD_DEV" -N "$EXPORT_NAME" -persist off -timeout "$NBD_CLIENT_TIMEOUT")
+    case "$NBD_BLOCK_SIZE" in
+        512|1024|2048|4096) ;;
+        *) echo "unsupported SLATEFS_NBD_BLOCK_SIZE=$NBD_BLOCK_SIZE; nbd-client accepts 512, 1024, 2048, or 4096" >&2; exit 1 ;;
+    esac
+    echo "== attaching $EXPORT_NAME to $NBD_DEV block_size=$NBD_BLOCK_SIZE"
+    local common_args=(127.0.0.1 "$PORT" "$NBD_DEV" -N "$EXPORT_NAME" -b "$NBD_BLOCK_SIZE" -timeout "$NBD_CLIENT_TIMEOUT")
     if nbd_client_supports_c; then
         if $SUDO nbd-client "${common_args[@]}" -C 2 >/tmp/nbd-client-attach.log 2>&1; then
             NBD_ATTACHED=1
@@ -352,15 +364,8 @@ attach_nbd() {
         echo "attached with single NBD connection"
         return 0
     fi
-    echo "nbd-client attach with -persist off failed; retrying without -persist off"
     cat /tmp/nbd-client-attach.log || true
-    local fallback_args=(127.0.0.1 "$PORT" "$NBD_DEV" -N "$EXPORT_NAME" -timeout "$NBD_CLIENT_TIMEOUT")
-    $SUDO nbd-client "${fallback_args[@]}" >/tmp/nbd-client-attach.log 2>&1 || {
-        cat /tmp/nbd-client-attach.log || true
-        return 1
-    }
-    NBD_ATTACHED=1
-    wait_device_size
+    return 1
 }
 
 mount_ext4() {
@@ -400,24 +405,6 @@ mounted_sha256() {
     timeout "$OP_TIMEOUT" $SUDO sha256sum "$path" | awk '{ print $1 }'
 }
 
-file_extents() {
-    local path="$1"
-    local block_size
-    block_size="$(stat -fc '%S' "$MNT")"
-    $SUDO filefrag -b"$block_size" -v "$path" | awk -v block_size="$block_size" '
-        /^[[:space:]]*[0-9]+:/ {
-            physical = $4
-            ext_len = $6
-            gsub(/:/, "", physical)
-            gsub(/:/, "", ext_len)
-            split(physical, p, /\.\./)
-            if (p[1] ~ /^[0-9]+$/ && ext_len ~ /^[0-9]+$/) {
-                print p[1] * block_size, ext_len * block_size
-            }
-        }
-    '
-}
-
 admin_get_volume() {
     local path="/admin/v1/tenants/$TENANT/volumes/$VOLUME"
     curl -fsS --max-time 15 "http://127.0.0.1:$ADMIN_PORT$path"
@@ -433,6 +420,42 @@ allocated_bytes() {
         return 1
     }
     printf '%s\n' "$value"
+}
+
+metrics_get() {
+    curl -fsS --max-time 15 "http://127.0.0.1:$METRICS_PORT/metrics"
+}
+
+nbd_request_count() {
+    local cmd="$1"
+    metrics_get | awk -v tenant="$TENANT" -v volume="$VOLUME" -v cmd="$cmd" '
+        $1 ~ /^slatefs_nbd_requests_total\{/ &&
+            index($0, "tenant=\"" tenant "\"") &&
+            index($0, "volume=\"" volume "\"") &&
+            index($0, "cmd=\"" cmd "\"") {
+                print int($2)
+                found = 1
+            }
+        END {
+            if (!found) {
+                print 0
+            }
+        }
+    '
+}
+
+dump_discard_queue() {
+    local name="${NBD_DEV##*/}"
+    local queue="/sys/block/$name/queue"
+    local attr path value
+    echo "== $NBD_DEV discard queue attributes"
+    for attr in discard_granularity discard_max_bytes discard_max_hw_bytes discard_zeroes_data logical_block_size physical_block_size; do
+        path="$queue/$attr"
+        if [ -r "$path" ]; then
+            value="$(cat "$path")"
+            echo "$attr=$value"
+        fi
+    done
 }
 
 wait_allocated_drop() {
@@ -540,32 +563,29 @@ trim_proof() {
     local trim_file="$MNT/trim-proof.bin"
     run_long $SUDO dd if=/dev/urandom of="$trim_file" bs=1M count="$TRIM_MIB" conv=fsync status=none
     run sync
-    local extents=()
-    mapfile -t extents < <(file_extents "$trim_file")
-    [ "${#extents[@]}" -gt 0 ] || {
-        echo "filefrag did not report extents for $trim_file"
-        exit 1
-    }
     local before after
     before="$(allocated_bytes)"
     echo "allocated_bytes before delete: $before"
     run $SUDO rm "$trim_file"
     run sync
-    run_long $SUDO fstrim -v "$MNT"
+    dump_discard_queue
+    findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS "$MNT"
+    local trim_requests_before trim_requests_after fstrim_output
+    trim_requests_before="$(nbd_request_count trim)"
+    echo "NBD trim requests before fstrim: $trim_requests_before"
+    fstrim_output="$(run_long $SUDO fstrim -v "$MNT")"
+    printf '%s\n' "$fstrim_output"
+    trim_requests_after="$(nbd_request_count trim)"
+    echo "NBD trim requests after fstrim: $trim_requests_after"
+    if [ "$trim_requests_after" -le "$trim_requests_before" ]; then
+        echo "fstrim sent no NBD TRIM requests"
+        exit 1
+    fi
     run sync
     if ! after="$(wait_allocated_drop "$before")"; then
         echo "$after"
-        echo "SLATEFS_NBD_FSTRIM_NO_ALLOC_DROP fstrim did not release the deleted file extents; issuing blkdiscard fallback"
-        unmount_ext4_strict
-        local extent offset length
-        for extent in "${extents[@]}"; do
-            read -r offset length <<<"$extent"
-            run $SUDO blkdiscard --force -o "$offset" -l "$length" "$NBD_DEV"
-        done
-        mount_ext4
-        after="$(wait_allocated_drop "$before")"
-        echo "allocated_bytes after blkdiscard fallback: $after"
-        return 0
+        echo "fstrim sent $((trim_requests_after - trim_requests_before)) NBD TRIM request(s) but did not release SlateFS allocation"
+        exit 1
     fi
     echo "allocated_bytes after fstrim: $after"
 }

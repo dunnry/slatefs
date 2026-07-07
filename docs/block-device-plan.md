@@ -9,8 +9,7 @@ quota, and snapshot machinery — but exposes a flat byte range instead of a POS
 > NBD server, daemon exports, CLI/admin, TLS/mTLS, metrics, dashboard, and
 > kernel/QEMU/ZFS smoke scripts are in-tree. Remaining work is explicit in §6:
 > fio matrix + chunk-size default confirmation (BD-2), NBD failover timing gate
-> (<10s AC), ext4 fstrim allocation-drop root cause, and continued ZFS
-> validation where the host kernel provides zfs.ko.
+> (<10s AC), and continued ZFS validation where the host kernel provides zfs.ko.
 > Design-decision numbers here are **BD-n** to avoid colliding with the master
 > plan's **DD-n**; DD references below are to the master plan.
 
@@ -286,7 +285,7 @@ client/wire suite. Daemon reconciliation and NBD export binding are wired in
 ### Phase B3 — Kernel-client integration & durability proof
 Privileged docker CI (extend `scripts/docker-kernel-mount-test.sh` pattern):
 `scripts/nbd-kernel-attach-test.sh` — `nbd-client` attach (multi-conn), `mkfs.ext4`, mount,
-fsstress, `fstrim` attempt + deleted-extent `blkdiscard` allocation-drop proof, clean detach; **crash-recovery drill** —
+fsstress, `fstrim` allocation-drop proof, clean detach; **crash-recovery drill** —
 kill `slatefsd` mid-fio-on-ext4, restart, reattach, mount must replay the journal cleanly
 (`e2fsck -f` clean), no acknowledged-FLUSH data lost; fio matrix (seq/rand × R/W × 4k/64k/1M)
 recorded in [performance.md](performance.md) alongside the NFS numbers.
@@ -296,20 +295,24 @@ resumed I/O, zero corruption.
 
 **Implemented**: [scripts/nbd-kernel-attach-test.sh](../scripts/nbd-kernel-attach-test.sh)
 creates a block volume, attaches a real Linux `nbd-client`, formats ext4,
-mounts ext4, exercises file operations, attempts `fstrim`, verifies a
-deleted-extent `blkdiscard` fallback lowers allocated bytes, kills/restarts `slatefsd` mid-load, remounts for journal
+mounts ext4, exercises file operations, verifies `fstrim` lowers
+`allocated_bytes`, kills/restarts `slatefsd` mid-load, remounts for journal
 replay, and requires `e2fsck -f -p` clean. The privileged CI job is
 `kernel-nbd` in [.github/workflows/ci.yml](../.github/workflows/ci.yml).
 Remaining B3 work: record the fio seq/rand × R/W × 4 KiB/64 KiB/1 MiB matrix
-add the NBD failover drill timing gate (<10s resumed I/O, zero corruption),
-and finish the ext4 fstrim allocation-drop investigation.
-TRIM outcome: Linux `nbd.ko`/`nbd-client` do not propagate the NBD preferred
-block size into discard granularity, so exact TRIM now handles partial edge
-chunks. However, local ext4 `fstrim` still did not lower allocation after
-deleting a file; it reported only small or zero FITRIM coverage even when
-targeted at captured file extents. The kernel smoke records
-`SLATEFS_NBD_FSTRIM_NO_ALLOC_DROP` and uses a deleted-extent `blkdiscard`
-fallback to keep the rest of the kernel/crash drill covered.
+and add the NBD failover drill timing gate (<10s resumed I/O, zero corruption).
+TRIM outcome: resolved 2026-07-07. The local OrbStack kernel
+(`7.0.11-orbstack-00360-gc9bc4d96ac70`) did send NBD TRIMs during `fstrim`,
+but before the fix SlateFS rejected coalesced large TRIM requests before they
+reached the execution/metrics path because `validate_request` applied the
+`max_payload` cap to every non-write command. Linux `nbd.ko` sets discard
+limits from `NBD_FLAG_SEND_TRIM` independently of `NBD_INFO_BLOCK_SIZE`, so
+ext4 can issue free-space TRIM extents far larger than the advertised max
+payload. The fix allows large `NBD_CMD_TRIM` ranges after normal device-bounds
+validation; the kernel smoke now asserts that `fstrim` itself sends TRIMs and
+drops SlateFS allocation. The script also attaches with `nbd-client -b 4096`
+so the kernel queue logical/physical block size and discard granularity match
+ext4's block size instead of nbd-client's 512-byte default.
 
 ### Phase B4 — TLS, ops polish, showcase workloads
 `STARTTLS`/`FORCEDTLS` with rustls (+ client-cert option); metrics + Grafana row + alert
@@ -349,12 +352,11 @@ module.
    block size from the userspace `NBD_SET_BLKSIZE` value; it does not advertise
    the NBD preferred block size as discard granularity. `nbd-client` also
    ignores `NBD_INFO_BLOCK_SIZE` in `OPT_GO` and defaults its block size to 512
-   unless `-b` is supplied. ext4/fstrim may therefore emit filesystem-block-scale
-   free extents. Mitigation implemented: exact TRIM RMW-zeroes partial edge
-   chunks and keeps batched deletes for fully-covered chunks; the cost is extra
-   RMW writes on trim edges. Open finding: in the local Docker/OrbStack kernel,
-   ext4 `fstrim` did not issue the deleted file extents even after remount and
-   targeted `fstrim -o/-l`; direct `blkdiscard` over the captured extents did.
+   unless `-b` is supplied. Mitigation implemented: the kernel harness supplies
+   `-b 4096`, exact TRIM RMW-zeroes partial edge chunks and keeps batched
+   deletes for fully-covered chunks, and the NBD server accepts large TRIM
+   extents even when they exceed the read/write max payload. The remaining cost
+   is extra RMW writes on partial trim edges.
 4. **Linux `nbd.ko` quirks**: reconnect semantics, `-persist` behavior across server
    restarts, timeout-induced device errors wedging mounts. Same discipline as the NFS kernel
    tests (soft timeouts, forced cleanup); capture findings in client-support.md.

@@ -1406,7 +1406,14 @@ fn backend_failure(error: FsError) -> RequestFailure {
 }
 
 fn validate_request(header: &RequestHeader, geometry: BlockGeometry) -> Option<u32> {
-    if header.command != NBD_CMD_WRITE && header.length > geometry.max_payload {
+    // Linux nbd.ko advertises discard limits independently of the negotiated
+    // max payload size. TRIM carries no payload, so large discard extents are
+    // safe to pass through to the block layer after the normal bounds check.
+    if matches!(
+        header.command,
+        NBD_CMD_READ | NBD_CMD_WRITE | NBD_CMD_WRITE_ZEROES
+    ) && header.length > geometry.max_payload
+    {
         return Some(NBD_EOVERFLOW);
     }
 
@@ -2916,6 +2923,22 @@ mod tests {
         assert_eq!(&reply.data[..4], &[0x11; 4]);
         assert_eq!(&reply.data[4..20], &[0; 16]);
         assert_eq!(&reply.data[20..], &[0; 4]);
+        server.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wire_trim_can_exceed_max_payload() {
+        let dev: Arc<dyn BlockDev> = Arc::new(TestBlockDev::new(false));
+        let server = serve_dev(dev).await;
+        let mut client = NbdTestClient::connect(server.local_addr(), EXPORT)
+            .await
+            .expect("client");
+
+        client
+            .trim(1, 0, TestBlockDev::geometry_for(false).max_payload * 2)
+            .await
+            .expect("large trim");
+        assert_ok(client.read_reply().await, 1);
         server.shutdown();
     }
 
