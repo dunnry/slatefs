@@ -4,6 +4,7 @@
 
 use bytes::Bytes;
 
+use crate::config::AtimeMode;
 use crate::meta::inode::{FileKind, Timespec};
 
 /// errno-style errors. Numeric values are Linux's; frontends map them to
@@ -259,6 +260,20 @@ pub trait Vfs: Send + Sync {
     async fn setattr(&self, creds: &Credentials, ino: u64, attrs: SetAttrs) -> FsResult<FileAttr>;
 
     async fn read(&self, creds: &Credentials, ino: u64, offset: u64, len: u32) -> FsResult<Bytes>;
+    /// Read with an export-scoped atime policy. Implementations that can
+    /// update atime should override this; read-only implementations may
+    /// ignore the policy and perform a plain read.
+    async fn read_with_atime_policy(
+        &self,
+        creds: &Credentials,
+        ino: u64,
+        offset: u64,
+        len: u32,
+        policy: AtimeMode,
+    ) -> FsResult<Bytes> {
+        let _ = policy;
+        self.read(creds, ino, offset, len).await
+    }
     async fn write(&self, creds: &Credentials, ino: u64, offset: u64, data: &[u8])
     -> FsResult<u32>;
 

@@ -20,7 +20,7 @@ use nfs3_server::vfs::{
     DirEntryPlus, NextResult, NfsFileSystem, NfsReadFileSystem, ReadDirPlusIterator,
     VFSCapabilities,
 };
-use slatefs_core::config::SquashMode;
+use slatefs_core::config::{AtimeMode, SquashMode};
 use slatefs_core::crypto::Secret32;
 use slatefs_core::meta::inode::{FileKind, ROOT_INO, Timespec};
 use slatefs_core::rate::RateLimiter;
@@ -102,12 +102,19 @@ pub struct SlateFsNfs {
     volume: Arc<dyn Vfs>,
     fh: FhCodec,
     policy: SquashPolicy,
+    atime_policy: AtimeMode,
     rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl SlateFsNfs {
     pub fn new(volume: Arc<dyn Vfs>, fh_key: Secret32, policy: SquashPolicy) -> SlateFsNfs {
-        Self::new_with_rate_limiter(volume, fh_key, policy, None)
+        Self::new_with_rate_limiter_and_atime_policy(
+            volume,
+            fh_key,
+            policy,
+            AtimeMode::Relatime,
+            None,
+        )
     }
 
     pub fn new_with_rate_limiter(
@@ -116,11 +123,28 @@ impl SlateFsNfs {
         policy: SquashPolicy,
         rate_limiter: Option<Arc<RateLimiter>>,
     ) -> SlateFsNfs {
+        Self::new_with_rate_limiter_and_atime_policy(
+            volume,
+            fh_key,
+            policy,
+            AtimeMode::Relatime,
+            rate_limiter,
+        )
+    }
+
+    pub fn new_with_rate_limiter_and_atime_policy(
+        volume: Arc<dyn Vfs>,
+        fh_key: Secret32,
+        policy: SquashPolicy,
+        atime_policy: AtimeMode,
+        rate_limiter: Option<Arc<RateLimiter>>,
+    ) -> SlateFsNfs {
         let fh = FhCodec::new(volume.fsid(), fh_key);
         SlateFsNfs {
             volume,
             fh,
             policy,
+            atime_policy,
             rate_limiter,
         }
     }
@@ -329,7 +353,7 @@ impl NfsReadFileSystem for SlateFsNfs {
             .map_err(map_err)?;
         let bytes = self
             .volume
-            .read(&self.creds(), ino, offset, count)
+            .read_with_atime_policy(&self.creds(), ino, offset, count, self.atime_policy)
             .await
             .map_err(map_err)?;
         let eof = offset + bytes.len() as u64 >= attr.size;

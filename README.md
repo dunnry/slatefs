@@ -124,6 +124,17 @@ volume is being served. `slatefsd` also reloads changed tenant rate limits and
 served-volume quota limits on the `[export_control].poll_interval_secs` loop:
 rate buckets are resized in place, and quota changes apply on the next mutation
 check without reopening the volume.
+Filesystem exports honor `atime = "relatime" | "strict" | "noatime"` per
+export for both NFS and 9P. `relatime` is the default and follows Linux-style
+updates when atime lags mtime/ctime or is older than 24 hours; `strict`
+persists atime on every successful read, which adds a metadata write on hot
+read paths; `noatime` suppresses read-side atime updates. Snapshot exports are
+read-only and never persist atime updates regardless of policy.
+
+| Export field | Default | Applies to | Notes |
+| --- | --- | --- | --- |
+| `atime` | `relatime` | NFS, 9P | Per-export read atime policy: `strict`, `relatime`, or `noatime`. |
+
 `slatefs tenant delete --yes` and `slatefs volume delete --yes` mark records
 deleting, drop wrapped keys from the current control-plane state, and delete
 the affected volume object-store prefixes.

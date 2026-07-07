@@ -17,6 +17,7 @@ use rs9p::fcall::{
     LockType, QId, QIdType, SetAttr, SetAttrMask, Stat, StatFs as P9StatFs, Time,
 };
 use rs9p::srv::{FId, Filesystem};
+use slatefs_core::config::AtimeMode;
 use slatefs_core::meta::inode::{FileKind, ROOT_INO, Timespec};
 use slatefs_core::rate::RateLimiter;
 use slatefs_core::vfs::{
@@ -82,6 +83,7 @@ impl FidState {
 
 pub struct SlateFs9p {
     volume: Arc<dyn Vfs>,
+    atime_policy: AtimeMode,
     /// Bearer token required in `uname` at attach (DD-10). `None` ⇒ open
     /// export (dev / network-isolated deployments).
     token: Option<String>,
@@ -100,6 +102,7 @@ impl Clone for SlateFs9p {
     fn clone(&self) -> Self {
         SlateFs9p {
             volume: Arc::clone(&self.volume),
+            atime_policy: self.atime_policy,
             token: self.token.clone(),
             export_name: self.export_name.clone(),
             conn_authed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -110,7 +113,13 @@ impl Clone for SlateFs9p {
 
 impl SlateFs9p {
     pub fn new(volume: Arc<dyn Vfs>, export_name: String, token: Option<String>) -> SlateFs9p {
-        Self::new_with_rate_limiter(volume, export_name, token, None)
+        Self::new_with_rate_limiter_and_atime_policy(
+            volume,
+            export_name,
+            token,
+            AtimeMode::Relatime,
+            None,
+        )
     }
 
     pub fn new_with_rate_limiter(
@@ -119,8 +128,25 @@ impl SlateFs9p {
         token: Option<String>,
         rate_limiter: Option<Arc<RateLimiter>>,
     ) -> SlateFs9p {
+        Self::new_with_rate_limiter_and_atime_policy(
+            volume,
+            export_name,
+            token,
+            AtimeMode::Relatime,
+            rate_limiter,
+        )
+    }
+
+    pub fn new_with_rate_limiter_and_atime_policy(
+        volume: Arc<dyn Vfs>,
+        export_name: String,
+        token: Option<String>,
+        atime_policy: AtimeMode,
+        rate_limiter: Option<Arc<RateLimiter>>,
+    ) -> SlateFs9p {
         SlateFs9p {
             volume,
+            atime_policy,
             token,
             export_name,
             conn_authed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -434,7 +460,7 @@ impl Filesystem for SlateFs9p {
         }
         let bytes = self
             .volume
-            .read(&state.creds(), state.ino, offset, count)
+            .read_with_atime_policy(&state.creds(), state.ino, offset, count, self.atime_policy)
             .await
             .map_err(errno)?;
         Ok(FCall::RRead {

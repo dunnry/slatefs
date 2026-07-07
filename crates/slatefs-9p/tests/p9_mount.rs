@@ -11,12 +11,14 @@ use std::time::Duration;
 
 use rs9p::fcall::{Data, FCall, GetAttrMask, Msg, QId, SetAttr, SetAttrMask, Time};
 use rs9p::serialize::{read_msg, write_msg};
-use slatefs_core::config::{ClientAddrRule, Compression};
+use slatefs_core::config::{AtimeMode, ClientAddrRule, Compression};
 use slatefs_core::control::{ControlPlane, QuotaLimit, QuotaLimits};
 use slatefs_core::crypto::kms::{Kms, StaticKms};
 use slatefs_core::crypto::{Cipher, Secret32};
+use slatefs_core::meta::inode::{ROOT_INO, Timespec};
 use slatefs_core::rate::{RateLimiter, RateLimits};
 use slatefs_core::store::{self, ObjectStore};
+use slatefs_core::vfs::{Credentials, SetAttrs, TimeSet, Vfs};
 use slatefs_core::volume::{self, CreateVolumeOptions, Volume};
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -118,6 +120,30 @@ fn free_port() -> u16 {
 
 async fn serve_9p(volume: Arc<Volume>, token: Option<String>) -> u16 {
     serve_9p_with_allowlist(volume, token, Vec::new()).await
+}
+
+async fn serve_9p_with_atime(volume: Arc<Volume>, token: Option<String>, atime: AtimeMode) -> u16 {
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}");
+    tokio::spawn(async move {
+        let _ = slatefs_9p::serve_export_with_allowlist_and_rate_limit_and_atime_policy(
+            volume,
+            "/t/v".to_string(),
+            token,
+            Vec::new(),
+            None,
+            atime,
+            &listen,
+        )
+        .await;
+    });
+    for _ in 0..50 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("9p server never came up");
 }
 
 async fn serve_9p_with_allowlist(
@@ -308,6 +334,52 @@ async fn p9_tls_end_to_end() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p9_strict_export_updates_atime_on_read() {
+    let object_store = store::resolve_root("memory:///").unwrap();
+    let volume = make_volume(Arc::clone(&object_store)).await;
+    let file = volume
+        .create(&Credentials::root(), ROOT_INO, b"p9-atime.txt", 0o644, true)
+        .await
+        .unwrap();
+    volume
+        .write(&Credentials::root(), file.ino, 0, b"payload")
+        .await
+        .unwrap();
+    let old = Timespec { secs: 10, nanos: 0 };
+    volume
+        .setattr(
+            &Credentials::root(),
+            file.ino,
+            SetAttrs {
+                atime: Some(TimeSet::Time(old)),
+                mtime: Some(TimeSet::Time(old)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let port = serve_9p_with_atime(Arc::clone(&volume), None, AtimeMode::Strict).await;
+    tokio::task::spawn_blocking(move || {
+        let mut c = P9c::connect(port);
+        c.attach(0, "", "/t/v", 0);
+        c.walk(0, 1, &["p9-atime.txt"]);
+        c.lopen(1, 0);
+        assert_eq!(c.read(1, 0, 7), b"payload");
+        c.clunk(1);
+    })
+    .await
+    .unwrap();
+
+    let after = volume
+        .getattr(&Credentials::root(), file.ino)
+        .await
+        .unwrap()
+        .atime;
+    assert!(after > old, "strict 9P read should update atime");
 }
 
 /// Minimal synchronous 9P2000.L client.

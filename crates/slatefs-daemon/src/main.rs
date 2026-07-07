@@ -2717,15 +2717,17 @@ impl ExportManager {
                     anon_uid: desired.config.anon_uid,
                     anon_gid: desired.config.anon_gid,
                 };
-                let listener = slatefs_nfs::bind_export_with_allowlist_and_rate_limit(
-                    Arc::clone(&volume),
-                    self.fh_key.clone(),
-                    policy,
-                    desired.config.allowed_clients.clone(),
-                    rate_limiter,
-                    &desired.config.listen,
-                )
-                .await;
+                let listener =
+                    slatefs_nfs::bind_export_with_allowlist_and_rate_limit_and_atime_policy(
+                        Arc::clone(&volume),
+                        self.fh_key.clone(),
+                        policy,
+                        desired.config.allowed_clients.clone(),
+                        rate_limiter,
+                        desired.config.atime,
+                        &desired.config.listen,
+                    )
+                    .await;
                 listener.map(|listener| {
                     let port = listener.get_listen_port();
                     tracing::info!(
@@ -2767,18 +2769,21 @@ impl ExportManager {
                 let token = desired.config.p9_token.clone();
                 let allowed_clients = desired.config.allowed_clients.clone();
                 match tls {
-                    Some((cert, key)) => slatefs_9p::bind_export_tls_with_allowlist_and_rate_limit(
-                        Arc::clone(&volume),
-                        export_name,
-                        token,
-                        allowed_clients,
-                        rate_limiter,
-                        &listen,
-                        slatefs_9p::TlsIdentity {
-                            cert_path: cert,
-                            key_path: key,
-                        },
-                    )
+                    Some((cert, key)) => {
+                        slatefs_9p::bind_export_tls_with_allowlist_and_rate_limit_and_atime_policy(
+                            Arc::clone(&volume),
+                            export_name,
+                            token,
+                            allowed_clients,
+                            rate_limiter,
+                            desired.config.atime,
+                            &listen,
+                            slatefs_9p::TlsIdentity {
+                                cert_path: cert,
+                                key_path: key,
+                            },
+                        )
+                    }
                     .await
                     .map(|listener| {
                         tracing::info!(
@@ -2796,12 +2801,13 @@ impl ExportManager {
                             }
                         })
                     }),
-                    None => slatefs_9p::bind_export_with_allowlist_and_rate_limit(
+                    None => slatefs_9p::bind_export_with_allowlist_and_rate_limit_and_atime_policy(
                         Arc::clone(&volume),
                         export_name,
                         token,
                         allowed_clients,
                         rate_limiter,
+                        desired.config.atime,
                         &listen,
                     )
                     .await

@@ -9,6 +9,7 @@ use bytes::Bytes;
 use slatedb::config::WriteOptions;
 use slatedb::{ByteRangeBounds, DbIterator, KeyValue, WriteBatch};
 
+use crate::config::AtimeMode;
 use crate::data;
 use crate::locks::{LockRange, RangeLock};
 use crate::meta::dirent::{Dirent, DirentIdx, Orphan};
@@ -36,9 +37,29 @@ const READAHEAD_WINDOW_CHUNKS: u32 = 8;
 /// Relatime window (plan §10): persist atime on read only if it lags mtime
 /// or is older than this.
 const RELATIME_SECS: i64 = 24 * 3600;
+const NANOS_PER_SEC: i128 = 1_000_000_000;
+const RELATIME_NANOS: i128 = RELATIME_SECS as i128 * NANOS_PER_SEC;
 
 fn now() -> Timespec {
     Timespec::now()
+}
+
+fn older_than(atime: Timespec, now: Timespec, age_nanos: i128) -> bool {
+    ((now.secs as i128 - atime.secs as i128) * NANOS_PER_SEC) + now.nanos as i128
+        - atime.nanos as i128
+        > age_nanos
+}
+
+fn atime_update_due(policy: AtimeMode, inode: &Inode, ts: Timespec) -> bool {
+    match policy {
+        AtimeMode::Strict => true,
+        AtimeMode::Relatime => {
+            inode.atime < inode.mtime
+                || inode.atime < inode.ctime
+                || older_than(inode.atime, ts, RELATIME_NANOS)
+        }
+        AtimeMode::Noatime => false,
+    }
 }
 
 fn validate_name(name: &[u8]) -> FsResult<()> {
@@ -402,12 +423,12 @@ impl Volume {
         Ok(())
     }
 
-    /// Persist relatime updates without making every read a write
-    /// (plan §10): only when atime lags mtime or is older than 24h.
-    async fn maybe_update_atime(&self, ino: u64, inode: &Inode) {
+    /// Persist read atime updates for the export policy. `strict` writes
+    /// metadata on every successful read; `relatime` follows Linux's
+    /// mtime/ctime/24h rules; `noatime` skips read-side updates.
+    async fn maybe_update_atime(&self, ino: u64, inode: &Inode, policy: AtimeMode) {
         let ts = now();
-        let due = inode.atime < inode.mtime || ts.secs - inode.atime.secs > RELATIME_SECS;
-        if !due {
+        if !atime_update_due(policy, inode, ts) {
             return;
         }
         let _guard = self.locks.write(ino).await;
@@ -422,7 +443,7 @@ impl Volume {
         let Ok(mut current) = Inode::decode(&bytes) else {
             return;
         };
-        if current.atime < current.mtime || ts.secs - current.atime.secs > RELATIME_SECS {
+        if atime_update_due(policy, &current, ts) {
             current.atime = ts;
             let mut batch = WriteBatch::new();
             if let Ok(encoded) = current.encode() {
@@ -605,6 +626,18 @@ impl Vfs for Volume {
     }
 
     async fn read(&self, creds: &Credentials, ino: u64, offset: u64, len: u32) -> FsResult<Bytes> {
+        self.read_with_atime_policy(creds, ino, offset, len, AtimeMode::Relatime)
+            .await
+    }
+
+    async fn read_with_atime_policy(
+        &self,
+        creds: &Credentials,
+        ino: u64,
+        offset: u64,
+        len: u32,
+        atime_policy: AtimeMode,
+    ) -> FsResult<Bytes> {
         let inode = self.load_inode_cached(ino).await?;
         match inode.kind {
             FileKind::File => {}
@@ -616,7 +649,7 @@ impl Vfs for Volume {
             data::read_range(&self.db, self.chunk_size, ino, inode.size, offset, len).await,
         )?;
         self.plan_readahead(ino, offset, offset + bytes.len() as u64, inode.size);
-        self.maybe_update_atime(ino, &inode).await;
+        self.maybe_update_atime(ino, &inode, atime_policy).await;
         Ok(bytes)
     }
 
@@ -1448,7 +1481,21 @@ impl Vfs for Volume {
 
 #[cfg(test)]
 mod tests {
-    use super::readahead_scan_bounds;
+    use super::{RELATIME_SECS, atime_update_due, readahead_scan_bounds};
+    use crate::config::AtimeMode;
+    use crate::meta::inode::{FileKind, Inode, Timespec};
+
+    fn ts(secs: i64, nanos: u32) -> Timespec {
+        Timespec { secs, nanos }
+    }
+
+    fn inode_with_times(atime: Timespec, mtime: Timespec, ctime: Timespec) -> Inode {
+        let mut inode = Inode::new(FileKind::File, 0o644, 0, 0, atime);
+        inode.atime = atime;
+        inode.mtime = mtime;
+        inode.ctime = ctime;
+        inode
+    }
 
     #[test]
     fn readahead_scan_bounds_prefetches_next_chunks() {
@@ -1466,5 +1513,40 @@ mod tests {
     #[test]
     fn readahead_scan_bounds_waits_until_near_horizon() {
         assert_eq!(readahead_scan_bounds(9, 6, 10), None);
+    }
+
+    #[test]
+    fn atime_policy_due_matches_strict_noatime_and_relatime() {
+        let now = ts(100, 0);
+        let inode = inode_with_times(ts(10, 0), ts(10, 0), ts(10, 0));
+
+        assert!(atime_update_due(AtimeMode::Strict, &inode, now));
+        assert!(!atime_update_due(AtimeMode::Noatime, &inode, now));
+    }
+
+    #[test]
+    fn relatime_due_when_atime_lags_mtime_or_ctime() {
+        let now = ts(100, 0);
+        let mtime_newer = inode_with_times(ts(10, 0), ts(11, 0), ts(10, 0));
+        let ctime_newer = inode_with_times(ts(10, 0), ts(10, 0), ts(11, 0));
+
+        assert!(atime_update_due(AtimeMode::Relatime, &mtime_newer, now));
+        assert!(atime_update_due(AtimeMode::Relatime, &ctime_newer, now));
+    }
+
+    #[test]
+    fn relatime_due_only_after_full_24h_window() {
+        let inode = inode_with_times(ts(10, 500), ts(10, 500), ts(10, 500));
+
+        assert!(!atime_update_due(
+            AtimeMode::Relatime,
+            &inode,
+            ts(10 + RELATIME_SECS, 500),
+        ));
+        assert!(atime_update_due(
+            AtimeMode::Relatime,
+            &inode,
+            ts(10 + RELATIME_SECS, 501),
+        ));
     }
 }

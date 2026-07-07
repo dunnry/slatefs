@@ -6,18 +6,21 @@ use std::sync::Arc;
 use nfs3_client::Nfs3ConnectionBuilder;
 use nfs3_client::nfs3_types::nfs3::{
     ACCESS3_MODIFY, ACCESS3_READ, ACCESS3args, ACCESS3res, CREATE3args, CREATE3res, FSSTAT3args,
-    FSSTAT3res, GETATTR3args, GETATTR3res, LINK3args, LINK3res, MKNOD3args, MKNOD3res, Nfs3Option,
-    READ3args, READ3res, SETATTR3args, SETATTR3res, WRITE3args, WRITE3res, createhow3, diropargs3,
-    ftype3, mknoddata3, nfs_fh3, nfsstat3, sattr3, sattrguard3, stable_how,
+    FSSTAT3res, GETATTR3args, GETATTR3res, LINK3args, LINK3res, LOOKUP3args, LOOKUP3res,
+    MKNOD3args, MKNOD3res, Nfs3Option, READ3args, READ3res, SETATTR3args, SETATTR3res, WRITE3args,
+    WRITE3res, createhow3, diropargs3, ftype3, mknoddata3, nfs_fh3, nfsstat3, sattr3, sattrguard3,
+    stable_how,
 };
 use nfs3_client::nfs3_types::rpc::{auth_unix, opaque_auth};
 use nfs3_client::nfs3_types::xdr_codec::Opaque;
 use nfs3_client::tokio::TokioConnector;
-use slatefs_core::config::Compression;
+use slatefs_core::config::{AtimeMode, Compression};
 use slatefs_core::control::{ControlPlane, QuotaLimit, QuotaLimits};
 use slatefs_core::crypto::kms::{Kms, StaticKms};
 use slatefs_core::crypto::{Cipher, Secret32};
+use slatefs_core::meta::inode::{ROOT_INO, Timespec};
 use slatefs_core::store::{self, ObjectStore};
+use slatefs_core::vfs::{Credentials, SetAttrs, TimeSet, Vfs};
 use slatefs_core::volume::{self, CreateVolumeOptions, Volume};
 use slatefs_nfs::{NFSTcp, SquashPolicy};
 
@@ -69,6 +72,23 @@ async fn serve(volume: Arc<Volume>, policy: SquashPolicy) -> u16 {
     port
 }
 
+async fn serve_with_atime(volume: Arc<Volume>, policy: SquashPolicy, atime: AtimeMode) -> u16 {
+    let listener = slatefs_nfs::bind_export_with_atime_policy(
+        volume,
+        Secret32::from_bytes([7; 32]),
+        policy,
+        atime,
+        "127.0.0.1:0",
+    )
+    .await
+    .expect("bind export");
+    let port = listener.get_listen_port();
+    tokio::spawn(async move {
+        let _ = listener.handle_forever().await;
+    });
+    port
+}
+
 type Conn = nfs3_client::Nfs3Connection<nfs3_client::tokio::TokioIo<tokio::net::TcpStream>>;
 
 /// Connect asserting an AUTH_UNIX identity.
@@ -105,6 +125,10 @@ fn clone_fh(fh: &nfs_fh3) -> nfs_fh3 {
     }
 }
 
+fn old_time() -> Timespec {
+    Timespec { secs: 10, nanos: 0 }
+}
+
 async fn create_file(conn: &mut Conn, dir: &nfs_fh3, name: &str, mode: u32) -> nfs_fh3 {
     let res = conn
         .nfs3_client
@@ -124,6 +148,83 @@ async fn create_file(conn: &mut Conn, dir: &nfs_fh3, name: &str, mode: u32) -> n
         },
         CREATE3res::Err((stat, _)) => panic!("create failed: {stat:?}"),
     }
+}
+
+#[tokio::test]
+async fn nfs_noatime_export_does_not_update_atime_on_read() {
+    let object_store = store::resolve_root("memory:///").unwrap();
+    let volume = make_volume(Arc::clone(&object_store), None).await;
+    let file = volume
+        .create(
+            &Credentials::root(),
+            ROOT_INO,
+            b"nfs-atime.txt",
+            0o644,
+            true,
+        )
+        .await
+        .unwrap();
+    volume
+        .write(&Credentials::root(), file.ino, 0, b"payload")
+        .await
+        .unwrap();
+    volume
+        .setattr(
+            &Credentials::root(),
+            file.ino,
+            SetAttrs {
+                atime: Some(TimeSet::Time(old_time())),
+                mtime: Some(TimeSet::Time(Timespec { secs: 20, nanos: 0 })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let before = volume
+        .getattr(&Credentials::root(), file.ino)
+        .await
+        .unwrap();
+
+    let port = serve_with_atime(
+        Arc::clone(&volume),
+        SquashPolicy::trust_as_root(),
+        AtimeMode::Noatime,
+    )
+    .await;
+    let mut conn = connect_as(port, 0, 0).await;
+    let root = conn.root_nfs_fh3();
+    let fh = match conn
+        .nfs3_client
+        .lookup(&LOOKUP3args {
+            what: dirop(&root, "nfs-atime.txt"),
+        })
+        .await
+        .expect("lookup rpc")
+    {
+        LOOKUP3res::Ok(ok) => ok.object,
+        LOOKUP3res::Err((stat, _)) => panic!("lookup failed: {stat:?}"),
+    };
+    match conn
+        .nfs3_client
+        .read(&READ3args {
+            file: clone_fh(&fh),
+            offset: 0,
+            count: 7,
+        })
+        .await
+        .expect("read rpc")
+    {
+        READ3res::Ok(ok) => assert_eq!(ok.data.as_ref(), b"payload"),
+        READ3res::Err((stat, _)) => panic!("read failed: {stat:?}"),
+    }
+    conn.unmount().await.expect("unmount");
+
+    let after = volume
+        .getattr(&Credentials::root(), file.ino)
+        .await
+        .unwrap();
+    assert_eq!(after.atime, before.atime);
+    assert_eq!(after.mtime, before.mtime);
 }
 
 #[tokio::test]

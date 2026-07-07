@@ -5,13 +5,15 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::{TEST_CHUNK, fresh_volume, fresh_volume_on, test_kms};
-use slatefs_core::config::Compression;
-use slatefs_core::control::{ControlPlane, QuotaLimit, QuotaLimits};
-use slatefs_core::crypto::Cipher;
-use slatefs_core::meta::inode::{FileKind, ROOT_INO};
-use slatefs_core::store;
+use slatefs_core::config::{AtimeMode, Compression};
+use slatefs_core::control::{ControlPlane, QuotaLimit, QuotaLimits, VolumeRecord};
+use slatefs_core::crypto::{Cipher, Secret32};
+use slatefs_core::meta::inode::{FileKind, ROOT_INO, Timespec};
+use slatefs_core::snapshot::SnapshotVolume;
+use slatefs_core::store::{self, ObjectStore};
 use slatefs_core::vfs::{Credentials, FsError, OpenMode, SetAttrs, TimeSet, Vfs};
 use slatefs_core::volume::{self, CreateVolumeOptions};
 
@@ -25,6 +27,44 @@ fn alice() -> Credentials {
 
 fn bob() -> Credentials {
     Credentials::user(1001, 1001)
+}
+
+fn fixed_time(secs: i64) -> Timespec {
+    Timespec { secs, nanos: 0 }
+}
+
+async fn fresh_volume_with_record() -> (Arc<dyn ObjectStore>, VolumeRecord, Secret32) {
+    let object_store = store::resolve_root("memory:///").unwrap();
+    let control = ControlPlane::open(Arc::clone(&object_store), test_kms())
+        .await
+        .expect("open control plane");
+    control.create_tenant("t", None).await.expect("tenant");
+    let record = volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "v",
+        common::create_opts(None, None),
+    )
+    .await
+    .expect("create volume");
+    let dek = control.unwrap_volume_dek(&record).await.expect("dek");
+    control.close().await.expect("close control");
+    (object_store, record, dek)
+}
+
+async fn set_file_times(v: &dyn Vfs, ino: u64, atime: Timespec, mtime: Timespec) {
+    v.setattr(
+        &root(),
+        ino,
+        SetAttrs {
+            atime: Some(TimeSet::Time(atime)),
+            mtime: Some(TimeSet::Time(mtime)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("set file times");
 }
 
 #[tokio::test]
@@ -71,6 +111,140 @@ async fn create_lookup_read_write_roundtrip() {
     );
 
     assert!(v.fsck().await.unwrap().is_clean());
+}
+
+#[tokio::test]
+async fn atime_policy_strict_updates_every_read() {
+    let v = fresh_volume().await;
+    let f = v
+        .create(&root(), ROOT_INO, b"strict-atime", 0o644, true)
+        .await
+        .unwrap();
+    v.write(&root(), f.ino, 0, b"payload").await.unwrap();
+
+    let old = fixed_time(10);
+    set_file_times(v.as_ref(), f.ino, old, old).await;
+    v.read_with_atime_policy(&root(), f.ino, 0, 7, AtimeMode::Strict)
+        .await
+        .unwrap();
+    let after_first = v.getattr(&root(), f.ino).await.unwrap().atime;
+    assert!(after_first > old, "strict read should update atime");
+
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    v.read_with_atime_policy(&root(), f.ino, 0, 7, AtimeMode::Strict)
+        .await
+        .unwrap();
+    let after_second = v.getattr(&root(), f.ino).await.unwrap().atime;
+    assert!(
+        after_second > after_first,
+        "strict should update atime on every successful read"
+    );
+}
+
+#[tokio::test]
+async fn atime_policy_noatime_skips_read_updates() {
+    let v = fresh_volume().await;
+    let f = v
+        .create(&root(), ROOT_INO, b"noatime", 0o644, true)
+        .await
+        .unwrap();
+    v.write(&root(), f.ino, 0, b"payload").await.unwrap();
+
+    let old = fixed_time(10);
+    let newer_mtime = fixed_time(20);
+    set_file_times(v.as_ref(), f.ino, old, newer_mtime).await;
+    v.read_with_atime_policy(&root(), f.ino, 0, 7, AtimeMode::Noatime)
+        .await
+        .unwrap();
+    let after = v.getattr(&root(), f.ino).await.unwrap();
+    assert_eq!(after.atime, old, "noatime read must not change atime");
+    assert_eq!(
+        after.mtime, newer_mtime,
+        "read-side atime policy must not affect mtime"
+    );
+}
+
+#[tokio::test]
+async fn atime_policy_relatime_updates_when_mtime_is_newer() {
+    let v = fresh_volume().await;
+    let f = v
+        .create(&root(), ROOT_INO, b"relatime", 0o644, true)
+        .await
+        .unwrap();
+    v.write(&root(), f.ino, 0, b"payload").await.unwrap();
+
+    let old = fixed_time(10);
+    set_file_times(v.as_ref(), f.ino, old, fixed_time(20)).await;
+    v.read_with_atime_policy(&root(), f.ino, 0, 7, AtimeMode::Relatime)
+        .await
+        .unwrap();
+    let after = v.getattr(&root(), f.ino).await.unwrap().atime;
+    assert!(after > old, "relatime should update when atime lags mtime");
+}
+
+#[tokio::test]
+async fn same_volume_exports_can_use_independent_atime_policies() {
+    let v = fresh_volume().await;
+    let f = v
+        .create(&root(), ROOT_INO, b"shared-volume", 0o644, true)
+        .await
+        .unwrap();
+    v.write(&root(), f.ino, 0, b"payload").await.unwrap();
+
+    let old = fixed_time(10);
+    set_file_times(v.as_ref(), f.ino, old, fixed_time(20)).await;
+    v.read_with_atime_policy(&root(), f.ino, 0, 7, AtimeMode::Noatime)
+        .await
+        .unwrap();
+    assert_eq!(
+        v.getattr(&root(), f.ino).await.unwrap().atime,
+        old,
+        "noatime export should leave shared inode unchanged"
+    );
+
+    v.read_with_atime_policy(&root(), f.ino, 0, 7, AtimeMode::Strict)
+        .await
+        .unwrap();
+    assert!(
+        v.getattr(&root(), f.ino).await.unwrap().atime > old,
+        "strict export should update the same backing volume"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_reads_never_persist_atime_even_with_strict_policy() {
+    let (object_store, record, dek) = fresh_volume_with_record().await;
+    let v = volume::Volume::open(&record, dek.clone(), Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let f = v
+        .create(&root(), ROOT_INO, b"snap-atime", 0o644, true)
+        .await
+        .unwrap();
+    v.write(&root(), f.ino, 0, b"payload").await.unwrap();
+    let old = fixed_time(10);
+    set_file_times(v.as_ref(), f.ino, old, old).await;
+    let snapshot = v
+        .create_live_snapshot(Some("snap".to_string()))
+        .await
+        .unwrap();
+
+    let snap = SnapshotVolume::open(&record, dek, object_store, &snapshot.id, Vec::new())
+        .await
+        .unwrap();
+    let before = snap.getattr(&root(), f.ino).await.unwrap().atime;
+    snap.read_with_atime_policy(&root(), f.ino, 0, 7, AtimeMode::Strict)
+        .await
+        .unwrap();
+    let after = snap.getattr(&root(), f.ino).await.unwrap().atime;
+    assert_eq!(before, old);
+    assert_eq!(
+        after, before,
+        "snapshot VFS is read-only and must ignore read atime policy"
+    );
+
+    snap.shutdown().await.unwrap();
+    v.shutdown().await.unwrap();
 }
 
 #[tokio::test]
