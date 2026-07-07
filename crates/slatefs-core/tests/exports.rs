@@ -2,7 +2,7 @@ mod common;
 
 use std::sync::Arc;
 
-use slatefs_core::config::{ExportConfig, ExportProtocol};
+use slatefs_core::config::{ExportConfig, ExportProtocol, NbdSyncMode};
 use slatefs_core::control::{ControlPlane, ExportRecord};
 use slatefs_core::store;
 use slatefs_core::volume;
@@ -33,6 +33,11 @@ async fn export_crud_round_trips() {
             listen: "127.0.0.1:12049".to_string(),
             allowed_clients: vec!["127.0.0.1".parse().unwrap()],
             protocol: ExportProtocol::Nfs,
+            read_only: false,
+            sync: NbdSyncMode::Default,
+            nbd_tls_cert: None,
+            nbd_tls_key: None,
+            nbd_tls_client_ca: None,
             p9_token: None,
             p9_tls_cert: None,
             p9_tls_key: None,
@@ -93,6 +98,11 @@ async fn export_validation_rejects_bad_records() {
             listen: "127.0.0.1:12049".to_string(),
             allowed_clients: Vec::new(),
             protocol: ExportProtocol::Nfs,
+            read_only: false,
+            sync: NbdSyncMode::Default,
+            nbd_tls_cert: None,
+            nbd_tls_key: None,
+            nbd_tls_client_ca: None,
             p9_token: None,
             p9_tls_cert: None,
             p9_tls_key: None,
@@ -113,6 +123,12 @@ async fn export_validation_rejects_bad_records() {
     invalid_id.protocol = ExportProtocol::Nfs;
     invalid_id.p9_tls_cert = Some("/tmp/cert.pem".into());
     invalid_id.p9_tls_key = Some("/tmp/key.pem".into());
+    assert!(control.create_export(invalid_id.clone()).await.is_err());
+
+    invalid_id.p9_tls_cert = None;
+    invalid_id.p9_tls_key = None;
+    invalid_id.nbd_tls_cert = Some("/tmp/cert.pem".into());
+    invalid_id.nbd_tls_key = Some("/tmp/key.pem".into());
     assert!(control.create_export(invalid_id).await.is_err());
     control.close().await.unwrap();
 }

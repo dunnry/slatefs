@@ -12,8 +12,9 @@ use slatefs_core::control::{
     SnapshotRetentionPolicy, VolumePlacementRecord,
 };
 use slatefs_core::crypto::kms::{self, LocalAgeKms};
+use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
-use slatefs_core::volume::{self, CreateVolumeOptions};
+use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
 use slatefs_core::{config, store};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -106,12 +107,24 @@ enum TenantRateCmd {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolumeCreateKind {
+    Filesystem,
+    Block,
+}
+
 #[derive(Subcommand)]
 enum VolumeCmd {
     /// Create a volume: control record + encrypted mkfs.
     Create {
         tenant: String,
         volume: String,
+        /// Volume kind. Filesystem is the default; block requires --size.
+        #[arg(long, default_value = "filesystem", value_parser = parse_volume_create_kind)]
+        kind: VolumeCreateKind,
+        /// Block volume virtual size in bytes, or K/M/G/T base-2 units.
+        #[arg(long, value_name = "BYTES|K|M|G|T", value_parser = parse_size_bytes)]
+        size: Option<u64>,
         /// Chunk size in bytes; power of two in [4KiB, 4MiB]. Fixed at mkfs.
         #[arg(long)]
         chunk_size: Option<u32>,
@@ -139,6 +152,15 @@ enum VolumeCmd {
     /// Read-only online structural scrub. Safe while the volume is served;
     /// reports drift but never rewrites counters.
     Scrub { tenant: String, volume: String },
+    /// Grow an offline block volume. Opens the volume writer lease, so do
+    /// not run while the volume is served by slatefsd.
+    Resize {
+        tenant: String,
+        volume: String,
+        /// New block volume size in bytes, or K/M/G/T base-2 units.
+        #[arg(long, value_name = "BYTES|K|M|G|T", value_parser = parse_size_bytes)]
+        size: u64,
+    },
     /// Mark a volume deleting and crypto-shred its wrapped DEK.
     Delete {
         tenant: String,
@@ -253,6 +275,12 @@ enum ExportCmd {
         snapshot: Option<String>,
         #[arg(long, default_value = "nfs", value_parser = parse_export_protocol)]
         protocol: config::ExportProtocol,
+        /// NBD only: export as read-only. Snapshot exports are always read-only.
+        #[arg(long)]
+        read_only: bool,
+        /// NBD only: strict forces every write/write-zeroes request to use FUA.
+        #[arg(long, default_value = "default", value_parser = parse_nbd_sync_mode)]
+        sync: config::NbdSyncMode,
         #[arg(long)]
         listen: String,
         #[arg(long = "allowed-client", value_parser = parse_client_addr_rule)]
@@ -271,6 +299,12 @@ enum ExportCmd {
         p9_tls_cert: Option<PathBuf>,
         #[arg(long)]
         p9_tls_key: Option<PathBuf>,
+        #[arg(long)]
+        nbd_tls_cert: Option<PathBuf>,
+        #[arg(long)]
+        nbd_tls_key: Option<PathBuf>,
+        #[arg(long)]
+        nbd_tls_client_ca: Option<PathBuf>,
         #[arg(long)]
         disabled: bool,
     },
@@ -291,6 +325,10 @@ enum ExportCmd {
         clear_snapshot: bool,
         #[arg(long, value_parser = parse_export_protocol)]
         protocol: Option<config::ExportProtocol>,
+        #[arg(long)]
+        read_only: Option<bool>,
+        #[arg(long, value_parser = parse_nbd_sync_mode)]
+        sync: Option<config::NbdSyncMode>,
         #[arg(long)]
         listen: Option<String>,
         #[arg(long = "allowed-client", value_parser = parse_client_addr_rule)]
@@ -317,6 +355,18 @@ enum ExportCmd {
         p9_tls_key: Option<PathBuf>,
         #[arg(long)]
         clear_p9_tls_key: bool,
+        #[arg(long)]
+        nbd_tls_cert: Option<PathBuf>,
+        #[arg(long)]
+        clear_nbd_tls_cert: bool,
+        #[arg(long)]
+        nbd_tls_key: Option<PathBuf>,
+        #[arg(long)]
+        clear_nbd_tls_key: bool,
+        #[arg(long)]
+        nbd_tls_client_ca: Option<PathBuf>,
+        #[arg(long)]
+        clear_nbd_tls_client_ca: bool,
         #[arg(long)]
         enabled: Option<bool>,
     },
@@ -482,6 +532,46 @@ fn parse_compression(s: &str) -> Result<config::Compression, String> {
     }
 }
 
+fn parse_volume_create_kind(s: &str) -> Result<VolumeCreateKind, String> {
+    match s {
+        "filesystem" | "fs" => Ok(VolumeCreateKind::Filesystem),
+        "block" => Ok(VolumeCreateKind::Block),
+        _ => Err(format!("unknown volume kind {s:?} (filesystem|block)")),
+    }
+}
+
+fn parse_size_bytes(raw: &str) -> Result<u64, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("size must not be empty".to_string());
+    }
+
+    let (digits, multiplier) = match raw.as_bytes().last().copied() {
+        Some(b'K' | b'k') => (&raw[..raw.len() - 1], 1024u64),
+        Some(b'M' | b'm') => (&raw[..raw.len() - 1], 1024u64.pow(2)),
+        Some(b'G' | b'g') => (&raw[..raw.len() - 1], 1024u64.pow(3)),
+        Some(b'T' | b't') => (&raw[..raw.len() - 1], 1024u64.pow(4)),
+        Some(byte) if byte.is_ascii_digit() => (raw, 1),
+        Some(_) => {
+            return Err(format!(
+                "invalid size {raw:?}; expected bytes or K/M/G/T suffix"
+            ));
+        }
+        None => unreachable!("raw is non-empty"),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "invalid size {raw:?}; expected integer bytes or K/M/G/T suffix"
+        ));
+    }
+    let value = digits
+        .parse::<u64>()
+        .map_err(|_| format!("invalid size {raw:?}; expected u64"))?;
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("size {raw:?} overflows u64"))
+}
+
 fn parse_cipher(s: &str) -> Result<config::CipherChoice, String> {
     match s {
         "auto" => Ok(config::CipherChoice::Auto),
@@ -497,7 +587,16 @@ fn parse_export_protocol(s: &str) -> Result<config::ExportProtocol, String> {
     match s {
         "nfs" => Ok(config::ExportProtocol::Nfs),
         "p9" => Ok(config::ExportProtocol::P9),
-        _ => Err(format!("unknown protocol {s:?} (nfs|p9)")),
+        "nbd" => Ok(config::ExportProtocol::Nbd),
+        _ => Err(format!("unknown protocol {s:?} (nfs|p9|nbd)")),
+    }
+}
+
+fn parse_nbd_sync_mode(s: &str) -> Result<config::NbdSyncMode, String> {
+    match s {
+        "default" => Ok(config::NbdSyncMode::Default),
+        "strict" => Ok(config::NbdSyncMode::Strict),
+        _ => Err(format!("unknown NBD sync mode {s:?} (default|strict)")),
     }
 }
 
@@ -645,6 +744,14 @@ fn protocol_name(protocol: config::ExportProtocol) -> &'static str {
     match protocol {
         config::ExportProtocol::Nfs => "nfs",
         config::ExportProtocol::P9 => "p9",
+        config::ExportProtocol::Nbd => "nbd",
+    }
+}
+
+fn nbd_sync_name(sync: config::NbdSyncMode) -> &'static str {
+    match sync {
+        config::NbdSyncMode::Default => "default",
+        config::NbdSyncMode::Strict => "strict",
     }
 }
 
@@ -670,6 +777,8 @@ fn print_export(export: &ExportRecord) {
     println!("target:      {}/{}", export.tenant, export.volume);
     println!("snapshot:    {}", export.snapshot.as_deref().unwrap_or("-"));
     println!("protocol:    {}", protocol_name(export.protocol));
+    println!("read_only:   {}", export.effective_read_only());
+    println!("sync:        {}", nbd_sync_name(export.sync));
     println!("listen:      {}", export.listen);
     println!(
         "allowed:     {}",
@@ -703,6 +812,30 @@ fn print_export(export: &ExportRecord) {
         "p9_tls_key:  {}",
         export
             .p9_tls_key
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!(
+        "nbd_tls_cert: {}",
+        export
+            .nbd_tls_cert
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!(
+        "nbd_tls_key:  {}",
+        export
+            .nbd_tls_key
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!(
+        "nbd_tls_client_ca: {}",
+        export
+            .nbd_tls_client_ca
             .as_deref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "-".to_string())
@@ -1004,28 +1137,68 @@ async fn run(
         Command::Volume(VolumeCmd::Create {
             tenant,
             volume,
+            kind,
+            size,
             chunk_size,
             compression,
             cipher,
             note,
-        }) => {
-            let mut opts = CreateVolumeOptions::from_defaults(&config.volume_defaults);
-            if let Some(chunk_size) = chunk_size {
-                opts.chunk_size = *chunk_size;
+        }) => match kind {
+            VolumeCreateKind::Filesystem => {
+                if size.is_some() {
+                    anyhow::bail!("--size requires --kind block");
+                }
+                let mut opts = CreateVolumeOptions::from_defaults(&config.volume_defaults);
+                if let Some(chunk_size) = chunk_size {
+                    opts.chunk_size = *chunk_size;
+                }
+                if let Some(compression) = compression {
+                    opts.compression = *compression;
+                }
+                if let Some(cipher) = cipher {
+                    opts.cipher = cipher.resolve();
+                }
+                opts.note = note.clone();
+                let record =
+                    volume::create_volume(control, object_store, tenant, volume, opts).await?;
+                println!(
+                    "created volume {}/{} fsid={:016x} cipher={} chunk_size={}",
+                    record.tenant, record.name, record.fsid, record.cipher, record.chunk_size
+                );
             }
-            if let Some(compression) = compression {
-                opts.compression = *compression;
+            VolumeCreateKind::Block => {
+                let size_bytes = size.ok_or_else(|| {
+                    anyhow::anyhow!("--kind block requires --size <bytes|K|M|G|T>")
+                })?;
+                let mut opts =
+                    CreateBlockVolumeOptions::from_defaults(&config.volume_defaults, size_bytes);
+                if let Some(chunk_size) = chunk_size {
+                    opts.chunk_size = *chunk_size;
+                }
+                if let Some(compression) = compression {
+                    opts.compression = *compression;
+                }
+                if let Some(cipher) = cipher {
+                    opts.cipher = cipher.resolve();
+                }
+                opts.note = note.clone();
+                let record =
+                    volume::create_block_volume(control, object_store, tenant, volume, opts)
+                        .await?;
+                let VolumeKind::Block { size_bytes } = record.kind else {
+                    unreachable!("create_block_volume returned a non-block volume")
+                };
+                println!(
+                    "created block volume {}/{} fsid={:016x} cipher={} chunk_size={} size_bytes={}",
+                    record.tenant,
+                    record.name,
+                    record.fsid,
+                    record.cipher,
+                    record.chunk_size,
+                    size_bytes
+                );
             }
-            if let Some(cipher) = cipher {
-                opts.cipher = cipher.resolve();
-            }
-            opts.note = note.clone();
-            let record = volume::create_volume(control, object_store, tenant, volume, opts).await?;
-            println!(
-                "created volume {}/{} fsid={:016x} cipher={} chunk_size={}",
-                record.tenant, record.name, record.fsid, record.cipher, record.chunk_size
-            );
-        }
+        },
         Command::Volume(VolumeCmd::Info { tenant, volume }) => {
             let info = volume::volume_info(control, object_store, tenant, volume).await?;
             let r = &info.record;
@@ -1033,6 +1206,14 @@ async fn run(
             println!("volume:      {}/{}", r.tenant, r.name);
             println!("state:       {:?}", r.state);
             println!("fsid:        {:016x}", sb.fsid);
+            match sb.kind {
+                VolumeKind::Filesystem => println!("kind:        filesystem"),
+                VolumeKind::Block { size_bytes } => {
+                    println!("kind:        block");
+                    println!("size_bytes:  {size_bytes}");
+                    println!("allocated:   {}", info.counter_bytes);
+                }
+            }
             println!("cipher:      {}", sb.cipher);
             println!("chunk_size:  {}", sb.chunk_size);
             println!("compression: {:?}", r.compression);
@@ -1061,13 +1242,29 @@ async fn run(
         }) => {
             let record = control.get_volume(tenant, vol_name).await?;
             let dek = control.unwrap_volume_dek(&record).await?;
-            let vol = volume::Volume::open(&record, dek, object_store).await?;
-            let report = if *recount {
-                vol.fsck_recount().await?
-            } else {
-                vol.fsck().await?
+            let report = match record.kind {
+                VolumeKind::Filesystem => {
+                    let vol = volume::Volume::open(&record, dek, object_store).await?;
+                    let report = if *recount {
+                        vol.fsck_recount().await?
+                    } else {
+                        vol.fsck().await?
+                    };
+                    vol.shutdown().await?;
+                    report
+                }
+                VolumeKind::Block { .. } => {
+                    let vol =
+                        slatefs_core::block::BlockVolume::open(&record, dek, object_store).await?;
+                    let report = if *recount {
+                        vol.fsck_recount().await?
+                    } else {
+                        vol.fsck().await?
+                    };
+                    vol.shutdown().await?;
+                    report
+                }
             };
-            vol.shutdown().await?;
 
             print_fsck_report(&report);
             if report.is_clean() {
@@ -1086,6 +1283,22 @@ async fn run(
             } else {
                 anyhow::bail!("scrub found problems or counter drift");
             }
+        }
+        Command::Volume(VolumeCmd::Resize {
+            tenant,
+            volume: volume_name,
+            size,
+        }) => {
+            let record =
+                volume::resize_block_volume(control, object_store, tenant, volume_name, *size)
+                    .await?;
+            let VolumeKind::Block { size_bytes } = record.kind else {
+                unreachable!("resize_block_volume returned a non-block volume")
+            };
+            println!(
+                "resized block volume {}/{} size_bytes={}",
+                record.tenant, record.name, size_bytes
+            );
         }
         Command::Volume(VolumeCmd::Delete {
             tenant,
@@ -1288,6 +1501,8 @@ async fn run(
                 volume,
                 snapshot,
                 protocol,
+                read_only,
+                sync,
                 listen,
                 allowed_clients,
                 squash,
@@ -1297,6 +1512,9 @@ async fn run(
                 p9_token,
                 p9_tls_cert,
                 p9_tls_key,
+                nbd_tls_cert,
+                nbd_tls_key,
+                nbd_tls_client_ca,
                 disabled,
             } => {
                 let record = ExportRecord::from_config(
@@ -1308,6 +1526,11 @@ async fn run(
                         listen: listen.clone(),
                         allowed_clients: allowed_clients.clone(),
                         protocol: *protocol,
+                        read_only: *read_only,
+                        sync: *sync,
+                        nbd_tls_cert: nbd_tls_cert.clone(),
+                        nbd_tls_key: nbd_tls_key.clone(),
+                        nbd_tls_client_ca: nbd_tls_client_ca.clone(),
                         p9_token: p9_token.clone(),
                         p9_tls_cert: p9_tls_cert.clone(),
                         p9_tls_key: p9_tls_key.clone(),
@@ -1324,12 +1547,14 @@ async fn run(
             ExportCmd::List => {
                 for export in control.list_exports().await? {
                     println!(
-                        "{}\t{}\t{}/{}\tsnapshot={}\tlisten={}\tenabled={}",
+                        "{}\t{}\t{}/{}\tsnapshot={}\tread_only={}\tsync={}\tlisten={}\tenabled={}",
                         export.id,
                         protocol_name(export.protocol),
                         export.tenant,
                         export.volume,
                         export.snapshot.as_deref().unwrap_or("-"),
+                        export.effective_read_only(),
+                        nbd_sync_name(export.sync),
                         export.listen,
                         export.enabled
                     );
@@ -1346,6 +1571,8 @@ async fn run(
                 snapshot,
                 clear_snapshot,
                 protocol,
+                read_only,
+                sync,
                 listen,
                 allowed_clients,
                 clear_allowed_clients,
@@ -1359,6 +1586,12 @@ async fn run(
                 clear_p9_tls_cert,
                 p9_tls_key,
                 clear_p9_tls_key,
+                nbd_tls_cert,
+                clear_nbd_tls_cert,
+                nbd_tls_key,
+                clear_nbd_tls_key,
+                nbd_tls_client_ca,
+                clear_nbd_tls_client_ca,
                 enabled,
             } => {
                 let mut record = control.get_export(id).await?;
@@ -1376,6 +1609,12 @@ async fn run(
                 }
                 if let Some(protocol) = protocol {
                     record.protocol = *protocol;
+                }
+                if let Some(read_only) = read_only {
+                    record.read_only = *read_only;
+                }
+                if let Some(sync) = sync {
+                    record.sync = *sync;
                 }
                 if let Some(listen) = listen {
                     record.listen = listen.clone();
@@ -1415,6 +1654,24 @@ async fn run(
                 }
                 if let Some(p9_tls_key) = p9_tls_key {
                     record.p9_tls_key = Some(p9_tls_key.clone());
+                }
+                if *clear_nbd_tls_cert {
+                    record.nbd_tls_cert = None;
+                }
+                if let Some(nbd_tls_cert) = nbd_tls_cert {
+                    record.nbd_tls_cert = Some(nbd_tls_cert.clone());
+                }
+                if *clear_nbd_tls_key {
+                    record.nbd_tls_key = None;
+                }
+                if let Some(nbd_tls_key) = nbd_tls_key {
+                    record.nbd_tls_key = Some(nbd_tls_key.clone());
+                }
+                if *clear_nbd_tls_client_ca {
+                    record.nbd_tls_client_ca = None;
+                }
+                if let Some(nbd_tls_client_ca) = nbd_tls_client_ca {
+                    record.nbd_tls_client_ca = Some(nbd_tls_client_ca.clone());
                 }
                 if let Some(enabled) = enabled {
                     record.enabled = *enabled;
@@ -1627,4 +1884,40 @@ async fn run(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_size_bytes_accepts_plain_bytes_and_binary_suffixes() {
+        assert_eq!(parse_size_bytes("4096").unwrap(), 4096);
+        assert_eq!(parse_size_bytes("1K").unwrap(), 1024);
+        assert_eq!(parse_size_bytes("2m").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(parse_size_bytes("100G").unwrap(), 100 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size_bytes("1T").unwrap(), 1024_u64.pow(4));
+    }
+
+    #[test]
+    fn parse_size_bytes_rejects_invalid_values() {
+        assert!(parse_size_bytes("").is_err());
+        assert!(parse_size_bytes("1.5G").is_err());
+        assert!(parse_size_bytes("12GB").is_err());
+        assert!(parse_size_bytes("K").is_err());
+        assert!(parse_size_bytes("18446744073709551615T").is_err());
+    }
+
+    #[test]
+    fn parses_nbd_export_cli_values() {
+        assert_eq!(
+            parse_export_protocol("nbd").unwrap(),
+            config::ExportProtocol::Nbd
+        );
+        assert_eq!(
+            parse_nbd_sync_mode("strict").unwrap(),
+            config::NbdSyncMode::Strict
+        );
+        assert!(parse_nbd_sync_mode("always").is_err());
+    }
 }

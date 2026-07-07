@@ -3994,6 +3994,7 @@ name = "slatefs-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "nfs3_server",
  "serde",
@@ -4001,11 +4002,26 @@ dependencies = [
  "slatedb",
  "slatefs-9p",
  "slatefs-core",
+ "slatefs-nbd",
  "slatefs-nfs",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "slatefs-nbd"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "proptest",
+ "rustls-pemfile",
+ "slatefs-core",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tracing",
 ]
 
 [[package]]

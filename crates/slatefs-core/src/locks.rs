@@ -54,6 +54,28 @@ impl LockManager {
         guards
     }
 
+    /// Exclusive locks for every key in an inclusive numeric range. This is
+    /// used by block extents keyed by chunk index; very large ranges lock all
+    /// stripes instead of materializing every chunk id.
+    pub async fn write_range(&self, first: u64, last: u64) -> Vec<OwnedRwLockWriteGuard<()>> {
+        if first > last {
+            return Vec::new();
+        }
+        let count = last - first + 1;
+        let mut stripes: Vec<usize> = if count >= STRIPES as u64 {
+            (0..STRIPES).collect()
+        } else {
+            (first..=last).map(|i| self.stripe_of(i)).collect()
+        };
+        stripes.sort_unstable();
+        stripes.dedup();
+        let mut guards = Vec::with_capacity(stripes.len());
+        for s in stripes {
+            guards.push(Arc::clone(&self.stripes[s]).write_owned().await);
+        }
+        guards
+    }
+
     /// Serializes directory renames volume-wide (plan §10: cycle check runs
     /// under this).
     pub async fn rename_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {

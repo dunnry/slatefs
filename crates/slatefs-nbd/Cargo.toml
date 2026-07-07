@@ -1,0 +1,23 @@
+[package]
+name = "slatefs-nbd"
+description = "NBD frontend for SlateFS block volumes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+slatefs-core.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+
+[features]
+test-support = []
+
+[dev-dependencies]
+async-trait.workspace = true
+proptest.workspace = true

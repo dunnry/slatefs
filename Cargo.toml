@@ -4,6 +4,7 @@ members = [
     "crates/slatefs-core",
     "crates/slatefs-nfs",
     "crates/slatefs-9p",
+    "crates/slatefs-nbd",
     "crates/slatefs-daemon",
     "crates/slatefs-cli",
     "crates/nfs3-server",
@@ -21,6 +22,7 @@ rust-version = "1.88"
 slatefs-core = { path = "crates/slatefs-core" }
 slatefs-nfs = { path = "crates/slatefs-nfs" }
 slatefs-9p = { path = "crates/slatefs-9p" }
+slatefs-nbd = { path = "crates/slatefs-nbd" }
 
 # Storage engine. Pinned against the API surface verified in slatefs-plan.md §0;
 # re-verify the BlockTransformer/DbBuilder contract before bumping.

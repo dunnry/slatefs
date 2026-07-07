@@ -15,6 +15,7 @@ use crate::error::Result;
 use crate::meta::dirent::{Dirent, DirentIdx, Orphan};
 use crate::meta::inode::{FileKind, Inode, ROOT_INO};
 use crate::meta::keys;
+use crate::meta::superblock::KEY_SUPERBLOCK;
 use crate::quota::{self, billed_chunk_bytes};
 
 #[derive(Debug, Default)]
@@ -151,6 +152,83 @@ pub async fn check_reader(
     names: &NameCodec,
 ) -> Result<FsckReport> {
     check_readable(reader, chunk_size, names).await
+}
+
+/// Verify a block volume keyspace and quota counters.
+pub async fn check_block(db: &Db, size_bytes: u64, chunk_size: u64) -> Result<FsckReport> {
+    check_block_readable(db, size_bytes, chunk_size).await
+}
+
+/// Verify a block volume through a read-only [`DbReader`].
+pub async fn check_block_reader(
+    reader: &DbReader,
+    size_bytes: u64,
+    chunk_size: u64,
+) -> Result<FsckReport> {
+    check_block_readable(reader, size_bytes, chunk_size).await
+}
+
+async fn check_block_readable(
+    db: &(impl FsckRead + Sync),
+    size_bytes: u64,
+    chunk_size: u64,
+) -> Result<FsckReport> {
+    let counter_bytes = quota::decode_counter(db.get_key(keys::KEY_QUOTA_BYTES).await?.as_deref());
+    let counter_inodes =
+        quota::decode_counter(db.get_key(keys::KEY_QUOTA_INODES).await?.as_deref());
+    let mut report = FsckReport {
+        inodes_counted: 1,
+        counter_bytes,
+        counter_inodes,
+        ..Default::default()
+    };
+    let mut saw_superblock = false;
+    let mut bytes_counted = 0i64;
+
+    let mut iter = db.scan_all_keys().await?;
+    while let Some(kv) = iter.next().await? {
+        let key: &[u8] = &kv.key;
+        if key == KEY_SUPERBLOCK {
+            saw_superblock = true;
+            continue;
+        }
+        if key == keys::KEY_QUOTA_BYTES || key == keys::KEY_QUOTA_INODES {
+            continue;
+        }
+
+        let Some((ino, idx)) = keys::parse_chunk(key) else {
+            report
+                .problems
+                .push(format!("unexpected block-volume key {:?}", kv.key));
+            continue;
+        };
+        if ino != crate::block::BLOCK_INO {
+            report.problems.push(format!(
+                "unexpected block-volume chunk owner {ino} at chunk {idx}"
+            ));
+            continue;
+        }
+
+        let chunk_start = idx as u64 * chunk_size;
+        if chunk_start >= size_bytes {
+            report.problems.push(format!(
+                "block chunk {idx}: starts at {chunk_start}, beyond size_bytes {size_bytes}"
+            ));
+        }
+        if kv.value.len() as u64 > chunk_size {
+            report.problems.push(format!(
+                "block chunk {idx}: oversize ({} bytes > chunk_size {chunk_size})",
+                kv.value.len()
+            ));
+        }
+        bytes_counted += billed_chunk_bytes(size_bytes, chunk_start, kv.value.len()) as i64;
+    }
+
+    if !saw_superblock {
+        report.problems.push("superblock missing".into());
+    }
+    report.bytes_counted = bytes_counted;
+    Ok(report)
 }
 
 async fn check_readable(
@@ -353,6 +431,19 @@ async fn check_readable(
 /// The volume must not be serving (single writer).
 pub async fn recount(db: &Db, chunk_size: u64, names: &NameCodec) -> Result<FsckReport> {
     let report = check(db, chunk_size, names).await?;
+    if !report.counters_match() {
+        let mut batch = WriteBatch::new();
+        batch.put(keys::KEY_QUOTA_BYTES, report.bytes_counted.to_le_bytes());
+        batch.put(keys::KEY_QUOTA_INODES, report.inodes_counted.to_le_bytes());
+        db.write(batch).await?;
+        db.flush().await?;
+    }
+    Ok(report)
+}
+
+/// Rewrite block-volume quota counters from a scan.
+pub async fn recount_block(db: &Db, size_bytes: u64, chunk_size: u64) -> Result<FsckReport> {
+    let report = check_block(db, size_bytes, chunk_size).await?;
     if !report.counters_match() {
         let mut batch = WriteBatch::new();
         batch.put(keys::KEY_QUOTA_BYTES, report.bytes_counted.to_le_bytes());

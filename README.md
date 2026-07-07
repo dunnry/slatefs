@@ -217,6 +217,21 @@ The Phase 6 security review is recorded in
 The current pre-GA on-disk format and explicit no-backwards-compatibility
 upgrade policy live in [docs/on-disk-format.md](docs/on-disk-format.md).
 
+**Block-device/NBD support implemented** (plan
+[docs/block-device-plan.md](docs/block-device-plan.md)): SlateFS now has
+`kind = block` volumes backed by the same encrypted per-volume SlateDB store,
+an NBD frontend with fixed-newstyle negotiation, READ/WRITE/FLUSH/TRIM/
+WRITE_ZEROES, single-writer session leases, optional TLS/mTLS, daemon export
+reconciliation, CLI/admin support, and Prometheus metrics. Kernel ext4-over-NBD
+and crash-recovery coverage lives in
+[scripts/nbd-kernel-attach-test.sh](scripts/nbd-kernel-attach-test.sh);
+QEMU userspace and ZFS showcase smokes are
+[scripts/qemu-nbd-smoke.sh](scripts/qemu-nbd-smoke.sh) and
+[scripts/zfs-over-nbd-smoke.sh](scripts/zfs-over-nbd-smoke.sh). Remaining
+pre-GA items are the NBD fio/chunk-size matrix, the <10s failover timing gate,
+the ext4 fstrim allocation-drop investigation, and ZFS validation on kernels
+with zfs.ko.
+
 > Testing against kernel NFS clients: always mount with
 > `soft,intr,timeo=…` and bound every command touching the mountpoint
 > with a timeout — a `hard,nointr` mount to a misbehaving dev server
@@ -231,6 +246,7 @@ upgrade policy live in [docs/on-disk-format.md](docs/on-disk-format.md).
 | `slatefs-daemon` | `slatefsd` server (stub until Phase 2) |
 | `slatefs-nfs` | NFSv3 frontend (Phase 2) |
 | `slatefs-9p` | 9P2000.L frontend (Phase 4) |
+| `slatefs-nbd` | NBD block-device frontend |
 
 ## Quickstart (local MinIO)
 

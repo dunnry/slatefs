@@ -19,14 +19,14 @@ use crate::locks::{LockRange, RangeLock, RangeLockTable};
 use crate::meta::dirent::{Dirent, DirentIdx};
 use crate::meta::inode::{FileKind, Inode, MAX_NAME_LEN};
 use crate::meta::keys;
-use crate::meta::superblock::{KEY_SUPERBLOCK, Superblock};
+use crate::meta::superblock::{KEY_SUPERBLOCK, Superblock, VolumeKind};
 use crate::quota::{self, CounterMergeOperator};
 use crate::store;
 use crate::vfs::{
     Credentials, DirEntry, FileAttr, FsError, FsResult, HandleId, OpenMode, ReadDir, SetAttrs,
     StatFs, Vfs,
 };
-use crate::volume::HandleTable;
+use crate::volume::{HandleTable, verify_superblock_matches_record};
 
 const ACCESS_R: u32 = 4;
 const NOMINAL_BYTES: u64 = 1 << 60;
@@ -93,13 +93,11 @@ impl SnapshotVolume {
                 .await?
                 .ok_or_else(|| Error::invalid("snapshot", "no superblock"))?;
             let superblock = Superblock::decode(&bytes)?;
-            if superblock.fsid != record.fsid {
+            verify_superblock_matches_record(record, &superblock, "snapshot superblock")?;
+            if !matches!(superblock.kind, VolumeKind::Filesystem) {
                 return Err(Error::invalid(
-                    "snapshot superblock",
-                    format!(
-                        "fsid {:016x} does not match control record {:016x}",
-                        superblock.fsid, record.fsid
-                    ),
+                    "volume kind",
+                    "block snapshot cannot be opened as a filesystem snapshot",
                 ));
             }
             Ok(superblock)

@@ -533,7 +533,8 @@ documented perf table vs targets; runbook covers outage/fence/restore/key-rotati
 snapshot mount of a live volume reads consistently while writes continue.
 
 ### Backlog (post-v1, explicitly out of scope)
-NFSv4.1, NLM, FUSE/SMB frontends, DbReader read-replica fan-out for read-heavy volumes, NBD,
+NFSv4.1, NLM, FUSE/SMB frontends, DbReader read-replica fan-out for read-heavy volumes,
+NBD block devices (now planned separately: [docs/block-device-plan.md](docs/block-device-plan.md)),
 dedup, DEK rotation via clone, per-tenant qos classes, multi-region.
 
 ---

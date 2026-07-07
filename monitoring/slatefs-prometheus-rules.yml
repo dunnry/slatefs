@@ -72,3 +72,12 @@ groups:
         annotations:
           summary: "SlateFS tenant rate-limit rejections for {{ $labels.tenant }}"
           description: "The daemon returned EAGAIN because a tenant ops/bytes token bucket was exhausted."
+
+      - alert: SlateFSNBDAttachRejections
+        expr: sum by (tenant, volume, reason) (increase(slatefs_nbd_attach_rejected_total[5m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SlateFS NBD attach rejected for {{ $labels.tenant }}/{{ $labels.volume }}"
+          description: "One or more NBD client attaches were rejected. Check the reason label for busy, allowlist, name, or invalid negotiation failures."

@@ -15,6 +15,7 @@ path = "src/main.rs"
 slatefs-core.workspace = true
 slatefs-nfs.workspace = true
 slatefs-9p.workspace = true
+slatefs-nbd.workspace = true
 slatedb.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
@@ -26,4 +27,6 @@ serde.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+bytes.workspace = true
 nfs3_server.workspace = true
+slatefs-nbd = { workspace = true, features = ["test-support"] }

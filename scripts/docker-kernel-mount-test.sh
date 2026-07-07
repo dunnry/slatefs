@@ -4,6 +4,11 @@
 # mount lives in the Docker VM; a hang can't wedge the host, just kill the
 # container).
 #
+# NBD extra scripts use the Docker host/VM kernel too. On Linux hosts this
+# wrapper bind-mounts /lib/modules when present so modprobe can load nbd.ko;
+# Docker Desktop's LinuxKit VM may still lack nbd.ko, in which case the NBD
+# script reports SLATEFS_NBD_KERNEL_TEST_SKIPPED and exits 0.
+#
 # Usage: scripts/docker-kernel-mount-test.sh [extra-script]
 #   extra-script: optional path (relative to repo root) run inside the
 #                 container after the smoke test, with the same env.
@@ -17,7 +22,13 @@ EXTRA="${1:-}"
 docker volume create slatefs-cargo-registry >/dev/null
 docker volume create slatefs-target-linux >/dev/null
 
+KERNEL_MODULE_ARGS=()
+if [ -d /lib/modules ]; then
+    KERNEL_MODULE_ARGS=(-v /lib/modules:/lib/modules:ro)
+fi
+
 docker run --rm --privileged \
+    "${KERNEL_MODULE_ARGS[@]}" \
     -e PJD_TESTS -e PJD_PROVE_ARGS -e PJD_TIMEOUT -e SKIP_SMOKE \
     -e BIN_OVERRIDE \
     -e FSX_OPS -e FSSTRESS_OPS -e FSSTRESS_PROCS -e RESTARTS \
@@ -42,6 +53,25 @@ docker run --rm --privileged \
     -e LIVE_SNAPSHOT_CLONE_PORT -e LIVE_SNAPSHOT_CLONE_VOLUME -e LIVE_SNAPSHOT_METRICS_PORT \
     -e QEMU_BIN -e QEMU_KERNEL -e QEMU_TIMEOUT -e QEMU_INSTALL_DEPS \
     -e BUSYBOX -e SLATEFS_P9_PORT -e SLATEFS_P9_TOKEN -e SLATEFS_P9_ANAME \
+    -e SLATEFS_NBD_TENANT -e SLATEFS_NBD_VOLUME -e SLATEFS_NBD_SIZE_BYTES \
+    -e SLATEFS_NBD_CHUNK_SIZE \
+    -e SLATEFS_NBD_PORT -e SLATEFS_NBD_ADMIN_PORT -e SLATEFS_NBD_CLIENT_TIMEOUT \
+    -e SLATEFS_NBD_CRASH_WARMUP -e SLATEFS_NBD_OP_TIMEOUT \
+    -e SLATEFS_NBD_LONG_TIMEOUT -e SLATEFS_NBD_DEVICES -e SLATEFS_NBD_TRIM_MIB \
+    -e SLATEFS_NBD_DD_LOAD_TIMEOUT -e SLATEFS_NBD_DD_LOAD_MIB \
+    -e SLATEFS_QEMU_NBD_TENANT -e SLATEFS_QEMU_NBD_VOLUME \
+    -e SLATEFS_QEMU_NBD_SIZE_MIB -e SLATEFS_QEMU_NBD_SIZE_BYTES \
+    -e SLATEFS_QEMU_NBD_CHUNK_SIZE -e SLATEFS_QEMU_NBD_PORT \
+    -e SLATEFS_QEMU_NBD_ADMIN_PORT -e SLATEFS_QEMU_NBD_OP_TIMEOUT \
+    -e SLATEFS_QEMU_NBD_LONG_TIMEOUT -e SLATEFS_QEMU_NBD_BENCH_COUNT \
+    -e SLATEFS_QEMU_NBD_BENCH_DEPTH -e SLATEFS_QEMU_NBD_INSTALL_DEPS \
+    -e SLATEFS_QEMU_NBD_URI \
+    -e SLATEFS_ZFS_NBD_TENANT -e SLATEFS_ZFS_NBD_VOLUME \
+    -e SLATEFS_ZFS_NBD_SIZE_BYTES -e SLATEFS_ZFS_NBD_CHUNK_SIZE \
+    -e SLATEFS_ZFS_NBD_PORT -e SLATEFS_ZFS_NBD_ADMIN_PORT \
+    -e SLATEFS_ZFS_NBD_CLIENT_TIMEOUT -e SLATEFS_ZFS_NBD_PAYLOAD_MIB \
+    -e SLATEFS_ZFS_NBD_OP_TIMEOUT -e SLATEFS_ZFS_NBD_LONG_TIMEOUT \
+    -e SLATEFS_ZFS_NBD_POOL -e SLATEFS_ZFS_NBD_DEVICES \
     -v "$PWD":/src:ro \
     -v slatefs-cargo-registry:/usr/local/cargo/registry \
     -v slatefs-target-linux:/target \

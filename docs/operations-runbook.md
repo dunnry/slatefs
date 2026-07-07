@@ -53,6 +53,65 @@ clean and `fsx` completed all 50000 operations.
 `FAILOVER_FSX_OPS` is disabled by default for quick local smokes. When set, the drill builds
 xfstests inside the container and runs `fsx` on the takeover mount after the timed failover.
 
+## NBD Block Exports
+
+Attach a Linux kernel client with a bounded timeout and, where available,
+multiple connections:
+
+```sh
+modprobe nbd max_part=8 nbds_max=16
+nbd-client 10.0.0.10 12059 /dev/nbd0 -N /t1/b1 -persist off -timeout 60 -C 2
+mkfs.ext4 -F /dev/nbd0
+mount -t ext4 -o noatime /dev/nbd0 /mnt/slatefs-block
+```
+
+Detach cleanly:
+
+```sh
+umount /mnt/slatefs-block
+nbd-client -d /dev/nbd0
+```
+
+Offline grow is metadata-only on the SlateFS side, but the NBD client must be
+detached so the device size can be renegotiated:
+
+```sh
+umount /mnt/slatefs-block
+nbd-client -d /dev/nbd0
+slatefs -c /etc/slatefs/slatefs.toml volume resize t1 b1 --size 200G
+systemctl restart slatefsd
+nbd-client 10.0.0.10 12059 /dev/nbd0 -N /t1/b1 -persist off -timeout 60
+blockdev --rereadpt /dev/nbd0 || true
+resize2fs /dev/nbd0
+```
+
+For failover, move the stable endpoint to the takeover daemon and use a client
+that retries transport drops. Kernel clients can run with `nbd-client
+-persist` and a finite `-timeout`; QEMU clients should set `reconnect-delay`
+on the NBD blockdev. Validate the recovered filesystem with `e2fsck -f -p`
+after any forced outage drill. The Phase B3 timing gate remains the same as
+the filesystem failover target: resumed I/O in less than 10 seconds with no
+corruption.
+
+For snapshots and restore drills:
+
+1. Create a live checkpoint through the serving daemon:
+   `slatefs -c /etc/slatefs/slatefs.toml snapshot create --live t1 b1 --name before-upgrade`.
+2. Export the checkpoint read-only:
+   `slatefs -c /etc/slatefs/slatefs.toml export add b1-snap --tenant t1 --volume b1 --snapshot <checkpoint-id> --protocol nbd --listen 10.0.0.10:12060 --read-only`.
+3. Attach the snapshot export read-only and verify expected contents without mounting it writable.
+4. Create a writable clone when restore work needs mutation:
+   `slatefs -c /etc/slatefs/slatefs.toml clone create t1 b1 b1-restore --snapshot <checkpoint-id>`.
+5. Export the clone as a normal NBD target, run the application recovery smoke, then validate with `slatefs volume scrub t1 b1-restore`.
+
+Automated smokes:
+
+```sh
+SKIP_SMOKE=1 scripts/docker-kernel-mount-test.sh scripts/nbd-kernel-attach-test.sh
+SKIP_SMOKE=1 scripts/docker-kernel-mount-test.sh scripts/qemu-nbd-smoke.sh
+SKIP_SMOKE=1 scripts/docker-kernel-mount-test.sh scripts/zfs-over-nbd-smoke.sh
+```
+
 ## Object Store Outage
 
 Signal:

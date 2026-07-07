@@ -17,8 +17,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use slatedb::admin::AdminBuilder;
 use slatedb::object_store::ObjectStore;
+use slatefs_core::block::{
+    BlockDev, BlockVolume, ReadOnlyBlockDev, SnapshotBlockVolume, StrictSyncBlockDev,
+};
 use slatefs_core::config::{
-    AdminConfig, AtimeMode, ClientAddrRule, Config, ExportConfig, ExportProtocol, SquashMode,
+    AdminConfig, AtimeMode, ClientAddrRule, Config, ExportConfig, ExportProtocol, NbdSyncMode,
+    SquashMode, validate_export_volume_kind,
 };
 use slatefs_core::control::{
     AuditAction, AuditActor, AuditDetailValue, AuditOutcome, AuditPlane, AuditQuery, AuditRecord,
@@ -26,12 +30,14 @@ use slatefs_core::control::{
     TenantRecord, VolumePlacementRecord, VolumeRecord,
 };
 use slatefs_core::crypto::kms;
+use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::metrics::{AggregatingRecorder, PrometheusSample, render_prometheus};
 use slatefs_core::rate::{RateLimiter, RateLimits};
 use slatefs_core::snapshot::SnapshotVolume;
 use slatefs_core::store;
 use slatefs_core::vfs::Vfs;
 use slatefs_core::volume::{self, Volume, VolumeCaches};
+use slatefs_nbd::NbdShutdownHandle;
 use slatefs_nfs::{NFSTcp, SquashPolicy};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -63,9 +69,27 @@ enum MetricsTarget {
         snapshot_id: String,
         volume: Arc<SnapshotVolume>,
     },
+    BlockWritable {
+        tenant: String,
+        volume_name: String,
+        volume: Arc<BlockVolume>,
+    },
+    BlockSnapshot {
+        tenant: String,
+        volume_name: String,
+        snapshot_id: String,
+    },
 }
 
 type AdminTargets = Arc<Mutex<HashMap<(String, String), Arc<Volume>>>>;
+type AdminBlockTargets = Arc<Mutex<HashMap<(String, String), Arc<BlockVolume>>>>;
+
+#[derive(Clone)]
+struct ExportManagerTargets {
+    metrics: Arc<Mutex<Vec<MetricsTarget>>>,
+    admin: AdminTargets,
+    admin_blocks: AdminBlockTargets,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ExportSource {
@@ -141,7 +165,7 @@ impl ExportMetrics {
     fn samples(&self) -> Vec<PrometheusSample> {
         let active = self.active.lock().expect("export metrics poisoned");
         let mut samples = Vec::new();
-        for protocol in [ExportProtocol::Nfs, ExportProtocol::P9] {
+        for protocol in [ExportProtocol::Nfs, ExportProtocol::P9, ExportProtocol::Nbd] {
             for source in [ExportSource::Config, ExportSource::Control] {
                 let value = active.get(&(protocol, source)).copied().unwrap_or(0);
                 samples.push(PrometheusSample::new(
@@ -177,14 +201,27 @@ impl ExportMetrics {
 struct RunningExport {
     desired: DesiredExport,
     backend_key: (String, String, Option<String>),
+    nbd_shutdown: Option<NbdShutdownHandle>,
     task: tokio::task::JoinHandle<()>,
 }
 
 struct OpenBackend {
-    vfs: Arc<dyn Vfs>,
+    vfs: Option<Arc<dyn Vfs>>,
+    block: Option<Arc<dyn BlockDev>>,
     writable: Option<Arc<Volume>>,
     snapshot: Option<Arc<SnapshotVolume>>,
+    block_writable: Option<Arc<BlockVolume>>,
+    block_snapshot: Option<Arc<SnapshotBlockVolume>>,
+    nbd_shutdowns: Arc<Mutex<Vec<NbdShutdownHandle>>>,
     ref_count: usize,
+}
+
+enum BackendExport {
+    Fs(Arc<dyn Vfs>),
+    Block {
+        device: Arc<dyn BlockDev>,
+        shutdowns: Arc<Mutex<Vec<NbdShutdownHandle>>>,
+    },
 }
 
 struct ExportManager {
@@ -196,6 +233,7 @@ struct ExportManager {
     metrics: ExportMetrics,
     metrics_targets: Arc<Mutex<Vec<MetricsTarget>>>,
     admin_targets: AdminTargets,
+    admin_block_targets: AdminBlockTargets,
     running: HashMap<ExportKey, RunningExport>,
     open_backends: HashMap<(String, String, Option<String>), OpenBackend>,
     rate_limiters: HashMap<String, Arc<RateLimiter>>,
@@ -213,6 +251,7 @@ fn protocol_label(protocol: ExportProtocol) -> &'static str {
     match protocol {
         ExportProtocol::Nfs => "nfs",
         ExportProtocol::P9 => "p9",
+        ExportProtocol::Nbd => "nbd",
     }
 }
 
@@ -404,8 +443,64 @@ fn render_daemon_metrics_with_exports(
                     volume.block_decode_failures() as f64,
                 ));
             }
+            MetricsTarget::BlockWritable {
+                tenant,
+                volume_name,
+                volume,
+            } => {
+                let labels = [
+                    ("tenant", tenant.as_str()),
+                    ("volume", volume_name.as_str()),
+                ];
+                samples.push(PrometheusSample::new(
+                    "slatefs_volume_dead",
+                    labels,
+                    if volume.is_dead() { 1.0 } else { 0.0 },
+                ));
+                samples.push(PrometheusSample::new(
+                    "slatefs_volume_degraded",
+                    labels,
+                    if volume.is_degraded() { 1.0 } else { 0.0 },
+                ));
+                samples.push(PrometheusSample::new(
+                    "slatefs_writer_fencing_events_total",
+                    labels,
+                    volume.writer_fencing_events() as f64,
+                ));
+                samples.push(PrometheusSample::new(
+                    "slatefs_storage_errors_total",
+                    labels,
+                    volume.storage_errors() as f64,
+                ));
+                samples.push(PrometheusSample::new(
+                    "slatefs_quota_bytes_used",
+                    labels,
+                    volume.quota_usage().0 as f64,
+                ));
+                samples.push(PrometheusSample::new(
+                    "slatefs_quota_bytes_hard_limit",
+                    labels,
+                    hard_limit_value(volume.quota_hard_limits().0),
+                ));
+            }
+            MetricsTarget::BlockSnapshot {
+                tenant,
+                volume_name,
+                snapshot_id,
+            } => {
+                samples.push(PrometheusSample::new(
+                    "slatefs_block_snapshot_exports_active",
+                    [
+                        ("tenant", tenant.as_str()),
+                        ("volume", volume_name.as_str()),
+                        ("snapshot", snapshot_id.as_str()),
+                    ],
+                    1.0,
+                ));
+            }
         }
     }
+    samples.extend(slatefs_nbd::prometheus_samples());
     samples.extend(export_metrics.samples());
     render_prometheus(&samples)
 }
@@ -513,6 +608,7 @@ enum AdminControl {
 #[derive(Clone)]
 struct AdminState {
     targets: AdminTargets,
+    block_targets: AdminBlockTargets,
     control: AdminControl,
     object_store: Arc<dyn ObjectStore>,
     kms: Arc<dyn kms::Kms>,
@@ -567,6 +663,16 @@ struct ExportCreateRequest {
     #[serde(default)]
     protocol: ExportProtocol,
     #[serde(default)]
+    read_only: bool,
+    #[serde(default)]
+    sync: NbdSyncMode,
+    #[serde(default)]
+    nbd_tls_cert: Option<std::path::PathBuf>,
+    #[serde(default)]
+    nbd_tls_key: Option<std::path::PathBuf>,
+    #[serde(default)]
+    nbd_tls_client_ca: Option<std::path::PathBuf>,
+    #[serde(default)]
     p9_token: Option<String>,
     #[serde(default)]
     p9_tls_cert: Option<std::path::PathBuf>,
@@ -595,6 +701,11 @@ impl ExportCreateRequest {
                 listen: self.listen,
                 allowed_clients: self.allowed_clients,
                 protocol: self.protocol,
+                read_only: self.read_only,
+                sync: self.sync,
+                nbd_tls_cert: self.nbd_tls_cert,
+                nbd_tls_key: self.nbd_tls_key,
+                nbd_tls_client_ca: self.nbd_tls_client_ca,
                 p9_token: self.p9_token,
                 p9_tls_cert: self.p9_tls_cert,
                 p9_tls_key: self.p9_tls_key,
@@ -623,6 +734,16 @@ struct ExportPatchRequest {
     allowed_clients: Option<Vec<ClientAddrRule>>,
     #[serde(default)]
     protocol: Option<ExportProtocol>,
+    #[serde(default)]
+    read_only: Option<bool>,
+    #[serde(default)]
+    sync: Option<NbdSyncMode>,
+    #[serde(default)]
+    nbd_tls_cert: Option<Option<std::path::PathBuf>>,
+    #[serde(default)]
+    nbd_tls_key: Option<Option<std::path::PathBuf>>,
+    #[serde(default)]
+    nbd_tls_client_ca: Option<Option<std::path::PathBuf>>,
     #[serde(default)]
     p9_token: Option<Option<String>>,
     #[serde(default)]
@@ -660,6 +781,21 @@ impl ExportPatchRequest {
         }
         if let Some(protocol) = self.protocol {
             record.protocol = protocol;
+        }
+        if let Some(read_only) = self.read_only {
+            record.read_only = read_only;
+        }
+        if let Some(sync) = self.sync {
+            record.sync = sync;
+        }
+        if let Some(nbd_tls_cert) = self.nbd_tls_cert {
+            record.nbd_tls_cert = nbd_tls_cert;
+        }
+        if let Some(nbd_tls_key) = self.nbd_tls_key {
+            record.nbd_tls_key = nbd_tls_key;
+        }
+        if let Some(nbd_tls_client_ca) = self.nbd_tls_client_ca {
+            record.nbd_tls_client_ca = nbd_tls_client_ca;
         }
         if let Some(p9_token) = self.p9_token {
             record.p9_token = p9_token;
@@ -1248,12 +1384,28 @@ fn volume_json(
     record: VolumeRecord,
     placement: Option<VolumePlacementRecord>,
     targets: &AdminTargets,
+    block_targets: &AdminBlockTargets,
 ) -> Result<Value, AdminError> {
     let quota = quota_json(&record, targets);
+    let (kind, size_bytes, allocated_bytes) = match record.kind {
+        VolumeKind::Filesystem => ("filesystem", Value::Null, Value::Null),
+        VolumeKind::Block { size_bytes } => {
+            let allocated = block_targets
+                .lock()
+                .expect("admin block targets poisoned")
+                .get(&(record.tenant.clone(), record.name.clone()))
+                .map(|volume| json!(volume.quota_usage().0))
+                .unwrap_or(Value::Null);
+            ("block", json!(size_bytes), allocated)
+        }
+    };
     Ok(json!({
         "tenant": record.tenant,
         "name": record.name,
         "state": format!("{:?}", record.state),
+        "kind": kind,
+        "size_bytes": size_bytes,
+        "allocated_bytes": allocated_bytes,
         "fsid": format!("{:016x}", record.fsid),
         "cipher": record.cipher.to_string(),
         "chunk_size": record.chunk_size,
@@ -1286,8 +1438,12 @@ fn export_config_json(id: &str, source: &str, export: &ExportConfig, enabled: bo
         "p9_token_set": export.p9_token.is_some(),
         "p9_tls_cert": export.p9_tls_cert.as_deref().map(|path| path.display().to_string()),
         "p9_tls_key": export.p9_tls_key.as_deref().map(|path| path.display().to_string()),
+        "nbd_tls_cert": export.nbd_tls_cert.as_deref().map(|path| path.display().to_string()),
+        "nbd_tls_key": export.nbd_tls_key.as_deref().map(|path| path.display().to_string()),
+        "nbd_tls_client_ca": export.nbd_tls_client_ca.as_deref().map(|path| path.display().to_string()),
         "enabled": enabled,
-        "read_only": source == "config",
+        "read_only": export.effective_read_only(),
+        "sync": export.sync,
     })
 }
 
@@ -1462,7 +1618,12 @@ async fn list_volumes_response(
             .try_get_volume_placement(&volume.tenant, &volume.name)
             .await
             .map_err(core_error)?;
-        out.push(volume_json(volume, placement, &state.targets)?);
+        out.push(volume_json(
+            volume,
+            placement,
+            &state.targets,
+            &state.block_targets,
+        )?);
     }
     Ok(AdminHttpResponse::json(
         200,
@@ -1486,7 +1647,7 @@ async fn get_volume_response(
         .map_err(core_error)?;
     Ok(AdminHttpResponse::json(
         200,
-        json!({ "volume": volume_json(record, placement, &state.targets)? }),
+        json!({ "volume": volume_json(record, placement, &state.targets, &state.block_targets)? }),
     ))
 }
 
@@ -2215,6 +2376,17 @@ async fn clone_parent_prefixes_from_reader(
     ))
 }
 
+fn block_export_device(device: Arc<dyn BlockDev>, export: &ExportConfig) -> Arc<dyn BlockDev> {
+    let mut device = device;
+    if export.effective_read_only() {
+        device = ReadOnlyBlockDev::new(device);
+    }
+    if export.sync == NbdSyncMode::Strict {
+        device = StrictSyncBlockDev::new(device);
+    }
+    device
+}
+
 #[derive(Debug)]
 struct RetentionDeletedSnapshot {
     id: String,
@@ -2405,8 +2577,7 @@ impl ExportManager {
         config: &Config,
         config_exports: Arc<Vec<ConfigExportRecord>>,
         metrics: ExportMetrics,
-        metrics_targets: Arc<Mutex<Vec<MetricsTarget>>>,
-        admin_targets: AdminTargets,
+        targets: ExportManagerTargets,
     ) -> Self {
         Self {
             object_store,
@@ -2415,8 +2586,9 @@ impl ExportManager {
             slatedb: config.slatedb.clone(),
             config_exports,
             metrics,
-            metrics_targets,
-            admin_targets,
+            metrics_targets: targets.metrics,
+            admin_targets: targets.admin,
+            admin_block_targets: targets.admin_blocks,
             running: HashMap::new(),
             open_backends: HashMap::new(),
             rate_limiters: HashMap::new(),
@@ -2528,10 +2700,18 @@ impl ExportManager {
             );
         }
 
-        let (backend_key, volume, rate_limits) = self.backend_for(reader, &desired.config).await?;
+        let (backend_key, backend, rate_limits) = self.backend_for(reader, &desired.config).await?;
         let rate_limiter = Some(self.rate_limiter_for(desired.config.tenant.clone(), rate_limits));
+        let mut nbd_shutdown = None;
         let bind_result = match desired.config.protocol {
             ExportProtocol::Nfs => {
+                let BackendExport::Fs(volume) = backend else {
+                    anyhow::bail!(
+                        "NFS export {}/{} requires a filesystem volume",
+                        desired.config.tenant,
+                        desired.config.volume
+                    );
+                };
                 let policy = SquashPolicy {
                     mode: desired.config.squash,
                     anon_uid: desired.config.anon_uid,
@@ -2566,6 +2746,13 @@ impl ExportManager {
                 })
             }
             ExportProtocol::P9 => {
+                let BackendExport::Fs(volume) = backend else {
+                    anyhow::bail!(
+                        "9P export {}/{} requires a filesystem volume",
+                        desired.config.tenant,
+                        desired.config.volume
+                    );
+                };
                 let export_name = format!("/{}/{}", desired.config.tenant, desired.config.volume);
                 let tls = match (&desired.config.p9_tls_cert, &desired.config.p9_tls_key) {
                     (Some(cert), Some(key)) => Some((cert.clone(), key.clone())),
@@ -2636,6 +2823,81 @@ impl ExportManager {
                     }),
                 }
             }
+            ExportProtocol::Nbd => {
+                let BackendExport::Block { device, shutdowns } = backend else {
+                    anyhow::bail!(
+                        "NBD export {}/{} requires a block volume",
+                        desired.config.tenant,
+                        desired.config.volume
+                    );
+                };
+                let export_name = format!("/{}/{}", desired.config.tenant, desired.config.volume);
+                let listen = desired.config.listen.clone();
+                let allowed_clients = desired.config.allowed_clients.clone();
+                let tls = match (&desired.config.nbd_tls_cert, &desired.config.nbd_tls_key) {
+                    (Some(cert), Some(key)) => Some(slatefs_nbd::NbdTlsIdentity {
+                        cert_path: cert.clone(),
+                        key_path: key.clone(),
+                        client_ca_path: desired.config.nbd_tls_client_ca.clone(),
+                    }),
+                    (None, None) if desired.config.nbd_tls_client_ca.is_none() => None,
+                    (None, None) => anyhow::bail!(
+                        "NBD export {}/{} sets nbd_tls_client_ca but does not set nbd_tls_cert and nbd_tls_key",
+                        desired.config.tenant,
+                        desired.config.volume
+                    ),
+                    _ => anyhow::bail!(
+                        "NBD export {}/{} must set both nbd_tls_cert and nbd_tls_key, or neither",
+                        desired.config.tenant,
+                        desired.config.volume
+                    ),
+                };
+                let bind = match tls {
+                    Some(identity) => {
+                        slatefs_nbd::bind_export_tls_with_allowlist_and_rate_limit(
+                            &listen,
+                            export_name,
+                            device,
+                            allowed_clients,
+                            rate_limiter,
+                            identity,
+                        )
+                        .await
+                    }
+                    None => {
+                        slatefs_nbd::bind_export_with_allowlist_and_rate_limit(
+                            &listen,
+                            export_name,
+                            device,
+                            allowed_clients,
+                            rate_limiter,
+                        )
+                        .await
+                    }
+                };
+                bind.map(|listener| {
+                    let shutdown = listener.shutdown_handle();
+                    shutdowns
+                        .lock()
+                        .expect("NBD shutdown handles poisoned")
+                        .push(shutdown.clone());
+                    nbd_shutdown = Some(shutdown);
+                    tracing::info!(
+                        source = desired.key.source.as_str(),
+                        id = desired.key.id,
+                        tenant = desired.config.tenant,
+                        volume = desired.config.volume,
+                        snapshot = desired.config.snapshot.as_deref().unwrap_or("-"),
+                        listen,
+                        "NBD export ready"
+                    );
+                    tokio::spawn(async move {
+                        if let Err(error) = listener.handle_forever().await {
+                            tracing::error!("NBD export listener exited: {error}");
+                        }
+                    })
+                })
+            }
         };
 
         let task = match bind_result {
@@ -2655,6 +2917,7 @@ impl ExportManager {
             RunningExport {
                 desired,
                 backend_key,
+                nbd_shutdown,
                 task,
             },
         );
@@ -2665,7 +2928,7 @@ impl ExportManager {
         &mut self,
         reader: &ControlReader,
         export: &ExportConfig,
-    ) -> anyhow::Result<((String, String, Option<String>), Arc<dyn Vfs>, RateLimits)> {
+    ) -> anyhow::Result<((String, String, Option<String>), BackendExport, RateLimits)> {
         let backend_key = (
             export.tenant.clone(),
             export.volume.clone(),
@@ -2673,17 +2936,79 @@ impl ExportManager {
         );
         let tenant = reader.get_tenant(&export.tenant).await?;
         if let Some(backend) = self.open_backends.get(&backend_key) {
-            return Ok((backend_key, Arc::clone(&backend.vfs), tenant.rate_limits));
+            let export_backend = match export.protocol {
+                ExportProtocol::Nfs | ExportProtocol::P9 => BackendExport::Fs(
+                    backend
+                        .vfs
+                        .as_ref()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("cached backend is not a filesystem"))?,
+                ),
+                ExportProtocol::Nbd => BackendExport::Block {
+                    device: block_export_device(
+                        backend.block.as_ref().cloned().ok_or_else(|| {
+                            anyhow::anyhow!("cached backend is not a block device")
+                        })?,
+                        export,
+                    ),
+                    shutdowns: Arc::clone(&backend.nbd_shutdowns),
+                },
+            };
+            return Ok((backend_key, export_backend, tenant.rate_limits));
         }
 
         let record = reader
             .get_mountable_volume(&export.tenant, &export.volume)
             .await?;
+        validate_export_volume_kind(export, record.kind).map_err(|error| match error {
+            slatefs_core::error::Error::Config(message) => anyhow::anyhow!(message),
+            error => anyhow::anyhow!(error),
+        })?;
         let dek = reader.unwrap_volume_dek(&record).await?;
         let clone_parent_prefixes = clone_parent_prefixes_from_reader(reader, &record).await?;
-        let backend: OpenBackend = if let Some(snapshot) = &export.snapshot {
+        let backend: OpenBackend = match record.kind {
+            VolumeKind::Filesystem => {
+                self.open_filesystem_backend(export, &record, dek, clone_parent_prefixes)
+                    .await?
+            }
+            VolumeKind::Block { .. } => {
+                self.open_block_backend(export, &record, dek, clone_parent_prefixes)
+                    .await?
+            }
+        };
+        let export_backend =
+            match export.protocol {
+                ExportProtocol::Nfs | ExportProtocol::P9 => BackendExport::Fs(
+                    backend
+                        .vfs
+                        .as_ref()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("opened backend is not a filesystem"))?,
+                ),
+                ExportProtocol::Nbd => BackendExport::Block {
+                    device: block_export_device(
+                        backend.block.as_ref().cloned().ok_or_else(|| {
+                            anyhow::anyhow!("opened backend is not a block device")
+                        })?,
+                        export,
+                    ),
+                    shutdowns: Arc::clone(&backend.nbd_shutdowns),
+                },
+            };
+        self.open_backends.insert(backend_key.clone(), backend);
+        Ok((backend_key, export_backend, tenant.rate_limits))
+    }
+
+    async fn open_filesystem_backend(
+        &self,
+        export: &ExportConfig,
+        record: &VolumeRecord,
+        dek: slatefs_core::crypto::Secret32,
+        clone_parent_prefixes: Vec<String>,
+    ) -> anyhow::Result<OpenBackend> {
+        if let Some(snapshot) = &export.snapshot {
             let snapshot_volume = SnapshotVolume::open(
-                &record,
+                record,
                 dek,
                 Arc::clone(&self.object_store),
                 snapshot,
@@ -2705,12 +3030,16 @@ impl ExportManager {
                     snapshot_id: snapshot.clone(),
                     volume: Arc::clone(&snapshot_volume),
                 });
-            OpenBackend {
-                vfs: snapshot_volume.clone(),
+            Ok(OpenBackend {
+                vfs: Some(snapshot_volume.clone()),
+                block: None,
                 writable: None,
                 snapshot: Some(snapshot_volume),
+                block_writable: None,
+                block_snapshot: None,
+                nbd_shutdowns: Arc::new(Mutex::new(Vec::new())),
                 ref_count: 0,
-            }
+            })
         } else {
             let mut caches = VolumeCaches::from_config(
                 &self.cache,
@@ -2722,7 +3051,7 @@ impl ExportManager {
             let recorder = Arc::new(AggregatingRecorder::default());
             caches.recorder = Some(Arc::clone(&recorder));
             let volume =
-                Volume::open_with_caches(&record, dek, Arc::clone(&self.object_store), &caches)
+                Volume::open_with_caches(record, dek, Arc::clone(&self.object_store), &caches)
                     .await
                     .with_context(|| {
                         format!("opening volume {}/{}", export.tenant, export.volume)
@@ -2754,16 +3083,121 @@ impl ExportManager {
                     (export.tenant.clone(), export.volume.clone()),
                     Arc::clone(&volume),
                 );
-            OpenBackend {
-                vfs: volume.clone(),
+            Ok(OpenBackend {
+                vfs: Some(volume.clone()),
+                block: None,
                 writable: Some(volume),
                 snapshot: None,
+                block_writable: None,
+                block_snapshot: None,
+                nbd_shutdowns: Arc::new(Mutex::new(Vec::new())),
                 ref_count: 0,
-            }
-        };
-        let vfs = Arc::clone(&backend.vfs);
-        self.open_backends.insert(backend_key.clone(), backend);
-        Ok((backend_key, vfs, tenant.rate_limits))
+            })
+        }
+    }
+
+    async fn open_block_backend(
+        &self,
+        export: &ExportConfig,
+        record: &VolumeRecord,
+        dek: slatefs_core::crypto::Secret32,
+        clone_parent_prefixes: Vec<String>,
+    ) -> anyhow::Result<OpenBackend> {
+        let nbd_shutdowns = Arc::new(Mutex::new(Vec::new()));
+        if let Some(snapshot) = &export.snapshot {
+            let snapshot_volume = SnapshotBlockVolume::open(
+                record,
+                dek,
+                Arc::clone(&self.object_store),
+                snapshot,
+                clone_parent_prefixes,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "opening block snapshot {snapshot} for {}/{}",
+                    export.tenant, export.volume
+                )
+            })?;
+            let device: Arc<dyn BlockDev> = snapshot_volume.clone();
+            self.metrics_targets
+                .lock()
+                .expect("metrics targets poisoned")
+                .push(MetricsTarget::BlockSnapshot {
+                    tenant: export.tenant.clone(),
+                    volume_name: export.volume.clone(),
+                    snapshot_id: snapshot.clone(),
+                });
+            Ok(OpenBackend {
+                vfs: None,
+                block: Some(device),
+                writable: None,
+                snapshot: None,
+                block_writable: None,
+                block_snapshot: Some(snapshot_volume),
+                nbd_shutdowns,
+                ref_count: 0,
+            })
+        } else {
+            let caches = VolumeCaches::from_config(
+                &self.cache,
+                &self.slatedb,
+                &export.tenant,
+                &export.volume,
+                self.live_share_count,
+            );
+            let volume =
+                BlockVolume::open_with_caches(record, dek, Arc::clone(&self.object_store), &caches)
+                    .await
+                    .with_context(|| {
+                        format!("opening block volume {}/{}", export.tenant, export.volume)
+                    })?;
+            let watched = Arc::clone(&volume);
+            let watched_tenant = export.tenant.clone();
+            let watched_volume = export.volume.clone();
+            let watched_shutdowns = Arc::clone(&nbd_shutdowns);
+            tokio::spawn(async move {
+                watched.wait_dead().await;
+                tracing::error!(
+                    tenant = watched_tenant,
+                    volume = watched_volume,
+                    "block volume fenced; hard-closing NBD connections"
+                );
+                for shutdown in watched_shutdowns
+                    .lock()
+                    .expect("NBD shutdown handles poisoned")
+                    .iter()
+                {
+                    shutdown.kill();
+                }
+            });
+            let device: Arc<dyn BlockDev> = volume.clone();
+            self.metrics_targets
+                .lock()
+                .expect("metrics targets poisoned")
+                .push(MetricsTarget::BlockWritable {
+                    tenant: export.tenant.clone(),
+                    volume_name: export.volume.clone(),
+                    volume: Arc::clone(&volume),
+                });
+            self.admin_block_targets
+                .lock()
+                .expect("admin block targets poisoned")
+                .insert(
+                    (export.tenant.clone(), export.volume.clone()),
+                    Arc::clone(&volume),
+                );
+            Ok(OpenBackend {
+                vfs: None,
+                block: Some(device),
+                writable: None,
+                snapshot: None,
+                block_writable: Some(volume),
+                block_snapshot: None,
+                nbd_shutdowns,
+                ref_count: 0,
+            })
+        }
     }
 
     fn rate_limiter_for(&mut self, tenant: String, limits: RateLimits) -> Arc<RateLimiter> {
@@ -2811,6 +3245,19 @@ impl ExportManager {
                     .map(|writable| (tenant.clone(), volume.clone(), Arc::clone(writable)))
             })
             .collect::<Vec<_>>();
+        let open_block_writable = self
+            .open_backends
+            .iter()
+            .filter_map(|((tenant, volume, snapshot), backend)| {
+                if snapshot.is_some() {
+                    return None;
+                }
+                backend
+                    .block_writable
+                    .as_ref()
+                    .map(|writable| (tenant.clone(), volume.clone(), Arc::clone(writable)))
+            })
+            .collect::<Vec<_>>();
 
         for (tenant, volume_name, volume) in open_writable {
             let Some(record) = reader.try_get_volume(&tenant, &volume_name).await? else {
@@ -2826,6 +3273,19 @@ impl ExportManager {
                 );
             }
         }
+        for (tenant, volume_name, volume) in open_block_writable {
+            let Some(record) = reader.try_get_volume(&tenant, &volume_name).await? else {
+                continue;
+            };
+            if volume.set_quota_limits(record.quota) {
+                tracing::info!(
+                    tenant,
+                    volume = volume_name,
+                    bytes_hard = ?record.quota.bytes.hard,
+                    "block volume quota limits reloaded"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -2833,6 +3293,9 @@ impl ExportManager {
         let Some(running) = self.running.remove(key) else {
             return;
         };
+        if let Some(shutdown) = &running.nbd_shutdown {
+            shutdown.kill();
+        }
         running.task.abort();
         self.metrics
             .stopped(running.desired.config.protocol, running.desired.key.source);
@@ -2888,6 +3351,29 @@ impl ExportManager {
                 "snapshot shutdown: {error}"
             );
         }
+        if let Some(volume) = backend.block_writable {
+            self.admin_block_targets
+                .lock()
+                .expect("admin block targets poisoned")
+                .remove(&(backend_key.0.clone(), backend_key.1.clone()));
+            if let Err(error) = volume.shutdown().await {
+                tracing::error!(
+                    tenant = backend_key.0,
+                    volume = backend_key.1,
+                    "block volume shutdown: {error}"
+                );
+            }
+        }
+        if let Some(snapshot) = backend.block_snapshot
+            && let Err(error) = snapshot.shutdown().await
+        {
+            tracing::error!(
+                tenant = backend_key.0,
+                volume = backend_key.1,
+                snapshot = backend_key.2.as_deref().unwrap_or("-"),
+                "block snapshot shutdown: {error}"
+            );
+        }
     }
 
     fn remove_metrics_target(&self, backend_key: &(String, String, Option<String>)) {
@@ -2908,6 +3394,22 @@ impl ExportManager {
                 volume_name,
                 snapshot_id,
                 ..
+            } => {
+                backend_key.2.as_ref() != Some(snapshot_id)
+                    || tenant != &backend_key.0
+                    || volume_name != &backend_key.1
+            }
+            MetricsTarget::BlockWritable {
+                tenant,
+                volume_name,
+                ..
+            } => {
+                backend_key.2.is_some() || tenant != &backend_key.0 || volume_name != &backend_key.1
+            }
+            MetricsTarget::BlockSnapshot {
+                tenant,
+                volume_name,
+                snapshot_id,
             } => {
                 backend_key.2.as_ref() != Some(snapshot_id)
                     || tenant != &backend_key.0
@@ -2946,6 +3448,7 @@ async fn main() -> anyhow::Result<()> {
     let export_metrics = ExportMetrics::default();
     let metrics_targets = Arc::new(Mutex::new(Vec::new()));
     let admin_targets = Arc::new(Mutex::new(HashMap::new()));
+    let admin_block_targets = Arc::new(Mutex::new(HashMap::new()));
 
     // Initialize deployment-wide server state that needs a writer, then use
     // read-only control handles for live reconciliation.
@@ -2962,8 +3465,11 @@ async fn main() -> anyhow::Result<()> {
         &config,
         Arc::clone(&config_exports),
         export_metrics.clone(),
-        Arc::clone(&metrics_targets),
-        Arc::clone(&admin_targets),
+        ExportManagerTargets {
+            metrics: Arc::clone(&metrics_targets),
+            admin: Arc::clone(&admin_targets),
+            admin_blocks: Arc::clone(&admin_block_targets),
+        },
     )));
 
     let control_reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
@@ -3026,6 +3532,7 @@ async fn main() -> anyhow::Result<()> {
         };
         let state = Arc::new(AdminState {
             targets,
+            block_targets: Arc::clone(&admin_block_targets),
             control,
             object_store: Arc::clone(&object_store),
             kms: Arc::clone(&kms),
@@ -3066,6 +3573,7 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    use bytes::Bytes;
     use nfs3_server::nfs3_types::nfs3::{filename3, nfsstat3, sattr3, stable_how};
     use nfs3_server::nfs3_types::xdr_codec::Opaque;
     use nfs3_server::vfs::{NfsFileSystem, NfsReadFileSystem};
@@ -3079,6 +3587,7 @@ mod tests {
     use slatefs_core::meta::inode::ROOT_INO;
     use slatefs_core::snapshot::SnapshotVolume;
     use slatefs_core::vfs::{Credentials, Vfs};
+    use slatefs_nbd::test_support::NbdTestClient;
     use slatefs_nfs::SlateFsNfs;
 
     fn create_opts() -> slatefs_core::volume::CreateVolumeOptions {
@@ -3091,6 +3600,17 @@ mod tests {
         }
     }
 
+    fn create_block_opts(size_bytes: u64) -> slatefs_core::volume::CreateBlockVolumeOptions {
+        slatefs_core::volume::CreateBlockVolumeOptions {
+            cipher: Cipher::Aes256Gcm,
+            chunk_size: 4096,
+            compression: Compression::Lz4,
+            quota: QuotaLimits::default(),
+            note: None,
+            size_bytes,
+        }
+    }
+
     async fn available_admin_state(
         object_store: Arc<dyn ObjectStore>,
         kms: Arc<dyn Kms>,
@@ -3099,6 +3619,7 @@ mod tests {
     ) -> Arc<AdminState> {
         Arc::new(AdminState {
             targets: Arc::new(Mutex::new(targets)),
+            block_targets: Arc::new(Mutex::new(HashMap::new())),
             control: AdminControl::Available(Arc::new(
                 ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
                     .await
@@ -3123,6 +3644,7 @@ mod tests {
     ) -> Arc<AdminState> {
         Arc::new(AdminState {
             targets: Arc::new(Mutex::new(targets)),
+            block_targets: Arc::new(Mutex::new(HashMap::new())),
             control: AdminControl::Unavailable("test unavailable".to_string()),
             object_store,
             kms: Arc::new(StaticKms::new(Secret32::from_bytes([251; 32]))),
@@ -3658,6 +4180,11 @@ mod tests {
             listen: "127.0.0.1:12049".to_string(),
             allowed_clients: Vec::new(),
             protocol: ExportProtocol::Nfs,
+            read_only: false,
+            sync: NbdSyncMode::Default,
+            nbd_tls_cert: None,
+            nbd_tls_key: None,
+            nbd_tls_client_ca: None,
             p9_token: None,
             p9_tls_cert: None,
             p9_tls_key: None,
@@ -3668,6 +4195,7 @@ mod tests {
         };
         let state = Arc::new(AdminState {
             targets: Arc::new(Mutex::new(HashMap::new())),
+            block_targets: Arc::new(Mutex::new(HashMap::new())),
             control: AdminControl::Unavailable("unused".to_string()),
             object_store,
             kms: Arc::new(StaticKms::new(Secret32::from_bytes([9; 32]))),
@@ -3691,7 +4219,7 @@ mod tests {
         assert_eq!(response_status(&get), 200, "{get}");
         let get_body: Value = serde_json::from_str(response_body(&get)).unwrap();
         assert_eq!(get_body["export"]["source"], "config");
-        assert_eq!(get_body["export"]["read_only"], true);
+        assert_eq!(get_body["export"]["read_only"], false);
 
         let patch = admin_exchange(
             state,
@@ -3847,6 +4375,11 @@ mod tests {
                 listen: listen.to_string(),
                 allowed_clients: Vec::new(),
                 protocol: ExportProtocol::Nfs,
+                read_only: false,
+                sync: NbdSyncMode::Default,
+                nbd_tls_cert: None,
+                nbd_tls_key: None,
+                nbd_tls_client_ca: None,
                 p9_token: None,
                 p9_tls_cert: None,
                 p9_tls_key: None,
@@ -3857,6 +4390,38 @@ mod tests {
             },
             true,
         )
+    }
+
+    fn nbd_export(id: &str, listen: &str) -> ExportRecord {
+        ExportRecord::from_config(
+            id.to_string(),
+            ExportConfig {
+                tenant: "t".to_string(),
+                volume: "b".to_string(),
+                snapshot: None,
+                listen: listen.to_string(),
+                allowed_clients: Vec::new(),
+                protocol: ExportProtocol::Nbd,
+                read_only: false,
+                sync: NbdSyncMode::Default,
+                nbd_tls_cert: None,
+                nbd_tls_key: None,
+                nbd_tls_client_ca: None,
+                p9_token: None,
+                p9_tls_cert: None,
+                p9_tls_key: None,
+                squash: Default::default(),
+                atime: Default::default(),
+                anon_uid: 65534,
+                anon_gid: 65534,
+            },
+            true,
+        )
+    }
+
+    fn free_loopback_addr() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().to_string()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3891,8 +4456,11 @@ mod tests {
             &config,
             config_export_records(&config.exports),
             metrics.clone(),
-            Arc::new(Mutex::new(Vec::new())),
-            Arc::new(Mutex::new(HashMap::new())),
+            ExportManagerTargets {
+                metrics: Arc::new(Mutex::new(Vec::new())),
+                admin: Arc::new(Mutex::new(HashMap::new())),
+                admin_blocks: Arc::new(Mutex::new(HashMap::new())),
+            },
         );
         let reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
             .await
@@ -3908,6 +4476,84 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1200)).await;
         manager.reconcile(&reader).await.unwrap();
         assert_eq!(metrics.active_total(), 0);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn export_manager_serves_nbd_round_trip_and_disable_closes_session() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([44; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        slatefs_core::volume::create_block_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "b",
+            create_block_opts(4096 * 2),
+        )
+        .await
+        .unwrap();
+        let fh_key = control.server_fh_key().await.unwrap();
+        let listen = free_loopback_addr();
+        control
+            .create_export(nbd_export("nbd1", &listen))
+            .await
+            .unwrap();
+        control.close().await.unwrap();
+
+        let config = test_config(Vec::new());
+        let metrics = ExportMetrics::default();
+        let mut manager = ExportManager::new(
+            Arc::clone(&object_store),
+            fh_key,
+            &config,
+            config_export_records(&config.exports),
+            metrics.clone(),
+            ExportManagerTargets {
+                metrics: Arc::new(Mutex::new(Vec::new())),
+                admin: Arc::new(Mutex::new(HashMap::new())),
+                admin_blocks: Arc::new(Mutex::new(HashMap::new())),
+            },
+        );
+        let reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        manager.reconcile(&reader).await.unwrap();
+        assert_eq!(metrics.active_total(), 1);
+
+        let addr = listen.parse().unwrap();
+        let mut client = NbdTestClient::connect(addr, "/t/b").await.unwrap();
+        client
+            .write_at(1, 512, Bytes::from_static(b"daemon-nbd"), true)
+            .await
+            .unwrap();
+        assert_eq!(client.read_reply().await.unwrap().error, 0);
+        client.read_at(2, 512, 10).await.unwrap();
+        let reply = client.read_reply().await.unwrap();
+        assert_eq!(reply.error, 0);
+        assert_eq!(&reply.data[..], b"daemon-nbd");
+
+        let control = ControlPlane::open(Arc::clone(&object_store), kms)
+            .await
+            .unwrap();
+        control.disable_export("nbd1").await.unwrap();
+        control.close().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        manager.reconcile(&reader).await.unwrap();
+        assert_eq!(metrics.active_total(), 0);
+
+        let write_after_disable = client.cache(3, 0, 1).await;
+        if write_after_disable.is_ok() {
+            let closed = tokio::time::timeout(Duration::from_secs(2), client.read_reply()).await;
+            assert!(
+                closed.is_ok(),
+                "NBD session did not close after export disable"
+            );
+            assert!(closed.unwrap().is_err(), "expected closed NBD session");
+        }
         manager.shutdown().await;
     }
 
@@ -3943,8 +4589,11 @@ mod tests {
             &config,
             config_export_records(&config.exports),
             metrics.clone(),
-            Arc::new(Mutex::new(Vec::new())),
-            Arc::new(Mutex::new(HashMap::new())),
+            ExportManagerTargets {
+                metrics: Arc::new(Mutex::new(Vec::new())),
+                admin: Arc::new(Mutex::new(HashMap::new())),
+                admin_blocks: Arc::new(Mutex::new(HashMap::new())),
+            },
         );
         let reader = ControlReader::open(Arc::clone(&object_store), kms)
             .await
@@ -4001,8 +4650,11 @@ mod tests {
             &config,
             config_export_records(&config.exports),
             metrics,
-            Arc::new(Mutex::new(Vec::new())),
-            Arc::new(Mutex::new(HashMap::new())),
+            ExportManagerTargets {
+                metrics: Arc::new(Mutex::new(Vec::new())),
+                admin: Arc::new(Mutex::new(HashMap::new())),
+                admin_blocks: Arc::new(Mutex::new(HashMap::new())),
+            },
         );
         let reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
             .await
@@ -4129,14 +4781,18 @@ mod tests {
 
         let config = test_config(Vec::new());
         let admin_targets = Arc::new(Mutex::new(HashMap::new()));
+        let admin_block_targets = Arc::new(Mutex::new(HashMap::new()));
         let mut manager = ExportManager::new(
             Arc::clone(&object_store),
             fh_key,
             &config,
             config_export_records(&config.exports),
             ExportMetrics::default(),
-            Arc::new(Mutex::new(Vec::new())),
-            Arc::clone(&admin_targets),
+            ExportManagerTargets {
+                metrics: Arc::new(Mutex::new(Vec::new())),
+                admin: Arc::clone(&admin_targets),
+                admin_blocks: Arc::clone(&admin_block_targets),
+            },
         );
         let reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
             .await
@@ -4162,6 +4818,7 @@ mod tests {
 
         let state = Arc::new(AdminState {
             targets: Arc::clone(&admin_targets),
+            block_targets: Arc::new(Mutex::new(HashMap::new())),
             control: AdminControl::Available(Arc::new(
                 ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
                     .await

@@ -13,13 +13,14 @@ use slatedb::object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use slatedb::{Db, DbReader, Settings, WriteBatch, config::DbReaderOptions};
 
 use crate::config::{
-    AtimeMode, ClientAddrRule, Compression, ExportConfig, ExportProtocol, SquashMode,
-    validate_export_config,
+    AtimeMode, ClientAddrRule, Compression, ExportConfig, ExportProtocol, NbdSyncMode, SquashMode,
+    validate_export_config, validate_export_volume_kind,
 };
 use crate::crypto::kms::{Kms, contexts};
 use crate::crypto::transformer::SlateBlockTransformer;
 use crate::crypto::{Cipher, Secret32};
 use crate::error::{Error, Result};
+use crate::meta::superblock::VolumeKind;
 use crate::meta::{decode_versioned, encode_versioned};
 use crate::rate::RateLimits;
 use crate::store;
@@ -120,11 +121,51 @@ pub struct VolumeRecord {
     pub chunk_size: u32,
     pub compression: Compression,
     pub quota: QuotaLimits,
+    /// Volume semantic kind. Missing in legacy records, which decode as
+    /// filesystem volumes for backward compatibility.
+    #[serde(default)]
+    pub kind: VolumeKind,
     /// Free-form operator note. Also exercised by the no-plaintext-at-rest
     /// tests, which write a marker here and scan the bucket for it.
     pub note: Option<String>,
     /// Unix seconds.
     pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VolumeRecordV1 {
+    tenant: String,
+    name: String,
+    state: VolumeState,
+    clone_parent: Option<CloneParent>,
+    fsid: u64,
+    wrapped_dek: Vec<u8>,
+    cipher: Cipher,
+    chunk_size: u32,
+    compression: Compression,
+    quota: QuotaLimits,
+    note: Option<String>,
+    created_at: u64,
+}
+
+impl From<VolumeRecordV1> for VolumeRecord {
+    fn from(value: VolumeRecordV1) -> Self {
+        VolumeRecord {
+            tenant: value.tenant,
+            name: value.name,
+            state: value.state,
+            clone_parent: value.clone_parent,
+            fsid: value.fsid,
+            wrapped_dek: value.wrapped_dek,
+            cipher: value.cipher,
+            chunk_size: value.chunk_size,
+            compression: value.compression,
+            quota: value.quota,
+            kind: VolumeKind::Filesystem,
+            note: value.note,
+            created_at: value.created_at,
+        }
+    }
 }
 
 /// Health state last reported for a serving daemon.
@@ -214,6 +255,16 @@ pub struct ExportRecord {
     pub protocol: ExportProtocol,
     pub listen: String,
     pub allowed_clients: Vec<ClientAddrRule>,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub sync: NbdSyncMode,
+    #[serde(default)]
+    pub nbd_tls_cert: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub nbd_tls_key: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub nbd_tls_client_ca: Option<std::path::PathBuf>,
     pub squash: SquashMode,
     pub atime: AtimeMode,
     pub anon_uid: u32,
@@ -231,6 +282,8 @@ pub struct ExportRecord {
 impl ExportRecord {
     pub fn from_config(id: impl Into<String>, config: ExportConfig, enabled: bool) -> Self {
         let now = now_unix();
+        let mut config = config;
+        config.normalize();
         Self {
             id: id.into(),
             tenant: config.tenant,
@@ -239,6 +292,11 @@ impl ExportRecord {
             protocol: config.protocol,
             listen: config.listen,
             allowed_clients: config.allowed_clients,
+            read_only: config.read_only,
+            sync: config.sync,
+            nbd_tls_cert: config.nbd_tls_cert,
+            nbd_tls_key: config.nbd_tls_key,
+            nbd_tls_client_ca: config.nbd_tls_client_ca,
             squash: config.squash,
             atime: config.atime,
             anon_uid: config.anon_uid,
@@ -252,6 +310,16 @@ impl ExportRecord {
         }
     }
 
+    pub fn normalize(&mut self) {
+        if self.snapshot.is_some() {
+            self.read_only = true;
+        }
+    }
+
+    pub fn effective_read_only(&self) -> bool {
+        self.read_only || self.snapshot.is_some()
+    }
+
     pub fn to_config(&self) -> ExportConfig {
         ExportConfig {
             tenant: self.tenant.clone(),
@@ -260,6 +328,11 @@ impl ExportRecord {
             listen: self.listen.clone(),
             allowed_clients: self.allowed_clients.clone(),
             protocol: self.protocol,
+            read_only: self.effective_read_only(),
+            sync: self.sync,
+            nbd_tls_cert: self.nbd_tls_cert.clone(),
+            nbd_tls_key: self.nbd_tls_key.clone(),
+            nbd_tls_client_ca: self.nbd_tls_client_ca.clone(),
             p9_token: self.p9_token.clone(),
             p9_tls_cert: self.p9_tls_cert.clone(),
             p9_tls_key: self.p9_tls_key.clone(),
@@ -268,6 +341,58 @@ impl ExportRecord {
             anon_uid: self.anon_uid,
             anon_gid: self.anon_gid,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ExportRecordV1 {
+    id: String,
+    tenant: String,
+    volume: String,
+    snapshot: Option<String>,
+    protocol: ExportProtocol,
+    listen: String,
+    allowed_clients: Vec<ClientAddrRule>,
+    squash: SquashMode,
+    atime: AtimeMode,
+    anon_uid: u32,
+    anon_gid: u32,
+    p9_token: Option<String>,
+    p9_tls_cert: Option<std::path::PathBuf>,
+    p9_tls_key: Option<std::path::PathBuf>,
+    enabled: bool,
+    created_at: u64,
+    updated_at: u64,
+}
+
+impl From<ExportRecordV1> for ExportRecord {
+    fn from(value: ExportRecordV1) -> Self {
+        let mut record = ExportRecord {
+            id: value.id,
+            tenant: value.tenant,
+            volume: value.volume,
+            snapshot: value.snapshot,
+            protocol: value.protocol,
+            listen: value.listen,
+            allowed_clients: value.allowed_clients,
+            read_only: false,
+            sync: NbdSyncMode::Default,
+            nbd_tls_cert: None,
+            nbd_tls_key: None,
+            nbd_tls_client_ca: None,
+            squash: value.squash,
+            atime: value.atime,
+            anon_uid: value.anon_uid,
+            anon_gid: value.anon_gid,
+            p9_token: value.p9_token,
+            p9_tls_cert: value.p9_tls_cert,
+            p9_tls_key: value.p9_tls_key,
+            enabled: value.enabled,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+        };
+        record.normalize();
+        record
     }
 }
 
@@ -310,6 +435,7 @@ pub enum AuditPlane {
     Admin,
     Nfs,
     P9,
+    Nbd,
     Cli,
 }
 
@@ -856,7 +982,7 @@ impl ControlPlane {
 
     pub async fn try_get_volume(&self, tenant: &str, volume: &str) -> Result<Option<VolumeRecord>> {
         match self.db.get(volume_key(tenant, volume).as_bytes()).await? {
-            Some(bytes) => Ok(Some(decode_versioned(VOLUME_RECORD_VERSION, &bytes)?)),
+            Some(bytes) => Ok(Some(decode_volume_record(&bytes)?)),
             None => Ok(None),
         }
     }
@@ -872,7 +998,7 @@ impl ControlPlane {
         let mut iter = self.db.scan_prefix(prefix.as_bytes(), ..).await?;
         let mut volumes = Vec::new();
         while let Some(kv) = iter.next().await? {
-            volumes.push(decode_versioned(VOLUME_RECORD_VERSION, &kv.value)?);
+            volumes.push(decode_volume_record(&kv.value)?);
         }
         Ok(volumes)
     }
@@ -1123,11 +1249,13 @@ impl ControlPlane {
     // ---- exports (control-plane managed live export definitions) ----
 
     pub async fn create_export(&self, mut record: ExportRecord) -> Result<ExportRecord> {
+        record.normalize();
         validate_export_record_fields(&record)?;
         if self.try_get_export(&record.id).await?.is_some() {
             return Err(Error::already_exists("export", &record.id));
         }
-        self.get_volume(&record.tenant, &record.volume).await?;
+        let volume = self.get_volume(&record.tenant, &record.volume).await?;
+        validate_export_record_volume_kind(&record, volume.kind)?;
         let now = now_unix();
         record.created_at = now;
         record.updated_at = now;
@@ -1136,9 +1264,11 @@ impl ControlPlane {
     }
 
     pub async fn update_export(&self, mut record: ExportRecord) -> Result<ExportRecord> {
+        record.normalize();
         validate_export_record_fields(&record)?;
         let existing = self.get_export(&record.id).await?;
-        self.get_volume(&record.tenant, &record.volume).await?;
+        let volume = self.get_volume(&record.tenant, &record.volume).await?;
+        validate_export_record_volume_kind(&record, volume.kind)?;
         record.created_at = existing.created_at;
         record.updated_at = now_unix();
         self.put_export(&record).await?;
@@ -1172,11 +1302,13 @@ impl ControlPlane {
     }
 
     pub async fn put_export(&self, record: &ExportRecord) -> Result<()> {
-        validate_export_record_fields(record)?;
+        let mut record = record.clone();
+        record.normalize();
+        validate_export_record_fields(&record)?;
         self.db
             .put(
                 export_key(&record.id).as_bytes(),
-                encode_versioned(EXPORT_RECORD_VERSION, record)?,
+                encode_versioned(EXPORT_RECORD_VERSION, &record)?,
             )
             .await?;
         Ok(())
@@ -2206,6 +2338,13 @@ fn validate_export_record_fields(record: &ExportRecord) -> Result<()> {
     })
 }
 
+fn validate_export_record_volume_kind(record: &ExportRecord, kind: VolumeKind) -> Result<()> {
+    validate_export_volume_kind(&record.to_config(), kind).map_err(|error| match error {
+        Error::Config(message) => Error::invalid("export volume kind", message),
+        error => error,
+    })
+}
+
 fn node_load_score(node: &DaemonNodeRecord, assigned_primary_volumes: u32) -> u128 {
     let metrics = node.metrics;
     let writable = assigned_primary_volumes.max(metrics.open_writable_volumes) as u128;
@@ -2242,7 +2381,20 @@ fn decode_tenant_record(bytes: &[u8]) -> Result<TenantRecord> {
 }
 
 fn decode_volume_record(bytes: &[u8]) -> Result<VolumeRecord> {
-    decode_versioned(VOLUME_RECORD_VERSION, bytes)
+    match bytes.split_first() {
+        Some((&VOLUME_RECORD_VERSION, rest)) => match postcard::from_bytes(rest) {
+            Ok(record) => Ok(record),
+            Err(new_error) => match postcard::from_bytes::<VolumeRecordV1>(rest) {
+                Ok(legacy) => Ok(legacy.into()),
+                Err(_) => Err(new_error.into()),
+            },
+        },
+        Some((&version, _)) => Err(Error::invalid(
+            "record",
+            format!("format version {version}, expected {VOLUME_RECORD_VERSION}"),
+        )),
+        None => Err(Error::invalid("record", "empty value")),
+    }
 }
 
 fn decode_daemon_node_record(bytes: &[u8]) -> Result<DaemonNodeRecord> {
@@ -2254,7 +2406,23 @@ fn decode_volume_placement_record(bytes: &[u8]) -> Result<VolumePlacementRecord>
 }
 
 fn decode_export_record(bytes: &[u8]) -> Result<ExportRecord> {
-    decode_versioned(EXPORT_RECORD_VERSION, bytes)
+    match bytes.split_first() {
+        Some((&EXPORT_RECORD_VERSION, rest)) => match postcard::from_bytes(rest) {
+            Ok(mut record) => {
+                ExportRecord::normalize(&mut record);
+                Ok(record)
+            }
+            Err(new_error) => match postcard::from_bytes::<ExportRecordV1>(rest) {
+                Ok(legacy) => Ok(legacy.into()),
+                Err(_) => Err(new_error.into()),
+            },
+        },
+        Some((&version, _)) => Err(Error::invalid(
+            "record",
+            format!("format version {version}, expected {EXPORT_RECORD_VERSION}"),
+        )),
+        None => Err(Error::invalid("record", "empty value")),
+    }
 }
 
 fn decode_snapshot_retention_policy(bytes: &[u8]) -> Result<SnapshotRetentionPolicy> {
@@ -2424,4 +2592,156 @@ fn parse_audit_key(key: &[u8]) -> Option<(u64, u32)> {
 
 fn audit_id(timestamp: u64, seq: u32) -> String {
     format!("{timestamp:016x}.{seq:08x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_volume_record_decodes_as_filesystem() {
+        let legacy = VolumeRecordV1 {
+            tenant: "t".to_string(),
+            name: "v".to_string(),
+            state: VolumeState::Active,
+            clone_parent: None,
+            fsid: 123,
+            wrapped_dek: vec![1, 2, 3],
+            cipher: Cipher::Aes256Gcm,
+            chunk_size: 4096,
+            compression: Compression::Lz4,
+            quota: QuotaLimits::default(),
+            note: None,
+            created_at: 456,
+        };
+        let bytes = encode_versioned(VOLUME_RECORD_VERSION, &legacy).unwrap();
+        let decoded = decode_volume_record(&bytes).unwrap();
+        assert_eq!(decoded.kind, VolumeKind::Filesystem);
+        assert_eq!(decoded.tenant, legacy.tenant);
+        assert_eq!(decoded.name, legacy.name);
+    }
+
+    #[test]
+    fn legacy_export_record_decodes_with_nbd_defaults() {
+        let legacy = ExportRecordV1 {
+            id: "exp".to_string(),
+            tenant: "t".to_string(),
+            volume: "v".to_string(),
+            snapshot: Some("snap".to_string()),
+            protocol: ExportProtocol::Nfs,
+            listen: "127.0.0.1:12049".to_string(),
+            allowed_clients: Vec::new(),
+            squash: SquashMode::AllSquash,
+            atime: AtimeMode::Relatime,
+            anon_uid: 65534,
+            anon_gid: 65534,
+            p9_token: None,
+            p9_tls_cert: None,
+            p9_tls_key: None,
+            enabled: true,
+            created_at: 1,
+            updated_at: 2,
+        };
+        let bytes = encode_versioned(EXPORT_RECORD_VERSION, &legacy).unwrap();
+        let decoded = decode_export_record(&bytes).unwrap();
+        assert!(decoded.read_only);
+        assert_eq!(decoded.sync, NbdSyncMode::Default);
+        assert!(decoded.effective_read_only());
+    }
+
+    #[tokio::test]
+    async fn export_volume_kind_mismatch_is_rejected() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(crate::crypto::kms::StaticKms::new(Secret32::from_bytes(
+            [42; 32],
+        )));
+        let control = ControlPlane::open(Arc::clone(&object_store), kms)
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        crate::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "fs",
+            crate::volume::CreateVolumeOptions {
+                cipher: Cipher::Aes256Gcm,
+                chunk_size: 4096,
+                compression: Compression::Lz4,
+                quota: QuotaLimits::default(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+        crate::volume::create_block_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "blk",
+            crate::volume::CreateBlockVolumeOptions {
+                cipher: Cipher::Aes256Gcm,
+                chunk_size: 4096,
+                compression: Compression::Lz4,
+                quota: QuotaLimits::default(),
+                note: None,
+                size_bytes: 4096,
+            },
+        )
+        .await
+        .unwrap();
+
+        let nbd_on_fs = ExportRecord::from_config(
+            "nbd-fs",
+            ExportConfig {
+                tenant: "t".to_string(),
+                volume: "fs".to_string(),
+                snapshot: None,
+                listen: "127.0.0.1:12090".to_string(),
+                allowed_clients: Vec::new(),
+                protocol: ExportProtocol::Nbd,
+                read_only: false,
+                sync: NbdSyncMode::Default,
+                nbd_tls_cert: None,
+                nbd_tls_key: None,
+                nbd_tls_client_ca: None,
+                p9_token: None,
+                p9_tls_cert: None,
+                p9_tls_key: None,
+                squash: SquashMode::AllSquash,
+                atime: AtimeMode::Relatime,
+                anon_uid: 65534,
+                anon_gid: 65534,
+            },
+            true,
+        );
+        assert!(control.create_export(nbd_on_fs).await.is_err());
+
+        let nfs_on_block = ExportRecord::from_config(
+            "nfs-block",
+            ExportConfig {
+                tenant: "t".to_string(),
+                volume: "blk".to_string(),
+                snapshot: None,
+                listen: "127.0.0.1:12091".to_string(),
+                allowed_clients: Vec::new(),
+                protocol: ExportProtocol::Nfs,
+                read_only: false,
+                sync: NbdSyncMode::Default,
+                nbd_tls_cert: None,
+                nbd_tls_key: None,
+                nbd_tls_client_ca: None,
+                p9_token: None,
+                p9_tls_cert: None,
+                p9_tls_key: None,
+                squash: SquashMode::AllSquash,
+                atime: AtimeMode::Relatime,
+                anon_uid: 65534,
+                anon_gid: 65534,
+            },
+            true,
+        );
+        assert!(control.create_export(nfs_on_block).await.is_err());
+        control.close().await.unwrap();
+    }
 }

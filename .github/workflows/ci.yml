@@ -122,6 +122,79 @@ jobs:
             [ "$failed" -le 2 ]
           }
 
+  # Phase B3: real Linux kernel NBD client against a SlateFS block volume.
+  # The script can SKIP on local Docker kernels without nbd.ko, but Ubuntu CI
+  # is expected to provide it, so the SKIP marker fails this job.
+  kernel-nbd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      minio:
+        image: bitnami/minio:latest
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+          MINIO_DEFAULT_BUCKETS: slatefs-test
+        ports:
+          - 9000:9000
+    env:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT: http://localhost:9000
+      AWS_ALLOW_HTTP: "true"
+      AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y nbd-client e2fsprogs util-linux jq curl kmod procps qemu-utils
+      - run: cargo build -p slatefs-daemon -p slatefs-cli
+      - name: provision NBD base config
+        run: |
+          cat > /tmp/slatefs-nbd.toml <<'EOF'
+          [object_store]
+          url = "s3://slatefs-test/kernel-nbd"
+          [kms]
+          provider = "static"
+          key_hex = "0000000000000000000000000000000000000000000000000000000000000001"
+          [slatedb]
+          l0_sst_size_bytes = 16777216
+          max_unflushed_bytes = 268435456
+          l0_max_ssts = 64
+          l0_max_ssts_per_key = 16
+          l0_flush_parallelism = 2
+          compaction_max_sst_size_bytes = 67108864
+          compaction_max_concurrent = 2
+          compaction_max_fetch_tasks = 2
+          EOF
+      - name: QEMU userspace NBD smoke
+        run: |
+          set -o pipefail
+          SLATEFS_CONFIG=/tmp/slatefs-nbd.toml ./scripts/qemu-nbd-smoke.sh | tee /tmp/qemu-nbd.log
+          if grep -q 'SLATEFS_QEMU_NBD_SMOKE_SKIPPED' /tmp/qemu-nbd.log; then
+            echo "::error::qemu-img was unavailable on an Ubuntu CI runner"
+            exit 1
+          fi
+          grep -q 'SLATEFS_QEMU_NBD_SMOKE_PASSED' /tmp/qemu-nbd.log
+      - name: ext4 over kernel NBD
+        run: |
+          set -o pipefail
+          SLATEFS_CONFIG=/tmp/slatefs-nbd.toml ./scripts/nbd-kernel-attach-test.sh | tee /tmp/nbd-kernel.log
+          if grep -q 'SLATEFS_NBD_KERNEL_TEST_SKIPPED' /tmp/nbd-kernel.log; then
+            echo "::error::NBD kernel support was missing on an Ubuntu CI runner"
+            exit 1
+          fi
+          grep -q 'SLATEFS_NBD_KERNEL_TEST_PASSED' /tmp/nbd-kernel.log
+      - name: ZFS over kernel NBD smoke (allow skip)
+        run: |
+          set -o pipefail
+          SLATEFS_CONFIG=/tmp/slatefs-nbd.toml ./scripts/zfs-over-nbd-smoke.sh | tee /tmp/zfs-nbd.log
+          if grep -q 'SLATEFS_ZFS_NBD_SMOKE_SKIPPED' /tmp/zfs-nbd.log; then
+            echo "::notice::ZFS over NBD smoke skipped; zfs.ko is not guaranteed on hosted runners"
+            exit 0
+          fi
+          grep -q 'SLATEFS_ZFS_NBD_SMOKE_PASSED' /tmp/zfs-nbd.log
+
   # Phase 1 acceptance criteria at scale, nightly only (plan §14): model
   # property runs and the crash/fsck loop with large iteration counts.
   nightly-heavy:
@@ -135,7 +208,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p slatefs-core --release --test model --test crash
+      - run: cargo test -p slatefs-core --release --test model --test crash --test block_model --test block_crash
 
   # Phase 2 endurance at AC scale, nightly only (plan §14): fsx 10M ops,
   # long fsstress, repeated restarts under load. file:// backend — this

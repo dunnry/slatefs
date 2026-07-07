@@ -28,12 +28,14 @@ use crate::meta::alloc::InodeAllocator;
 use crate::meta::dirent::Orphan;
 use crate::meta::inode::{FileKind, Inode, ROOT_INO, Timespec};
 use crate::meta::keys;
-use crate::meta::superblock::{KEY_SUPERBLOCK, Superblock};
+use crate::meta::superblock::{KEY_SUPERBLOCK, Superblock, VolumeKind};
 use crate::quota::{self, CounterMergeOperator, QuotaTracker};
 use crate::store;
 use crate::vfs::{FsError, FsResult, OpenMode};
 
 const DEFAULT_DISK_CACHE_OPEN_FILES: usize = 256;
+pub const DEFAULT_BLOCK_CHUNK_SIZE: u32 = 64 * 1024;
+const BLOCK_SECTOR_SIZE: u64 = 4096;
 
 /// Parameters fixed at volume creation. `cipher` must already be resolved
 /// (no `Auto` here): the choice is recorded in the volume format and must not
@@ -57,6 +59,39 @@ impl CreateVolumeOptions {
             note: None,
         }
     }
+}
+
+/// Parameters fixed at block-volume creation.
+#[derive(Debug, Clone)]
+pub struct CreateBlockVolumeOptions {
+    pub cipher: Cipher,
+    pub chunk_size: u32,
+    pub compression: Compression,
+    pub quota: QuotaLimits,
+    pub note: Option<String>,
+    pub size_bytes: u64,
+}
+
+impl CreateBlockVolumeOptions {
+    pub fn from_defaults(defaults: &VolumeDefaults, size_bytes: u64) -> Self {
+        CreateBlockVolumeOptions {
+            cipher: defaults.cipher.resolve(),
+            chunk_size: DEFAULT_BLOCK_CHUNK_SIZE,
+            compression: defaults.compression,
+            quota: QuotaLimits::default(),
+            note: None,
+            size_bytes,
+        }
+    }
+}
+
+struct CreateVolumeRequest {
+    cipher: Cipher,
+    chunk_size: u32,
+    compression: Compression,
+    quota: QuotaLimits,
+    note: Option<String>,
+    kind: VolumeKind,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -114,6 +149,8 @@ impl VolumeCaches {
 pub struct VolumeInfo {
     pub record: VolumeRecord,
     pub superblock: Superblock,
+    pub counter_bytes: i64,
+    pub counter_inodes: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +192,57 @@ pub async fn create_volume(
     volume_name: &str,
     opts: CreateVolumeOptions,
 ) -> Result<VolumeRecord> {
+    create_volume_inner(
+        control,
+        object_store,
+        tenant_name,
+        volume_name,
+        CreateVolumeRequest {
+            cipher: opts.cipher,
+            chunk_size: opts.chunk_size,
+            compression: opts.compression,
+            quota: opts.quota,
+            note: opts.note,
+            kind: VolumeKind::Filesystem,
+        },
+    )
+    .await
+}
+
+pub async fn create_block_volume(
+    control: &ControlPlane,
+    object_store: Arc<dyn ObjectStore>,
+    tenant_name: &str,
+    volume_name: &str,
+    opts: CreateBlockVolumeOptions,
+) -> Result<VolumeRecord> {
+    validate_block_size(opts.size_bytes, opts.chunk_size)?;
+    create_volume_inner(
+        control,
+        object_store,
+        tenant_name,
+        volume_name,
+        CreateVolumeRequest {
+            cipher: opts.cipher,
+            chunk_size: opts.chunk_size,
+            compression: opts.compression,
+            quota: opts.quota,
+            note: opts.note,
+            kind: VolumeKind::Block {
+                size_bytes: opts.size_bytes,
+            },
+        },
+    )
+    .await
+}
+
+async fn create_volume_inner(
+    control: &ControlPlane,
+    object_store: Arc<dyn ObjectStore>,
+    tenant_name: &str,
+    volume_name: &str,
+    opts: CreateVolumeRequest,
+) -> Result<VolumeRecord> {
     store::validate_name("tenant name", tenant_name)?;
     store::validate_name("volume name", volume_name)?;
 
@@ -168,6 +256,16 @@ pub async fn create_volume(
 
     let mut record = match control.try_get_volume(tenant_name, volume_name).await? {
         Some(existing) if existing.state == VolumeState::Creating => {
+            if existing.cipher != opts.cipher
+                || existing.chunk_size != opts.chunk_size
+                || existing.compression != opts.compression
+                || existing.kind != opts.kind
+            {
+                return Err(Error::invalid(
+                    "volume record",
+                    "interrupted create format differs from requested volume",
+                ));
+            }
             tracing::warn!(
                 tenant = tenant_name,
                 volume = volume_name,
@@ -199,6 +297,7 @@ pub async fn create_volume(
                 chunk_size: opts.chunk_size,
                 compression: opts.compression,
                 quota: opts.quota,
+                kind: opts.kind,
                 note: opts.note,
                 created_at: now_unix(),
             };
@@ -298,6 +397,7 @@ pub async fn clone_volume(
             if existing.cipher != source.cipher
                 || existing.chunk_size != source.chunk_size
                 || existing.compression != source.compression
+                || existing.kind != source.kind
             {
                 return Err(Error::invalid(
                     "clone record",
@@ -353,6 +453,7 @@ pub async fn clone_volume(
                 chunk_size: source.chunk_size,
                 compression: source.compression,
                 quota: source.quota,
+                kind: source.kind,
                 note: opts.note,
                 created_at: now_unix(),
             };
@@ -395,7 +496,7 @@ async fn rewrite_cloned_superblock(
     object_store: Arc<dyn ObjectStore>,
 ) -> Result<()> {
     let db = open_volume_db(clone, dek, object_store, &VolumeCaches::default()).await?;
-    let result = async {
+    let result: Result<()> = async {
         let bytes = db
             .get(KEY_SUPERBLOCK)
             .await?
@@ -410,14 +511,9 @@ async fn rewrite_cloned_superblock(
                 ),
             ));
         }
-        if superblock.chunk_size != clone.chunk_size || superblock.cipher != clone.cipher {
-            return Err(Error::invalid(
-                "clone superblock",
-                "chunk size or cipher differs from clone control record",
-            ));
-        }
         superblock.fsid = clone.fsid;
         superblock.created_at = clone.created_at;
+        verify_superblock_matches_record(clone, &superblock, "clone superblock")?;
         db.put(KEY_SUPERBLOCK, superblock.encode()?).await?;
         db.flush().await?;
         Ok(())
@@ -438,35 +534,30 @@ async fn mkfs(
 ) -> Result<()> {
     let db = open_volume_db(record, dek, object_store, &VolumeCaches::default()).await?;
 
-    let result = async {
+    let result: Result<()> = async {
         match db.get(KEY_SUPERBLOCK).await? {
             Some(bytes) => {
                 let existing = Superblock::decode(&bytes)?;
-                if existing.fsid != record.fsid {
-                    return Err(Error::invalid(
-                        "superblock",
-                        format!(
-                            "fsid {:016x} does not match control record {:016x}",
-                            existing.fsid, record.fsid
-                        ),
-                    ));
-                }
+                verify_superblock_matches_record(record, &existing, "superblock")?;
             }
             None => {
                 let superblock = Superblock {
                     fsid: record.fsid,
                     cipher: record.cipher,
                     chunk_size: record.chunk_size,
-                    name_enc: true,
+                    name_enc: matches!(record.kind, VolumeKind::Filesystem),
                     created_at: record.created_at,
+                    kind: record.kind,
                 };
-                let mut root = Inode::new(FileKind::Dir, 0o755, 0, 0, Timespec::now());
-                root.parent_dir = ROOT_INO;
 
                 let mut batch = WriteBatch::new();
                 batch.put(KEY_SUPERBLOCK, superblock.encode()?);
-                batch.put(keys::inode(ROOT_INO), root.encode()?);
-                batch.put(keys::KEY_NEXT_INO, (ROOT_INO + 1).to_be_bytes());
+                if matches!(record.kind, VolumeKind::Filesystem) {
+                    let mut root = Inode::new(FileKind::Dir, 0o755, 0, 0, Timespec::now());
+                    root.parent_dir = ROOT_INO;
+                    batch.put(keys::inode(ROOT_INO), root.encode()?);
+                    batch.put(keys::KEY_NEXT_INO, (ROOT_INO + 1).to_be_bytes());
+                }
                 batch.merge(keys::KEY_QUOTA_INODES, quota::encode_delta(1));
                 db.write(batch).await?;
                 db.flush().await?;
@@ -478,6 +569,73 @@ async fn mkfs(
 
     db.close().await?;
     result
+}
+
+pub(crate) fn validate_block_size(size_bytes: u64, chunk_size: u32) -> Result<()> {
+    if size_bytes == 0 {
+        return Err(Error::invalid(
+            "block size",
+            "size_bytes must be greater than zero",
+        ));
+    }
+    if !size_bytes.is_multiple_of(BLOCK_SECTOR_SIZE) {
+        return Err(Error::invalid(
+            "block size",
+            format!("size_bytes must be a multiple of {BLOCK_SECTOR_SIZE}"),
+        ));
+    }
+    if chunk_size == 0 {
+        return Err(Error::invalid(
+            "block chunk size",
+            "chunk_size must be greater than zero",
+        ));
+    }
+    let max = chunk_size as u128 * (u32::MAX as u128 + 1);
+    if size_bytes as u128 > max {
+        return Err(Error::invalid(
+            "block size",
+            format!("size_bytes exceeds chunk_size * 2^32 ({max})"),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_superblock_matches_record(
+    record: &VolumeRecord,
+    superblock: &Superblock,
+    what: &'static str,
+) -> Result<()> {
+    if superblock.fsid != record.fsid {
+        return Err(Error::invalid(
+            what,
+            format!(
+                "fsid {:016x} does not match control record {:016x}",
+                superblock.fsid, record.fsid
+            ),
+        ));
+    }
+    if superblock.cipher != record.cipher {
+        return Err(Error::invalid(what, "cipher does not match control record"));
+    }
+    if superblock.chunk_size != record.chunk_size {
+        return Err(Error::invalid(
+            what,
+            "chunk size does not match control record",
+        ));
+    }
+    if superblock.kind != record.kind {
+        return Err(Error::invalid(
+            what,
+            format!(
+                "kind {:?} does not match control record {:?}",
+                superblock.kind, record.kind
+            ),
+        ));
+    }
+    if let VolumeKind::Block { size_bytes } = superblock.kind {
+        validate_block_size(size_bytes, superblock.chunk_size)?;
+    }
+    Ok(())
 }
 
 /// Open a volume's SlateDB as the (single) writer, with its block
@@ -555,20 +713,90 @@ pub async fn volume_info(
 ) -> Result<VolumeInfo> {
     let record = control.get_volume(tenant_name, volume_name).await?;
     let dek = control.unwrap_volume_dek(&record).await?;
+    let clone_parent_prefixes = clone_parent_prefixes(control, &record).await?;
+    let reader_store = if clone_parent_prefixes.is_empty() {
+        Arc::clone(&object_store)
+    } else {
+        store::clone_parent_read_fallback_store(
+            Arc::clone(&object_store),
+            &record.tenant,
+            &record.name,
+            clone_parent_prefixes,
+        )
+    };
 
     let path = store::volume_db_path(&record.tenant, &record.name);
-    let reader = DbReader::builder(path, object_store)
+    let reader = DbReader::builder(path, reader_store)
         .with_block_transformer(Arc::new(SlateBlockTransformer::new(record.cipher, dek)))
         .with_merge_operator(Arc::new(CounterMergeOperator))
         .build()
         .await?;
 
-    let result = async {
+    let result: Result<(Superblock, i64, i64)> = async {
         let bytes = reader
             .get(KEY_SUPERBLOCK)
             .await?
             .ok_or_else(|| Error::invalid("volume", "no superblock (mkfs incomplete?)"))?;
         let superblock = Superblock::decode(&bytes)?;
+        verify_superblock_matches_record(&record, &superblock, "superblock")?;
+        let counter_bytes =
+            quota::decode_counter(reader.get(keys::KEY_QUOTA_BYTES).await?.as_deref());
+        let counter_inodes =
+            quota::decode_counter(reader.get(keys::KEY_QUOTA_INODES).await?.as_deref());
+        Ok((superblock, counter_bytes, counter_inodes))
+    }
+    .await;
+
+    reader.close().await?;
+    let (superblock, counter_bytes, counter_inodes) = result?;
+    Ok(VolumeInfo {
+        record,
+        superblock,
+        counter_bytes,
+        counter_inodes,
+    })
+}
+
+/// Grow an offline block volume. This opens the volume DB as the writer, just
+/// like offline fsck/recount; callers must not run it against a served volume.
+pub async fn resize_block_volume(
+    control: &ControlPlane,
+    object_store: Arc<dyn ObjectStore>,
+    tenant_name: &str,
+    volume_name: &str,
+    new_size_bytes: u64,
+) -> Result<VolumeRecord> {
+    store::validate_name("tenant name", tenant_name)?;
+    store::validate_name("volume name", volume_name)?;
+    let mut record = control.get_volume(tenant_name, volume_name).await?;
+    if record.state != VolumeState::Active {
+        return Err(Error::invalid(
+            "volume state",
+            format!(
+                "{tenant_name}/{volume_name} is {:?}, not Active",
+                record.state
+            ),
+        ));
+    }
+    let VolumeKind::Block {
+        size_bytes: record_size,
+    } = record.kind
+    else {
+        return Err(Error::invalid(
+            "volume kind",
+            "filesystem volume cannot be resized as a block volume",
+        ));
+    };
+    validate_block_size(new_size_bytes, record.chunk_size)?;
+
+    let dek = control.unwrap_volume_dek(&record).await?;
+    let db = open_volume_db(&record, dek, object_store, &VolumeCaches::default()).await?;
+    let result: Result<VolumeRecord> = async {
+        let bytes = db
+            .get(KEY_SUPERBLOCK)
+            .await?
+            .ok_or_else(|| Error::invalid("volume", "no superblock (mkfs incomplete?)"))?;
+        let mut superblock = Superblock::decode(&bytes)?;
         if superblock.fsid != record.fsid {
             return Err(Error::invalid(
                 "superblock",
@@ -578,15 +806,58 @@ pub async fn volume_info(
                 ),
             ));
         }
-        Ok(superblock)
+        if superblock.cipher != record.cipher {
+            return Err(Error::invalid(
+                "superblock",
+                "cipher does not match control record",
+            ));
+        }
+        if superblock.chunk_size != record.chunk_size {
+            return Err(Error::invalid(
+                "superblock",
+                "chunk size does not match control record",
+            ));
+        }
+        let VolumeKind::Block {
+            size_bytes: superblock_size,
+        } = superblock.kind
+        else {
+            return Err(Error::invalid(
+                "superblock",
+                "filesystem superblock cannot be resized as a block volume",
+            ));
+        };
+        validate_block_size(superblock_size, superblock.chunk_size)?;
+        if new_size_bytes < superblock_size {
+            return Err(Error::invalid(
+                "block size",
+                format!("cannot shrink block volume from {superblock_size} to {new_size_bytes}"),
+            ));
+        }
+
+        if new_size_bytes != superblock_size {
+            superblock.kind = VolumeKind::Block {
+                size_bytes: new_size_bytes,
+            };
+            db.put(KEY_SUPERBLOCK, superblock.encode()?).await?;
+            db.flush().await?;
+        }
+
+        record.kind = VolumeKind::Block {
+            size_bytes: new_size_bytes,
+        };
+        // Recovery rule: the superblock is authoritative (BD-9). We write and
+        // flush it before the control record, so a crash here leaves a loud
+        // kind/size mismatch; rerunning resize repairs the stale control size.
+        if record_size != new_size_bytes || superblock_size != new_size_bytes {
+            control.put_volume(&record).await?;
+        }
+        Ok(record)
     }
     .await;
 
-    reader.close().await?;
-    Ok(VolumeInfo {
-        record,
-        superblock: result?,
-    })
+    db.close().await?;
+    result
 }
 
 /// Run the fsck structural checker through a read-only [`DbReader`]. Unlike
@@ -621,7 +892,7 @@ pub async fn scrub_volume(
         .build()
         .await?;
 
-    let result = async {
+    let result: Result<crate::fsck::FsckReport> = async {
         let bytes = reader
             .get(KEY_SUPERBLOCK)
             .await?
@@ -636,7 +907,23 @@ pub async fn scrub_volume(
                 ),
             ));
         }
-        crate::fsck::check_reader(&reader, superblock.chunk_size as u64, &names).await
+        match (record.kind, superblock.kind) {
+            (VolumeKind::Filesystem, VolumeKind::Filesystem) => {
+                crate::fsck::check_reader(&reader, superblock.chunk_size as u64, &names).await
+            }
+            (VolumeKind::Block { .. }, VolumeKind::Block { size_bytes }) => {
+                verify_superblock_matches_record(&record, &superblock, "superblock")?;
+                crate::fsck::check_block_reader(&reader, size_bytes, superblock.chunk_size as u64)
+                    .await
+            }
+            _ => Err(Error::invalid(
+                "superblock",
+                format!(
+                    "kind {:?} does not match control record {:?}",
+                    superblock.kind, record.kind
+                ),
+            )),
+        }
     }
     .await;
 
@@ -691,9 +978,21 @@ pub async fn create_snapshot(
     }
     let dek = control.unwrap_volume_dek(&record).await?;
     let path = store::volume_db_path(&record.tenant, &record.name);
-    let volume = Volume::open(&record, dek, Arc::clone(&object_store)).await?;
-    let created = volume.create_live_snapshot(name).await?;
-    volume.shutdown().await?;
+    let created = match record.kind {
+        VolumeKind::Filesystem => {
+            let volume = Volume::open(&record, dek, Arc::clone(&object_store)).await?;
+            let created = volume.create_live_snapshot(name).await?;
+            volume.shutdown().await?;
+            created
+        }
+        VolumeKind::Block { .. } => {
+            let volume =
+                crate::block::BlockVolume::open(&record, dek, Arc::clone(&object_store)).await?;
+            let created = volume.create_live_snapshot(name).await?;
+            volume.shutdown().await?;
+            created
+        }
+    };
 
     let admin = AdminBuilder::new(path, object_store).build();
     admin
@@ -877,10 +1176,15 @@ impl Volume {
             Some(bytes) => Superblock::decode(&bytes)?,
             None => return Err(Error::invalid("volume", "no superblock (mkfs incomplete?)")),
         };
-        if superblock.fsid != record.fsid {
+        if let Err(error) = verify_superblock_matches_record(record, &superblock, "superblock") {
+            db.close().await?;
+            return Err(error);
+        }
+        if !matches!(superblock.kind, VolumeKind::Filesystem) {
+            db.close().await?;
             return Err(Error::invalid(
-                "superblock",
-                "fsid mismatch with control record",
+                "volume kind",
+                "block volume cannot be opened as a filesystem; use BlockVolume",
             ));
         }
 

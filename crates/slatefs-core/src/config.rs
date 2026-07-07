@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::Cipher;
 use crate::error::{Error, Result};
+use crate::meta::superblock::VolumeKind;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -184,6 +185,15 @@ pub enum ExportProtocol {
     #[default]
     Nfs,
     P9,
+    Nbd,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NbdSyncMode {
+    #[default]
+    Default,
+    Strict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -205,6 +215,26 @@ pub struct ExportConfig {
     /// Wire protocol for this export (one listener per export, DD-10).
     #[serde(default)]
     pub protocol: ExportProtocol,
+    /// NBD only: expose the block device as read-only. Snapshot exports are
+    /// always read-only regardless of this field.
+    #[serde(default)]
+    pub read_only: bool,
+    /// NBD only: write durability mode. `strict` forces every write and
+    /// write-zeroes request to behave as if the client sent FUA.
+    #[serde(default)]
+    pub sync: NbdSyncMode,
+    /// NBD only: PEM certificate chain for STARTTLS-required NBD. Must be
+    /// paired with `nbd_tls_key`.
+    #[serde(default)]
+    pub nbd_tls_cert: Option<std::path::PathBuf>,
+    /// NBD only: PEM private key for STARTTLS-required NBD. Must be paired
+    /// with `nbd_tls_cert`.
+    #[serde(default)]
+    pub nbd_tls_key: Option<std::path::PathBuf>,
+    /// NBD only: optional PEM client CA bundle. When set, NBD TLS clients must
+    /// present a certificate chaining to one of these roots.
+    #[serde(default)]
+    pub nbd_tls_client_ca: Option<std::path::PathBuf>,
     /// 9P only: bearer token clients must present in `uname` at Tattach
     /// (DD-10). Unset ⇒ open export (use network isolation).
     #[serde(default)]
@@ -231,6 +261,18 @@ pub struct ExportConfig {
     pub anon_uid: u32,
     #[serde(default = "default_anon_id")]
     pub anon_gid: u32,
+}
+
+impl ExportConfig {
+    pub fn normalize(&mut self) {
+        if self.snapshot.is_some() {
+            self.read_only = true;
+        }
+    }
+
+    pub fn effective_read_only(&self) -> bool {
+        self.read_only || self.snapshot.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -461,9 +503,16 @@ impl Config {
     }
 
     pub fn parse(raw: &str) -> Result<Config> {
-        let config: Config = toml::from_str(raw).map_err(|e| Error::Config(e.to_string()))?;
+        let mut config: Config = toml::from_str(raw).map_err(|e| Error::Config(e.to_string()))?;
+        config.normalize();
         config.validate()?;
         Ok(config)
+    }
+
+    fn normalize(&mut self) {
+        for export in &mut self.exports {
+            export.normalize();
+        }
     }
 
     fn validate(&self) -> Result<()> {
@@ -535,21 +584,102 @@ impl Config {
 }
 
 pub fn validate_export_config(export: &ExportConfig) -> Result<()> {
-    let has_tls_cert = export.p9_tls_cert.is_some();
-    let has_tls_key = export.p9_tls_key.is_some();
-    if has_tls_cert != has_tls_key {
+    let has_p9_tls_cert = export.p9_tls_cert.is_some();
+    let has_p9_tls_key = export.p9_tls_key.is_some();
+    let has_nbd_tls_cert = export.nbd_tls_cert.is_some();
+    let has_nbd_tls_key = export.nbd_tls_key.is_some();
+    let has_nbd_tls_client_ca = export.nbd_tls_client_ca.is_some();
+    let has_p9_token = export.p9_token.is_some();
+    if has_p9_tls_cert != has_p9_tls_key {
         return Err(Error::Config(format!(
             "export {}/{} must set both p9_tls_cert and p9_tls_key, or neither",
             export.tenant, export.volume
         )));
     }
-    if export.protocol != ExportProtocol::P9 && (has_tls_cert || has_tls_key) {
+    if has_nbd_tls_cert != has_nbd_tls_key {
+        return Err(Error::Config(format!(
+            "export {}/{} must set both nbd_tls_cert and nbd_tls_key, or neither",
+            export.tenant, export.volume
+        )));
+    }
+    if has_nbd_tls_client_ca && !(has_nbd_tls_cert && has_nbd_tls_key) {
+        return Err(Error::Config(format!(
+            "export {}/{} sets nbd_tls_client_ca but does not set nbd_tls_cert and nbd_tls_key",
+            export.tenant, export.volume
+        )));
+    }
+    if export.protocol != ExportProtocol::P9 && (has_p9_tls_cert || has_p9_tls_key) {
         return Err(Error::Config(format!(
             "export {}/{} sets 9P TLS fields but protocol is not p9",
             export.tenant, export.volume
         )));
     }
+    if export.protocol != ExportProtocol::Nbd
+        && (has_nbd_tls_cert || has_nbd_tls_key || has_nbd_tls_client_ca)
+    {
+        return Err(Error::Config(format!(
+            "export {}/{} sets NBD TLS fields but protocol is not nbd",
+            export.tenant, export.volume
+        )));
+    }
+    match export.protocol {
+        ExportProtocol::Nbd => {
+            if has_p9_token {
+                return Err(Error::Config(format!(
+                    "export {}/{} sets 9P token but protocol is nbd",
+                    export.tenant, export.volume
+                )));
+            }
+            if export.squash != SquashMode::AllSquash
+                || export.atime != AtimeMode::Relatime
+                || export.anon_uid != default_anon_id()
+                || export.anon_gid != default_anon_id()
+            {
+                return Err(Error::Config(format!(
+                    "export {}/{} sets filesystem export fields but protocol is nbd",
+                    export.tenant, export.volume
+                )));
+            }
+        }
+        ExportProtocol::Nfs | ExportProtocol::P9 => {
+            if export.sync != NbdSyncMode::Default {
+                return Err(Error::Config(format!(
+                    "export {}/{} sets NBD sync mode but protocol is not nbd",
+                    export.tenant, export.volume
+                )));
+            }
+            if export.read_only && export.snapshot.is_none() {
+                return Err(Error::Config(format!(
+                    "export {}/{} sets read_only on a live filesystem export",
+                    export.tenant, export.volume
+                )));
+            }
+        }
+    }
     Ok(())
+}
+
+pub fn validate_export_volume_kind(export: &ExportConfig, kind: VolumeKind) -> Result<()> {
+    match (export.protocol, kind) {
+        (ExportProtocol::Nbd, VolumeKind::Block { .. }) => Ok(()),
+        (ExportProtocol::Nbd, VolumeKind::Filesystem) => Err(Error::Config(format!(
+            "nbd export {}/{} targets a filesystem volume",
+            export.tenant, export.volume
+        ))),
+        (ExportProtocol::Nfs | ExportProtocol::P9, VolumeKind::Filesystem) => Ok(()),
+        (ExportProtocol::Nfs | ExportProtocol::P9, VolumeKind::Block { .. }) => {
+            Err(Error::Config(format!(
+                "{} export {}/{} targets a block volume",
+                match export.protocol {
+                    ExportProtocol::Nfs => "nfs",
+                    ExportProtocol::P9 => "p9",
+                    ExportProtocol::Nbd => unreachable!("handled above"),
+                },
+                export.tenant,
+                export.volume
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -611,6 +741,59 @@ mod tests {
         assert_eq!(config.admin.listen.as_deref(), Some("127.0.0.1:12081"));
         assert_eq!(config.exports[0].allowed_clients.len(), 2);
         assert!(config.exports[0].allowed_clients[1].contains("10.9.8.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn nbd_export_parses_and_snapshot_implies_read_only() {
+        let raw = r#"
+            [object_store]
+            url = "memory:///"
+
+            [kms]
+            provider = "static"
+            key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+            [[exports]]
+            tenant = "t"
+            volume = "b"
+            listen = "127.0.0.1:12090"
+            protocol = "nbd"
+            allowed_clients = ["127.0.0.1"]
+            sync = "strict"
+
+            [[exports]]
+            tenant = "t"
+            volume = "snap"
+            snapshot = "018f7d79-0354-77a0-a14b-33b863d8999a"
+            listen = "127.0.0.1:12091"
+            protocol = "nbd"
+        "#;
+        let config = Config::parse(raw).unwrap();
+        assert_eq!(config.exports[0].protocol, ExportProtocol::Nbd);
+        assert_eq!(config.exports[0].sync, NbdSyncMode::Strict);
+        assert!(!config.exports[0].read_only);
+        assert!(config.exports[1].read_only);
+        assert!(config.exports[1].effective_read_only());
+    }
+
+    #[test]
+    fn nbd_export_rejects_filesystem_protocol_fields() {
+        let raw = r#"
+            [object_store]
+            url = "memory:///"
+
+            [kms]
+            provider = "static"
+            key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+            [[exports]]
+            tenant = "t"
+            volume = "b"
+            listen = "127.0.0.1:12090"
+            protocol = "nbd"
+            atime = "strict"
+        "#;
+        assert!(Config::parse(raw).is_err());
     }
 
     #[test]
@@ -753,6 +936,57 @@ mod tests {
         assert!(Config::parse(&missing_key).is_err());
 
         let nfs_tls = raw.replace(r#"protocol = "p9""#, r#"protocol = "nfs""#);
+        assert!(Config::parse(&nfs_tls).is_err());
+    }
+
+    #[test]
+    fn nbd_tls_fields_parse_and_validate() {
+        let raw = r#"
+            [object_store]
+            url = "memory:///"
+
+            [kms]
+            provider = "static"
+            key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+            [[exports]]
+            tenant = "t"
+            volume = "b"
+            listen = "127.0.0.1:12060"
+            protocol = "nbd"
+            nbd_tls_cert = "/tmp/slatefs-nbd.crt"
+            nbd_tls_key = "/tmp/slatefs-nbd.key"
+            nbd_tls_client_ca = "/tmp/slatefs-nbd-client-ca.pem"
+        "#;
+        let config = Config::parse(raw).unwrap();
+        assert_eq!(
+            config.exports[0].nbd_tls_cert.as_deref(),
+            Some(std::path::Path::new("/tmp/slatefs-nbd.crt"))
+        );
+        assert_eq!(
+            config.exports[0].nbd_tls_key.as_deref(),
+            Some(std::path::Path::new("/tmp/slatefs-nbd.key"))
+        );
+        assert_eq!(
+            config.exports[0].nbd_tls_client_ca.as_deref(),
+            Some(std::path::Path::new("/tmp/slatefs-nbd-client-ca.pem"))
+        );
+
+        let missing_key = raw
+            .lines()
+            .filter(|line| !line.contains("nbd_tls_key"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(Config::parse(&missing_key).is_err());
+
+        let client_ca_without_cert_key = raw
+            .lines()
+            .filter(|line| !line.contains("nbd_tls_cert") && !line.contains("nbd_tls_key"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(Config::parse(&client_ca_without_cert_key).is_err());
+
+        let nfs_tls = raw.replace(r#"protocol = "nbd""#, r#"protocol = "nfs""#);
         assert!(Config::parse(&nfs_tls).is_err());
     }
 }

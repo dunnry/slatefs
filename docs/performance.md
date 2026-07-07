@@ -90,6 +90,30 @@ compaction_max_concurrent = 2
 compaction_max_fetch_tasks = 2
 ```
 
+## NBD
+
+Phase B3 block-device fio work should run through a real kernel NBD attach, not
+the in-process NBD client. The functional/crash fixture is:
+
+```sh
+SKIP_SMOKE=1 \
+BIN_OVERRIDE=release \
+FIO_RUNTIME=30 \
+FIO_SIZE=1g \
+FIO_JOBS=4 \
+FIO_BS=64k \
+FIO_RW=randwrite \
+scripts/docker-kernel-mount-test.sh scripts/nbd-kernel-attach-test.sh
+```
+
+Set any `FIO_*` variable to make the crash-recovery drill use fio instead of
+the default dd loop. Sweep `FIO_RW` over `read write randread randwrite` and
+`FIO_BS` over `4k 64k 1m` for the B3 matrix; keep `FIO_RUNTIME`, `FIO_SIZE`,
+and `FIO_JOBS` fixed for comparable rows. The Docker wrapper is privileged and
+passes the NBD knobs through, but the kernel module must exist in the host/VM
+kernel. Docker Desktop may report `SLATEFS_NBD_KERNEL_TEST_SKIPPED`; run the
+matrix on Linux CI or a Linux bench host where `modprobe nbd` succeeds.
+
 ## Failover Timing
 
 The failover drill can run a fio workload against the primary NFS mount while

@@ -6,6 +6,7 @@
 //! Phase 1 (see `slatefs-plan.md` §14).
 
 pub mod attrcache;
+pub mod block;
 pub mod config;
 pub mod control;
 pub mod crypto;
