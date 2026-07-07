@@ -718,12 +718,20 @@ pub async fn list_snapshots(
     name_filter: Option<&str>,
 ) -> Result<Vec<SnapshotInfo>> {
     let record = control.get_volume(tenant_name, volume_name).await?;
+    list_snapshots_for_record(&record, object_store, name_filter).await
+}
+
+pub async fn list_snapshots_for_record(
+    record: &VolumeRecord,
+    object_store: Arc<dyn ObjectStore>,
+    name_filter: Option<&str>,
+) -> Result<Vec<SnapshotInfo>> {
     if record.state != VolumeState::Active {
         return Err(Error::invalid(
             "volume state",
             format!(
-                "{tenant_name}/{volume_name} is {:?}, not Active",
-                record.state
+                "{}/{} is {:?}, not Active",
+                record.tenant, record.name, record.state
             ),
         ));
     }

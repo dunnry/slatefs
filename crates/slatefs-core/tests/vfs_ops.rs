@@ -139,6 +139,14 @@ async fn fenced_writer_marks_volume_dead() {
     let takeover = volume::Volume::open(&record, dek, Arc::clone(&object_store))
         .await
         .unwrap();
+    let takeover_probe = takeover
+        .create(&root(), ROOT_INO, b"takeover-probe", 0o644, true)
+        .await
+        .unwrap();
+    takeover
+        .write(&root(), takeover_probe.ino, 0, b"new writer active")
+        .await
+        .unwrap();
     let stale_watch = Arc::clone(&stale);
     let wait_dead = tokio::spawn(async move {
         stale_watch.wait_dead().await;

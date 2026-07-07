@@ -3976,6 +3976,7 @@ dependencies = [
  "postcard",
  "proptest",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "slatedb",
  "slatedb-common",
@@ -3994,12 +3995,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "serde_json",
+ "slatedb",
  "slatefs-9p",
  "slatefs-core",
  "slatefs-nfs",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

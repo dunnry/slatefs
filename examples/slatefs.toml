@@ -41,6 +41,8 @@ cipher = "auto"              # auto | aes256gcm | xchacha20poly1305
 # Loopback-only daemon admin endpoint for live-writer actions.
 # [admin]
 # listen = "127.0.0.1:12081"
+# token = "replace-me"        # required if listen is not loopback
+# token_file = "/run/slatefs/admin-token"
 
 # Fleet placement is stored in the encrypted control DB, not in this config.
 # Register and heartbeat daemon nodes with:

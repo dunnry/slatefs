@@ -152,6 +152,10 @@ pub struct MetricsConfig {
 pub struct AdminConfig {
     /// Optional loopback `ip:port` listener for daemon-local admin actions.
     pub listen: Option<String>,
+    /// Optional static bearer token for `/admin/v1` routes.
+    pub token: Option<String>,
+    /// Optional file containing the static bearer token for `/admin/v1` routes.
+    pub token_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -453,6 +457,19 @@ impl Config {
             ));
         }
         self.slatedb.validate()?;
+        if self.admin.token.is_some() && self.admin.token_file.is_some() {
+            return Err(Error::Config(
+                "admin.token and admin.token_file are mutually exclusive".into(),
+            ));
+        }
+        if self
+            .admin
+            .token
+            .as_deref()
+            .is_some_and(|token| token.is_empty())
+        {
+            return Err(Error::Config("admin.token must not be empty".into()));
+        }
         if let Some(listen) = &self.admin.listen {
             if listen.is_empty() {
                 return Err(Error::Config(
@@ -462,9 +479,12 @@ impl Config {
             let addr: SocketAddr = listen.parse().map_err(|e| {
                 Error::Config(format!("admin.listen must be an ip:port listener: {e}"))
             })?;
-            if !addr.ip().is_loopback() {
+            if !addr.ip().is_loopback()
+                && self.admin.token.is_none()
+                && self.admin.token_file.is_none()
+            {
                 return Err(Error::Config(
-                    "admin.listen must bind a loopback address".into(),
+                    "admin.listen must bind a loopback address unless admin.token or admin.token_file is set".into(),
                 ));
             }
         }
@@ -561,6 +581,42 @@ mod tests {
 
             [admin]
             listen = "0.0.0.0:12081"
+        "#;
+        assert!(Config::parse(raw).is_err());
+    }
+
+    #[test]
+    fn admin_listener_may_bind_non_loopback_with_token() {
+        let raw = r#"
+            [object_store]
+            url = "memory:///"
+
+            [kms]
+            provider = "static"
+            key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+            [admin]
+            listen = "0.0.0.0:12081"
+            token = "secret"
+        "#;
+        let config = Config::parse(raw).unwrap();
+        assert_eq!(config.admin.token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn admin_token_sources_are_mutually_exclusive() {
+        let raw = r#"
+            [object_store]
+            url = "memory:///"
+
+            [kms]
+            provider = "static"
+            key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+            [admin]
+            listen = "127.0.0.1:12081"
+            token = "secret"
+            token_file = "/run/slatefs/admin-token"
         "#;
         assert!(Config::parse(raw).is_err());
     }

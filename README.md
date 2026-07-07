@@ -134,8 +134,29 @@ rotate-kek <tenant>` rotates that tenant's KEK by rewrapping active volume DEKs
 in the control plane; volume data blocks are not rewritten. Optional
 `[metrics].listen = "ip:port"` exposes Prometheus text at `/metrics`, including
 SlateDB cache/flush samples per writable volume and `slatefs_volume_dead`.
-`[admin].listen = "127.0.0.1:port"` exposes loopback-only daemon admin actions
-such as live-writer snapshot creation.
+`[admin].listen = "127.0.0.1:port"` exposes the daemon admin listener. It
+keeps the legacy live-writer snapshot route and serves admin API v1:
+
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` | `/livez` | Process liveness JSON. |
+| `GET` | `/readyz` | Readiness JSON; `?verbose=1` adds identity fields. |
+| `GET` | `/status` | Legacy text status. |
+| `POST` | `/snapshot/{tenant}/{volume}?name=` | Legacy live-writer snapshot. |
+| `GET` | `/admin/v1/audit` | Audit records with `since`, `until`, `tenant`, `volume`, `action`, `limit`, `page_token`, `newest_first`. |
+| `GET` | `/admin/v1/tenants` | Tenant inventory with `limit` and `page_token`. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes` | Volume inventory with `limit` and `page_token`. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}` | Volume detail. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshot?name=` | v1 live-writer snapshot alias. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshots` | Checkpoint inventory with `limit`, `page_token`, and optional `name`. |
+| `GET` | `/admin/v1/nodes` | Daemon node inventory with `limit` and `page_token`. |
+
+Every admin response includes `X-Request-Id`; callers may provide it or the
+daemon generates a UUID. v1 errors use `{"error":{"code","message","request_id"}}`.
+Unauthenticated loopback remains the default. To bind the admin listener
+outside loopback, configure `[admin].token = "..."` or `token_file = "..."`;
+then all `/admin/v1` routes require `Authorization: Bearer <token>`, while
+`/livez` and `/readyz` remain unauthenticated.
 The control plane now also stores fleet placement: daemon node health/load,
 per-volume primary ownership, standby lists, stable endpoints, drain/rebalance
 state, read replicas, and snapshot-serving pools. `slatefs fleet node ...` and

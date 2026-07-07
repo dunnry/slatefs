@@ -4,12 +4,13 @@
 //! as a raw object at `<root>/control.dek` (it can't live inside the DB it
 //! unlocks).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde::{Deserialize, Serialize};
 use slatedb::object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
-use slatedb::{Db, Settings, WriteBatch};
+use slatedb::{Db, DbReader, Settings, WriteBatch, config::DbReaderOptions};
 
 use crate::config::{Compression, ExportProtocol};
 use crate::crypto::kms::{Kms, contexts};
@@ -25,6 +26,9 @@ const TENANT_RECORD_VERSION: u8 = 1;
 const VOLUME_RECORD_VERSION: u8 = 1;
 const DAEMON_NODE_RECORD_VERSION: u8 = 1;
 const VOLUME_PLACEMENT_RECORD_VERSION: u8 = 1;
+const AUDIT_RECORD_VERSION: u8 = 1;
+const MAX_AUDIT_DETAILS_BYTES: usize = 128 * 1024;
+const MAX_AUDIT_PAGE_LIMIT: usize = 1_000;
 
 /// Contents of `<root>/control.dek`. The cipher is recorded here (not chosen
 /// per process) so every node opens the control DB with the same AEAD.
@@ -218,6 +222,184 @@ pub struct VolumePlacementRecord {
     pub updated_at: u64,
 }
 
+/// Control plane that emitted the audited action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuditPlane {
+    Admin,
+    Nfs,
+    P9,
+    Cli,
+}
+
+/// Best-effort identity before a real auth system exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditActor {
+    pub plane: AuditPlane,
+    #[serde(default)]
+    pub source_ip: Option<String>,
+    #[serde(default)]
+    pub client_agent: Option<String>,
+}
+
+/// Typed action name used for audit filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuditAction {
+    TenantCreate,
+    TenantUpdate,
+    TenantDelete,
+    VolumeCreate,
+    VolumeDelete,
+    SnapshotCreate,
+    SnapshotDelete,
+    PlacementAssign,
+    PlacementMove,
+    PlacementClaim,
+    NodeRegister,
+    NodeDrain,
+    NodeRemove,
+    LimitsChange,
+    Maintain,
+    AuthDenied,
+    QuotaRejected,
+}
+
+impl AuditAction {
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "TenantCreate" => Self::TenantCreate,
+            "TenantUpdate" => Self::TenantUpdate,
+            "TenantDelete" => Self::TenantDelete,
+            "VolumeCreate" => Self::VolumeCreate,
+            "VolumeDelete" => Self::VolumeDelete,
+            "SnapshotCreate" => Self::SnapshotCreate,
+            "SnapshotDelete" => Self::SnapshotDelete,
+            "PlacementAssign" => Self::PlacementAssign,
+            "PlacementMove" => Self::PlacementMove,
+            "PlacementClaim" => Self::PlacementClaim,
+            "NodeRegister" => Self::NodeRegister,
+            "NodeDrain" => Self::NodeDrain,
+            "NodeRemove" => Self::NodeRemove,
+            "LimitsChange" => Self::LimitsChange,
+            "Maintain" => Self::Maintain,
+            "AuthDenied" => Self::AuthDenied,
+            "QuotaRejected" => Self::QuotaRejected,
+            _ => return None,
+        })
+    }
+}
+
+/// Audit action outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuditOutcome {
+    Success,
+    Denied,
+    Failed { reason: String },
+}
+
+/// Postcard-friendly JSON-like value used inside audit details.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AuditDetailValue {
+    Null,
+    Bool(bool),
+    U64(u64),
+    I64(i64),
+    F64(f64),
+    String(String),
+    Array(Vec<AuditDetailValue>),
+    Object(BTreeMap<String, AuditDetailValue>),
+}
+
+impl From<serde_json::Value> for AuditDetailValue {
+    fn from(value: serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::Null => Self::Null,
+            serde_json::Value::Bool(value) => Self::Bool(value),
+            serde_json::Value::Number(value) => {
+                if let Some(value) = value.as_u64() {
+                    Self::U64(value)
+                } else if let Some(value) = value.as_i64() {
+                    Self::I64(value)
+                } else if let Some(value) = value.as_f64() {
+                    Self::F64(value)
+                } else {
+                    Self::Null
+                }
+            }
+            serde_json::Value::String(value) => Self::String(value),
+            serde_json::Value::Array(values) => {
+                Self::Array(values.into_iter().map(Self::from).collect())
+            }
+            serde_json::Value::Object(values) => Self::Object(
+                values
+                    .into_iter()
+                    .map(|(key, value)| (key, Self::from(value)))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// Scope attached to an audit event.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditScope {
+    #[serde(default)]
+    pub tenant: Option<String>,
+    #[serde(default)]
+    pub volume: Option<String>,
+    #[serde(default)]
+    pub node: Option<String>,
+}
+
+/// Durable audit record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditRecord {
+    pub id: String,
+    /// Unix time in nanoseconds. This is the primary ordering field.
+    pub time: u64,
+    pub actor: AuditActor,
+    pub action: AuditAction,
+    pub scope: AuditScope,
+    pub request_id: String,
+    pub outcome: AuditOutcome,
+    #[serde(default)]
+    pub details: BTreeMap<String, AuditDetailValue>,
+}
+
+impl AuditRecord {
+    pub fn new(
+        actor: AuditActor,
+        action: AuditAction,
+        scope: AuditScope,
+        request_id: impl Into<String>,
+        outcome: AuditOutcome,
+    ) -> Self {
+        Self {
+            id: String::new(),
+            time: 0,
+            actor,
+            action,
+            scope,
+            request_id: request_id.into(),
+            outcome,
+            details: BTreeMap::new(),
+        }
+    }
+}
+
+/// Audit query filter. `since` and `until` use Unix nanoseconds.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AuditQuery<'a> {
+    pub since: Option<u64>,
+    pub until: Option<u64>,
+    pub tenant: Option<&'a str>,
+    pub volume: Option<&'a str>,
+    pub node: Option<&'a str>,
+    pub action: Option<AuditAction>,
+    pub limit: usize,
+    pub page_token: Option<&'a str>,
+    pub newest_first: bool,
+}
+
 impl VolumePlacementRecord {
     fn unassigned(tenant: &str, volume: &str, now: u64) -> Self {
         Self {
@@ -264,6 +446,12 @@ pub struct ControlPlane {
     db: Db,
     object_store: Arc<dyn ObjectStore>,
     kms: Arc<dyn Kms>,
+    audit_seq: AtomicU32,
+}
+
+/// Read-only control-plane handle for daemon admin inventory and health checks.
+pub struct ControlReader {
+    db: DbReader,
 }
 
 impl ControlPlane {
@@ -286,6 +474,7 @@ impl ControlPlane {
             db,
             object_store,
             kms,
+            audit_seq: AtomicU32::new(0),
         })
     }
 
@@ -299,18 +488,8 @@ impl ControlPlane {
     ) -> Result<(Cipher, Secret32)> {
         let path = store::control_dek_path();
 
-        let read_existing = |bytes: Vec<u8>| -> Result<ControlKeyFile> {
-            decode_versioned(CONTROL_KEYFILE_VERSION, &bytes)
-        };
-
         match object_store.get(&path).await {
-            Ok(result) => {
-                let keyfile = read_existing(result.bytes().await?.to_vec())?;
-                let dek = kms
-                    .unwrap(&keyfile.wrapped_dek, contexts::CONTROL_DEK)
-                    .await?;
-                Ok((keyfile.cipher, dek))
-            }
+            Ok(result) => Self::decode_control_dek(result.bytes().await?.to_vec(), kms).await,
             Err(slatedb::object_store::Error::NotFound { .. }) => {
                 let cipher = Cipher::auto_select();
                 let dek = Secret32::generate();
@@ -330,11 +509,7 @@ impl ControlPlane {
                     Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
                         // Lost the race; adopt the winner's keyfile.
                         let bytes = object_store.get(&path).await?.bytes().await?;
-                        let keyfile = read_existing(bytes.to_vec())?;
-                        let dek = kms
-                            .unwrap(&keyfile.wrapped_dek, contexts::CONTROL_DEK)
-                            .await?;
-                        Ok((keyfile.cipher, dek))
+                        Self::decode_control_dek(bytes.to_vec(), kms).await
                     }
                     Err(e) => Err(e.into()),
                 }
@@ -343,8 +518,81 @@ impl ControlPlane {
         }
     }
 
+    async fn load_existing_dek(
+        object_store: &Arc<dyn ObjectStore>,
+        kms: &dyn Kms,
+    ) -> Result<(Cipher, Secret32)> {
+        let bytes = object_store
+            .get(&store::control_dek_path())
+            .await?
+            .bytes()
+            .await?;
+        Self::decode_control_dek(bytes.to_vec(), kms).await
+    }
+
+    async fn decode_control_dek(bytes: Vec<u8>, kms: &dyn Kms) -> Result<(Cipher, Secret32)> {
+        let keyfile: ControlKeyFile = decode_versioned(CONTROL_KEYFILE_VERSION, &bytes)?;
+        let dek = kms
+            .unwrap(&keyfile.wrapped_dek, contexts::CONTROL_DEK)
+            .await?;
+        Ok((keyfile.cipher, dek))
+    }
+
     pub async fn close(&self) -> Result<()> {
         self.db.close().await.map_err(Error::from)
+    }
+
+    /// Append one durable audit record under the ordered audit keyspace.
+    pub async fn append_audit_record(&self, record: AuditRecord) -> Result<AuditRecord> {
+        Ok(self.append_audit_records([record]).await?.remove(0))
+    }
+
+    /// Append a batch of durable audit records.
+    pub async fn append_audit_records<I>(&self, records: I) -> Result<Vec<AuditRecord>>
+    where
+        I: IntoIterator<Item = AuditRecord>,
+    {
+        let mut batch = WriteBatch::new();
+        let mut appended = Vec::new();
+        for record in records {
+            let (timestamp, seq, key) = self.next_audit_key(record.time).await?;
+            let mut record = bounded_audit_record(record);
+            record.time = timestamp;
+            record.id = audit_id(timestamp, seq);
+            batch.put(key, encode_versioned(AUDIT_RECORD_VERSION, &record)?);
+            appended.push(record);
+        }
+        if !appended.is_empty() {
+            self.db.write(batch).await?;
+        }
+        Ok(appended)
+    }
+
+    /// Query audit records by time range and optional scope/action filters.
+    pub async fn list_audit(
+        &self,
+        query: AuditQuery<'_>,
+    ) -> Result<(Vec<AuditRecord>, Option<String>)> {
+        list_audit_from_db(&self.db, query).await
+    }
+
+    async fn next_audit_key(&self, requested_time: u64) -> Result<(u64, u32, Vec<u8>)> {
+        let mut timestamp = if requested_time == 0 {
+            now_unix_nanos()
+        } else {
+            requested_time
+        };
+        loop {
+            let mut seq = self.audit_seq.fetch_add(1, Ordering::Relaxed);
+            for _ in 0..1024 {
+                let key = audit_key(timestamp, seq);
+                if self.db.get(&key).await?.is_none() {
+                    return Ok((timestamp, seq, key));
+                }
+                seq = seq.wrapping_add(1);
+            }
+            timestamp = now_unix_nanos().max(timestamp.saturating_add(1));
+        }
     }
 
     // ---- tenants ----
@@ -1368,6 +1616,120 @@ impl ControlPlane {
     }
 }
 
+impl ControlReader {
+    /// Open the encrypted control DB in read-only mode.
+    pub async fn open(object_store: Arc<dyn ObjectStore>, kms: Arc<dyn Kms>) -> Result<Self> {
+        let (cipher, dek) = ControlPlane::load_existing_dek(&object_store, kms.as_ref()).await?;
+        let db = DbReader::builder(store::CONTROL_DB_PATH, object_store)
+            .with_options(DbReaderOptions {
+                manifest_poll_interval: std::time::Duration::from_secs(1),
+                checkpoint_lifetime: std::time::Duration::from_secs(60),
+                ..DbReaderOptions::default()
+            })
+            .with_block_transformer(Arc::new(SlateBlockTransformer::new(cipher, dek)))
+            .build()
+            .await?;
+        Ok(Self { db })
+    }
+
+    pub async fn close(&self) -> Result<()> {
+        self.db.close().await.map_err(Error::from)
+    }
+
+    pub async fn try_get_tenant(&self, name: &str) -> Result<Option<TenantRecord>> {
+        match self.db.get(tenant_key(name).as_bytes()).await? {
+            Some(bytes) => Ok(Some(decode_tenant_record(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_tenant(&self, name: &str) -> Result<TenantRecord> {
+        self.try_get_tenant(name)
+            .await?
+            .ok_or_else(|| Error::not_found("tenant", name))
+    }
+
+    pub async fn list_tenants(&self) -> Result<Vec<TenantRecord>> {
+        let mut iter = self.db.scan_prefix(b"t/".as_slice(), ..).await?;
+        let mut tenants = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            tenants.push(decode_tenant_record(&kv.value)?);
+        }
+        tenants.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(tenants)
+    }
+
+    pub async fn try_get_volume(&self, tenant: &str, volume: &str) -> Result<Option<VolumeRecord>> {
+        match self.db.get(volume_key(tenant, volume).as_bytes()).await? {
+            Some(bytes) => Ok(Some(decode_volume_record(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_volume(&self, tenant: &str, volume: &str) -> Result<VolumeRecord> {
+        self.try_get_volume(tenant, volume)
+            .await?
+            .ok_or_else(|| Error::not_found("volume", format!("{tenant}/{volume}")))
+    }
+
+    pub async fn list_volumes(&self, tenant: &str) -> Result<Vec<VolumeRecord>> {
+        let prefix = format!("v/{tenant}/");
+        let mut iter = self.db.scan_prefix(prefix.as_bytes(), ..).await?;
+        let mut volumes = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            volumes.push(decode_volume_record(&kv.value)?);
+        }
+        volumes.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(volumes)
+    }
+
+    pub async fn list_daemon_nodes(&self) -> Result<Vec<DaemonNodeRecord>> {
+        let mut iter = self.db.scan_prefix(b"dn/".as_slice(), ..).await?;
+        let mut nodes = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            nodes.push(decode_daemon_node_record(&kv.value)?);
+        }
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(nodes)
+    }
+
+    pub async fn try_get_volume_placement(
+        &self,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<Option<VolumePlacementRecord>> {
+        match self
+            .db
+            .get(volume_placement_key(tenant, volume).as_bytes())
+            .await?
+        {
+            Some(bytes) => Ok(Some(decode_volume_placement_record(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn list_volume_placements(&self) -> Result<Vec<VolumePlacementRecord>> {
+        let mut iter = self.db.scan_prefix(b"vp/".as_slice(), ..).await?;
+        let mut placements = Vec::new();
+        while let Some(kv) = iter.next().await? {
+            placements.push(decode_volume_placement_record(&kv.value)?);
+        }
+        placements.sort_by(|a, b| {
+            a.tenant
+                .cmp(&b.tenant)
+                .then_with(|| a.volume.cmp(&b.volume))
+        });
+        Ok(placements)
+    }
+
+    pub async fn list_audit(
+        &self,
+        query: AuditQuery<'_>,
+    ) -> Result<(Vec<AuditRecord>, Option<String>)> {
+        list_audit_from_reader(&self.db, query).await
+    }
+}
+
 fn validate_limit(kind: &'static str, limit: &QuotaLimit) -> Result<()> {
     if let (Some(soft), Some(hard)) = (limit.soft, limit.hard)
         && soft > hard
@@ -1446,4 +1808,181 @@ fn move_stable_endpoints(
 
 fn decode_tenant_record(bytes: &[u8]) -> Result<TenantRecord> {
     decode_versioned(TENANT_RECORD_VERSION, bytes)
+}
+
+fn decode_volume_record(bytes: &[u8]) -> Result<VolumeRecord> {
+    decode_versioned(VOLUME_RECORD_VERSION, bytes)
+}
+
+fn decode_daemon_node_record(bytes: &[u8]) -> Result<DaemonNodeRecord> {
+    decode_versioned(DAEMON_NODE_RECORD_VERSION, bytes)
+}
+
+fn decode_volume_placement_record(bytes: &[u8]) -> Result<VolumePlacementRecord> {
+    decode_versioned(VOLUME_PLACEMENT_RECORD_VERSION, bytes)
+}
+
+fn decode_audit_record(bytes: &[u8]) -> Result<AuditRecord> {
+    decode_versioned(AUDIT_RECORD_VERSION, bytes)
+}
+
+fn now_unix_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+async fn list_audit_from_db(
+    db: &Db,
+    query: AuditQuery<'_>,
+) -> Result<(Vec<AuditRecord>, Option<String>)> {
+    let mut iter = db.scan_prefix(b"a/".as_slice(), ..).await?;
+    let mut records = Vec::new();
+    while let Some(kv) = iter.next().await? {
+        let Some((time, _)) = parse_audit_key(kv.key.as_ref()) else {
+            continue;
+        };
+        if !audit_time_matches(time, &query) {
+            continue;
+        }
+        let record = decode_audit_record(&kv.value)?;
+        if audit_record_matches(&record, &query) {
+            records.push(record);
+        }
+    }
+    page_audit_records(records, query)
+}
+
+async fn list_audit_from_reader(
+    db: &DbReader,
+    query: AuditQuery<'_>,
+) -> Result<(Vec<AuditRecord>, Option<String>)> {
+    let mut iter = db.scan_prefix(b"a/".as_slice(), ..).await?;
+    let mut records = Vec::new();
+    while let Some(kv) = iter.next().await? {
+        let Some((time, _)) = parse_audit_key(kv.key.as_ref()) else {
+            continue;
+        };
+        if !audit_time_matches(time, &query) {
+            continue;
+        }
+        let record = decode_audit_record(&kv.value)?;
+        if audit_record_matches(&record, &query) {
+            records.push(record);
+        }
+    }
+    page_audit_records(records, query)
+}
+
+fn audit_time_matches(time: u64, query: &AuditQuery<'_>) -> bool {
+    if query.since.is_some_and(|since| time < since) {
+        return false;
+    }
+    if query.until.is_some_and(|until| time > until) {
+        return false;
+    }
+    true
+}
+
+fn audit_record_matches(record: &AuditRecord, query: &AuditQuery<'_>) -> bool {
+    if query
+        .tenant
+        .is_some_and(|tenant| record.scope.tenant.as_deref() != Some(tenant))
+    {
+        return false;
+    }
+    if query
+        .volume
+        .is_some_and(|volume| record.scope.volume.as_deref() != Some(volume))
+    {
+        return false;
+    }
+    if query
+        .node
+        .is_some_and(|node| record.scope.node.as_deref() != Some(node))
+    {
+        return false;
+    }
+    if query.action.is_some_and(|action| record.action != action) {
+        return false;
+    }
+    true
+}
+
+fn page_audit_records(
+    mut records: Vec<AuditRecord>,
+    query: AuditQuery<'_>,
+) -> Result<(Vec<AuditRecord>, Option<String>)> {
+    if query.newest_first {
+        records.reverse();
+    }
+    let limit = if query.limit == 0 {
+        100
+    } else {
+        query.limit.min(MAX_AUDIT_PAGE_LIMIT)
+    };
+    let mut started = query.page_token.is_none();
+    let mut page = Vec::new();
+    let mut next = None;
+    for record in records {
+        if !started {
+            if query.page_token == Some(record.id.as_str()) {
+                started = true;
+            }
+            continue;
+        }
+        if page.len() == limit {
+            next = page.last().map(|record: &AuditRecord| record.id.clone());
+            break;
+        }
+        page.push(record);
+    }
+    Ok((page, next))
+}
+
+fn bounded_audit_record(mut record: AuditRecord) -> AuditRecord {
+    let Ok(encoded) = postcard::to_allocvec(&record.details) else {
+        record.details = audit_truncation_details(0);
+        return record;
+    };
+    if encoded.len() <= MAX_AUDIT_DETAILS_BYTES {
+        return record;
+    }
+    record.details = audit_truncation_details(encoded.len() as u64);
+    record
+}
+
+fn audit_truncation_details(original_bytes: u64) -> BTreeMap<String, AuditDetailValue> {
+    let mut details = BTreeMap::new();
+    details.insert("details_truncated".to_owned(), AuditDetailValue::Bool(true));
+    details.insert(
+        "original_details_bytes".to_owned(),
+        AuditDetailValue::U64(original_bytes),
+    );
+    details
+}
+
+fn audit_key(timestamp: u64, seq: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(15);
+    key.extend_from_slice(b"a/");
+    key.extend_from_slice(&timestamp.to_be_bytes());
+    key.push(b'/');
+    key.extend_from_slice(&seq.to_be_bytes());
+    key
+}
+
+fn parse_audit_key(key: &[u8]) -> Option<(u64, u32)> {
+    if key.len() != 15 || &key[..2] != b"a/" || key[10] != b'/' {
+        return None;
+    }
+    let mut timestamp = [0u8; 8];
+    timestamp.copy_from_slice(&key[2..10]);
+    let mut seq = [0u8; 4];
+    seq.copy_from_slice(&key[11..15]);
+    Some((u64::from_be_bytes(timestamp), u32::from_be_bytes(seq)))
+}
+
+fn audit_id(timestamp: u64, seq: u32) -> String {
+    format!("{timestamp:016x}.{seq:08x}")
 }
