@@ -8,8 +8,9 @@ quota, and snapshot machinery — but exposes a flat byte range instead of a POS
 > Status: IMPLEMENTED through Phase B4 (v1, 2026-07-07). Core block volumes,
 > NBD server, daemon exports, CLI/admin, TLS/mTLS, metrics, dashboard, and
 > kernel/QEMU/ZFS smoke scripts are in-tree. Remaining work is explicit in §6:
-> fio matrix + chunk-size default confirmation (BD-2), NBD failover timing gate
-> (<10s AC), and continued ZFS validation where the host kernel provides zfs.ko.
+> NBD failover timing gate (<10s AC) and continued ZFS validation where the host
+> kernel provides zfs.ko. The NBD fio matrix confirmed the block chunk-size
+> decision on 2026-07-07.
 > Design-decision numbers here are **BD-n** to avoid colliding with the master
 > plan's **DD-n**; DD references below are to the master plan.
 
@@ -83,9 +84,12 @@ Content lives at the existing chunk keys `c/<BLOCK_INO>/<chunk_idx>` with a rese
 `BLOCK_INO` constant, so `data.rs` (`read_range`, `plan_write`, `plan_truncate`) and the
 `billed_chunk_bytes` accounting rule (DD-6, DD-9) apply without modification. Absent chunk ⇒
 zeros, which makes thin provisioning native. Chunk size remains an mkfs-time constant;
-default for block volumes is **64 KiB** (vs 128 KiB for filesystem volumes) because guest
-filesystems issue many 4–64 KiB random writes and the read-modify-write cost dominates —
-confirm with the Phase B1 bench matrix (32/64/128/256 KiB under fio randwrite) before GA.
+default for block volumes is **32 KiB** (vs 128 KiB for filesystem volumes) because guest
+filesystems issue many 4-64 KiB random writes and the read-modify-write cost dominates.
+The 2026-07-07 nested-VM NBD fio matrix in [performance.md](performance.md) confirmed
+32 KiB over 64/128/256 KiB for the small-write default: sparse 4 KiB randwrite was
+1580 IOPS at 1.58x allocated-byte amplification with 32 KiB chunks, versus 800 IOPS
+and 2.86x amplification at 64 KiB.
 
 **BD-3: A dedicated `BlockDev` trait, implemented twice.**
 ```rust
@@ -164,7 +168,7 @@ only that one name).
 `size_bytes` is fixed at create time and stored in both the control record and the
 superblock (superblock is authoritative; mismatch fails open, loudly). Constraints:
 `size_bytes` must be a multiple of 4096; max = `chunk_size × 2^32` (16 TiB @ 4 KiB … 16 PiB
-@ 4 MiB; 4 TiB at the 64 KiB default × 2^26 chunks is ample — same u32 chunk-index bound as
+@ 4 MiB; 4 TiB at the 32 KiB default × 2^27 chunks is ample — same u32 chunk-index bound as
 files). Advertised block sizes: minimum 512 (RMW handles sub-chunk writes), preferred =
 `chunk_size`, maximum payload 32 MiB (spec default; large requests are split into per-chunk
 batches internally). **Grow** (`slatefs volume resize --grow`) is metadata-only (bump both
@@ -238,7 +242,7 @@ NBD row to the existing dashboard.
 `kind` in superblock + control record; `BlockDev` trait; `BlockVolume` over `data.rs`
 (read/write/flush/trim/write_zeroes, quota, striped chunk locks); `SnapshotBlockVolume`;
 CLI `volume create --kind block --size … | info | delete | fsck [--recount] | resize --grow`;
-chunk-size bench matrix to confirm the 64 KiB default.
+chunk-size bench matrix to select the block default.
 Tests, copying the Phase 1 culture: **model-based property tests** — random
 read/write/trim/zeroes/flush sequences against `BlockVolume` (memory:// store) and a plain
 `Vec<u8>` reference, byte- and errno-exact, quota compared to recount after every sequence;
@@ -257,8 +261,8 @@ and resize core live in [crates/slatefs-core/src/block.rs](../crates/slatefs-cor
 with coverage in `crates/slatefs-core/tests/block*.rs`. The CLI has
 `volume create --kind block`, `volume info`, `volume fsck|scrub`, and offline
 `volume resize --size` in [crates/slatefs-cli/src/main.rs](../crates/slatefs-cli/src/main.rs).
-Remaining B1 work: run and record the fio chunk-size matrix to confirm the
-64 KiB default from BD-2 before GA.
+The B1 chunk-size matrix is complete: the 2026-07-07 NBD fio run changed the
+block default from 64 KiB to 32 KiB; see [performance.md](performance.md).
 
 ### Phase B2 — NBD server
 `slatefs-nbd`: fixed-newstyle negotiation (`OPT_GO`/`INFO`/`LIST`/`ABORT`/`STARTTLS`),
@@ -299,8 +303,8 @@ mounts ext4, exercises file operations, verifies `fstrim` lowers
 `allocated_bytes`, kills/restarts `slatefsd` mid-load, remounts for journal
 replay, and requires `e2fsck -f -p` clean. The privileged CI job is
 `kernel-nbd` in [.github/workflows/ci.yml](../.github/workflows/ci.yml).
-Remaining B3 work: record the fio seq/rand × R/W × 4 KiB/64 KiB/1 MiB matrix
-and add the NBD failover drill timing gate (<10s resumed I/O, zero corruption).
+Remaining B3 work: add the NBD failover drill timing gate (<10s resumed I/O,
+zero corruption).
 TRIM outcome: resolved 2026-07-07. The local OrbStack kernel
 (`7.0.11-orbstack-00360-gc9bc4d96ac70`) did send NBD TRIMs during `fstrim`,
 but before the fix SlateFS rejected coalesced large TRIM requests before they
@@ -341,8 +345,8 @@ module.
 ## 7. Risks & open questions
 
 1. **RMW write amplification** on small random writes (the workload block devices attract).
-   Mitigation: 64 KiB default + B1 bench matrix; if 4k-heavy workloads still suffer,
-   consider a smaller-chunk volume option (mkfs-time, already supported down to 4 KiB).
+   Mitigation: 32 KiB default confirmed by the B1/NBD fio matrix; if 4k-heavy
+   workloads still suffer, use a smaller mkfs-time chunk option (already supported down to 4 KiB).
 2. **Plain-NBD session identity is still source-IP based** (BD-6). This is
    weak identity under NAT, but acceptable only under the DD-10 network-isolation
    posture. The stronger path is implemented: mTLS exports key writable sessions

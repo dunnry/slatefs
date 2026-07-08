@@ -114,6 +114,139 @@ passes the NBD knobs through, but the kernel module must exist in the host/VM
 kernel. Docker Desktop may report `SLATEFS_NBD_KERNEL_TEST_SKIPPED`; run the
 matrix on Linux CI or a Linux bench host where `modprobe nbd` succeeds.
 
+### Nested VM NBD Chunk-Size Evidence
+
+On 2026-07-07, `nested-vm` ran the NBD chunk-size matrix through the Linux
+kernel NBD client against raw `/dev/nbd0` devices, with no filesystem layered on
+top. The host was a 2 vCPU / 3.8 GiB Ubuntu Azure VM, kernel
+`6.8.0-1052-azure`, `fio-3.28`, `nbd-client` 3.23, and `nbd.ko`. Each chunk
+size ran in its own fresh `slatefsd` process and local `file://` object store
+under `/mnt`, then the store was removed after result capture. The local-disk
+backend makes absolute throughput optimistic versus S3/Azure Blob, but the
+relative chunk-size comparison is still valid because the backend and SlateDB
+settings were held fixed.
+
+The initial target was 1 GiB and 30 seconds per cell, but an all-volume run
+filled the available `/mnt` local disk and a second all-volume run exceeded the
+small VM's memory during background compaction. The completed matrix therefore
+used one isolated daemon/store per chunk size, 1 GiB virtual block volumes,
+`FIO_SIZE=256m`, `FIO_RUNTIME=20`, `numjobs=1`, and `iodepth=8`. The first
+4 KiB `randwrite` row for each chunk size ran before prefill on a sparse volume
+so `allocated_bytes` growth could be measured; the read rows were preceded by a
+256 MiB raw-device prefill.
+
+Attach command, with `b32`, `b64`, `b128`, and `b256` substituted per chunk:
+
+```sh
+sudo nbd-client 127.0.0.1 22200 /dev/nbd0 \
+  -N /t1/b<chunk-kib> -b 4096 -timeout 60 -C 2
+```
+
+Prefill command before read rows:
+
+```sh
+sudo fio --name=c<chunk-kib>-prefill --filename=/dev/nbd0 \
+  --rw=write --bs=1m --size=256m --ioengine=libaio --iodepth=8 \
+  --numjobs=1 --direct=1 --group_reporting=1 --fallocate=none \
+  --end_fsync=1 --eta=never --output-format=json --output=<json>
+```
+
+Read and write matrix commands:
+
+```sh
+sudo fio --name=c<chunk-kib>-<rw>-<bs> --filename=/dev/nbd0 \
+  --rw=<read|write|randread|randwrite> --bs=<4k|64k|1m> \
+  --size=256m --runtime=20 --time_based=1 --ioengine=libaio \
+  --iodepth=8 --numjobs=1 --direct=1 --group_reporting=1 \
+  --fallocate=none --eta=never --output-format=json --output=<json>
+```
+
+Write and mixed rows also used `--end_fsync=1`. The mixed row used:
+
+```sh
+sudo fio --name=c<chunk-kib>-randrw70-4k --filename=/dev/nbd0 \
+  --rw=randrw --rwmixread=70 --bs=4k --size=256m --runtime=20 \
+  --time_based=1 --ioengine=libaio --iodepth=8 --numjobs=1 \
+  --direct=1 --group_reporting=1 --fallocate=none --end_fsync=1 \
+  --eta=never --output-format=json --output=<json>
+```
+
+| chunk | workload | block | IOPS | MiB/s | mean ms | p99 ms |
+|---:|---|---:|---:|---:|---:|---:|
+| 32 KiB | randwrite | 4k | 1580 | 6.2 | 5.037 | 6.586 |
+| 32 KiB | read | 4k | 20901 | 81.6 | 0.374 | 0.971 |
+| 32 KiB | write | 4k | 2410 | 9.4 | 3.291 | 49.021 |
+| 32 KiB | randread | 4k | 11988 | 46.8 | 0.649 | 2.245 |
+| 32 KiB | read | 64k | 7006 | 437.9 | 1.117 | 3.064 |
+| 32 KiB | write | 64k | 904 | 56.5 | 8.790 | 76.022 |
+| 32 KiB | randread | 64k | 5808 | 363.0 | 1.351 | 3.228 |
+| 32 KiB | randwrite | 64k | 253 | 15.8 | 31.537 | 110.625 |
+| 32 KiB | read | 1m | 348 | 348.1 | 22.808 | 221.250 |
+| 32 KiB | write | 1m | 32 | 32.1 | 246.219 | 8153.727 |
+| 32 KiB | randread | 1m | 430 | 429.8 | 18.441 | 96.993 |
+| 32 KiB | randwrite | 1m | 21 | 21.5 | 371.360 | 7818.183 |
+| 32 KiB | randrw70read | 4k | 1551 | 6.1 | 2.674 | 7.438 |
+| 32 KiB | randrw30write | 4k | 663 | 2.6 | 5.713 | 8.847 |
+| 64 KiB | randwrite | 4k | 800 | 3.1 | 9.970 | 12.911 |
+| 64 KiB | read | 4k | 24262 | 94.8 | 0.322 | 0.872 |
+| 64 KiB | write | 4k | 1106 | 4.3 | 7.205 | 69.730 |
+| 64 KiB | randread | 4k | 12709 | 49.6 | 0.613 | 2.056 |
+| 64 KiB | read | 64k | 10622 | 663.9 | 0.732 | 2.212 |
+| 64 KiB | write | 64k | 1033 | 64.5 | 7.689 | 84.410 |
+| 64 KiB | randread | 64k | 6700 | 418.7 | 1.172 | 3.097 |
+| 64 KiB | randwrite | 64k | 277 | 17.3 | 28.826 | 81.265 |
+| 64 KiB | read | 1m | 536 | 535.8 | 14.767 | 87.556 |
+| 64 KiB | write | 1m | 57 | 57.4 | 138.411 | 2004.877 |
+| 64 KiB | randread | 1m | 609 | 609.0 | 12.986 | 49.545 |
+| 64 KiB | randwrite | 1m | 16 | 15.8 | 504.816 | 10804.527 |
+| 64 KiB | randrw70read | 4k | 481 | 1.9 | 3.072 | 72.876 |
+| 64 KiB | randrw30write | 4k | 207 | 0.8 | 31.445 | 183.501 |
+| 128 KiB | randwrite | 4k | 409 | 1.6 | 19.507 | 20.316 |
+| 128 KiB | read | 4k | 25862 | 101.0 | 0.302 | 0.856 |
+| 128 KiB | write | 4k | 607 | 2.4 | 13.145 | 109.576 |
+| 128 KiB | randread | 4k | 12919 | 50.5 | 0.602 | 1.892 |
+| 128 KiB | read | 64k | 11169 | 698.1 | 0.696 | 1.794 |
+| 128 KiB | write | 64k | 471 | 29.5 | 16.901 | 158.335 |
+| 128 KiB | randread | 64k | 7214 | 450.9 | 1.084 | 2.834 |
+| 128 KiB | randwrite | 64k | 124 | 7.7 | 64.459 | 244.318 |
+| 128 KiB | read | 1m | 637 | 636.8 | 12.398 | 92.799 |
+| 128 KiB | write | 1m | 71 | 71.5 | 110.921 | 1044.382 |
+| 128 KiB | randread | 1m | 839 | 838.8 | 9.362 | 29.229 |
+| 128 KiB | randwrite | 1m | 15 | 14.9 | 535.816 | 9730.785 |
+| 128 KiB | randrw70read | 4k | 110 | 0.4 | 2.356 | 61.604 |
+| 128 KiB | randrw30write | 4k | 49 | 0.2 | 157.328 | 8657.043 |
+| 256 KiB | randwrite | 4k | 226 | 0.9 | 35.273 | 89.653 |
+| 256 KiB | read | 4k | 25762 | 100.6 | 0.302 | 0.954 |
+| 256 KiB | write | 4k | 284 | 1.1 | 28.136 | 379.585 |
+| 256 KiB | randread | 4k | 13294 | 51.9 | 0.585 | 1.630 |
+| 256 KiB | read | 64k | 11985 | 749.0 | 0.647 | 1.729 |
+| 256 KiB | write | 64k | 302 | 18.9 | 26.412 | 227.541 |
+| 256 KiB | randread | 64k | 8481 | 530.1 | 0.919 | 2.671 |
+| 256 KiB | randwrite | 64k | 52 | 3.2 | 154.680 | 599.785 |
+| 256 KiB | read | 1m | 574 | 573.9 | 13.785 | 66.322 |
+| 256 KiB | write | 1m | 33 | 32.7 | 242.799 | 784.335 |
+| 256 KiB | randread | 1m | 898 | 897.5 | 8.738 | 19.005 |
+| 256 KiB | randwrite | 1m | 10 | 9.8 | 818.236 | 16844.325 |
+| 256 KiB | randrw70read | 4k | 45 | 0.2 | 1.466 | 6.980 |
+| 256 KiB | randrw30write | 4k | 19 | 0.1 | 411.673 | 9059.697 |
+
+For the sparse 4 KiB randwrite cell, SlateFS-side allocation growth and NBD
+write metrics were:
+
+| chunk | fio write bytes | allocated delta | alloc amp | NBD written bytes | NBD write reqs |
+|---:|---:|---:|---:|---:|---:|
+| 32 KiB | 147558400 | 233500672 | 1.58x | 147558400 | 36025 |
+| 64 KiB | 77205504 | 221093888 | 2.86x | 77205504 | 18849 |
+| 128 KiB | 39481344 | 216031232 | 5.47x | 39481344 | 9639 |
+| 256 KiB | 19959808 | 214708224 | 10.76x | 19959808 | 4873 |
+
+Conclusion: change the block-volume default from 64 KiB to 32 KiB. The 64 KiB
+chunk size remained competitive for 64 KiB and 1 MiB rows, but the product
+default is meant to protect guest filesystem 4-64 KiB write behavior. In the
+decision rows, 32 KiB delivered 2.0x the sparse 4 KiB randwrite IOPS of 64 KiB
+with lower p99 latency, 3.2x the mixed 70/30 4 KiB write IOPS, and materially
+lower allocation amplification (1.58x versus 2.86x).
+
 ## Failover Timing
 
 The failover drill can run a fio workload against the primary NFS mount while

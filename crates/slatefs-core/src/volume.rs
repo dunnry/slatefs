@@ -34,7 +34,7 @@ use crate::store;
 use crate::vfs::{FsError, FsResult, OpenMode};
 
 const DEFAULT_DISK_CACHE_OPEN_FILES: usize = 256;
-pub const DEFAULT_BLOCK_CHUNK_SIZE: u32 = 64 * 1024;
+pub const DEFAULT_BLOCK_CHUNK_SIZE: u32 = 32 * 1024;
 const BLOCK_SECTOR_SIZE: u64 = 4096;
 
 /// Parameters fixed at volume creation. `cipher` must already be resolved
