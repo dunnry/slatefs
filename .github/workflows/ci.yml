@@ -195,6 +195,8 @@ jobs:
           fi
           grep -q 'SLATEFS_NBD_FAILOVER_PASSED' /tmp/nbd-failover.log
       - name: ZFS over kernel NBD smoke (allow skip)
+        # Keep allow-skip for hosted runners; this passed on a real nested-vm
+        # kernel on 2026-07-07 (Linux 6.8.0-1052-azure, zfs-kmod 2.2.2).
         run: |
           set -o pipefail
           SLATEFS_CONFIG=/tmp/slatefs-nbd.toml ./scripts/zfs-over-nbd-smoke.sh | tee /tmp/zfs-nbd.log

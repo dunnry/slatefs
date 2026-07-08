@@ -8,6 +8,10 @@
 #
 # Run through the Docker harness:
 #   SKIP_SMOKE=1 scripts/docker-kernel-mount-test.sh scripts/zfs-over-nbd-smoke.sh
+#
+# Optional env:
+#   SLATEFS_ZFS_NBD_BLOCK_SIZE  nbd-client block size (default: 4096)
+#   SLATEFS_ZFS_NBD_TRIM_MIB    file size for ZFS trim proof in MiB (default: 32)
 # shellcheck disable=SC2086
 set -euo pipefail
 
@@ -19,10 +23,12 @@ TENANT="${SLATEFS_ZFS_NBD_TENANT:-${SLATEFS_NBD_TENANT:-t1}}"
 VOLUME="${SLATEFS_ZFS_NBD_VOLUME:-zfs-b1}"
 SIZE_BYTES="${SLATEFS_ZFS_NBD_SIZE_BYTES:-536870912}"
 CHUNK_SIZE="${SLATEFS_ZFS_NBD_CHUNK_SIZE:-${SLATEFS_NBD_CHUNK_SIZE:-4096}}"
+NBD_BLOCK_SIZE="${SLATEFS_ZFS_NBD_BLOCK_SIZE:-4096}"
 PORT="${SLATEFS_ZFS_NBD_PORT:-12062}"
 ADMIN_PORT="${SLATEFS_ZFS_NBD_ADMIN_PORT:-13062}"
 NBD_CLIENT_TIMEOUT="${SLATEFS_ZFS_NBD_CLIENT_TIMEOUT:-60}"
 PAYLOAD_MIB="${SLATEFS_ZFS_NBD_PAYLOAD_MIB:-16}"
+TRIM_MIB="${SLATEFS_ZFS_NBD_TRIM_MIB:-32}"
 OP_TIMEOUT="${SLATEFS_ZFS_NBD_OP_TIMEOUT:-60}"
 LONG_TIMEOUT="${SLATEFS_ZFS_NBD_LONG_TIMEOUT:-240}"
 BIN="${CARGO_TARGET_DIR:-target}/${BIN_OVERRIDE:-debug}"
@@ -101,7 +107,7 @@ ensure_binaries() {
 
 install_missing_tools() {
     local missing=()
-    for cmd in timeout nbd-client modprobe blockdev sha256sum lsmod; do
+    for cmd in timeout nbd-client modprobe blockdev sha256sum lsmod curl jq; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
     done
     if [ "${#missing[@]}" -gt 0 ]; then
@@ -112,7 +118,7 @@ install_missing_tools() {
         echo "== installing NBD/ZFS smoke base tools: ${missing[*]}"
         $SUDO apt-get update -qq >/dev/null
         DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq \
-            nbd-client kmod util-linux coreutils procps >/dev/null
+            nbd-client kmod util-linux coreutils procps curl jq >/dev/null
     fi
 
     if ! command -v zpool >/dev/null 2>&1 || ! command -v zfs >/dev/null 2>&1; then
@@ -195,6 +201,11 @@ ensure_block_volume() {
         }
         grep -q "^size_bytes:[[:space:]]*$SIZE_BYTES$" <<<"$info" || {
             echo "existing block volume $TENANT/$VOLUME does not match size_bytes=$SIZE_BYTES"
+            echo "$info"
+            exit 1
+        }
+        grep -q "^chunk_size:[[:space:]]*$CHUNK_SIZE$" <<<"$info" || {
+            echo "existing block volume $TENANT/$VOLUME does not match chunk_size=$CHUNK_SIZE"
             echo "$info"
             exit 1
         }
@@ -295,22 +306,57 @@ wait_device_size() {
 
 attach_nbd() {
     select_free_nbd
-    echo "== attaching $EXPORT_NAME to $NBD_DEV"
-    local common_args=(127.0.0.1 "$PORT" "$NBD_DEV" -N "$EXPORT_NAME" -persist off -timeout "$NBD_CLIENT_TIMEOUT")
-    if $SUDO nbd-client "${common_args[@]}" >/tmp/zfs-nbd-client-attach.log 2>&1; then
-        NBD_ATTACHED=1
-        wait_device_size
-        return 0
-    fi
-    echo "nbd-client attach with -persist off failed; retrying without -persist off"
-    cat /tmp/zfs-nbd-client-attach.log || true
-    local fallback_args=(127.0.0.1 "$PORT" "$NBD_DEV" -N "$EXPORT_NAME" -timeout "$NBD_CLIENT_TIMEOUT")
-    $SUDO nbd-client "${fallback_args[@]}" >/tmp/zfs-nbd-client-attach.log 2>&1 || {
+    case "$NBD_BLOCK_SIZE" in
+        512|1024|2048|4096) ;;
+        *) echo "unsupported SLATEFS_ZFS_NBD_BLOCK_SIZE=$NBD_BLOCK_SIZE; nbd-client accepts 512, 1024, 2048, or 4096" >&2; exit 1 ;;
+    esac
+    echo "== attaching $EXPORT_NAME to $NBD_DEV block_size=$NBD_BLOCK_SIZE"
+    local common_args=(127.0.0.1 "$PORT" "$NBD_DEV" -N "$EXPORT_NAME" -b "$NBD_BLOCK_SIZE" -timeout "$NBD_CLIENT_TIMEOUT")
+    $SUDO nbd-client "${common_args[@]}" >/tmp/zfs-nbd-client-attach.log 2>&1 || {
         cat /tmp/zfs-nbd-client-attach.log || true
         return 1
     }
     NBD_ATTACHED=1
     wait_device_size
+}
+
+admin_get_volume() {
+    local path="/admin/v1/tenants/$TENANT/volumes/$VOLUME"
+    curl -fsS --max-time 15 "http://127.0.0.1:$ADMIN_PORT$path"
+}
+
+allocated_bytes() {
+    local body value
+    body="$(admin_get_volume)"
+    value="$(printf '%s\n' "$body" | jq -r '.volume.allocated_bytes // empty')"
+    [[ "$value" =~ ^-?[0-9]+$ ]] || {
+        echo "admin allocated_bytes was not numeric" >&2
+        printf '%s\n' "$body" >&2
+        return 1
+    }
+    printf '%s\n' "$value"
+}
+
+wait_allocated_drop() {
+    local before="$1"
+    local after err="$WORK/allocated-bytes.err"
+    for _ in $(seq 1 40); do
+        if after="$(allocated_bytes 2>"$err")"; then
+            if [ "$after" -lt "$before" ]; then
+                echo "$after"
+                return 0
+            fi
+        else
+            cat "$err" >&2 || true
+        fi
+        sleep 0.5
+    done
+    after="$(allocated_bytes 2>"$err")" || {
+        cat "$err" >&2 || true
+        after="unavailable"
+    }
+    echo "allocated_bytes did not drop after ZFS trim: before=$before after=$after"
+    return 1
 }
 
 wait_scrub_done() {
@@ -325,9 +371,42 @@ wait_scrub_done() {
     return 1
 }
 
+zfs_trim_proof() {
+    echo "== ZFS TRIM allocated_bytes proof"
+    if ! run $SUDO zpool set autotrim=on "$POOL"; then
+        echo "zpool autotrim=on was rejected; skipping ZFS trim allocation proof"
+        return 0
+    fi
+
+    local trim_file="$MNT/trim-proof.bin"
+    run_long $SUDO dd if=/dev/urandom of="$trim_file" bs=1M count="$TRIM_MIB" conv=fsync status=none
+    run sync
+
+    local before after trim_log
+    before="$(allocated_bytes)"
+    echo "allocated_bytes before ZFS trim: $before"
+    run $SUDO rm "$trim_file"
+    run sync
+
+    trim_log="$WORK/zpool-trim.log"
+    if ! timeout "$LONG_TIMEOUT" $SUDO zpool trim -w "$POOL" >"$trim_log" 2>&1; then
+        cat "$trim_log" || true
+        echo "zpool trim -w failed; skipping ZFS trim allocation proof"
+        return 0
+    fi
+    cat "$trim_log" || true
+    run sync
+
+    if ! after="$(wait_allocated_drop "$before")"; then
+        echo "$after"
+        exit 1
+    fi
+    echo "allocated_bytes after ZFS trim: $after"
+}
+
 exercise_zfs() {
     echo "== zpool create $POOL on $NBD_DEV"
-    run_long $SUDO zpool create -f -m "$MNT" -O atime=off "$POOL" "$NBD_DEV"
+    run_long $SUDO zpool create -f -o ashift=12 -m "$MNT" -O atime=off "$POOL" "$NBD_DEV"
     POOL_CREATED=1
 
     echo "== write payload through ZFS"
@@ -337,6 +416,20 @@ exercise_zfs() {
 
     echo "== zfs snapshot"
     run $SUDO zfs snapshot "$POOL@smoke"
+
+    echo "== zfs rollback"
+    printf "after snapshot\n" | timeout "$OP_TIMEOUT" $SUDO tee "$MNT/after-snapshot.txt" >/dev/null
+    run sync
+    run $SUDO zfs rollback "$POOL@smoke"
+    [ ! -e "$MNT/after-snapshot.txt" ] || {
+        echo "ZFS rollback left post-snapshot file behind"
+        exit 1
+    }
+    actual="$(run $SUDO sha256sum "$MNT/payload.bin" | awk '{ print $1 }')"
+    [ "$actual" = "$expected" ] || {
+        echo "ZFS payload checksum mismatch after rollback: $actual != $expected"
+        exit 1
+    }
 
     echo "== zpool scrub"
     run $SUDO zpool scrub "$POOL"
@@ -353,6 +446,8 @@ exercise_zfs() {
         echo "ZFS payload checksum mismatch after scrub: $actual != $expected"
         exit 1
     }
+
+    zfs_trim_proof
 
     echo "== destroy zpool"
     run_long $SUDO zpool destroy "$POOL"

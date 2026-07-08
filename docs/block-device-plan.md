@@ -7,10 +7,10 @@ quota, and snapshot machinery — but exposes a flat byte range instead of a POS
 
 > Status: IMPLEMENTED through Phase B4 (v1, 2026-07-08). Core block volumes,
 > NBD server, daemon exports, CLI/admin, TLS/mTLS, metrics, dashboard,
-> kernel/QEMU/ZFS smoke scripts, and the NBD failover timing gate are in-tree.
-> Remaining work is explicit in §6: continued ZFS validation where the host
-> kernel provides zfs.ko. The NBD fio matrix confirmed the block chunk-size
-> decision on 2026-07-07.
+> kernel/QEMU/ZFS smoke scripts, real ZFS-over-NBD validation, and the NBD
+> failover timing gate are in-tree. The NBD fio matrix confirmed the block
+> chunk-size decision on 2026-07-07, and the ZFS showcase smoke passed three
+> real-kernel runs on 2026-07-07.
 > Design-decision numbers here are **BD-n** to avoid colliding with the master
 > plan's **DD-n**; DD references below are to the master plan.
 
@@ -343,11 +343,16 @@ and attach-rejection alerts in
 [monitoring/slatefs-prometheus-rules.yml](../monitoring/slatefs-prometheus-rules.yml).
 The QEMU userspace smoke is [scripts/qemu-nbd-smoke.sh](../scripts/qemu-nbd-smoke.sh);
 the ZFS showcase smoke is [scripts/zfs-over-nbd-smoke.sh](../scripts/zfs-over-nbd-smoke.sh)
-and skips cleanly when zfs.ko is unavailable. Client support and operational
-recipes are synced in [client-support.md](client-support.md) and
-[operations-runbook.md](operations-runbook.md). Remaining B4 work is environment
-validation for ZFS on runner/production kernels that actually ship the ZFS
-module.
+and skips cleanly when zfs.ko is unavailable. On 2026-07-07, `nested-vm`
+(`6.8.0-1052-azure`, `nbd-client` 3.23, `zfsutils-linux`
+`2.1.5-1ubuntu6~22.04.6`, `zfs-kmod` `2.2.2-0ubuntu9.4`) ran three passes
+against a freshly built `slatefsd`: `nbd-client -b 4096`,
+`zpool create -o ashift=12`, payload checksum, snapshot/rollback, scrub with zero errors,
+`zpool set autotrim=on`, `zpool trim -w`, clean pool destroy, and NBD detach.
+The trim proof dropped SlateFS `allocated_bytes` in every pass (`54538240 ->
+31535104`, `54558720 -> 31629312`, `54534144 -> 31588352`). Client support
+and operational recipes are synced in [client-support.md](client-support.md)
+and [operations-runbook.md](operations-runbook.md).
 
 ## 7. Risks & open questions
 

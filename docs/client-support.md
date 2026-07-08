@@ -15,7 +15,8 @@ host-filesystem server, not a transport to an arbitrary TCP 9P server.
 | Linux v9fs over TCP | `mount -t 9p -o trans=tcp,version=9p2000.L,msize=1048576,uname=<token>,aname=/tenant/volume,access=user <host> <mnt>` | Kernel smoke, pjdfstest, cross-protocol coherence |
 | TLS-wrapped 9P TCP | Configure `p9_tls_cert` + `p9_tls_key`; connect with a TLS-capable 9P client or TLS tunnel that forwards plaintext 9P locally | In-process rustls end-to-end test |
 | QEMU guest over TCP | Same 9P TCP mount from inside the guest, using the host/sidecar address reachable from the VM | `scripts/qemu-p9-tcp-smoke.sh` |
-| Linux kernel NBD | `nbd-client <host> <port> /dev/nbdX -N /tenant/volume -persist off [-C 2]` | ext4 kernel attach/crash/TRIM smoke |
+| Linux kernel NBD | `nbd-client <host> <port> /dev/nbdX -N /tenant/volume -b 4096 [-C 2]` | ext4 kernel attach/crash/TRIM smoke |
+| ZFS on Linux kernel NBD | `nbd-client <host> <port> /dev/nbdX -N /tenant/volume -b 4096`; `zpool create -o ashift=12 ... /dev/nbdX` | Three-pass real-kernel ZFS smoke |
 | QEMU/qemu-img NBD | `qemu-img info nbd://<host>:<port>//tenant/volume` | Userspace info/convert/bench smoke |
 
 Linux kernel v9fs does not negotiate TLS itself. For encrypted transport with
@@ -49,6 +50,18 @@ For failover drills, the validated kernel fallback is explicit
 Bare `nbd-client -persist` is client/kernel dependent; on the 2026-07-08
 `nested-vm` run (`nbd-client` 3.23, Linux `6.8.0-1052-azure`) it did not
 transparently resume within the 10 second gate.
+
+For ZFS, attach the NBD device with `-b 4096` and create the pool with
+`-o ashift=12` so ZFS uses 4 KiB sectors instead of inferring 512-byte sectors
+from `nbd-client` defaults. The ZFS-over-NBD smoke passed three consecutive
+real-kernel runs on `nested-vm` on 2026-07-07: Linux `6.8.0-1052-azure`,
+`nbd-client` 3.23, `zfsutils-linux` `2.1.5-1ubuntu6~22.04.6`, and
+`zfs-kmod` `2.2.2-0ubuntu9.4`. Each run created a ZFS pool on `/dev/nbd0`,
+wrote and checksummed data, snapshotted and rolled back, scrubbed with zero
+errors, destroyed the pool, and detached NBD cleanly. `zpool set autotrim=on`
+and `zpool trim -w` worked on that host; SlateFS `allocated_bytes` dropped in
+all three passes: `54538240 -> 31535104`, `54558720 -> 31629312`, and
+`54534144 -> 31588352`.
 
 QEMU userspace tools do not need `nbd.ko`. For SlateFS export names of the
 form `/tenant/volume`, QEMU's URI form needs a doubled slash after the port:
