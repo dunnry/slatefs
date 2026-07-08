@@ -80,18 +80,50 @@ umount /mnt/slatefs-block
 nbd-client -d /dev/nbd0
 slatefs -c /etc/slatefs/slatefs.toml volume resize t1 b1 --size 200G
 systemctl restart slatefsd
-nbd-client 10.0.0.10 12059 /dev/nbd0 -N /t1/b1 -persist off -timeout 60
+nbd-client 10.0.0.10 12059 /dev/nbd0 -N /t1/b1 -timeout 60
 blockdev --rereadpt /dev/nbd0 || true
 resize2fs /dev/nbd0
 ```
 
-For failover, move the stable endpoint to the takeover daemon and use a client
-that retries transport drops. Kernel clients can run with `nbd-client
--persist` and a finite `-timeout`; QEMU clients should set `reconnect-delay`
-on the NBD blockdev. Validate the recovered filesystem with `e2fsck -f -p`
-after any forced outage drill. The Phase B3 timing gate remains the same as
-the filesystem failover target: resumed I/O in less than 10 seconds with no
-corruption.
+For failover, move the stable endpoint to the takeover daemon. The validated
+kernel fallback is explicit detach/reattach of the fixed device after the
+primary transport drops:
+
+```sh
+nbd-client -d /dev/nbd0
+nbd-client 10.0.0.11 12059 /dev/nbd0 -N /t1/b1 -b 4096 -timeout 10
+```
+
+Bare `nbd-client -persist` may help on some client/kernel combinations, but
+on `nested-vm` (`nbd-client` 3.23, Linux `6.8.0-1052-azure`) it did not
+transparently resume the fixed `/dev/nbd0` session within the 10 second gate
+after the primary process was killed and the takeover daemon rebound the same
+endpoint. QEMU clients should set `reconnect-delay` on the NBD blockdev.
+Validate the recovered filesystem with `e2fsck -f -p` after any forced outage
+drill. The Phase B3 timing gate remains the same as the filesystem failover
+target: resumed I/O in less than 10 seconds with no corruption.
+
+Automated NBD failover drill:
+
+```sh
+SKIP_SMOKE=1 scripts/docker-kernel-mount-test.sh scripts/nbd-failover-drill.sh
+```
+
+The drill writes a FLUSHed raw-device marker through the kernel NBD client,
+runs verified raw-device load, kills the primary daemon, starts the takeover
+daemon on the same NBD endpoint, detaches and reattaches the client, gates the
+time to first verified takeover I/O with `SLATEFS_NBD_FAILOVER_MAX_SECONDS`
+(default: `10`), verifies post-takeover writes, checks liveness metrics, and
+runs offline `slatefs volume fsck`. Set any `FIO_*` variable, or
+`SLATEFS_NBD_FAILOVER_LOAD_MODE=fio`, to use fio verify load instead of the
+default checksum loop. Set `SLATEFS_NBD_FAILOVER_PERSIST_PROBE=1` to also try
+the non-gating `nbd-client -persist` reconnect probe.
+
+On 2026-07-08, three direct runs on `nested-vm` measured 0.742s, 0.683s, and
+0.771s to first verified takeover I/O. The largest components were detach
+(0.385-0.486s) and takeover open (0.215-0.238s); reattach and first I/O were
+each below 0.05s. All three runs passed the 10 second gate and offline block
+fsck was clean.
 
 For snapshots and restore drills:
 
@@ -108,6 +140,7 @@ Automated smokes:
 
 ```sh
 SKIP_SMOKE=1 scripts/docker-kernel-mount-test.sh scripts/nbd-kernel-attach-test.sh
+SKIP_SMOKE=1 scripts/docker-kernel-mount-test.sh scripts/nbd-failover-drill.sh
 SKIP_SMOKE=1 scripts/docker-kernel-mount-test.sh scripts/qemu-nbd-smoke.sh
 SKIP_SMOKE=1 scripts/docker-kernel-mount-test.sh scripts/zfs-over-nbd-smoke.sh
 ```

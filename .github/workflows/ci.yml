@@ -185,6 +185,15 @@ jobs:
             exit 1
           fi
           grep -q 'SLATEFS_NBD_KERNEL_TEST_PASSED' /tmp/nbd-kernel.log
+      - name: NBD failover timing gate
+        run: |
+          set -o pipefail
+          SLATEFS_CONFIG=/tmp/slatefs-nbd.toml ./scripts/nbd-failover-drill.sh | tee /tmp/nbd-failover.log
+          if grep -q 'SLATEFS_NBD_FAILOVER_SKIPPED' /tmp/nbd-failover.log; then
+            echo "::error::NBD kernel support was missing on an Ubuntu CI runner"
+            exit 1
+          fi
+          grep -q 'SLATEFS_NBD_FAILOVER_PASSED' /tmp/nbd-failover.log
       - name: ZFS over kernel NBD smoke (allow skip)
         run: |
           set -o pipefail

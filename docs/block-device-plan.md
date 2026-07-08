@@ -5,10 +5,10 @@ protocol, alongside the existing NFSv3/9P filesystem frontends. A block volume i
 volume *kind* that reuses the existing per-volume SlateDB database, encryption, caching,
 quota, and snapshot machinery — but exposes a flat byte range instead of a POSIX tree.
 
-> Status: IMPLEMENTED through Phase B4 (v1, 2026-07-07). Core block volumes,
-> NBD server, daemon exports, CLI/admin, TLS/mTLS, metrics, dashboard, and
-> kernel/QEMU/ZFS smoke scripts are in-tree. Remaining work is explicit in §6:
-> NBD failover timing gate (<10s AC) and continued ZFS validation where the host
+> Status: IMPLEMENTED through Phase B4 (v1, 2026-07-08). Core block volumes,
+> NBD server, daemon exports, CLI/admin, TLS/mTLS, metrics, dashboard,
+> kernel/QEMU/ZFS smoke scripts, and the NBD failover timing gate are in-tree.
+> Remaining work is explicit in §6: continued ZFS validation where the host
 > kernel provides zfs.ko. The NBD fio matrix confirmed the block chunk-size
 > decision on 2026-07-07.
 > Design-decision numbers here are **BD-n** to avoid colliding with the master
@@ -301,10 +301,17 @@ resumed I/O, zero corruption.
 creates a block volume, attaches a real Linux `nbd-client`, formats ext4,
 mounts ext4, exercises file operations, verifies `fstrim` lowers
 `allocated_bytes`, kills/restarts `slatefsd` mid-load, remounts for journal
-replay, and requires `e2fsck -f -p` clean. The privileged CI job is
-`kernel-nbd` in [.github/workflows/ci.yml](../.github/workflows/ci.yml).
-Remaining B3 work: add the NBD failover drill timing gate (<10s resumed I/O,
-zero corruption).
+replay, and requires `e2fsck -f -p` clean.
+[scripts/nbd-failover-drill.sh](../scripts/nbd-failover-drill.sh) kills the
+primary under verified raw-device load, starts the takeover daemon on the same
+NBD endpoint, detaches/reattaches the fixed kernel device, verifies the
+pre-kill FLUSH marker and post-takeover writes, and runs offline block
+`volume fsck`. On 2026-07-08, `nested-vm` (`6.8.0-1052-azure`,
+`nbd-client` 3.23) ran three passes at 0.742s, 0.683s, and 0.771s to first
+verified takeover I/O. Breakdown was dominated by detach (0.385-0.486s) and
+takeover open (0.215-0.238s); reattach was 0.027-0.042s and first I/O was
+0.020-0.025s. The privileged CI job is `kernel-nbd` in
+[.github/workflows/ci.yml](../.github/workflows/ci.yml).
 TRIM outcome: resolved 2026-07-07. The local OrbStack kernel
 (`7.0.11-orbstack-00360-gc9bc4d96ac70`) did send NBD TRIMs during `fstrim`,
 but before the fix SlateFS rejected coalesced large TRIM requests before they
@@ -361,9 +368,13 @@ module.
    deletes for fully-covered chunks, and the NBD server accepts large TRIM
    extents even when they exceed the read/write max payload. The remaining cost
    is extra RMW writes on partial trim edges.
-4. **Linux `nbd.ko` quirks**: reconnect semantics, `-persist` behavior across server
-   restarts, timeout-induced device errors wedging mounts. Same discipline as the NFS kernel
-   tests (soft timeouts, forced cleanup); capture findings in client-support.md.
+4. **Linux `nbd.ko` reconnect quirks**: `nested-vm` passed the scripted
+   detach/reattach failover gate in under 1s, but bare `nbd-client -persist`
+   did not transparently resume the fixed `/dev/nbd0` session within the 10s
+   window after the primary process was killed and the takeover listener bound
+   the same endpoint. Treat transparent kernel reconnect as client/kernel
+   dependent; keep the scripted detach/reattach operator fallback and bounded
+   cleanup timeouts.
 5. **Blocking on rate limit** (§4) interacts with client timeouts — bound the wait below the
    kernel's default nbd timeout and document tenant-limit sizing.
 6. **`NBD_OPT_LIST`/name privacy** — listing returns only the export's own name; verify no

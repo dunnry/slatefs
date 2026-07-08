@@ -41,8 +41,14 @@ client build does not expose it. Attach with a bounded timeout:
 
 ```sh
 modprobe nbd max_part=8 nbds_max=16
-nbd-client 127.0.0.1 12059 /dev/nbd0 -N /t1/b1 -persist off -timeout 60 -C 2
+nbd-client 127.0.0.1 12059 /dev/nbd0 -N /t1/b1 -b 4096 -timeout 60 -C 2
 ```
+
+For failover drills, the validated kernel fallback is explicit
+`nbd-client -d /dev/nbdX` followed by reattach to the stable endpoint.
+Bare `nbd-client -persist` is client/kernel dependent; on the 2026-07-08
+`nested-vm` run (`nbd-client` 3.23, Linux `6.8.0-1052-azure`) it did not
+transparently resume within the 10 second gate.
 
 QEMU userspace tools do not need `nbd.ko`. For SlateFS export names of the
 form `/tenant/volume`, QEMU's URI form needs a doubled slash after the port:
