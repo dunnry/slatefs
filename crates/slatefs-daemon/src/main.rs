@@ -6,9 +6,10 @@
 //! (DD-10).
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -39,9 +40,14 @@ use slatefs_core::vfs::Vfs;
 use slatefs_core::volume::{self, Volume, VolumeCaches};
 use slatefs_nbd::NbdShutdownHandle;
 use slatefs_nfs::{NFSTcp, SquashPolicy};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::server::WebPkiClientVerifier;
+use tokio_rustls::rustls::{RootCertStore, ServerConfig};
 use tracing::Instrument;
+use x509_parser::{extensions::GeneralName, parse_x509_certificate, x509::X509Name};
 
 #[derive(Parser)]
 #[command(name = "slatefsd", version, about = "SlateFS file server daemon")]
@@ -505,22 +511,28 @@ fn render_daemon_metrics_with_exports(
     render_prometheus(&samples)
 }
 
-async fn write_http_response(
-    stream: &mut TcpStream,
+async fn write_http_response<W>(
+    stream: &mut W,
     status: &str,
     content_type: &str,
     body: String,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     write_http_response_with_headers(stream, status, content_type, &[], body).await
 }
 
-async fn write_http_response_with_headers(
-    stream: &mut TcpStream,
+async fn write_http_response_with_headers<W>(
+    stream: &mut W,
     status: &str,
     content_type: &str,
     headers: &[(&str, String)],
     body: String,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len(),
@@ -598,6 +610,7 @@ const ADMIN_API_PREFIX: &str = "/admin/v1";
 const DEFAULT_PAGE_LIMIT: usize = 100;
 const MAX_PAGE_LIMIT: usize = 1_000;
 const SLATEDB_VERSION: &str = "0.14.1";
+static RUSTLS_PROVIDER: Once = Once::new();
 
 #[derive(Clone)]
 enum AdminControl {
@@ -618,6 +631,7 @@ struct AdminState {
     export_count: usize,
     snapshot_export_count: usize,
     auth_token: Option<String>,
+    allow_cert_auth: bool,
     node_id: Option<String>,
 }
 
@@ -628,6 +642,8 @@ struct AdminHttpRequest {
     headers: HashMap<String, String>,
     request_id: String,
     peer: Option<SocketAddr>,
+    cert_principal: Option<String>,
+    authenticated_principal: Option<String>,
     body: String,
 }
 
@@ -1184,36 +1200,73 @@ fn token_matches(expected: &str, presented: &str) -> bool {
     diff == 0
 }
 
-fn require_admin_auth(state: &AdminState, request: &AdminHttpRequest) -> Result<(), AdminError> {
-    let Some(expected) = state.auth_token.as_deref() else {
-        return Ok(());
-    };
-    let Some(header) = request.headers.get("authorization") else {
-        return Err(AdminError {
-            status: 401,
-            message: "missing bearer token".to_string(),
-        });
-    };
-    let Some(presented) = header.strip_prefix("Bearer ") else {
-        return Err(AdminError {
-            status: 401,
-            message: "missing bearer token".to_string(),
-        });
-    };
-    if token_matches(expected, presented) {
-        Ok(())
-    } else {
-        Err(AdminError {
-            status: 401,
-            message: "invalid bearer token".to_string(),
-        })
-    }
+fn bearer_token_from_headers(headers: &HashMap<String, String>) -> Option<&str> {
+    let header = headers.get("authorization")?;
+    let (scheme, token) = header.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then_some(token)
 }
 
-async fn read_admin_request(
-    stream: &mut TcpStream,
+fn admin_principal_from_headers(headers: &HashMap<String, String>) -> Option<String> {
+    let value = headers.get("x-admin-principal")?.trim();
+    (!value.is_empty() && value.len() <= 256).then(|| value.to_string())
+}
+
+fn cert_auth_principal(request: &AdminHttpRequest) -> Option<String> {
+    request
+        .cert_principal
+        .as_ref()
+        .map(|principal| format!("cert:{principal}"))
+}
+
+fn authenticate_admin_request(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+) -> Result<Option<String>, AdminError> {
+    if let Some(expected) = state.auth_token.as_deref() {
+        let Some(presented) = bearer_token_from_headers(&request.headers) else {
+            if state.allow_cert_auth
+                && let Some(principal) = cert_auth_principal(request)
+            {
+                return Ok(Some(principal));
+            }
+            return Err(AdminError {
+                status: 401,
+                message: "missing bearer token".to_string(),
+            });
+        };
+        if token_matches(expected, presented) {
+            return Ok(admin_principal_from_headers(&request.headers));
+        }
+        if state.allow_cert_auth
+            && let Some(principal) = cert_auth_principal(request)
+        {
+            return Ok(Some(principal));
+        }
+        return Err(AdminError {
+            status: 401,
+            message: "invalid bearer token".to_string(),
+        });
+    }
+
+    if state.allow_cert_auth {
+        return cert_auth_principal(request)
+            .map(Some)
+            .ok_or_else(|| AdminError {
+                status: 401,
+                message: "missing client certificate".to_string(),
+            });
+    }
+
+    Ok(None)
+}
+
+async fn read_admin_request<R>(
+    stream: &mut R,
     peer: Option<SocketAddr>,
-) -> Result<Option<AdminHttpRequest>, AdminError> {
+) -> Result<Option<AdminHttpRequest>, AdminError>
+where
+    R: AsyncRead + Unpin,
+{
     let mut buf = [0u8; 16 * 1024];
     let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
     let n = match read {
@@ -1263,6 +1316,8 @@ async fn read_admin_request(
         headers,
         request_id,
         peer,
+        cert_principal: None,
+        authenticated_principal: None,
         body: body.to_string(),
     }))
 }
@@ -1467,6 +1522,7 @@ fn parse_json_body<T: for<'de> Deserialize<'de>>(
 fn admin_actor(request: &AdminHttpRequest) -> AuditActor {
     AuditActor {
         plane: AuditPlane::Admin,
+        principal: request.authenticated_principal.clone(),
         source_ip: request.peer.map(|addr| addr.ip().to_string()),
         client_agent: request.headers.get("user-agent").cloned(),
     }
@@ -2116,10 +2172,10 @@ async fn health_response(state: &AdminState, ready: bool, verbose: bool) -> Admi
 
 async fn route_admin_request(
     state: &AdminState,
-    request: &AdminHttpRequest,
+    request: &mut AdminHttpRequest,
 ) -> Result<AdminHttpResponse, AdminError> {
     if request.path.starts_with(ADMIN_API_PREFIX) {
-        require_admin_auth(state, request)?;
+        request.authenticated_principal = authenticate_admin_request(state, request)?;
     }
 
     match (request.method.as_str(), request.path.as_str()) {
@@ -2244,12 +2300,27 @@ async fn route_admin_request(
     }
 }
 
-async fn handle_admin_connection(
-    mut stream: TcpStream,
+async fn handle_admin_connection<S>(
+    stream: S,
     state: Arc<AdminState>,
     peer: Option<SocketAddr>,
-) -> std::io::Result<()> {
-    let request = match read_admin_request(&mut stream, peer).await {
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    handle_admin_connection_with_cert(stream, state, peer, None).await
+}
+
+async fn handle_admin_connection_with_cert<S>(
+    mut stream: S,
+    state: Arc<AdminState>,
+    peer: Option<SocketAddr>,
+    cert_principal: Option<String>,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut request = match read_admin_request(&mut stream, peer).await {
         Ok(Some(request)) => request,
         Ok(None) => return Ok(()),
         Err(error) => {
@@ -2268,6 +2339,7 @@ async fn handle_admin_connection(
             .await;
         }
     };
+    request.cert_principal = cert_principal;
 
     let span = tracing::info_span!(
         "admin_request",
@@ -2277,7 +2349,7 @@ async fn handle_admin_connection(
         peer = request.peer.map(|addr| addr.to_string()).unwrap_or_default(),
     );
     let mut response = async {
-        match route_admin_request(&state, &request).await {
+        match route_admin_request(&state, &mut request).await {
             Ok(response) => response,
             Err(error) if request.path.starts_with(ADMIN_API_PREFIX) => {
                 json_error_response(error.status, error.message, &request.request_id)
@@ -2304,17 +2376,181 @@ async fn handle_admin_connection(
     .await
 }
 
-async fn serve_admin(listen: String, state: Arc<AdminState>) -> std::io::Result<()> {
+fn install_rustls_provider() {
+    RUSTLS_PROVIDER.call_once(|| {
+        let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
+fn load_admin_cert_chain(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening admin TLS certificate {}", path.display()))?;
+    let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(file))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("reading admin TLS certificate {}", path.display()))?;
+    if certs.is_empty() {
+        anyhow::bail!(
+            "admin TLS certificate file {} contained no certificates",
+            path.display()
+        );
+    }
+    Ok(certs)
+}
+
+fn load_admin_private_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening admin TLS private key {}", path.display()))?;
+    rustls_pemfile::private_key(&mut std::io::BufReader::new(file))
+        .with_context(|| format!("reading admin TLS private key {}", path.display()))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "admin TLS private key file {} contained no private key",
+                path.display()
+            )
+        })
+}
+
+fn load_admin_root_cert_store(path: &Path) -> anyhow::Result<RootCertStore> {
+    let mut roots = RootCertStore::empty();
+    for cert in load_admin_cert_chain(path)? {
+        roots.add(cert).with_context(|| {
+            format!(
+                "invalid admin TLS client CA certificate in {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(roots)
+}
+
+fn build_admin_tls_acceptor(config: &AdminConfig) -> anyhow::Result<Option<TlsAcceptor>> {
+    let (Some(cert_path), Some(key_path)) = (&config.tls_cert, &config.tls_key) else {
+        return Ok(None);
+    };
+    install_rustls_provider();
+
+    let certs = load_admin_cert_chain(cert_path)?;
+    let key = load_admin_private_key(key_path)?;
+    let builder = ServerConfig::builder();
+    let builder = match config.tls_client_ca.as_deref() {
+        Some(path) => {
+            let verifier =
+                WebPkiClientVerifier::builder(Arc::new(load_admin_root_cert_store(path)?))
+                    .build()
+                    .with_context(|| {
+                        format!("invalid admin TLS client CA bundle {}", path.display())
+                    })?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let mut tls = builder
+        .with_single_cert(certs, key)
+        .context("invalid admin TLS certificate/key pair")?;
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Some(TlsAcceptor::from(Arc::new(tls))))
+}
+
+fn verified_client_principal<IO>(stream: &tokio_rustls::server::TlsStream<IO>) -> Option<String> {
+    let (_, connection) = stream.get_ref();
+    connection
+        .peer_certificates()?
+        .first()
+        .and_then(|cert| cert_principal_from_der(cert.as_ref()))
+}
+
+fn cert_principal_from_der(der: &[u8]) -> Option<String> {
+    let (_, cert) = parse_x509_certificate(der).ok()?;
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for name in &san.value.general_names {
+            if let Some(value) = principal_from_general_name(name) {
+                return Some(value);
+            }
+        }
+    }
+    cert_common_name(cert.subject())
+}
+
+fn principal_from_general_name(name: &GeneralName<'_>) -> Option<String> {
+    match name {
+        GeneralName::DNSName(value) | GeneralName::RFC822Name(value) | GeneralName::URI(value) => {
+            sanitize_cert_principal(value)
+        }
+        GeneralName::IPAddress(bytes) => cert_ip_principal(bytes).map(|ip| ip.to_string()),
+        _ => None,
+    }
+}
+
+fn cert_ip_principal(bytes: &[u8]) -> Option<IpAddr> {
+    match bytes.len() {
+        4 => Some(IpAddr::V4(Ipv4Addr::new(
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ))),
+        16 => {
+            let mut octets = [0_u8; 16];
+            octets.copy_from_slice(bytes);
+            Some(IpAddr::V6(Ipv6Addr::from(octets)))
+        }
+        _ => None,
+    }
+}
+
+fn cert_common_name(name: &X509Name<'_>) -> Option<String> {
+    name.iter_common_name()
+        .find_map(|cn| cn.as_str().ok())
+        .and_then(sanitize_cert_principal)
+}
+
+fn sanitize_cert_principal(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && value.len() <= 256).then(|| value.to_owned())
+}
+
+async fn serve_admin(
+    listen: String,
+    state: Arc<AdminState>,
+    tls: Option<TlsAcceptor>,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(&listen).await?;
-    tracing::info!(listen, "admin endpoint ready");
+    tracing::info!(listen, tls = tls.is_some(), "admin endpoint ready");
+    serve_admin_listener(listener, state, tls).await
+}
+
+async fn serve_admin_listener(
+    listener: TcpListener,
+    state: Arc<AdminState>,
+    tls: Option<TlsAcceptor>,
+) -> std::io::Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            if let Err(error) = handle_admin_connection(stream, state, Some(peer)).await {
-                tracing::debug!(%peer, "admin request failed: {error}");
+        match tls.clone() {
+            Some(acceptor) => {
+                tokio::spawn(async move {
+                    let stream = match acceptor.accept(stream).await {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            tracing::debug!(%peer, "admin TLS handshake failed: {error}");
+                            return;
+                        }
+                    };
+                    let cert_principal = verified_client_principal(&stream);
+                    if let Err(error) =
+                        handle_admin_connection_with_cert(stream, state, Some(peer), cert_principal)
+                            .await
+                    {
+                        tracing::debug!(%peer, "admin request failed: {error}");
+                    }
+                });
             }
-        });
+            None => {
+                tokio::spawn(async move {
+                    if let Err(error) = handle_admin_connection(stream, state, Some(peer)).await {
+                        tracing::debug!(%peer, "admin request failed: {error}");
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -2468,6 +2704,7 @@ fn snapshot_retention_audit_record(
     let mut record = AuditRecord::new(
         AuditActor {
             plane: AuditPlane::Admin,
+            principal: None,
             source_ip: None,
             client_agent: Some("slatefsd snapshot-retention".to_string()),
         },
@@ -3449,6 +3686,20 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("resolving object store {}", config.object_store.url))?;
     let kms = kms::from_config(&config.kms)?;
     let admin_token = load_admin_token(&config.admin)?;
+    let admin_tls = build_admin_tls_acceptor(&config.admin)?;
+    let admin_cert_auth_allowed = config.admin.allow_cert_auth;
+    if config.admin.listen.is_some() {
+        if admin_token.is_none() && !admin_cert_auth_allowed {
+            tracing::warn!(
+                "slatefs admin API is unauthenticated; set admin.token/admin.token_file or enable mTLS cert auth on untrusted networks"
+            );
+        }
+        if admin_token.is_some() && admin_tls.is_none() {
+            tracing::warn!(
+                "slatefs admin bearer tokens are accepted over cleartext HTTP; set admin.tls_cert and admin.tls_key on untrusted networks"
+            );
+        }
+    }
 
     let config_exports = config_export_records(&config.exports);
     let export_metrics = ExportMetrics::default();
@@ -3552,9 +3803,10 @@ async fn main() -> anyhow::Result<()> {
                 .filter(|export| export.snapshot.is_some())
                 .count(),
             auth_token: admin_token,
+            allow_cert_auth: admin_cert_auth_allowed,
             node_id: None,
         });
-        servers.spawn(async move { serve_admin(listen, state).await });
+        servers.spawn(async move { serve_admin(listen, state, admin_tls).await });
     }
 
     if let Some(listen) = config.metrics.listen.clone() {
@@ -3595,6 +3847,19 @@ mod tests {
     use slatefs_core::vfs::{Credentials, Vfs};
     use slatefs_nbd::test_support::NbdTestClient;
     use slatefs_nfs::SlateFsNfs;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use tokio::task::JoinHandle;
+    use tokio_rustls::TlsConnector;
+    use tokio_rustls::rustls::pki_types::ServerName;
+
+    use rcgen::{
+        BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
+        Issuer, KeyPair, KeyUsagePurpose,
+    };
+
+    type TestResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+    const ADMIN_TOKEN: &str = "secret-admin-token";
 
     fn create_opts() -> slatefs_core::volume::CreateVolumeOptions {
         slatefs_core::volume::CreateVolumeOptions {
@@ -3639,6 +3904,7 @@ mod tests {
             export_count: 1,
             snapshot_export_count: 0,
             auth_token,
+            allow_cert_auth: false,
             node_id: None,
         })
     }
@@ -3660,6 +3926,7 @@ mod tests {
             export_count: 1,
             snapshot_export_count: 0,
             auth_token,
+            allow_cert_auth: false,
             node_id: None,
         })
     }
@@ -3710,6 +3977,164 @@ mod tests {
             "PATCH {path} HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: {request_id}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    struct TlsAdminServer {
+        addr: SocketAddr,
+        task: JoinHandle<()>,
+    }
+
+    impl TlsAdminServer {
+        async fn start(state: Arc<AdminState>, tls: TlsAcceptor) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                serve_admin_listener(listener, state, Some(tls))
+                    .await
+                    .unwrap();
+            });
+            Self { addr, task }
+        }
+
+        async fn shutdown(self) {
+            self.task.abort();
+            let _ = self.task.await;
+        }
+    }
+
+    struct TestCerts {
+        ca: PathBuf,
+        server_cert: PathBuf,
+        server_key: PathBuf,
+        client_cert: PathBuf,
+        client_key: PathBuf,
+    }
+
+    impl TestCerts {
+        fn generate(dir: &Path) -> TestResult<Self> {
+            let (ca_cert, ca_issuer) = new_ca()?;
+            let (server_cert, server_key) = new_leaf(
+                &ca_issuer,
+                "slatefs-admin",
+                &["localhost", "127.0.0.1"],
+                ExtendedKeyUsagePurpose::ServerAuth,
+            )?;
+            let (client_cert, client_key) = new_leaf(
+                &ca_issuer,
+                "slatefs-client",
+                &["slatefs-client"],
+                ExtendedKeyUsagePurpose::ClientAuth,
+            )?;
+
+            let ca = dir.join("ca.pem");
+            let server_cert_path = dir.join("server.pem");
+            let server_key_path = dir.join("server-key.pem");
+            let client_cert_path = dir.join("client.pem");
+            let client_key_path = dir.join("client-key.pem");
+            fs::write(&ca, ca_cert.pem())?;
+            fs::write(&server_cert_path, server_cert.pem())?;
+            fs::write(&server_key_path, server_key.serialize_pem())?;
+            fs::write(&client_cert_path, client_cert.pem())?;
+            fs::write(&client_key_path, client_key.serialize_pem())?;
+
+            Ok(Self {
+                ca,
+                server_cert: server_cert_path,
+                server_key: server_key_path,
+                client_cert: client_cert_path,
+                client_key: client_key_path,
+            })
+        }
+    }
+
+    fn new_ca() -> TestResult<(Certificate, Issuer<'static, KeyPair>)> {
+        let mut params = CertificateParams::new(Vec::<String>::new())?;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "slatefs-test-ca");
+        params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+        params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+        params.key_usages.push(KeyUsagePurpose::CrlSign);
+        let key_pair = KeyPair::generate()?;
+        let cert = params.self_signed(&key_pair)?;
+        Ok((cert, Issuer::new(params, key_pair)))
+    }
+
+    fn new_leaf(
+        issuer: &Issuer<'static, KeyPair>,
+        common_name: &str,
+        sans: &[&str],
+        eku: ExtendedKeyUsagePurpose,
+    ) -> TestResult<(Certificate, KeyPair)> {
+        let mut params =
+            CertificateParams::new(sans.iter().map(|san| (*san).to_owned()).collect::<Vec<_>>())?;
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name);
+        params.use_authority_key_identifier_extension = true;
+        params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+        params.extended_key_usages.push(eku);
+        let key_pair = KeyPair::generate()?;
+        let cert = params.signed_by(&key_pair, issuer)?;
+        Ok((cert, key_pair))
+    }
+
+    fn admin_tls_acceptor(certs: &TestCerts, client_ca: bool) -> TestResult<TlsAcceptor> {
+        Ok(build_admin_tls_acceptor(&AdminConfig {
+            listen: None,
+            token: None,
+            token_file: None,
+            tls_cert: Some(certs.server_cert.clone()),
+            tls_key: Some(certs.server_key.clone()),
+            tls_client_ca: client_ca.then(|| certs.ca.clone()),
+            allow_cert_auth: false,
+        })?
+        .unwrap())
+    }
+
+    fn tls_client_config(
+        ca_path: &Path,
+        identity: Option<(&Path, &Path)>,
+    ) -> TestResult<Arc<tokio_rustls::rustls::ClientConfig>> {
+        install_rustls_provider();
+        let roots = load_admin_root_cert_store(ca_path)?;
+        let builder = tokio_rustls::rustls::ClientConfig::builder().with_root_certificates(roots);
+        let mut config = match identity {
+            Some((cert_path, key_path)) => builder.with_client_auth_cert(
+                load_admin_cert_chain(cert_path)?,
+                load_admin_private_key(key_path)?,
+            )?,
+            None => builder.with_no_client_auth(),
+        };
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Ok(Arc::new(config))
+    }
+
+    async fn tls_admin_exchange(
+        addr: SocketAddr,
+        ca_path: &Path,
+        identity: Option<(&Path, &Path)>,
+        request: &[u8],
+    ) -> TestResult<String> {
+        let stream = TcpStream::connect(addr).await?;
+        let connector = TlsConnector::from(tls_client_config(ca_path, identity)?);
+        let server_name = ServerName::try_from("localhost")?.to_owned();
+        let mut stream = connector.connect(server_name, stream).await?;
+        stream.write_all(request).await?;
+        stream.shutdown().await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        Ok(String::from_utf8(response)?)
+    }
+
+    async fn tcp_exchange(addr: SocketAddr, request: &[u8]) -> std::io::Result<String> {
+        let mut client = TcpStream::connect(addr).await?;
+        client.write_all(request).await?;
+        let _ = client.shutdown().await;
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await?;
+        Ok(String::from_utf8_lossy(&response).to_string())
     }
 
     async fn poll_live_limits_once(
@@ -3923,6 +4348,144 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn https_admin_serves_tls_and_rejects_plain_http() -> TestResult<()> {
+        let dir = tempfile::tempdir()?;
+        let certs = TestCerts::generate(dir.path())?;
+        let object_store = store::resolve_root("memory:///")?;
+        let state = unavailable_admin_state(object_store, HashMap::new(), Some(ADMIN_TOKEN.into()));
+        let server = TlsAdminServer::start(state, admin_tls_acceptor(&certs, false)?).await;
+
+        let response = tls_admin_exchange(
+            server.addr,
+            &certs.ca,
+            None,
+            b"GET /livez HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await?;
+        assert_eq!(response_status(&response), 200, "{response}");
+
+        let plain = tcp_exchange(
+            server.addr,
+            b"GET /livez HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(
+            plain.as_deref().unwrap_or_default().is_empty()
+                || !plain.unwrap().starts_with("HTTP/1.1 200"),
+            "plain HTTP unexpectedly reached TLS listener"
+        );
+
+        server.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mtls_requires_client_cert_and_allows_token_auth() -> TestResult<()> {
+        let dir = tempfile::tempdir()?;
+        let certs = TestCerts::generate(dir.path())?;
+        let object_store = store::resolve_root("memory:///")?;
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([38; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms)).await?;
+        control.close().await?;
+        let state =
+            available_admin_state(object_store, kms, HashMap::new(), Some(ADMIN_TOKEN.into()))
+                .await;
+        let server = TlsAdminServer::start(state, admin_tls_acceptor(&certs, true)?).await;
+
+        let rejected = tls_admin_exchange(
+            server.addr,
+            &certs.ca,
+            None,
+            format!(
+                "GET /admin/v1/nodes HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {ADMIN_TOKEN}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(
+            rejected.is_err(),
+            "mTLS listener accepted a request without client certificate"
+        );
+
+        let response = tls_admin_exchange(
+            server.addr,
+            &certs.ca,
+            Some((&certs.client_cert, &certs.client_key)),
+            format!(
+                "GET /admin/v1/nodes HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {ADMIN_TOKEN}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+        assert_eq!(response_status(&response), 200, "{response}");
+
+        server.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mtls_cert_auth_records_cert_principal_in_audit() -> TestResult<()> {
+        let dir = tempfile::tempdir()?;
+        let certs = TestCerts::generate(dir.path())?;
+        let object_store = store::resolve_root("memory:///")?;
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([37; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms)).await?;
+        control.create_tenant("t", None).await?;
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            create_opts(),
+        )
+        .await?;
+        control.close().await?;
+
+        let state = available_admin_state(
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            HashMap::new(),
+            Some(ADMIN_TOKEN.into()),
+        )
+        .await;
+        let mut state = (*state).clone();
+        state.allow_cert_auth = true;
+        let server =
+            TlsAdminServer::start(Arc::new(state), admin_tls_acceptor(&certs, true)?).await;
+
+        let quota_patch = patch_request(
+            "/admin/v1/tenants/t/volumes/v/quota",
+            "cert-quota",
+            r#"{"bytes_soft":512}"#,
+        );
+        let response = tls_admin_exchange(
+            server.addr,
+            &certs.ca,
+            Some((&certs.client_cert, &certs.client_key)),
+            quota_patch.as_bytes(),
+        )
+        .await?;
+        assert_eq!(response_status(&response), 200, "{response}");
+
+        let control = ControlPlane::open(Arc::clone(&object_store), kms).await?;
+        let (records, _) = control
+            .list_audit(AuditQuery {
+                action: Some(AuditAction::QuotaSet),
+                newest_first: false,
+                ..AuditQuery::default()
+            })
+            .await?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].actor.principal.as_deref(),
+            Some("cert:slatefs-client")
+        );
+
+        server.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn readyz_degrades_when_control_reader_unavailable() {
         let object_store = store::resolve_root("memory:///").unwrap();
         let state = unavailable_admin_state(object_store, HashMap::new(), Some("secret".into()));
@@ -3961,6 +4524,7 @@ mod tests {
         let mut record = AuditRecord::new(
             AuditActor {
                 plane: AuditPlane::Admin,
+                principal: None,
                 source_ip: Some("127.0.0.1".to_string()),
                 client_agent: Some("test".to_string()),
             },
@@ -4214,6 +4778,7 @@ mod tests {
             export_count: 1,
             snapshot_export_count: 0,
             auth_token: None,
+            allow_cert_auth: false,
             node_id: None,
         });
 
@@ -4838,6 +5403,7 @@ mod tests {
             export_count: 1,
             snapshot_export_count: 0,
             auth_token: None,
+            allow_cert_auth: false,
             node_id: None,
         });
 

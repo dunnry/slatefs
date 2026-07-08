@@ -43,6 +43,7 @@ moka = { version = "0.12", features = ["sync"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
+x509-parser = "0.18"
 
 # NFSv3 frontend (plan §9.2 spike outcome; zerofs_nfsserve excluded by license).
 # Vendored fork of nfs3_server 0.11.0 (BSD-3-Clause) carrying the slatefs
@@ -73,3 +74,4 @@ uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 futures = "0.3"
 proptest = "1"
+rcgen = "0.14"

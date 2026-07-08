@@ -162,6 +162,16 @@ pub struct AdminConfig {
     pub token: Option<String>,
     /// Optional file containing the static bearer token for `/admin/v1` routes.
     pub token_file: Option<std::path::PathBuf>,
+    /// Optional PEM certificate chain served by the admin listener.
+    pub tls_cert: Option<std::path::PathBuf>,
+    /// Optional PEM private key for `tls_cert`.
+    pub tls_key: Option<std::path::PathBuf>,
+    /// Optional PEM CA bundle. When set, admin TLS clients must present a
+    /// certificate chaining to one of these roots.
+    pub tls_client_ca: Option<std::path::PathBuf>,
+    /// Allows a verified client certificate to satisfy `/admin/v1` auth
+    /// without a bearer token.
+    pub allow_cert_auth: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -553,6 +563,24 @@ impl Config {
         {
             return Err(Error::Config("admin.token must not be empty".into()));
         }
+        let has_admin_tls_cert = self.admin.tls_cert.is_some();
+        let has_admin_tls_key = self.admin.tls_key.is_some();
+        let has_admin_tls_client_ca = self.admin.tls_client_ca.is_some();
+        if has_admin_tls_cert != has_admin_tls_key {
+            return Err(Error::Config(
+                "admin.tls_cert and admin.tls_key must both be set, or neither".into(),
+            ));
+        }
+        if has_admin_tls_client_ca && !(has_admin_tls_cert && has_admin_tls_key) {
+            return Err(Error::Config(
+                "admin.tls_client_ca requires admin.tls_cert and admin.tls_key".into(),
+            ));
+        }
+        if self.admin.allow_cert_auth && !has_admin_tls_client_ca {
+            return Err(Error::Config(
+                "admin.allow_cert_auth requires admin.tls_client_ca".into(),
+            ));
+        }
         if let Some(listen) = &self.admin.listen {
             if listen.is_empty() {
                 return Err(Error::Config(
@@ -562,12 +590,14 @@ impl Config {
             let addr: SocketAddr = listen.parse().map_err(|e| {
                 Error::Config(format!("admin.listen must be an ip:port listener: {e}"))
             })?;
-            if !addr.ip().is_loopback()
-                && self.admin.token.is_none()
-                && self.admin.token_file.is_none()
-            {
+            let has_token = self.admin.token.is_some() || self.admin.token_file.is_some();
+            let has_cert_auth = has_admin_tls_cert
+                && has_admin_tls_key
+                && has_admin_tls_client_ca
+                && self.admin.allow_cert_auth;
+            if !addr.ip().is_loopback() && !has_token && !has_cert_auth {
                 return Err(Error::Config(
-                    "admin.listen must bind a loopback address unless admin.token or admin.token_file is set".into(),
+                    "admin.listen must bind a loopback address unless admin.token, admin.token_file, or mTLS cert auth is set".into(),
                 ));
             }
         }
@@ -828,6 +858,88 @@ mod tests {
         "#;
         let config = Config::parse(raw).unwrap();
         assert_eq!(config.admin.token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn admin_tls_fields_parse_and_validate() {
+        let raw = r#"
+            [object_store]
+            url = "memory:///"
+
+            [kms]
+            provider = "static"
+            key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+            [admin]
+            listen = "127.0.0.1:12081"
+            tls_cert = "/tmp/slatefs-admin.pem"
+            tls_key = "/tmp/slatefs-admin.key"
+            tls_client_ca = "/tmp/slatefs-admin-ca.pem"
+            allow_cert_auth = true
+        "#;
+        let config = Config::parse(raw).unwrap();
+        assert_eq!(
+            config.admin.tls_cert.as_deref(),
+            Some(std::path::Path::new("/tmp/slatefs-admin.pem"))
+        );
+        assert_eq!(
+            config.admin.tls_key.as_deref(),
+            Some(std::path::Path::new("/tmp/slatefs-admin.key"))
+        );
+        assert_eq!(
+            config.admin.tls_client_ca.as_deref(),
+            Some(std::path::Path::new("/tmp/slatefs-admin-ca.pem"))
+        );
+        assert!(config.admin.allow_cert_auth);
+
+        let missing_key = raw
+            .lines()
+            .filter(|line| !line.contains("tls_key"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(Config::parse(&missing_key).is_err());
+
+        let missing_cert = raw
+            .lines()
+            .filter(|line| !line.contains("tls_cert"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(Config::parse(&missing_cert).is_err());
+
+        let client_ca_without_server_tls = raw
+            .lines()
+            .filter(|line| !line.contains("tls_cert") && !line.contains("tls_key"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(Config::parse(&client_ca_without_server_tls).is_err());
+
+        let allow_without_client_ca = raw
+            .lines()
+            .filter(|line| !line.contains("tls_client_ca"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(Config::parse(&allow_without_client_ca).is_err());
+    }
+
+    #[test]
+    fn admin_listener_may_bind_non_loopback_with_mtls_cert_auth() {
+        let raw = r#"
+            [object_store]
+            url = "memory:///"
+
+            [kms]
+            provider = "static"
+            key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+            [admin]
+            listen = "0.0.0.0:12081"
+            tls_cert = "/tmp/slatefs-admin.pem"
+            tls_key = "/tmp/slatefs-admin.key"
+            tls_client_ca = "/tmp/slatefs-admin-ca.pem"
+            allow_cert_auth = true
+        "#;
+        let config = Config::parse(raw).unwrap();
+        assert!(config.admin.allow_cert_auth);
     }
 
     #[test]

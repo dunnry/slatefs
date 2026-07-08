@@ -197,9 +197,67 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 Every admin response includes `X-Request-Id`; callers may provide it or the
 daemon generates a UUID. v1 errors use `{"error":{"code","message","request_id"}}`.
 Unauthenticated loopback remains the default. To bind the admin listener
-outside loopback, configure `[admin].token = "..."` or `token_file = "..."`;
-then all `/admin/v1` routes require `Authorization: Bearer <token>`, while
-`/livez` and `/readyz` remain unauthenticated.
+outside loopback, configure `[admin].token = "..."`, `token_file = "..."`, or
+mTLS cert auth. `/admin/v1` routes require the configured app-level
+authentication; `/livez` and `/readyz` remain unauthenticated but are still
+served over HTTPS/mTLS when admin TLS is enabled.
+
+Enable HTTPS on the admin listener with `[admin].tls_cert` and
+`[admin].tls_key`. Add `[admin].tls_client_ca` to require and verify client
+certificates. Set `[admin].allow_cert_auth = true` only when a verified client
+certificate should authenticate `/admin/v1` routes without a bearer token.
+Certificate auth records audit principals as `cert:<SAN-or-CN>`. If a bearer
+token is configured without TLS, startup warns that the token is accepted over
+cleartext HTTP.
+
+| Mode | Admin config | Admin route authentication | Audit principal |
+| --- | --- | --- | --- |
+| Token-only | `token` or `token_file` | Bearer token over HTTP; startup warns about cleartext token transport. | `X-Admin-Principal` after token validation, otherwise no principal. |
+| TLS + token | Token plus `tls_cert` and `tls_key` | Bearer token over HTTPS. | Same as token-only. |
+| mTLS + token | TLS + token plus `tls_client_ca` | Verified client certificate and bearer token are both required. | Same as token-only. |
+| mTLS cert auth | mTLS plus `allow_cert_auth = true` | A verified client certificate is sufficient; bearer token is still accepted when configured. | `cert:<SAN-or-CN>` for cert-authenticated requests. |
+
+Example mTLS admin config:
+
+```toml
+[admin]
+listen = "0.0.0.0:12081"
+token_file = "/run/slatefs/admin-token"
+tls_cert = "/etc/slatefs/admin.pem"
+tls_key = "/etc/slatefs/admin.key"
+tls_client_ca = "/etc/slatefs/admin-ca.pem"
+allow_cert_auth = false
+```
+
+For a local lab CA and leaf certificates:
+
+```sh
+mkdir -p certs
+openssl req -x509 -newkey rsa:3072 -nodes -days 365 \
+  -keyout certs/ca.key -out certs/ca.pem -subj "/CN=slatefs-admin-ca"
+
+openssl req -newkey rsa:3072 -nodes \
+  -keyout certs/admin.key -out certs/admin.csr -subj "/CN=slatefs-admin"
+cat > certs/admin.ext <<'EOF'
+subjectAltName=DNS:localhost,IP:127.0.0.1
+extendedKeyUsage=serverAuth
+EOF
+openssl x509 -req -in certs/admin.csr -CA certs/ca.pem -CAkey certs/ca.key \
+  -CAcreateserial -out certs/admin.pem -days 365 -extfile certs/admin.ext
+
+openssl req -newkey rsa:3072 -nodes \
+  -keyout certs/client.key -out certs/client.csr -subj "/CN=slatefs-operator"
+cat > certs/client.ext <<'EOF'
+extendedKeyUsage=clientAuth
+EOF
+openssl x509 -req -in certs/client.csr -CA certs/ca.pem -CAkey certs/ca.key \
+  -CAcreateserial -out certs/client.pem -days 365 -extfile certs/client.ext
+```
+
+`slate-admind` supports `ca_cert`, `client_cert`, and
+`insecure_skip_verify` client settings for calling slatefsd HTTPS or mTLS
+admin URLs.
+
 The control plane now also stores fleet placement: daemon node health/load,
 per-volume primary ownership, standby lists, stable endpoints, drain/rebalance
 state, read replicas, and snapshot-serving pools. `slatefs fleet node ...` and

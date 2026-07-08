@@ -444,6 +444,8 @@ pub enum AuditPlane {
 pub struct AuditActor {
     pub plane: AuditPlane,
     #[serde(default)]
+    pub principal: Option<String>,
+    #[serde(default)]
     pub source_ip: Option<String>,
     #[serde(default)]
     pub client_agent: Option<String>,
