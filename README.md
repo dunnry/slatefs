@@ -212,6 +212,15 @@ Certificate auth records audit principals as `cert:<SAN-or-CN>`. If a bearer
 token is configured without TLS, startup warns that the token is accepted over
 cleartext HTTP.
 
+Admin TLS certificates and TLS-wrapped 9P export certificates are reloaded for
+new connections without restarting `slatefsd`; existing TLS sessions continue
+on the config they handshook with. The daemon polls cert/key/client-CA file
+mtime and content hash every `[tls].reload_poll_secs` seconds (default `60`)
+and also reloads immediately on `SIGHUP`. Reload failures keep serving the last
+good config and emit `slatefs_tls_reload_failures_total{surface=...}`; successful
+reloads emit `slatefs_tls_reloads_total{surface=...}` and
+`slatefs_tls_cert_expiry_timestamp_seconds{surface=...}`.
+
 | Mode | Admin config | Admin route authentication | Audit principal |
 | --- | --- | --- | --- |
 | Token-only | `token` or `token_file` | Bearer token over HTTP; startup warns about cleartext token transport. | `X-Admin-Principal` after token validation, otherwise no principal. |

@@ -28,6 +28,7 @@ uuid.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
 x509-parser.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true

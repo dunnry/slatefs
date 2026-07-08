@@ -19,6 +19,24 @@ groups:
           summary: "SlateFS daemon metrics scrape is missing"
           description: "Prometheus has no healthy scrape target for job=slatefsd. Check the daemon process, scrape config, and [metrics].listen."
 
+      - alert: SlateFSTLSCertificateExpiresSoon
+        expr: (slatefs_tls_cert_expiry_timestamp_seconds - time()) < 21 * 24 * 60 * 60
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SlateFS TLS certificate for {{ $labels.surface }} expires within 21 days"
+          description: "The TLS certificate served by {{ $labels.surface }} is nearing expiry. Check certificate renewal and slatefsd TLS reload logs."
+
+      - alert: SlateFSTLSCertificateExpiresCritical
+        expr: (slatefs_tls_cert_expiry_timestamp_seconds - time()) < 7 * 24 * 60 * 60
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SlateFS TLS certificate for {{ $labels.surface }} expires within 7 days"
+          description: "The TLS certificate served by {{ $labels.surface }} is close to expiry. Renew the certificate and verify slatefsd reload success."
+
       - alert: SlateFSBlockDecodeFailures
         expr: increase(slatefs_block_decode_failures_total[5m]) > 0
         for: 0m

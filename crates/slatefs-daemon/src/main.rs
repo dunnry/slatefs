@@ -6,16 +6,18 @@
 //! (DD-10).
 
 use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Once};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, Once, RwLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
 use clap::Parser;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use slatedb::admin::AdminBuilder;
 use slatedb::object_store::ObjectStore;
 use slatefs_core::block::{
@@ -48,6 +50,8 @@ use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::{RootCertStore, ServerConfig};
 use tracing::Instrument;
 use x509_parser::{extensions::GeneralName, parse_x509_certificate, x509::X509Name};
+
+type SharedServerConfig = Arc<RwLock<Arc<ServerConfig>>>;
 
 #[derive(Parser)]
 #[command(name = "slatefsd", version, about = "SlateFS file server daemon")]
@@ -129,6 +133,9 @@ struct ExportMetrics {
     active: Arc<Mutex<HashMap<(ExportProtocol, ExportSource), usize>>>,
     reconcile_failures: Arc<AtomicU64>,
     snapshot_retention_deleted: Arc<Mutex<HashMap<(String, String), u64>>>,
+    tls_reloads: Arc<Mutex<HashMap<String, u64>>>,
+    tls_reload_failures: Arc<Mutex<HashMap<String, u64>>>,
+    tls_expiry: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl ExportMetrics {
@@ -158,6 +165,60 @@ impl ExportMetrics {
         *deleted
             .entry((tenant.to_string(), volume.to_string()))
             .or_insert(0) += count;
+    }
+
+    fn register_tls_surface(&self, surface: &str, expiry_timestamp_seconds: i64) {
+        self.tls_reloads
+            .lock()
+            .expect("TLS reload metrics poisoned")
+            .entry(surface.to_string())
+            .or_insert(0);
+        self.tls_reload_failures
+            .lock()
+            .expect("TLS reload metrics poisoned")
+            .entry(surface.to_string())
+            .or_insert(0);
+        self.tls_expiry
+            .lock()
+            .expect("TLS reload metrics poisoned")
+            .insert(surface.to_string(), expiry_timestamp_seconds);
+    }
+
+    fn unregister_tls_surface(&self, surface: &str) {
+        self.tls_reloads
+            .lock()
+            .expect("TLS reload metrics poisoned")
+            .remove(surface);
+        self.tls_reload_failures
+            .lock()
+            .expect("TLS reload metrics poisoned")
+            .remove(surface);
+        self.tls_expiry
+            .lock()
+            .expect("TLS reload metrics poisoned")
+            .remove(surface);
+    }
+
+    fn tls_reload_success(&self, surface: &str, expiry_timestamp_seconds: i64) {
+        *self
+            .tls_reloads
+            .lock()
+            .expect("TLS reload metrics poisoned")
+            .entry(surface.to_string())
+            .or_insert(0) += 1;
+        self.tls_expiry
+            .lock()
+            .expect("TLS reload metrics poisoned")
+            .insert(surface.to_string(), expiry_timestamp_seconds);
+    }
+
+    fn tls_reload_failure(&self, surface: &str) {
+        *self
+            .tls_reload_failures
+            .lock()
+            .expect("TLS reload metrics poisoned")
+            .entry(surface.to_string())
+            .or_insert(0) += 1;
     }
 
     fn active_total(&self) -> usize {
@@ -200,6 +261,42 @@ impl ExportMetrics {
                 *value as f64,
             ));
         }
+        for (surface, value) in self
+            .tls_reloads
+            .lock()
+            .expect("TLS reload metrics poisoned")
+            .iter()
+        {
+            samples.push(PrometheusSample::new(
+                "slatefs_tls_reloads_total",
+                [("surface", surface.as_str())],
+                *value as f64,
+            ));
+        }
+        for (surface, value) in self
+            .tls_reload_failures
+            .lock()
+            .expect("TLS reload metrics poisoned")
+            .iter()
+        {
+            samples.push(PrometheusSample::new(
+                "slatefs_tls_reload_failures_total",
+                [("surface", surface.as_str())],
+                *value as f64,
+            ));
+        }
+        for (surface, value) in self
+            .tls_expiry
+            .lock()
+            .expect("TLS reload metrics poisoned")
+            .iter()
+        {
+            samples.push(PrometheusSample::new(
+                "slatefs_tls_cert_expiry_timestamp_seconds",
+                [("surface", surface.as_str())],
+                *value as f64,
+            ));
+        }
         samples
     }
 }
@@ -208,6 +305,7 @@ struct RunningExport {
     desired: DesiredExport,
     backend_key: (String, String, Option<String>),
     nbd_shutdown: Option<NbdShutdownHandle>,
+    tls_reload: Option<Arc<TlsReloadTarget>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -259,6 +357,10 @@ fn protocol_label(protocol: ExportProtocol) -> &'static str {
         ExportProtocol::P9 => "p9",
         ExportProtocol::Nbd => "nbd",
     }
+}
+
+fn tls_surface_for_export(key: &ExportKey) -> String {
+    format!("p9:{}:{}", key.source.as_str(), key.id)
 }
 
 fn hard_limit_value(limit: Option<u64>) -> f64 {
@@ -2382,63 +2484,278 @@ fn install_rustls_provider() {
     });
 }
 
-fn load_admin_cert_chain(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("opening admin TLS certificate {}", path.display()))?;
-    let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(file))
+#[derive(Clone, PartialEq, Eq)]
+struct TlsFileFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+    sha256: [u8; 32],
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TlsInputFingerprint {
+    cert: TlsFileFingerprint,
+    key: TlsFileFingerprint,
+    client_ca: Option<TlsFileFingerprint>,
+}
+
+struct FingerprintedFile {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    fingerprint: TlsFileFingerprint,
+}
+
+struct TlsInputSnapshot {
+    cert: FingerprintedFile,
+    key: FingerprintedFile,
+    client_ca: Option<FingerprintedFile>,
+}
+
+impl TlsInputSnapshot {
+    fn load(
+        cert_path: &Path,
+        key_path: &Path,
+        client_ca_path: Option<&Path>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            cert: read_fingerprinted_file(cert_path, "TLS certificate")?,
+            key: read_fingerprinted_file(key_path, "TLS private key")?,
+            client_ca: client_ca_path
+                .map(|path| read_fingerprinted_file(path, "TLS client CA bundle"))
+                .transpose()?,
+        })
+    }
+
+    fn fingerprint(&self) -> TlsInputFingerprint {
+        TlsInputFingerprint {
+            cert: self.cert.fingerprint.clone(),
+            key: self.key.fingerprint.clone(),
+            client_ca: self.client_ca.as_ref().map(|file| file.fingerprint.clone()),
+        }
+    }
+}
+
+struct LoadedTlsConfig {
+    config: Arc<ServerConfig>,
+    fingerprint: TlsInputFingerprint,
+    expiry_timestamp_seconds: i64,
+}
+
+#[derive(Clone)]
+enum TlsReloadKind {
+    Admin {
+        cert_path: PathBuf,
+        key_path: PathBuf,
+        client_ca_path: Option<PathBuf>,
+    },
+    P9 {
+        cert_path: PathBuf,
+        key_path: PathBuf,
+    },
+}
+
+impl TlsReloadKind {
+    fn load_snapshot(&self) -> anyhow::Result<TlsInputSnapshot> {
+        match self {
+            Self::Admin {
+                cert_path,
+                key_path,
+                client_ca_path,
+            } => TlsInputSnapshot::load(cert_path, key_path, client_ca_path.as_deref()),
+            Self::P9 {
+                cert_path,
+                key_path,
+            } => TlsInputSnapshot::load(cert_path, key_path, None),
+        }
+    }
+
+    fn build_config(&self, snapshot: &TlsInputSnapshot) -> anyhow::Result<LoadedTlsConfig> {
+        let (config, expiry_timestamp_seconds) = match self {
+            Self::Admin { .. } => build_admin_server_config(snapshot)?,
+            Self::P9 { .. } => build_p9_server_config(snapshot)?,
+        };
+        Ok(LoadedTlsConfig {
+            config,
+            fingerprint: snapshot.fingerprint(),
+            expiry_timestamp_seconds,
+        })
+    }
+}
+
+struct TlsReloadTarget {
+    surface: String,
+    kind: TlsReloadKind,
+    config: SharedServerConfig,
+    metrics: ExportMetrics,
+    fingerprint: Mutex<TlsInputFingerprint>,
+}
+
+impl TlsReloadTarget {
+    fn new(
+        surface: String,
+        kind: TlsReloadKind,
+        config: SharedServerConfig,
+        metrics: ExportMetrics,
+        loaded: &LoadedTlsConfig,
+    ) -> Self {
+        metrics.register_tls_surface(&surface, loaded.expiry_timestamp_seconds);
+        Self {
+            surface,
+            kind,
+            config,
+            metrics,
+            fingerprint: Mutex::new(loaded.fingerprint.clone()),
+        }
+    }
+
+    fn reload_if_changed(&self, force: bool) {
+        let snapshot = match self.kind.load_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.metrics.tls_reload_failure(&self.surface);
+                tracing::error!(
+                    surface = self.surface,
+                    "TLS certificate reload failed: {error:#}"
+                );
+                return;
+            }
+        };
+        let fingerprint = snapshot.fingerprint();
+        {
+            let current = self.fingerprint.lock().expect("TLS reload target poisoned");
+            if !force && *current == fingerprint {
+                return;
+            }
+        }
+
+        match self.kind.build_config(&snapshot) {
+            Ok(loaded) => {
+                *self.config.write().expect("TLS config poisoned") = Arc::clone(&loaded.config);
+                *self.fingerprint.lock().expect("TLS reload target poisoned") = loaded.fingerprint;
+                self.metrics
+                    .tls_reload_success(&self.surface, loaded.expiry_timestamp_seconds);
+                tracing::info!(
+                    surface = self.surface,
+                    expiry_timestamp_seconds = loaded.expiry_timestamp_seconds,
+                    "TLS certificate reloaded"
+                );
+            }
+            Err(error) => {
+                *self.fingerprint.lock().expect("TLS reload target poisoned") = fingerprint;
+                self.metrics.tls_reload_failure(&self.surface);
+                tracing::error!(
+                    surface = self.surface,
+                    "TLS certificate reload failed: {error:#}"
+                );
+            }
+        }
+    }
+
+    fn unregister(&self) {
+        self.metrics.unregister_tls_surface(&self.surface);
+    }
+}
+
+fn shared_server_config(config: Arc<ServerConfig>) -> SharedServerConfig {
+    Arc::new(RwLock::new(config))
+}
+
+fn tls_acceptor(config: &SharedServerConfig) -> TlsAcceptor {
+    TlsAcceptor::from(config.read().expect("TLS config poisoned").clone())
+}
+
+fn read_fingerprinted_file(path: &Path, purpose: &str) -> anyhow::Result<FingerprintedFile> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("reading {purpose} {}", path.display()))?;
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("statting {purpose} {}", path.display()))?;
+    let sha256: [u8; 32] = Sha256::digest(&bytes).into();
+    Ok(FingerprintedFile {
+        path: path.to_path_buf(),
+        bytes,
+        fingerprint: TlsFileFingerprint {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            sha256,
+        },
+    })
+}
+
+fn parse_tls_cert_chain(
+    bytes: &[u8],
+    path: &Path,
+    purpose: &str,
+) -> anyhow::Result<Vec<CertificateDer<'static>>> {
+    let mut reader = std::io::BufReader::new(Cursor::new(bytes));
+    let certs = rustls_pemfile::certs(&mut reader)
         .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("reading admin TLS certificate {}", path.display()))?;
+        .with_context(|| format!("reading {purpose} {}", path.display()))?;
     if certs.is_empty() {
         anyhow::bail!(
-            "admin TLS certificate file {} contained no certificates",
+            "{purpose} file {} contained no certificates",
             path.display()
         );
     }
     Ok(certs)
 }
 
-fn load_admin_private_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("opening admin TLS private key {}", path.display()))?;
-    rustls_pemfile::private_key(&mut std::io::BufReader::new(file))
-        .with_context(|| format!("reading admin TLS private key {}", path.display()))?
+fn parse_tls_private_key(
+    bytes: &[u8],
+    path: &Path,
+    purpose: &str,
+) -> anyhow::Result<PrivateKeyDer<'static>> {
+    let mut reader = std::io::BufReader::new(Cursor::new(bytes));
+    rustls_pemfile::private_key(&mut reader)
+        .with_context(|| format!("reading {purpose} {}", path.display()))?
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "admin TLS private key file {} contained no private key",
-                path.display()
-            )
+            anyhow::anyhow!("{purpose} file {} contained no private key", path.display())
         })
 }
 
-fn load_admin_root_cert_store(path: &Path) -> anyhow::Result<RootCertStore> {
+fn leaf_expiry_timestamp_seconds(certs: &[CertificateDer<'static>]) -> anyhow::Result<i64> {
+    let leaf = certs
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("TLS certificate chain contained no leaf certificate"))?;
+    let (_, cert) = parse_x509_certificate(leaf.as_ref())
+        .map_err(|error| anyhow::anyhow!("parsing TLS leaf certificate: {error}"))?;
+    Ok(cert.validity().not_after.timestamp())
+}
+
+fn root_cert_store_from_snapshot(file: &FingerprintedFile) -> anyhow::Result<RootCertStore> {
     let mut roots = RootCertStore::empty();
-    for cert in load_admin_cert_chain(path)? {
+    for cert in parse_tls_cert_chain(&file.bytes, &file.path, "admin TLS client CA bundle")? {
         roots.add(cert).with_context(|| {
             format!(
                 "invalid admin TLS client CA certificate in {}",
-                path.display()
+                file.path.display()
             )
         })?;
     }
     Ok(roots)
 }
 
-fn build_admin_tls_acceptor(config: &AdminConfig) -> anyhow::Result<Option<TlsAcceptor>> {
-    let (Some(cert_path), Some(key_path)) = (&config.tls_cert, &config.tls_key) else {
-        return Ok(None);
-    };
+fn build_admin_server_config(
+    snapshot: &TlsInputSnapshot,
+) -> anyhow::Result<(Arc<ServerConfig>, i64)> {
     install_rustls_provider();
-
-    let certs = load_admin_cert_chain(cert_path)?;
-    let key = load_admin_private_key(key_path)?;
+    let certs = parse_tls_cert_chain(
+        &snapshot.cert.bytes,
+        &snapshot.cert.path,
+        "admin TLS certificate",
+    )?;
+    let expiry = leaf_expiry_timestamp_seconds(&certs)?;
+    let key = parse_tls_private_key(
+        &snapshot.key.bytes,
+        &snapshot.key.path,
+        "admin TLS private key",
+    )?;
     let builder = ServerConfig::builder();
-    let builder = match config.tls_client_ca.as_deref() {
-        Some(path) => {
+    let builder = match &snapshot.client_ca {
+        Some(file) => {
             let verifier =
-                WebPkiClientVerifier::builder(Arc::new(load_admin_root_cert_store(path)?))
+                WebPkiClientVerifier::builder(Arc::new(root_cert_store_from_snapshot(file)?))
                     .build()
                     .with_context(|| {
-                        format!("invalid admin TLS client CA bundle {}", path.display())
+                        format!("invalid admin TLS client CA bundle {}", file.path.display())
                     })?;
             builder.with_client_cert_verifier(verifier)
         }
@@ -2448,7 +2765,62 @@ fn build_admin_tls_acceptor(config: &AdminConfig) -> anyhow::Result<Option<TlsAc
         .with_single_cert(certs, key)
         .context("invalid admin TLS certificate/key pair")?;
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(Some(TlsAcceptor::from(Arc::new(tls))))
+    Ok((Arc::new(tls), expiry))
+}
+
+fn build_p9_server_config(snapshot: &TlsInputSnapshot) -> anyhow::Result<(Arc<ServerConfig>, i64)> {
+    install_rustls_provider();
+    let certs = parse_tls_cert_chain(
+        &snapshot.cert.bytes,
+        &snapshot.cert.path,
+        "9P TLS certificate",
+    )?;
+    let expiry = leaf_expiry_timestamp_seconds(&certs)?;
+    let key = parse_tls_private_key(
+        &snapshot.key.bytes,
+        &snapshot.key.path,
+        "9P TLS private key",
+    )?;
+    let tls = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("invalid 9P TLS certificate/key pair")?;
+    Ok((Arc::new(tls), expiry))
+}
+
+fn load_tls_config(kind: &TlsReloadKind) -> anyhow::Result<LoadedTlsConfig> {
+    let snapshot = kind.load_snapshot()?;
+    kind.build_config(&snapshot)
+}
+
+fn load_admin_tls_config(config: &AdminConfig) -> anyhow::Result<Option<LoadedTlsConfig>> {
+    let (Some(cert_path), Some(key_path)) = (&config.tls_cert, &config.tls_key) else {
+        return Ok(None);
+    };
+    load_tls_config(&TlsReloadKind::Admin {
+        cert_path: cert_path.clone(),
+        key_path: key_path.clone(),
+        client_ca_path: config.tls_client_ca.clone(),
+    })
+    .map(Some)
+}
+
+#[cfg(test)]
+fn load_admin_cert_chain(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
+    let file = read_fingerprinted_file(path, "admin TLS certificate")?;
+    parse_tls_cert_chain(&file.bytes, &file.path, "admin TLS certificate")
+}
+
+#[cfg(test)]
+fn load_admin_private_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
+    let file = read_fingerprinted_file(path, "admin TLS private key")?;
+    parse_tls_private_key(&file.bytes, &file.path, "admin TLS private key")
+}
+
+#[cfg(test)]
+fn load_admin_root_cert_store(path: &Path) -> anyhow::Result<RootCertStore> {
+    let file = read_fingerprinted_file(path, "admin TLS client CA bundle")?;
+    root_cert_store_from_snapshot(&file)
 }
 
 fn verified_client_principal<IO>(stream: &tokio_rustls::server::TlsStream<IO>) -> Option<String> {
@@ -2509,7 +2881,7 @@ fn sanitize_cert_principal(value: &str) -> Option<String> {
 async fn serve_admin(
     listen: String,
     state: Arc<AdminState>,
-    tls: Option<TlsAcceptor>,
+    tls: Option<SharedServerConfig>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(&listen).await?;
     tracing::info!(listen, tls = tls.is_some(), "admin endpoint ready");
@@ -2519,14 +2891,15 @@ async fn serve_admin(
 async fn serve_admin_listener(
     listener: TcpListener,
     state: Arc<AdminState>,
-    tls: Option<TlsAcceptor>,
+    tls: Option<SharedServerConfig>,
 ) -> std::io::Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         let state = Arc::clone(&state);
         match tls.clone() {
-            Some(acceptor) => {
+            Some(config) => {
                 tokio::spawn(async move {
+                    let acceptor = tls_acceptor(&config);
                     let stream = match acceptor.accept(stream).await {
                         Ok(stream) => stream,
                         Err(error) => {
@@ -2985,6 +3358,7 @@ impl ExportManager {
         let (backend_key, backend, rate_limits) = self.backend_for(reader, &desired.config).await?;
         let rate_limiter = Some(self.rate_limiter_for(desired.config.tenant.clone(), rate_limits));
         let mut nbd_shutdown = None;
+        let mut tls_reload = None;
         let bind_result = match desired.config.protocol {
             ExportProtocol::Nfs => {
                 let BackendExport::Fs(volume) = backend else {
@@ -3052,7 +3426,14 @@ impl ExportManager {
                 let allowed_clients = desired.config.allowed_clients.clone();
                 match tls {
                     Some((cert, key)) => {
-                        slatefs_9p::bind_export_tls_with_allowlist_and_rate_limit_and_atime_policy(
+                        let surface = tls_surface_for_export(&desired.key);
+                        let kind = TlsReloadKind::P9 {
+                            cert_path: cert,
+                            key_path: key,
+                        };
+                        let loaded = load_tls_config(&kind).map_err(std::io::Error::other)?;
+                        let shared = shared_server_config(Arc::clone(&loaded.config));
+                        match slatefs_9p::bind_export_tls_with_reloadable_config_and_atime_policy(
                             Arc::clone(&volume),
                             export_name,
                             token,
@@ -3060,29 +3441,41 @@ impl ExportManager {
                             rate_limiter,
                             desired.config.atime,
                             &listen,
-                            slatefs_9p::TlsIdentity {
-                                cert_path: cert,
-                                key_path: key,
-                            },
+                            Arc::clone(&shared),
                         )
-                    }
-                    .await
-                    .map(|listener| {
-                        tracing::info!(
-                            source = desired.key.source.as_str(),
-                            id = desired.key.id,
-                            tenant = desired.config.tenant,
-                            volume = desired.config.volume,
-                            snapshot = desired.config.snapshot.as_deref().unwrap_or("-"),
-                            listen,
-                            "TLS-wrapped 9P export ready"
-                        );
-                        tokio::spawn(async move {
-                            if let Err(error) = listener.handle_forever().await {
-                                tracing::error!("9P TLS export listener exited: {error}");
+                        .await
+                        {
+                            Ok(listener) => {
+                                tls_reload = Some(Arc::new(TlsReloadTarget::new(
+                                    surface,
+                                    kind,
+                                    shared,
+                                    self.metrics.clone(),
+                                    &loaded,
+                                )));
+                                Ok({
+                                    tracing::info!(
+                                        source = desired.key.source.as_str(),
+                                        id = desired.key.id,
+                                        tenant = desired.config.tenant,
+                                        volume = desired.config.volume,
+                                        snapshot =
+                                            desired.config.snapshot.as_deref().unwrap_or("-"),
+                                        listen,
+                                        "TLS-wrapped 9P export ready"
+                                    );
+                                    tokio::spawn(async move {
+                                        if let Err(error) = listener.handle_forever().await {
+                                            tracing::error!(
+                                                "9P TLS export listener exited: {error}"
+                                            );
+                                        }
+                                    })
+                                })
                             }
-                        })
-                    }),
+                            Err(error) => Err(error),
+                        }
+                    }
                     None => slatefs_9p::bind_export_with_allowlist_and_rate_limit_and_atime_policy(
                         Arc::clone(&volume),
                         export_name,
@@ -3206,6 +3599,7 @@ impl ExportManager {
                 desired,
                 backend_key,
                 nbd_shutdown,
+                tls_reload,
                 task,
             },
         );
@@ -3584,6 +3978,9 @@ impl ExportManager {
         if let Some(shutdown) = &running.nbd_shutdown {
             shutdown.kill();
         }
+        if let Some(target) = &running.tls_reload {
+            target.unregister();
+        }
         running.task.abort();
         self.metrics
             .stopped(running.desired.config.protocol, running.desired.key.source);
@@ -3707,11 +4104,45 @@ impl ExportManager {
         });
     }
 
+    fn tls_reload_targets(&self) -> Vec<Arc<TlsReloadTarget>> {
+        self.running
+            .values()
+            .filter_map(|running| running.tls_reload.as_ref().map(Arc::clone))
+            .collect()
+    }
+
     async fn shutdown(&mut self) {
         let keys = self.running.keys().cloned().collect::<Vec<_>>();
         for key in keys {
             self.stop_export(&key).await;
         }
+    }
+}
+
+async fn reload_tls_targets(
+    manager: Arc<tokio::sync::Mutex<ExportManager>>,
+    admin: Option<Arc<TlsReloadTarget>>,
+    force: bool,
+) {
+    if let Some(target) = admin {
+        target.reload_if_changed(force);
+    }
+    let targets = manager.lock().await.tls_reload_targets();
+    for target in targets {
+        target.reload_if_changed(force);
+    }
+}
+
+#[cfg(unix)]
+async fn serve_tls_reload_signal(
+    manager: Arc<tokio::sync::Mutex<ExportManager>>,
+    admin: Option<Arc<TlsReloadTarget>>,
+) -> std::io::Result<()> {
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    loop {
+        sighup.recv().await;
+        tracing::info!("received SIGHUP; reloading TLS certificates");
+        reload_tls_targets(Arc::clone(&manager), admin.clone(), true).await;
     }
 }
 
@@ -3731,7 +4162,35 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("resolving object store {}", config.object_store.url))?;
     let kms = kms::from_config(&config.kms)?;
     let admin_token = load_admin_token(&config.admin)?;
-    let admin_tls = build_admin_tls_acceptor(&config.admin)?;
+    let export_metrics = ExportMetrics::default();
+    let admin_tls_loaded = load_admin_tls_config(&config.admin)?;
+    let admin_tls = admin_tls_loaded.map(|loaded| {
+        let shared = shared_server_config(Arc::clone(&loaded.config));
+        let target = Arc::new(TlsReloadTarget::new(
+            "admin".to_string(),
+            TlsReloadKind::Admin {
+                cert_path: config
+                    .admin
+                    .tls_cert
+                    .as_ref()
+                    .expect("admin TLS cert path")
+                    .clone(),
+                key_path: config
+                    .admin
+                    .tls_key
+                    .as_ref()
+                    .expect("admin TLS key path")
+                    .clone(),
+                client_ca_path: config.admin.tls_client_ca.clone(),
+            },
+            Arc::clone(&shared),
+            export_metrics.clone(),
+            &loaded,
+        ));
+        (shared, target)
+    });
+    let admin_tls_config = admin_tls.as_ref().map(|(shared, _)| Arc::clone(shared));
+    let admin_tls_target = admin_tls.as_ref().map(|(_, target)| Arc::clone(target));
     let admin_cert_auth_allowed = config.admin.allow_cert_auth;
     if config.admin.listen.is_some() {
         if admin_token.is_none() && !admin_cert_auth_allowed {
@@ -3747,7 +4206,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let config_exports = config_export_records(&config.exports);
-    let export_metrics = ExportMetrics::default();
     let metrics_targets = Arc::new(Mutex::new(Vec::new()));
     let admin_targets = Arc::new(Mutex::new(HashMap::new()));
     let admin_block_targets = Arc::new(Mutex::new(HashMap::new()));
@@ -3823,6 +4281,25 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let tls_poll_manager = Arc::clone(&manager);
+    let tls_poll_admin = admin_tls_target.clone();
+    let tls_poll_interval = Duration::from_secs(config.tls.reload_poll_secs);
+    servers.spawn(async move {
+        let mut tick = tokio::time::interval(tls_poll_interval);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            reload_tls_targets(Arc::clone(&tls_poll_manager), tls_poll_admin.clone(), false).await;
+        }
+    });
+
+    #[cfg(unix)]
+    {
+        let signal_manager = Arc::clone(&manager);
+        let signal_admin = admin_tls_target.clone();
+        servers.spawn(async move { serve_tls_reload_signal(signal_manager, signal_admin).await });
+    }
+
     if let Some(listen) = config.admin.listen.clone() {
         let targets = Arc::clone(&admin_targets);
         let control = match ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms)).await {
@@ -3851,7 +4328,7 @@ async fn main() -> anyhow::Result<()> {
             allow_cert_auth: admin_cert_auth_allowed,
             node_id: None,
         });
-        servers.spawn(async move { serve_admin(listen, state, admin_tls).await });
+        servers.spawn(async move { serve_admin(listen, state, admin_tls_config).await });
     }
 
     if let Some(listen) = config.metrics.listen.clone() {
@@ -4070,7 +4547,7 @@ mod tests {
     }
 
     impl TlsAdminServer {
-        async fn start(state: Arc<AdminState>, tls: TlsAcceptor) -> Self {
+        async fn start(state: Arc<AdminState>, tls: SharedServerConfig) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let task = tokio::spawn(async move {
@@ -4089,6 +4566,7 @@ mod tests {
 
     struct TestCerts {
         ca: PathBuf,
+        ca_issuer: Issuer<'static, KeyPair>,
         server_cert: PathBuf,
         server_key: PathBuf,
         client_cert: PathBuf,
@@ -4101,7 +4579,7 @@ mod tests {
             let (server_cert, server_key) = new_leaf(
                 &ca_issuer,
                 "slatefs-admin",
-                &["localhost", "127.0.0.1"],
+                &["localhost", "127.0.0.1", "cert-a.local"],
                 ExtendedKeyUsagePurpose::ServerAuth,
             )?;
             let (client_cert, client_key) = new_leaf(
@@ -4124,11 +4602,24 @@ mod tests {
 
             Ok(Self {
                 ca,
+                ca_issuer,
                 server_cert: server_cert_path,
                 server_key: server_key_path,
                 client_cert: client_cert_path,
                 client_key: client_key_path,
             })
+        }
+
+        fn overwrite_server_leaf(&self, marker_san: &str) -> TestResult<()> {
+            let (server_cert, server_key) = new_leaf(
+                &self.ca_issuer,
+                "slatefs-admin-reloaded",
+                &["localhost", "127.0.0.1", marker_san],
+                ExtendedKeyUsagePurpose::ServerAuth,
+            )?;
+            fs::write(&self.server_cert, server_cert.pem())?;
+            fs::write(&self.server_key, server_key.serialize_pem())?;
+            Ok(())
         }
     }
 
@@ -4165,8 +4656,8 @@ mod tests {
         Ok((cert, key_pair))
     }
 
-    fn admin_tls_acceptor(certs: &TestCerts, client_ca: bool) -> TestResult<TlsAcceptor> {
-        Ok(build_admin_tls_acceptor(&AdminConfig {
+    fn admin_tls_config(certs: &TestCerts, client_ca: bool) -> TestResult<SharedServerConfig> {
+        let loaded = load_admin_tls_config(&AdminConfig {
             listen: None,
             token: None,
             token_file: None,
@@ -4175,7 +4666,8 @@ mod tests {
             tls_client_ca: client_ca.then(|| certs.ca.clone()),
             allow_cert_auth: false,
         })?
-        .unwrap())
+        .unwrap();
+        Ok(shared_server_config(loaded.config))
     }
 
     fn tls_client_config(
@@ -4211,6 +4703,77 @@ mod tests {
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await?;
         Ok(String::from_utf8(response)?)
+    }
+
+    async fn tls_admin_connect(
+        addr: SocketAddr,
+        ca_path: &Path,
+    ) -> TestResult<tokio_rustls::client::TlsStream<TcpStream>> {
+        let stream = TcpStream::connect(addr).await?;
+        let connector = TlsConnector::from(tls_client_config(ca_path, None)?);
+        let server_name = ServerName::try_from("localhost")?.to_owned();
+        Ok(connector.connect(server_name, stream).await?)
+    }
+
+    fn peer_dns_names(
+        stream: &tokio_rustls::client::TlsStream<TcpStream>,
+    ) -> TestResult<Vec<String>> {
+        let (_, connection) = stream.get_ref();
+        let cert = connection
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .ok_or_else(|| std::io::Error::other("missing peer certificate"))?;
+        let (_, cert) = parse_x509_certificate(cert.as_ref())
+            .map_err(|error| std::io::Error::other(format!("parse peer certificate: {error}")))?;
+        let names = cert
+            .subject_alternative_name()
+            .map_err(|error| std::io::Error::other(format!("parse peer SAN: {error}")))?
+            .map(|san| {
+                san.value
+                    .general_names
+                    .iter()
+                    .filter_map(|name| match name {
+                        GeneralName::DNSName(value) => Some((*value).to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(names)
+    }
+
+    async fn finish_tls_admin_request(
+        stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
+    ) -> TestResult<String> {
+        stream
+            .write_all(b"GET /livez HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await?;
+        stream.shutdown().await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        Ok(String::from_utf8(response)?)
+    }
+
+    fn admin_reload_target(
+        certs: &TestCerts,
+        metrics: ExportMetrics,
+    ) -> TestResult<(SharedServerConfig, Arc<TlsReloadTarget>, i64)> {
+        let kind = TlsReloadKind::Admin {
+            cert_path: certs.server_cert.clone(),
+            key_path: certs.server_key.clone(),
+            client_ca_path: None,
+        };
+        let loaded = load_tls_config(&kind)?;
+        let expiry = loaded.expiry_timestamp_seconds;
+        let shared = shared_server_config(Arc::clone(&loaded.config));
+        let target = Arc::new(TlsReloadTarget::new(
+            "admin".to_string(),
+            kind,
+            Arc::clone(&shared),
+            metrics,
+            &loaded,
+        ));
+        Ok((shared, target, expiry))
     }
 
     async fn tcp_exchange(addr: SocketAddr, request: &[u8]) -> std::io::Result<String> {
@@ -4438,7 +5001,7 @@ mod tests {
         let certs = TestCerts::generate(dir.path())?;
         let object_store = store::resolve_root("memory:///")?;
         let state = unavailable_admin_state(object_store, HashMap::new(), Some(ADMIN_TOKEN.into()));
-        let server = TlsAdminServer::start(state, admin_tls_acceptor(&certs, false)?).await;
+        let server = TlsAdminServer::start(state, admin_tls_config(&certs, false)?).await;
 
         let response = tls_admin_exchange(
             server.addr,
@@ -4465,6 +5028,72 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_tls_reloads_certificates_without_dropping_existing_connections() -> TestResult<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let certs = TestCerts::generate(dir.path())?;
+        let metrics = ExportMetrics::default();
+        let (tls, target, initial_expiry) = admin_reload_target(&certs, metrics.clone())?;
+        let object_store = store::resolve_root("memory:///")?;
+        let state = unavailable_admin_state(object_store, HashMap::new(), Some(ADMIN_TOKEN.into()));
+        let server = TlsAdminServer::start(state, tls).await;
+
+        let mut existing = tls_admin_connect(server.addr, &certs.ca).await?;
+        assert!(
+            peer_dns_names(&existing)?
+                .iter()
+                .any(|name| name == "cert-a.local"),
+            "initial TLS connection did not see cert A"
+        );
+        let rendered = render_daemon_metrics_with_exports(&[], &metrics);
+        assert!(
+            rendered.contains(&format!(
+                "slatefs_tls_cert_expiry_timestamp_seconds{{surface=\"admin\"}} {initial_expiry}"
+            )),
+            "{rendered}"
+        );
+
+        certs.overwrite_server_leaf("cert-b.local")?;
+        target.reload_if_changed(false);
+        let mut reloaded = tls_admin_connect(server.addr, &certs.ca).await?;
+        assert!(
+            peer_dns_names(&reloaded)?
+                .iter()
+                .any(|name| name == "cert-b.local"),
+            "new TLS connection did not see cert B"
+        );
+        let response = finish_tls_admin_request(&mut existing).await?;
+        assert_eq!(response_status(&response), 200, "{response}");
+        let response = finish_tls_admin_request(&mut reloaded).await?;
+        assert_eq!(response_status(&response), 200, "{response}");
+        let rendered = render_daemon_metrics_with_exports(&[], &metrics);
+        assert!(
+            rendered.contains("slatefs_tls_reloads_total{surface=\"admin\"} 1"),
+            "{rendered}"
+        );
+
+        fs::write(&certs.server_key, b"not a pem key")?;
+        target.reload_if_changed(false);
+        let mut after_bad_reload = tls_admin_connect(server.addr, &certs.ca).await?;
+        assert!(
+            peer_dns_names(&after_bad_reload)?
+                .iter()
+                .any(|name| name == "cert-b.local"),
+            "bad reload replaced the last good TLS config"
+        );
+        let response = finish_tls_admin_request(&mut after_bad_reload).await?;
+        assert_eq!(response_status(&response), 200, "{response}");
+        let rendered = render_daemon_metrics_with_exports(&[], &metrics);
+        assert!(
+            rendered.contains("slatefs_tls_reload_failures_total{surface=\"admin\"} 1"),
+            "{rendered}"
+        );
+
+        server.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mtls_requires_client_cert_and_allows_token_auth() -> TestResult<()> {
         let dir = tempfile::tempdir()?;
         let certs = TestCerts::generate(dir.path())?;
@@ -4475,7 +5104,7 @@ mod tests {
         let state =
             available_admin_state(object_store, kms, HashMap::new(), Some(ADMIN_TOKEN.into()))
                 .await;
-        let server = TlsAdminServer::start(state, admin_tls_acceptor(&certs, true)?).await;
+        let server = TlsAdminServer::start(state, admin_tls_config(&certs, true)?).await;
 
         let rejected = tls_admin_exchange(
             server.addr,
@@ -4535,8 +5164,7 @@ mod tests {
         .await;
         let mut state = (*state).clone();
         state.allow_cert_auth = true;
-        let server =
-            TlsAdminServer::start(Arc::new(state), admin_tls_acceptor(&certs, true)?).await;
+        let server = TlsAdminServer::start(Arc::new(state), admin_tls_config(&certs, true)?).await;
 
         let quota_patch = patch_request(
             "/admin/v1/tenants/t/volumes/v/quota",
@@ -5075,6 +5703,38 @@ mod tests {
         )
     }
 
+    fn p9_tls_export(
+        id: &str,
+        listen: &str,
+        cert_path: PathBuf,
+        key_path: PathBuf,
+    ) -> ExportRecord {
+        ExportRecord::from_config(
+            id.to_string(),
+            ExportConfig {
+                tenant: "t".to_string(),
+                volume: "v".to_string(),
+                snapshot: None,
+                listen: listen.to_string(),
+                allowed_clients: Vec::new(),
+                protocol: ExportProtocol::P9,
+                read_only: false,
+                sync: NbdSyncMode::Default,
+                nbd_tls_cert: None,
+                nbd_tls_key: None,
+                nbd_tls_client_ca: None,
+                p9_token: None,
+                p9_tls_cert: Some(cert_path),
+                p9_tls_key: Some(key_path),
+                squash: Default::default(),
+                atime: Default::default(),
+                anon_uid: 65534,
+                anon_gid: 65534,
+            },
+            true,
+        )
+    }
+
     fn free_loopback_addr() -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().to_string()
@@ -5210,6 +5870,77 @@ mod tests {
             );
             assert!(closed.unwrap().is_err(), "expected closed NBD session");
         }
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn export_manager_wires_tls_reload_for_p9_exports() {
+        let dir = tempfile::tempdir().unwrap();
+        let certs = TestCerts::generate(dir.path()).unwrap();
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([45; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        let fh_key = control.server_fh_key().await.unwrap();
+        let listen = free_loopback_addr();
+        control
+            .create_export(p9_tls_export(
+                "p9tls",
+                &listen,
+                certs.server_cert.clone(),
+                certs.server_key.clone(),
+            ))
+            .await
+            .unwrap();
+        control.close().await.unwrap();
+
+        let config = test_config(Vec::new());
+        let metrics = ExportMetrics::default();
+        let mut manager = ExportManager::new(
+            Arc::clone(&object_store),
+            fh_key,
+            &config,
+            config_export_records(&config.exports),
+            metrics.clone(),
+            ExportManagerTargets {
+                metrics: Arc::new(Mutex::new(Vec::new())),
+                admin: Arc::new(Mutex::new(HashMap::new())),
+                admin_blocks: Arc::new(Mutex::new(HashMap::new())),
+            },
+        );
+        let reader = ControlReader::open(Arc::clone(&object_store), kms)
+            .await
+            .unwrap();
+        manager.reconcile(&reader).await.unwrap();
+        assert_eq!(metrics.active_total(), 1);
+        let targets = manager.tls_reload_targets();
+        assert_eq!(targets.len(), 1);
+        let rendered = render_daemon_metrics_with_exports(&[], &metrics);
+        assert!(
+            rendered.contains(
+                "slatefs_tls_cert_expiry_timestamp_seconds{surface=\"p9:control:p9tls\"}"
+            ),
+            "{rendered}"
+        );
+
+        certs.overwrite_server_leaf("p9-cert-b.local").unwrap();
+        targets[0].reload_if_changed(false);
+        let rendered = render_daemon_metrics_with_exports(&[], &metrics);
+        assert!(
+            rendered.contains("slatefs_tls_reloads_total{surface=\"p9:control:p9tls\"} 1"),
+            "{rendered}"
+        );
         manager.shutdown().await;
     }
 

@@ -44,6 +44,9 @@ pub struct Config {
     /// Optional loopback-only daemon admin endpoint.
     #[serde(default)]
     pub admin: AdminConfig,
+    /// TLS certificate hot-reload settings for daemon listeners.
+    #[serde(default)]
+    pub tls: TlsConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -151,6 +154,21 @@ impl SlateDbConfig {
 pub struct MetricsConfig {
     /// Optional `ip:port` listener for Prometheus text at `/metrics`.
     pub listen: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TlsConfig {
+    /// Poll interval in seconds for detecting TLS certificate/key file changes.
+    pub reload_poll_secs: u64,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            reload_poll_secs: 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -606,6 +624,11 @@ impl Config {
                 "export_control.poll_interval_secs must be greater than 0".into(),
             ));
         }
+        if self.tls.reload_poll_secs == 0 {
+            return Err(Error::Config(
+                "tls.reload_poll_secs must be greater than 0".into(),
+            ));
+        }
         for export in &self.exports {
             validate_export_config(export)?;
         }
@@ -919,6 +942,27 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(Config::parse(&allow_without_client_ca).is_err());
+    }
+
+    #[test]
+    fn tls_reload_poll_config_defaults_and_validates() {
+        let base = r#"
+            [object_store]
+            url = "memory:///"
+
+            [kms]
+            provider = "static"
+            key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+        "#;
+        let config = Config::parse(base).unwrap();
+        assert_eq!(config.tls.reload_poll_secs, 60);
+
+        let configured = format!("{base}\n[tls]\nreload_poll_secs = 5\n");
+        let config = Config::parse(&configured).unwrap();
+        assert_eq!(config.tls.reload_poll_secs, 5);
+
+        let invalid = format!("{base}\n[tls]\nreload_poll_secs = 0\n");
+        assert!(Config::parse(&invalid).is_err());
     }
 
     #[test]

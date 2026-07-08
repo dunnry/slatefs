@@ -35,7 +35,7 @@
 pub mod filesystem;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Once, RwLock};
 
 use slatefs_core::config::{AtimeMode, ClientAddrRule};
 use slatefs_core::rate::RateLimiter;
@@ -92,9 +92,11 @@ impl P9TcpListener {
 pub struct P9TlsListener {
     listener: TcpListener,
     fs: SlateFs9p,
-    tls: TlsAcceptor,
+    tls: ReloadableTlsConfig,
     allowed_clients: Vec<ClientAddrRule>,
 }
+
+pub type ReloadableTlsConfig = Arc<RwLock<Arc<ServerConfig>>>;
 
 impl P9TlsListener {
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
@@ -115,8 +117,9 @@ impl P9TlsListener {
             }
 
             let fs = self.fs.clone();
-            let tls = self.tls.clone();
+            let tls = Arc::clone(&self.tls);
             tokio::spawn(async move {
+                let tls = TlsAcceptor::from(tls.read().expect("9P TLS config poisoned").clone());
                 let stream = match tls.accept(stream).await {
                     Ok(stream) => stream,
                     Err(error) => {
@@ -448,13 +451,44 @@ pub async fn bind_export_tls_with_allowlist_and_rate_limit_and_atime_policy(
         atime_policy,
         rate_limiter,
     );
-    let tls = TlsAcceptor::from(load_tls_config(&identity.cert_path, &identity.key_path)?);
+    let tls = Arc::new(RwLock::new(load_tls_config(
+        &identity.cert_path,
+        &identity.key_path,
+    )?));
     let listener = TcpListener::bind(listen).await?;
     tracing::info!(
         listen,
         cert = %identity.cert_path.display(),
         "9p TLS listener ready"
     );
+    Ok(P9TlsListener {
+        listener,
+        fs,
+        tls,
+        allowed_clients,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn bind_export_tls_with_reloadable_config_and_atime_policy(
+    volume: Arc<dyn Vfs>,
+    export_name: String,
+    token: Option<String>,
+    allowed_clients: Vec<ClientAddrRule>,
+    rate_limiter: Option<Arc<RateLimiter>>,
+    atime_policy: AtimeMode,
+    listen: &str,
+    tls: ReloadableTlsConfig,
+) -> std::io::Result<P9TlsListener> {
+    let fs = SlateFs9p::new_with_rate_limiter_and_atime_policy(
+        volume,
+        export_name,
+        token,
+        atime_policy,
+        rate_limiter,
+    );
+    let listener = TcpListener::bind(listen).await?;
+    tracing::info!(listen, "9p TLS listener ready");
     Ok(P9TlsListener {
         listener,
         fs,

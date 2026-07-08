@@ -51,6 +51,11 @@ cipher = "auto"              # auto | aes256gcm | xchacha20poly1305
 # [export_control]
 # poll_interval_secs = 30
 
+# TLS certificate/key files are hot-reloaded for new admin and 9P TLS
+# connections. SIGHUP reloads immediately.
+# [tls]
+# reload_poll_secs = 60
+
 # Fleet placement is stored in the encrypted control DB, not in this config.
 # Register and heartbeat daemon nodes with:
 #   slatefs fleet node register daemon-a --advertise-endpoint 10.0.0.10:2049
