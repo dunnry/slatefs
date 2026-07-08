@@ -102,7 +102,7 @@ versioned `ControlKeyFile { cipher, wrapped_dek }`.
 Current record payloads:
 
 - `TenantRecord { name, display_name, state, rate_limits, wrapped_kek, created_at }`
-- `VolumeRecord { tenant, name, state, clone_parent, fsid, wrapped_dek, cipher, chunk_size, compression, quota, note, created_at }`
+- `VolumeRecord { tenant, name, state, clone_parent, clone_parent_checkpoint_ids, fsid, wrapped_dek, cipher, chunk_size, compression, quota, kind, note, created_at }`
 - `CloneParent { tenant, volume }`
 - `QuotaLimits { bytes, inodes }`
 - `QuotaLimit { soft, hard, grace_until }`
@@ -169,7 +169,11 @@ Current `FileKind` variants are `File`, `Dir`, `Symlink`, `Fifo`, `Socket`,
   the unlinked inode closes.
 - Snapshot exports serve SlateDB checkpoints read-only. Writable clones get a
   new `VolumeRecord`, new fsid, and cloned superblock while sharing source SSTs
-  through SlateDB until compaction naturally separates them.
+  through SlateDB until compaction naturally separates them. New clone records
+  store `clone_parent_checkpoint_ids` for the source-side checkpoints retention
+  must preserve. Legacy clone records where that field is absent decode with
+  `None`; retention treats those as unknown and keeps the old conservative
+  whole-parent-volume skip.
 
 ## Format Change Checklist
 

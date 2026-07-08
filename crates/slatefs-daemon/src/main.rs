@@ -1420,7 +1420,7 @@ fn snapshot_retention_json(policy: Option<&SnapshotRetentionPolicy>) -> Value {
                 "max_age_secs": policy.max_age_secs,
                 "updated_at": policy.updated_at,
                 "named_snapshots_exempt": false,
-                "active_clone_parent_behavior": "skip_volume",
+                "active_clone_parent_behavior": "skip_pinned_checkpoints_or_legacy_volume",
             })
         })
         .unwrap_or(Value::Null)
@@ -2636,26 +2636,61 @@ fn checkpoint_age_secs(checkpoint: &slatedb::Checkpoint, now: u64) -> Option<u64
     (created >= 0).then(|| now.saturating_sub(created as u64))
 }
 
-async fn active_clone_parent_volumes(
+#[derive(Default)]
+struct CloneParentCheckpointPins {
+    pinned: HashMap<(String, String), HashSet<String>>,
+    conservative: HashSet<(String, String)>,
+}
+
+impl CloneParentCheckpointPins {
+    fn pinned_for(&self, tenant: &str, volume: &str) -> HashSet<String> {
+        self.pinned
+            .get(&(tenant.to_string(), volume.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn requires_conservative_skip(&self, tenant: &str, volume: &str) -> bool {
+        self.conservative
+            .contains(&(tenant.to_string(), volume.to_string()))
+    }
+}
+
+async fn active_clone_parent_checkpoint_pins(
     reader: &ControlReader,
-) -> anyhow::Result<HashSet<(String, String)>> {
-    let mut parents = HashSet::new();
+) -> anyhow::Result<CloneParentCheckpointPins> {
+    let mut pins = CloneParentCheckpointPins::default();
     for tenant in reader.list_tenants().await? {
         for volume in reader.list_volumes(&tenant.name).await? {
-            if let Some(parent) = volume.clone_parent
-                && !matches!(volume.state, slatefs_core::control::VolumeState::Deleting)
-            {
-                parents.insert((parent.tenant, parent.volume));
+            let Some(parent) = volume.clone_parent.as_ref() else {
+                continue;
+            };
+            if matches!(volume.state, slatefs_core::control::VolumeState::Deleting) {
+                continue;
+            }
+            let parent_key = (parent.tenant.clone(), parent.volume.clone());
+            if !matches!(volume.state, slatefs_core::control::VolumeState::Active) {
+                pins.conservative.insert(parent_key);
+                continue;
+            }
+            match volume.clone_parent_checkpoint_ids {
+                Some(ids) if !ids.is_empty() => {
+                    pins.pinned.entry(parent_key).or_default().extend(ids);
+                }
+                _ => {
+                    pins.conservative.insert(parent_key);
+                }
             }
         }
     }
-    Ok(parents)
+    Ok(pins)
 }
 
 async fn enforce_retention_for_policy(
     object_store: Arc<dyn ObjectStore>,
     record: &VolumeRecord,
     policy: &SnapshotRetentionPolicy,
+    pinned_checkpoints: &HashSet<String>,
 ) -> anyhow::Result<Vec<RetentionDeletedSnapshot>> {
     let path = store::volume_db_path(&record.tenant, &record.name);
     let admin = AdminBuilder::new(path, object_store).build();
@@ -2683,6 +2718,9 @@ async fn enforce_retention_for_policy(
             reasons.push("max_age");
         }
         if reasons.is_empty() {
+            continue;
+        }
+        if pinned_checkpoints.contains(&checkpoint.id.to_string()) {
             continue;
         }
         admin.delete_checkpoint(checkpoint.id).await?;
@@ -2756,15 +2794,15 @@ async fn enforce_snapshot_retention(
     if policies.is_empty() {
         return Ok(());
     }
-    let clone_parent_volumes = active_clone_parent_volumes(reader).await?;
+    let clone_parent_checkpoint_pins = active_clone_parent_checkpoint_pins(reader).await?;
     let mut audit_records = Vec::new();
 
     for policy in policies {
-        if clone_parent_volumes.contains(&(policy.tenant.clone(), policy.volume.clone())) {
+        if clone_parent_checkpoint_pins.requires_conservative_skip(&policy.tenant, &policy.volume) {
             tracing::warn!(
                 tenant = policy.tenant.as_str(),
                 volume = policy.volume.as_str(),
-                "snapshot retention skipped: active clone parent checkpoints are not individually detectable"
+                "snapshot retention skipped: active clone parent has legacy or in-progress clone pins"
             );
             continue;
         }
@@ -2777,8 +2815,15 @@ async fn enforce_snapshot_retention(
         if !matches!(record.state, slatefs_core::control::VolumeState::Active) {
             continue;
         }
-        let deleted =
-            enforce_retention_for_policy(Arc::clone(&object_store), &record, &policy).await?;
+        let pinned_checkpoints =
+            clone_parent_checkpoint_pins.pinned_for(&policy.tenant, &policy.volume);
+        let deleted = enforce_retention_for_policy(
+            Arc::clone(&object_store),
+            &record,
+            &policy,
+            &pinned_checkpoints,
+        )
+        .await?;
         if deleted.is_empty() {
             continue;
         }
@@ -3869,6 +3914,46 @@ mod tests {
             quota: QuotaLimits::default(),
             note: None,
         }
+    }
+
+    async fn write_root_file(
+        control: &ControlPlane,
+        object_store: Arc<dyn ObjectStore>,
+        tenant: &str,
+        volume_name: &str,
+        name: &[u8],
+        contents: &[u8],
+    ) {
+        let record = control.get_volume(tenant, volume_name).await.unwrap();
+        let dek = control.unwrap_volume_dek(&record).await.unwrap();
+        let volume = Volume::open(&record, dek, object_store).await.unwrap();
+        let creds = Credentials::root();
+        let file = volume
+            .create(&creds, ROOT_INO, name, 0o644, true)
+            .await
+            .unwrap();
+        volume.write(&creds, file.ino, 0, contents).await.unwrap();
+        volume.flush().await.unwrap();
+        volume.shutdown().await.unwrap();
+    }
+
+    async fn read_root_file(
+        control: &ControlPlane,
+        object_store: Arc<dyn ObjectStore>,
+        record: &VolumeRecord,
+        name: &[u8],
+    ) -> Vec<u8> {
+        let dek = control.unwrap_volume_dek(record).await.unwrap();
+        let volume = Volume::open(record, dek, object_store).await.unwrap();
+        let creds = Credentials::root();
+        let attr = volume.lookup(&creds, ROOT_INO, name).await.unwrap();
+        let bytes = volume
+            .read(&creds, attr.ino, 0, attr.size as u32)
+            .await
+            .unwrap()
+            .to_vec();
+        volume.shutdown().await.unwrap();
+        bytes
     }
 
     fn create_block_opts(size_bytes: u64) -> slatefs_core::volume::CreateBlockVolumeOptions {
@@ -5603,7 +5688,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn snapshot_retention_skips_active_clone_parent_volume() {
+    async fn snapshot_retention_skips_only_clone_pinned_checkpoints() {
         let object_store = store::resolve_root("memory:///").unwrap();
         let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([14; 32])));
         let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
@@ -5619,6 +5704,24 @@ mod tests {
         )
         .await
         .unwrap();
+        write_root_file(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "src",
+            b"file",
+            b"clone-safe",
+        )
+        .await;
+        let old_unpinned = slatefs_core::volume::create_snapshot(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "src",
+            Some("old-unpinned".to_string()),
+        )
+        .await
+        .unwrap();
         let parent_snapshot = slatefs_core::volume::create_snapshot(
             &control,
             Arc::clone(&object_store),
@@ -5628,7 +5731,16 @@ mod tests {
         )
         .await
         .unwrap();
-        slatefs_core::volume::clone_volume(
+        let newer_unpinned = slatefs_core::volume::create_snapshot(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "src",
+            Some("newer-unpinned".to_string()),
+        )
+        .await
+        .unwrap();
+        let clone = slatefs_core::volume::clone_volume(
             &control,
             Arc::clone(&object_store),
             "t",
@@ -5641,6 +5753,184 @@ mod tests {
         )
         .await
         .unwrap();
+        let clone_pins = clone
+            .clone_parent_checkpoint_ids
+            .clone()
+            .expect("new clone should record source checkpoint pins");
+        assert!(clone_pins.contains(&parent_snapshot.id));
+        assert!(
+            clone_pins.len() >= 2,
+            "clone should record the requested checkpoint plus SlateDB's final checkpoint: {clone_pins:?}"
+        );
+        control
+            .set_snapshot_retention_policy("t", "src", Some(0), None)
+            .await
+            .unwrap();
+        control.close().await.unwrap();
+
+        let reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        enforce_snapshot_retention(
+            &reader,
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            ExportMetrics::default(),
+        )
+        .await
+        .unwrap();
+        reader.close().await.unwrap();
+
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        let remaining = slatefs_core::volume::list_snapshots(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "src",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !remaining
+                .iter()
+                .any(|snapshot| snapshot.id == old_unpinned.id),
+            "old unpinned checkpoint should be removed despite active clone"
+        );
+        assert!(
+            remaining
+                .iter()
+                .any(|snapshot| snapshot.id == parent_snapshot.id),
+            "explicit clone source checkpoint must be retained while the clone is active"
+        );
+        assert!(
+            !remaining
+                .iter()
+                .any(|snapshot| snapshot.id == newer_unpinned.id),
+            "newer unpinned checkpoint should be removed despite active clone"
+        );
+        let (records, _) = control
+            .list_audit(AuditQuery {
+                tenant: Some("t"),
+                volume: Some("src"),
+                action: Some(AuditAction::SnapshotRetentionDelete),
+                newest_first: false,
+                ..AuditQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        let clone = control.get_volume("t", "clone").await.unwrap();
+        assert_eq!(
+            read_root_file(&control, Arc::clone(&object_store), &clone, b"file").await,
+            b"clone-safe"
+        );
+        let source_scrub =
+            slatefs_core::volume::scrub_volume(&control, Arc::clone(&object_store), "t", "src")
+                .await
+                .unwrap();
+        assert!(source_scrub.is_clean(), "source scrub: {source_scrub:?}");
+        let clone_scrub =
+            slatefs_core::volume::scrub_volume(&control, Arc::clone(&object_store), "t", "clone")
+                .await
+                .unwrap();
+        assert!(clone_scrub.is_clean(), "clone scrub: {clone_scrub:?}");
+
+        control.delete_volume("t", "clone").await.unwrap();
+        control.close().await.unwrap();
+
+        let reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        enforce_snapshot_retention(
+            &reader,
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            ExportMetrics::default(),
+        )
+        .await
+        .unwrap();
+        reader.close().await.unwrap();
+
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        let remaining = slatefs_core::volume::list_snapshots(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "src",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !remaining
+                .iter()
+                .any(|snapshot| snapshot.id == parent_snapshot.id),
+            "clone deletion should release the explicit source checkpoint pin"
+        );
+        for pin in &clone_pins {
+            assert!(
+                !remaining.iter().any(|snapshot| snapshot.id == pin.as_str()),
+                "clone deletion should release pin {pin}"
+            );
+        }
+        control.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_retention_legacy_clone_record_keeps_conservative_skip() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([44; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "src",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        let old_unpinned = slatefs_core::volume::create_snapshot(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "src",
+            Some("old-unpinned".to_string()),
+        )
+        .await
+        .unwrap();
+        let parent_snapshot = slatefs_core::volume::create_snapshot(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "src",
+            Some("parent".to_string()),
+        )
+        .await
+        .unwrap();
+        let mut clone = slatefs_core::volume::clone_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "src",
+            "clone",
+            slatefs_core::volume::CloneVolumeOptions {
+                source_snapshot_id: Some(parent_snapshot.id.clone()),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+        clone.clone_parent_checkpoint_ids = None;
+        control.put_volume(&clone).await.unwrap();
         control
             .set_snapshot_retention_policy("t", "src", Some(0), None)
             .await
@@ -5675,8 +5965,12 @@ mod tests {
         assert!(
             remaining
                 .iter()
-                .any(|snapshot| snapshot.id == parent_snapshot.id),
-            "source checkpoint must be retained while an active clone points at this volume"
+                .any(|snapshot| snapshot.id == old_unpinned.id)
+        );
+        assert!(
+            remaining
+                .iter()
+                .any(|snapshot| snapshot.id == parent_snapshot.id)
         );
         let (records, _) = control
             .list_audit(AuditQuery {

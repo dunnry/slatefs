@@ -734,7 +734,7 @@ fn print_snapshot_retention(tenant: &str, volume: &str, policy: Option<&Snapshot
             println!("max_age_secs: {}", format_limit(policy.max_age_secs));
             println!("updated_at:   {}", policy.updated_at);
             println!("named_snapshots_exempt: false");
-            println!("active_clone_parent_behavior: skip_volume");
+            println!("active_clone_parent_behavior: skip_pinned_checkpoints_or_legacy_volume");
         }
         None => println!("policy:       none"),
     }

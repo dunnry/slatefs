@@ -157,9 +157,11 @@ retention show|set <tenant> <volume> [--keep-last N] [--max-age SECS] [--clear]`
 stores a per-volume retention policy in the control plane. `slatefsd` enforces
 policies on the same poll loop family by deleting checkpoints beyond
 `keep_last` (newest kept) or older than `max_age`; named snapshots are not
-exempt. If a volume is the parent of an active clone, retention skips that
-source volume because the current control record does not identify SlateDB's
-per-clone pin checkpoint IDs precisely enough to delete safely. Deletions write
+exempt. If a volume is the parent of an active clone, retention preserves the
+source checkpoint IDs recorded on that clone, including SlateDB's clone pin
+checkpoint, while deleting unpinned checkpoints that match the policy. Legacy
+clone records without recorded pin IDs keep the old conservative whole-parent
+skip. Deletions write
 `SnapshotRetentionDelete` audit records and increment
 `slatefs_snapshots_retention_deleted_total{tenant,volume}`. `slatefs key
 rotate-kek <tenant>` rotates that tenant's KEK by rewrapping active volume DEKs

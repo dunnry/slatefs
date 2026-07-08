@@ -114,6 +114,10 @@ pub struct VolumeRecord {
     /// Instant clones share source SSTs; keep this so source deletion can
     /// refuse to orphan active clones.
     pub clone_parent: Option<CloneParent>,
+    /// Source-side checkpoint IDs this clone depends on. `None` on legacy
+    /// clone records means retention must keep using the conservative
+    /// whole-parent-volume skip.
+    pub clone_parent_checkpoint_ids: Option<Vec<String>>,
     pub fsid: u64,
     /// Volume DEK wrapped by the tenant KEK, context `volume_dek(t, v)`.
     pub wrapped_dek: Vec<u8>,
@@ -155,6 +159,7 @@ impl From<VolumeRecordV1> for VolumeRecord {
             name: value.name,
             state: value.state,
             clone_parent: value.clone_parent,
+            clone_parent_checkpoint_ids: None,
             fsid: value.fsid,
             wrapped_dek: value.wrapped_dek,
             cipher: value.cipher,
@@ -2619,6 +2624,7 @@ mod tests {
         let bytes = encode_versioned(VOLUME_RECORD_VERSION, &legacy).unwrap();
         let decoded = decode_volume_record(&bytes).unwrap();
         assert_eq!(decoded.kind, VolumeKind::Filesystem);
+        assert!(decoded.clone_parent_checkpoint_ids.is_none());
         assert_eq!(decoded.tenant, legacy.tenant);
         assert_eq!(decoded.name, legacy.name);
     }

@@ -287,6 +287,7 @@ async fn create_volume_inner(
                 name: volume_name.to_string(),
                 state: VolumeState::Creating,
                 clone_parent: None,
+                clone_parent_checkpoint_ids: None,
                 fsid: random_u64(),
                 wrapped_dek: aead::wrap_key(
                     &kek,
@@ -443,6 +444,7 @@ pub async fn clone_volume(
                     tenant: tenant_name.to_string(),
                     volume: source_volume_name.to_string(),
                 }),
+                clone_parent_checkpoint_ids: None,
                 fsid: random_u64(),
                 wrapped_dek: aead::wrap_key(
                     &tenant_kek,
@@ -466,14 +468,18 @@ pub async fn clone_volume(
     let clone_path = store::volume_db_path(tenant_name, clone_volume_name);
     let admin = AdminBuilder::new(clone_path, Arc::clone(&object_store)).build();
     let source_spec = match checkpoint {
-        Some(checkpoint) => CloneSourceSpec::with_checkpoint(source_path, checkpoint),
-        None => CloneSourceSpec::new(source_path),
+        Some(checkpoint) => CloneSourceSpec::with_checkpoint(source_path.clone(), checkpoint),
+        None => CloneSourceSpec::new(source_path.clone()),
     };
     admin
         .create_clone_builder_from_source(source_spec)
         .build()
         .await
         .map_err(|e| Error::invalid("clone", e.to_string()))?;
+
+    record.clone_parent_checkpoint_ids =
+        Some(clone_parent_checkpoint_ids(&admin, &source_path, checkpoint).await?);
+    control.put_volume(&record).await?;
 
     rewrite_cloned_superblock(&record, &source, source_dek, Arc::clone(&object_store)).await?;
 
@@ -487,6 +493,45 @@ pub async fn clone_volume(
         "volume clone created"
     );
     Ok(record)
+}
+
+async fn clone_parent_checkpoint_ids(
+    admin: &slatedb::admin::Admin,
+    source_path: &str,
+    requested_checkpoint: Option<uuid::Uuid>,
+) -> Result<Vec<String>> {
+    let manifest = admin
+        .read_manifest(None)
+        .await?
+        .ok_or_else(|| Error::invalid("clone manifest", "missing clone manifest after build"))?;
+    let mut ids = Vec::new();
+    if let Some(id) = requested_checkpoint {
+        push_unique_checkpoint_id(&mut ids, id);
+    }
+    for external_db in manifest
+        .external_dbs()
+        .iter()
+        .filter(|external_db| external_db.path == source_path)
+    {
+        push_unique_checkpoint_id(&mut ids, external_db.source_checkpoint_id);
+        if let Some(id) = external_db.final_checkpoint_id {
+            push_unique_checkpoint_id(&mut ids, id);
+        }
+    }
+    if ids.is_empty() {
+        return Err(Error::invalid(
+            "clone manifest",
+            format!("no checkpoint reference found for source {source_path}"),
+        ));
+    }
+    Ok(ids)
+}
+
+fn push_unique_checkpoint_id(ids: &mut Vec<String>, id: uuid::Uuid) {
+    let id = id.to_string();
+    if !ids.iter().any(|existing| existing == &id) {
+        ids.push(id);
+    }
 }
 
 async fn rewrite_cloned_superblock(
