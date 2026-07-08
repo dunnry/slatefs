@@ -321,18 +321,34 @@ async fn fenced_writer_marks_volume_dead() {
         .write(&root(), takeover_probe.ino, 0, b"new writer active")
         .await
         .unwrap();
+    takeover.flush().await.unwrap();
     let stale_watch = Arc::clone(&stale);
     let wait_dead = tokio::spawn(async move {
         stale_watch.wait_dead().await;
     });
 
-    assert_eq!(
-        stale
-            .write(&root(), file.ino, 0, b"stale writer")
-            .await
-            .unwrap_err(),
-        FsError::Io
-    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match stale.write(&root(), file.ino, 0, b"stale writer").await {
+                Ok(_) => {}
+                Err(FsError::Io) => break,
+                Err(error) => panic!("expected stale writer fencing as EIO, got {error:?}"),
+            }
+            match stale.flush().await {
+                Ok(()) => {}
+                Err(error) => {
+                    assert!(
+                        stale.is_dead(),
+                        "stale writer flush should latch fencing, got {error}"
+                    );
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stale writer should observe fencing");
     assert!(stale.is_dead(), "stale writer should latch dead");
     assert_eq!(stale.writer_fencing_events(), 1);
     assert!(!stale.is_degraded(), "fencing should be dead, not degraded");
@@ -347,6 +363,13 @@ async fn fenced_writer_marks_volume_dead() {
         .expect("dead waiter task should complete");
     assert_eq!(
         stale.getattr(&root(), ROOT_INO).await.unwrap_err(),
+        FsError::Io
+    );
+    assert_eq!(
+        stale
+            .write(&root(), file.ino, 0, b"already fenced")
+            .await
+            .unwrap_err(),
         FsError::Io
     );
 
