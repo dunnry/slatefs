@@ -41,7 +41,7 @@ use slatefs_core::store;
 use slatefs_core::vfs::Vfs;
 use slatefs_core::volume::{self, Volume, VolumeCaches};
 use slatefs_nbd::NbdShutdownHandle;
-use slatefs_nfs::{NFSTcp, SquashPolicy};
+use slatefs_nfs::{NFSTcp, NfsExportRuntime, QuotaRejectionAudit, SquashPolicy};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
@@ -330,6 +330,7 @@ enum BackendExport {
 
 struct ExportManager {
     object_store: Arc<dyn ObjectStore>,
+    kms: Arc<dyn kms::Kms>,
     fh_key: slatefs_core::crypto::Secret32,
     cache: slatefs_core::config::CacheConfig,
     slatedb: slatefs_core::config::SlateDbConfig,
@@ -3225,9 +3226,75 @@ async fn enforce_snapshot_retention(
     Ok(())
 }
 
+fn quota_rejection_audit(
+    object_store: Arc<dyn ObjectStore>,
+    kms: Arc<dyn kms::Kms>,
+    tenant: String,
+    volume: String,
+    plane: AuditPlane,
+) -> QuotaRejectionAudit {
+    Arc::new(move |operation| {
+        let object_store = Arc::clone(&object_store);
+        let kms = Arc::clone(&kms);
+        let tenant = tenant.clone();
+        let volume = volume.clone();
+        Box::pin(async move {
+            let control = match ControlPlane::open(object_store, kms).await {
+                Ok(control) => control,
+                Err(error) => {
+                    tracing::warn!(
+                        tenant,
+                        volume,
+                        operation,
+                        "quota rejection audit open failed: {error}"
+                    );
+                    return;
+                }
+            };
+            let mut audit = AuditRecord::new(
+                AuditActor {
+                    plane,
+                    principal: None,
+                    source_ip: None,
+                    client_agent: None,
+                },
+                AuditAction::QuotaRejected,
+                AuditScope {
+                    tenant: Some(tenant.clone()),
+                    volume: Some(volume.clone()),
+                    node: None,
+                },
+                format!("quota-rejected-{}", uuid::Uuid::new_v4()),
+                AuditOutcome::Denied,
+            );
+            audit.details.insert(
+                "operation".to_string(),
+                AuditDetailValue::String(operation.to_string()),
+            );
+            if let Err(error) = control.append_audit_record(audit).await {
+                tracing::warn!(
+                    tenant,
+                    volume,
+                    operation,
+                    "quota rejection audit append failed: {error}"
+                );
+            }
+            if let Err(error) = control.close().await {
+                tracing::warn!(
+                    tenant,
+                    volume,
+                    operation,
+                    "quota rejection audit close failed: {error}"
+                );
+            }
+        })
+    })
+}
+
 impl ExportManager {
     fn new(
         object_store: Arc<dyn ObjectStore>,
+        kms: Arc<dyn kms::Kms>,
         fh_key: slatefs_core::crypto::Secret32,
         config: &Config,
         config_exports: Arc<Vec<ConfigExportRecord>>,
@@ -3236,6 +3303,7 @@ impl ExportManager {
     ) -> Self {
         Self {
             object_store,
+            kms,
             fh_key,
             cache: config.cache.clone(),
             slatedb: config.slatedb.clone(),
@@ -3374,12 +3442,21 @@ impl ExportManager {
                     anon_gid: desired.config.anon_gid,
                 };
                 let listener =
-                    slatefs_nfs::bind_export_with_allowlist_and_rate_limit_and_atime_policy(
+                    slatefs_nfs::bind_export_with_allowlist_and_runtime_and_atime_policy(
                         Arc::clone(&volume),
                         self.fh_key.clone(),
                         policy,
                         desired.config.allowed_clients.clone(),
-                        rate_limiter,
+                        NfsExportRuntime {
+                            rate_limiter,
+                            quota_rejection_audit: Some(quota_rejection_audit(
+                                Arc::clone(&self.object_store),
+                                Arc::clone(&self.kms),
+                                desired.config.tenant.clone(),
+                                desired.config.volume.clone(),
+                                AuditPlane::Nfs,
+                            )),
+                        },
                         desired.config.atime,
                         &desired.config.listen,
                     )
@@ -4221,6 +4298,7 @@ async fn main() -> anyhow::Result<()> {
     let mut servers = tokio::task::JoinSet::new();
     let manager = Arc::new(tokio::sync::Mutex::new(ExportManager::new(
         Arc::clone(&object_store),
+        Arc::clone(&kms),
         fh_key,
         &config,
         Arc::clone(&config_exports),
@@ -4249,13 +4327,13 @@ async fn main() -> anyhow::Result<()> {
     let watcher_metrics = export_metrics.clone();
     let poll_interval = Duration::from_secs(config.export_control.poll_interval_secs);
     servers.spawn(async move {
-        let reader = ControlReader::open(Arc::clone(&watcher_store), Arc::clone(&watcher_kms))
-            .await
-            .map_err(std::io::Error::other)?;
         let mut tick = tokio::time::interval(poll_interval);
         tick.tick().await;
         loop {
             tick.tick().await;
+            let reader = ControlReader::open(Arc::clone(&watcher_store), Arc::clone(&watcher_kms))
+                .await
+                .map_err(std::io::Error::other)?;
             {
                 let mut manager = watcher_manager.lock().await;
                 if let Err(error) = manager.reconcile(&reader).await {
@@ -4278,6 +4356,7 @@ async fn main() -> anyhow::Result<()> {
                 watcher_metrics.failure();
                 tracing::error!("snapshot retention enforcement failed: {error:#}");
             }
+            reader.close().await.map_err(std::io::Error::other)?;
         }
     });
 
@@ -4800,6 +4879,23 @@ mod tests {
             .reload_live_limits(&reader)
             .await
             .unwrap();
+        reader.close().await.unwrap();
+    }
+
+    async fn poll_export_control_once(
+        manager: Arc<tokio::sync::Mutex<ExportManager>>,
+        object_store: Arc<dyn ObjectStore>,
+        kms: Arc<dyn Kms>,
+    ) {
+        let mut tick = tokio::time::interval(Duration::from_millis(10));
+        tick.tick().await;
+        tick.tick().await;
+        let reader = ControlReader::open(object_store, kms).await.unwrap();
+        {
+            let mut manager = manager.lock().await;
+            manager.reconcile(&reader).await.unwrap();
+            manager.reload_live_limits(&reader).await.unwrap();
+        }
         reader.close().await.unwrap();
     }
 
@@ -5768,6 +5864,7 @@ mod tests {
         let metrics = ExportMetrics::default();
         let mut manager = ExportManager::new(
             Arc::clone(&object_store),
+            Arc::clone(&kms),
             fh_key,
             &config,
             config_export_records(&config.exports),
@@ -5824,6 +5921,7 @@ mod tests {
         let metrics = ExportMetrics::default();
         let mut manager = ExportManager::new(
             Arc::clone(&object_store),
+            Arc::clone(&kms),
             fh_key,
             &config,
             config_export_records(&config.exports),
@@ -5909,6 +6007,7 @@ mod tests {
         let metrics = ExportMetrics::default();
         let mut manager = ExportManager::new(
             Arc::clone(&object_store),
+            Arc::clone(&kms),
             fh_key,
             &config,
             config_export_records(&config.exports),
@@ -5972,6 +6071,7 @@ mod tests {
         let metrics = ExportMetrics::default();
         let mut manager = ExportManager::new(
             Arc::clone(&object_store),
+            Arc::clone(&kms),
             fh_key,
             &config,
             config_export_records(&config.exports),
@@ -6033,6 +6133,7 @@ mod tests {
         let metrics = ExportMetrics::default();
         let mut manager = ExportManager::new(
             Arc::clone(&object_store),
+            Arc::clone(&kms),
             fh_key,
             &config,
             config_export_records(&config.exports),
@@ -6171,6 +6272,7 @@ mod tests {
         let admin_block_targets = Arc::new(Mutex::new(HashMap::new()));
         let mut manager = ExportManager::new(
             Arc::clone(&object_store),
+            Arc::clone(&kms),
             fh_key,
             &config,
             config_export_records(&config.exports),
@@ -6287,6 +6389,166 @@ mod tests {
             "expected frontend rate rejection, got {limited:?}"
         );
 
+        manager.lock().await.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_export_quota_patch_is_enforced_by_nfs_and_audited() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([33; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        let fh_key = control.server_fh_key().await.unwrap();
+        control.close().await.unwrap();
+
+        let config = test_config(Vec::new());
+        let admin_targets = Arc::new(Mutex::new(HashMap::new()));
+        let mut manager = ExportManager::new(
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            fh_key.clone(),
+            &config,
+            config_export_records(&config.exports),
+            ExportMetrics::default(),
+            ExportManagerTargets {
+                metrics: Arc::new(Mutex::new(Vec::new())),
+                admin: Arc::clone(&admin_targets),
+                admin_blocks: Arc::new(Mutex::new(HashMap::new())),
+            },
+        );
+        let reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        manager.reconcile(&reader).await.unwrap();
+        reader.close().await.unwrap();
+        let manager = Arc::new(tokio::sync::Mutex::new(manager));
+
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control
+            .create_export(nfs_export("exp-quota-nfs", "127.0.0.1:0"))
+            .await
+            .unwrap();
+        control.close().await.unwrap();
+        poll_export_control_once(
+            Arc::clone(&manager),
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+        )
+        .await;
+
+        let volume = {
+            let manager = manager.lock().await;
+            manager
+                .open_backends
+                .get(&("t".to_string(), "v".to_string(), None))
+                .and_then(|backend| backend.writable.as_ref())
+                .cloned()
+                .expect("writable backend")
+        };
+        let state = Arc::new(AdminState {
+            targets: Arc::clone(&admin_targets),
+            block_targets: Arc::new(Mutex::new(HashMap::new())),
+            control: AdminControl::Available(Arc::new(
+                ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+                    .await
+                    .unwrap(),
+            )),
+            object_store: Arc::clone(&object_store),
+            kms: Arc::clone(&kms),
+            config_exports: Arc::new(Vec::new()),
+            export_metrics: ExportMetrics::default(),
+            started_at: Instant::now(),
+            export_count: 1,
+            snapshot_export_count: 0,
+            auth_token: None,
+            allow_cert_auth: false,
+            node_id: None,
+        });
+
+        let nfs_volume: Arc<dyn Vfs> = volume.clone();
+        let nfs = SlateFsNfs::new_with_rate_limiter_and_atime_policy_and_quota_audit(
+            nfs_volume,
+            fh_key,
+            SquashPolicy::trust_as_root(),
+            AtimeMode::Relatime,
+            None,
+            Some(quota_rejection_audit(
+                Arc::clone(&object_store),
+                Arc::clone(&kms),
+                "t".to_string(),
+                "v".to_string(),
+                AuditPlane::Nfs,
+            )),
+        );
+        let root = nfs.root_dir();
+        let name = filename3(Opaque::borrowed(b"quota-live"));
+        let (file, _) = nfs.create(&root, &name, sattr3::default()).await.unwrap();
+        let initial = vec![7_u8; 8192];
+        nfs.write(&file, 0, &initial, stable_how::UNSTABLE)
+            .await
+            .unwrap();
+        assert_eq!(volume.quota_usage().0, 8192);
+
+        let quota_patch = patch_request(
+            "/admin/v1/tenants/t/volumes/v/quota",
+            "quota-live-patch",
+            r#"{"bytes_hard":1024}"#,
+        );
+        let quota_response = admin_exchange(Arc::clone(&state), quota_patch.as_bytes()).await;
+        assert_eq!(response_status(&quota_response), 200, "{quota_response}");
+        let quota_body: Value = serde_json::from_str(response_body(&quota_response)).unwrap();
+        assert_eq!(quota_body["quota"]["limits"]["bytes"]["hard"], 1024);
+        assert_eq!(quota_body["quota"]["usage"]["bytes"], 8192);
+
+        poll_export_control_once(
+            Arc::clone(&manager),
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+        )
+        .await;
+        assert_eq!(volume.quota_hard_limits().0, Some(1024));
+
+        let rejected = nfs.write(&file, 8192, b"x", stable_how::UNSTABLE).await;
+        assert!(
+            matches!(rejected, Err(nfsstat3::NFS3ERR_DQUOT)),
+            "expected DQUOT, got {rejected:?}"
+        );
+        assert_eq!(volume.quota_rejections(), 1);
+
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        let (records, _) = control
+            .list_audit(AuditQuery {
+                tenant: Some("t"),
+                volume: Some("v"),
+                action: Some(AuditAction::QuotaRejected),
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].actor.plane, AuditPlane::Nfs);
+        assert_eq!(records[0].outcome, AuditOutcome::Denied);
+        assert_eq!(
+            records[0].details.get("operation"),
+            Some(&AuditDetailValue::String("write".to_string()))
+        );
+        control.close().await.unwrap();
         manager.lock().await.shutdown().await;
     }
 

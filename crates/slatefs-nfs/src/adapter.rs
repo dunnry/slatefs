@@ -8,6 +8,8 @@
 //! [`Credentials`] every Vfs call runs under.
 
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use nfs3_server::nfs3_types::nfs3::{
@@ -31,6 +33,9 @@ use crate::fh::{FhCodec, SlateFsHandle};
 /// Verifier stored at exclusive create so retransmitted CREATE(EXCLUSIVE)
 /// calls are idempotent (RFC 1813 §3.3.8).
 const EXCL_VERF_XATTR: &[u8] = b"system.slatefs.createverf";
+
+pub type QuotaRejectionAudit =
+    Arc<dyn Fn(&'static str) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Maps the caller's (unauthenticated) AUTH_UNIX assertion to the identity
 /// Vfs calls run under (DD-10 squash policy).
@@ -104,6 +109,7 @@ pub struct SlateFsNfs {
     policy: SquashPolicy,
     atime_policy: AtimeMode,
     rate_limiter: Option<Arc<RateLimiter>>,
+    quota_rejection_audit: Option<QuotaRejectionAudit>,
 }
 
 impl SlateFsNfs {
@@ -139,6 +145,24 @@ impl SlateFsNfs {
         atime_policy: AtimeMode,
         rate_limiter: Option<Arc<RateLimiter>>,
     ) -> SlateFsNfs {
+        Self::new_with_rate_limiter_and_atime_policy_and_quota_audit(
+            volume,
+            fh_key,
+            policy,
+            atime_policy,
+            rate_limiter,
+            None,
+        )
+    }
+
+    pub fn new_with_rate_limiter_and_atime_policy_and_quota_audit(
+        volume: Arc<dyn Vfs>,
+        fh_key: Secret32,
+        policy: SquashPolicy,
+        atime_policy: AtimeMode,
+        rate_limiter: Option<Arc<RateLimiter>>,
+        quota_rejection_audit: Option<QuotaRejectionAudit>,
+    ) -> SlateFsNfs {
         let fh = FhCodec::new(volume.fsid(), fh_key);
         SlateFsNfs {
             volume,
@@ -146,6 +170,7 @@ impl SlateFsNfs {
             policy,
             atime_policy,
             rate_limiter,
+            quota_rejection_audit,
         }
     }
 
@@ -187,6 +212,19 @@ impl SlateFsNfs {
             mtime: to_nfstime(attr.mtime),
             ctime: to_nfstime(attr.ctime),
         }
+    }
+
+    async fn map_vfs_result<T>(
+        &self,
+        operation: &'static str,
+        result: Result<T, FsError>,
+    ) -> Result<T, nfsstat3> {
+        if matches!(result, Err(FsError::QuotaExceeded))
+            && let Some(audit) = &self.quota_rejection_audit
+        {
+            audit(operation).await;
+        }
+        result.map_err(map_err)
     }
 
     async fn getattr_checked(&self, handle: &SlateFsHandle) -> Result<FileAttr, nfsstat3> {
@@ -499,10 +537,11 @@ impl NfsFileSystem for SlateFsNfs {
             return Ok(self.fattr(&attr));
         }
         let attr = self
-            .volume
-            .setattr(&self.creds(), ino, attrs)
-            .await
-            .map_err(map_err)?;
+            .map_vfs_result(
+                "setattr",
+                self.volume.setattr(&self.creds(), ino, attrs).await,
+            )
+            .await?;
         Ok(self.fattr(&attr))
     }
 
@@ -515,10 +554,11 @@ impl NfsFileSystem for SlateFsNfs {
     ) -> Result<(fattr3, stable_how), nfsstat3> {
         let ino = self.ino_of(id)?;
         self.check_rate(data.len() as u64)?;
-        self.volume
-            .write(&self.creds(), ino, offset, data)
-            .await
-            .map_err(map_err)?;
+        self.map_vfs_result(
+            "write",
+            self.volume.write(&self.creds(), ino, offset, data).await,
+        )
+        .await?;
         // DD-7: UNSTABLE acks from memtable+WAL buffer; DATA_SYNC/FILE_SYNC
         // only after the WAL reaches the object store.
         let achieved = match stable {
@@ -550,10 +590,13 @@ impl NfsFileSystem for SlateFsNfs {
         let requested = to_setattrs(&attr);
         let mode = requested.mode.unwrap_or(0o644);
         let created = self
-            .volume
-            .create(&self.creds(), dir, filename.0.as_ref(), mode, false)
-            .await
-            .map_err(map_err)?;
+            .map_vfs_result(
+                "create",
+                self.volume
+                    .create(&self.creds(), dir, filename.0.as_ref(), mode, false)
+                    .await,
+            )
+            .await?;
         // UNCHECKED create may carry attributes (typically size=0 to
         // truncate an existing file).
         let mut post = created;
@@ -563,10 +606,11 @@ impl NfsFileSystem for SlateFsNfs {
         };
         if !followup.is_empty() {
             post = self
-                .volume
-                .setattr(&self.creds(), post.ino, followup)
-                .await
-                .map_err(map_err)?;
+                .map_vfs_result(
+                    "setattr",
+                    self.volume.setattr(&self.creds(), post.ino, followup).await,
+                )
+                .await?;
         }
         Ok((self.handle_for(&post), self.fattr(&post)))
     }
@@ -587,10 +631,13 @@ impl NfsFileSystem for SlateFsNfs {
         {
             Ok(attr) => {
                 // Persist the verifier so a retransmit is recognized.
-                self.volume
-                    .setxattr(&self.creds(), attr.ino, EXCL_VERF_XATTR, &createverf.0)
-                    .await
-                    .map_err(map_err)?;
+                self.map_vfs_result(
+                    "setxattr",
+                    self.volume
+                        .setxattr(&self.creds(), attr.ino, EXCL_VERF_XATTR, &createverf.0)
+                        .await,
+                )
+                .await?;
                 Ok(self.handle_for(&attr))
             }
             Err(FsError::Exists) => {
@@ -608,7 +655,7 @@ impl NfsFileSystem for SlateFsNfs {
                     _ => Err(nfsstat3::NFS3ERR_EXIST),
                 }
             }
-            Err(e) => Err(map_err(e)),
+            Err(e) => self.map_vfs_result("create", Err(e)).await,
         }
     }
 
@@ -624,10 +671,13 @@ impl NfsFileSystem for SlateFsNfs {
         let requested = to_setattrs(attr);
         let mode = requested.mode.unwrap_or(0o755);
         let mut made = self
-            .volume
-            .mkdir(&creds, dir, dirname.0.as_ref(), mode)
-            .await
-            .map_err(map_err)?;
+            .map_vfs_result(
+                "mkdir",
+                self.volume
+                    .mkdir(&creds, dir, dirname.0.as_ref(), mode)
+                    .await,
+            )
+            .await?;
         // Remaining requested attributes (uid/gid/times) apply post-create,
         // mirroring the CREATE path.
         let followup = SetAttrs {
@@ -637,10 +687,11 @@ impl NfsFileSystem for SlateFsNfs {
         };
         if !followup.is_empty() {
             made = self
-                .volume
-                .setattr(&creds, made.ino, followup)
-                .await
-                .map_err(map_err)?;
+                .map_vfs_result(
+                    "setattr",
+                    self.volume.setattr(&creds, made.ino, followup).await,
+                )
+                .await?;
         }
         Ok((self.handle_for(&made), self.fattr(&made)))
     }
@@ -704,10 +755,13 @@ impl NfsFileSystem for SlateFsNfs {
         let dir = self.ino_of(dirid)?;
         self.check_rate(symlink.0.len() as u64)?;
         let attr = self
-            .volume
-            .symlink(&self.creds(), dir, linkname.0.as_ref(), symlink.0.as_ref())
-            .await
-            .map_err(map_err)?;
+            .map_vfs_result(
+                "symlink",
+                self.volume
+                    .symlink(&self.creds(), dir, linkname.0.as_ref(), symlink.0.as_ref())
+                    .await,
+            )
+            .await?;
         Ok((self.handle_for(&attr), self.fattr(&attr)))
     }
 
@@ -721,10 +775,13 @@ impl NfsFileSystem for SlateFsNfs {
         let dir = self.ino_of(link_dir)?;
         self.check_rate(0)?;
         let attr = self
-            .volume
-            .link(&self.creds(), ino, dir, link_name.0.as_ref())
-            .await
-            .map_err(map_err)?;
+            .map_vfs_result(
+                "link",
+                self.volume
+                    .link(&self.creds(), ino, dir, link_name.0.as_ref())
+                    .await,
+            )
+            .await?;
         Ok(self.fattr(&attr))
     }
 
@@ -753,10 +810,13 @@ impl NfsFileSystem for SlateFsNfs {
         };
         let mode = to_setattrs(sattr).mode.unwrap_or(0o644);
         let attr = self
-            .volume
-            .mknod(&self.creds(), dir, name.0.as_ref(), mode, kind, rdev)
-            .await
-            .map_err(map_err)?;
+            .map_vfs_result(
+                "mknod",
+                self.volume
+                    .mknod(&self.creds(), dir, name.0.as_ref(), mode, kind, rdev)
+                    .await,
+            )
+            .await?;
         Ok((self.handle_for(&attr), self.fattr(&attr)))
     }
 
