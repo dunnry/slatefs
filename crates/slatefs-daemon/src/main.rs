@@ -1290,6 +1290,34 @@ where
     (page, next)
 }
 
+fn live_snapshot_response(
+    snapshot: slatefs_core::volume::CreatedSnapshot,
+    json_body: bool,
+) -> AdminHttpResponse {
+    if json_body {
+        AdminHttpResponse::json(
+            200,
+            json!({
+                "snapshot": {
+                    "id": snapshot.id,
+                    "manifest_id": snapshot.manifest_id,
+                    "name": snapshot.name,
+                }
+            }),
+        )
+    } else {
+        AdminHttpResponse::text(
+            200,
+            format!(
+                "id={}\nmanifest={}\nname={}\n",
+                snapshot.id,
+                snapshot.manifest_id,
+                snapshot.name.as_deref().unwrap_or("-")
+            ),
+        )
+    }
+}
+
 fn token_matches(expected: &str, presented: &str) -> bool {
     let expected = expected.as_bytes();
     let presented = presented.as_bytes();
@@ -1440,39 +1468,40 @@ async fn create_live_snapshot_response(
     name: Option<String>,
     json_body: bool,
 ) -> Result<AdminHttpResponse, AdminError> {
-    let target = state
-        .targets
-        .lock()
-        .expect("admin targets poisoned")
-        .get(&(tenant.clone(), volume.clone()))
-        .cloned()
-        .ok_or_else(|| not_found(format!("no live writable volume {tenant}/{volume}")))?;
+    let target = {
+        state
+            .targets
+            .lock()
+            .expect("admin targets poisoned")
+            .get(&(tenant.clone(), volume.clone()))
+            .cloned()
+    };
+    if let Some(target) = target {
+        let snapshot = target
+            .create_live_snapshot(name)
+            .await
+            .map_err(core_error)?;
+        return Ok(live_snapshot_response(snapshot, json_body));
+    }
+
+    let target = {
+        state
+            .block_targets
+            .lock()
+            .expect("admin block targets poisoned")
+            .get(&(tenant.clone(), volume.clone()))
+            .cloned()
+    };
+    let Some(target) = target else {
+        return Err(not_found(format!(
+            "no live writable volume {tenant}/{volume}"
+        )));
+    };
     let snapshot = target
         .create_live_snapshot(name)
         .await
         .map_err(core_error)?;
-    if json_body {
-        Ok(AdminHttpResponse::json(
-            200,
-            json!({
-                "snapshot": {
-                    "id": snapshot.id,
-                    "manifest_id": snapshot.manifest_id,
-                    "name": snapshot.name,
-                }
-            }),
-        ))
-    } else {
-        Ok(AdminHttpResponse::text(
-            200,
-            format!(
-                "id={}\nmanifest={}\nname={}\n",
-                snapshot.id,
-                snapshot.manifest_id,
-                snapshot.name.as_deref().unwrap_or("-")
-            ),
-        ))
-    }
+    Ok(live_snapshot_response(snapshot, json_body))
 }
 
 fn rate_limits_json(record: &TenantRecord) -> Value {
@@ -4529,9 +4558,20 @@ mod tests {
         targets: HashMap<(String, String), Arc<Volume>>,
         auth_token: Option<String>,
     ) -> Arc<AdminState> {
+        available_admin_state_with_blocks(object_store, kms, targets, HashMap::new(), auth_token)
+            .await
+    }
+
+    async fn available_admin_state_with_blocks(
+        object_store: Arc<dyn ObjectStore>,
+        kms: Arc<dyn Kms>,
+        targets: HashMap<(String, String), Arc<Volume>>,
+        block_targets: HashMap<(String, String), Arc<BlockVolume>>,
+        auth_token: Option<String>,
+    ) -> Arc<AdminState> {
         Arc::new(AdminState {
             targets: Arc::new(Mutex::new(targets)),
-            block_targets: Arc::new(Mutex::new(HashMap::new())),
+            block_targets: Arc::new(Mutex::new(block_targets)),
             control: AdminControl::Available(Arc::new(
                 ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
                     .await
@@ -5050,6 +5090,92 @@ mod tests {
         );
         snapshot.shutdown().await.unwrap();
         volume.shutdown().await.unwrap();
+        control.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_snapshot_endpoint_creates_live_block_checkpoint() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([6; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        let record = slatefs_core::volume::create_block_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "b",
+            create_block_opts(4096 * 2),
+        )
+        .await
+        .unwrap();
+        let dek = control.unwrap_volume_dek(&record).await.unwrap();
+        let block = BlockVolume::open(&record, dek, Arc::clone(&object_store))
+            .await
+            .unwrap();
+        block
+            .write(0, Bytes::from_static(b"baseline"), false)
+            .await
+            .unwrap();
+
+        let mut block_targets = HashMap::new();
+        block_targets.insert(("t".to_string(), "b".to_string()), Arc::clone(&block));
+        let state = available_admin_state_with_blocks(
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            HashMap::new(),
+            block_targets,
+            None,
+        )
+        .await;
+
+        let response = admin_exchange(
+            Arc::clone(&state),
+            b"POST /snapshot/t/b?name=block-admin HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response_header(&response, REQUEST_ID_HEADER).is_some());
+        assert!(response.contains("name=block-admin\n"), "{response}");
+        let snapshot_id = response
+            .lines()
+            .find_map(|line| line.strip_prefix("id="))
+            .expect("snapshot id")
+            .to_string();
+
+        let alias_response = admin_exchange(
+            state,
+            b"POST /admin/v1/tenants/t/volumes/b/snapshot?name=block-v1 HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: block-alias\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&alias_response), 200, "{alias_response}");
+        assert_eq!(
+            response_header(&alias_response, REQUEST_ID_HEADER).as_deref(),
+            Some("block-alias")
+        );
+        let alias_body: Value = serde_json::from_str(response_body(&alias_response)).unwrap();
+        assert_eq!(alias_body["snapshot"]["name"], "block-v1");
+
+        block
+            .write(0, Bytes::from_static(b"latest!!"), true)
+            .await
+            .unwrap();
+
+        let snapshot_dek = control.unwrap_volume_dek(&record).await.unwrap();
+        let snapshot = SnapshotBlockVolume::open(
+            &record,
+            snapshot_dek,
+            Arc::clone(&object_store),
+            &snapshot_id,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let bytes = snapshot.read(0, 8).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"baseline");
+        snapshot.shutdown().await.unwrap();
+        block.shutdown().await.unwrap();
         control.close().await.unwrap();
     }
 
@@ -6578,6 +6704,15 @@ mod tests {
         )
         .await
         .unwrap();
+        slatefs_core::volume::create_block_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "block",
+            create_block_opts(4096 * 2),
+        )
+        .await
+        .unwrap();
         let _old_named = slatefs_core::volume::create_snapshot(
             &control,
             Arc::clone(&object_store),
@@ -6614,8 +6749,30 @@ mod tests {
         )
         .await
         .unwrap();
+        let _block_old = slatefs_core::volume::create_snapshot(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "block",
+            Some("block-old".to_string()),
+        )
+        .await
+        .unwrap();
+        let block_newest = slatefs_core::volume::create_snapshot(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "block",
+            Some("block-newest".to_string()),
+        )
+        .await
+        .unwrap();
         control
             .set_snapshot_retention_policy("t", "v", Some(1), None)
+            .await
+            .unwrap();
+        control
+            .set_snapshot_retention_policy("t", "block", Some(1), None)
             .await
             .unwrap();
         control.close().await.unwrap();
@@ -6659,22 +6816,39 @@ mod tests {
         .unwrap();
         assert_eq!(untouched_remaining.len(), 1);
         assert_eq!(untouched_remaining[0].id, untouched.id);
+        let block_remaining = slatefs_core::volume::list_snapshots(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "block",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(block_remaining.len(), 1);
+        assert_eq!(block_remaining[0].id, block_newest.id);
 
         let (records, _) = control
             .list_audit(AuditQuery {
                 tenant: Some("t"),
-                volume: Some("v"),
+                volume: None,
                 action: Some(AuditAction::SnapshotRetentionDelete),
                 newest_first: false,
                 ..AuditQuery::default()
             })
             .await
             .unwrap();
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), 3);
         let rendered = render_daemon_metrics_with_exports(&[], &metrics);
         assert!(
             rendered
                 .contains("slatefs_snapshots_retention_deleted_total{tenant=\"t\",volume=\"v\"} 2"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "slatefs_snapshots_retention_deleted_total{tenant=\"t\",volume=\"block\"} 1"
+            ),
             "{rendered}"
         );
         control.close().await.unwrap();

@@ -174,6 +174,10 @@ impl BlockVolume {
     }
 
     pub async fn create_live_snapshot(&self, name: Option<String>) -> Result<CreatedSnapshot> {
+        self.db.flush().await.map_err(|error| {
+            self.note_storage_error(&error);
+            Error::from(error)
+        })?;
         let created = self
             .db
             .create_checkpoint(
@@ -183,7 +187,11 @@ impl BlockVolume {
                     ..CheckpointOptions::default()
                 },
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                self.note_storage_error(&error);
+                Error::from(error)
+            })?;
         Ok(CreatedSnapshot {
             id: created.id.to_string(),
             manifest_id: created.manifest_id,
