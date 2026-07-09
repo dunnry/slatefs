@@ -182,7 +182,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/audit` | Audit records with `since`, `until`, `tenant`, `volume`, `action`, `limit`, `page_token`, `newest_first`. |
 | `GET` | `/admin/v1/exports` | All exports with `source=config|control`; config exports are read-only. |
 | `GET` | `/admin/v1/exports/{id}` | Export detail. |
-| `POST` | `/admin/v1/exports/{id}` | Create a control-plane export from JSON fields matching TOML exports plus `enabled`. |
+| `POST` | `/admin/v1/exports` | Create an enabled control-plane export from JSON fields including `name`, `tenant`, `volume`, `protocol`, `listen`, `allowed_clients`, `read_only`, `sync`, and `snapshot`. |
 | `PATCH` | `/admin/v1/exports/{id}` | Update a control-plane export; use JSON `null` to clear optional fields. |
 | `DELETE` | `/admin/v1/exports/{id}` | Remove a control-plane export. |
 | `GET` | `/admin/v1/tenants` | Tenant inventory with `limit` and `page_token`. |
@@ -190,6 +190,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes` | Volume inventory with `limit` and `page_token`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}` | Volume detail. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/quota` | Set nullable quota fields: `bytes_soft`, `bytes_hard`, `bytes_grace`, `inodes_soft`, `inodes_hard`, `inodes_grace`; returns limits and live usage. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/clones` | Create a writable clone from `{"clone_volume":"...","snapshot_id":"..."}`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshot?name=` | v1 live-writer snapshot alias. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshots` | Checkpoint inventory with `limit`, `page_token`, and optional `name`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshot-retention` | Snapshot retention policy; named snapshots are not exempt. |

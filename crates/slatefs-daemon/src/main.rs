@@ -771,69 +771,62 @@ struct ConfigExportRecord {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CloneCreateRequest {
+    clone_volume: String,
+    snapshot_id: String,
+}
+
+#[derive(Debug)]
+struct RequiredNullableString(Option<String>);
+
+impl<'de> Deserialize<'de> for RequiredNullableString {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer).map(Self)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExportCreateRequest {
+    name: String,
     tenant: String,
     volume: String,
-    #[serde(default)]
-    snapshot: Option<String>,
+    snapshot: RequiredNullableString,
     listen: String,
-    #[serde(default)]
     allowed_clients: Vec<ClientAddrRule>,
-    #[serde(default)]
     protocol: ExportProtocol,
-    #[serde(default)]
     read_only: bool,
-    #[serde(default)]
     sync: NbdSyncMode,
-    #[serde(default)]
-    nbd_tls_cert: Option<std::path::PathBuf>,
-    #[serde(default)]
-    nbd_tls_key: Option<std::path::PathBuf>,
-    #[serde(default)]
-    nbd_tls_client_ca: Option<std::path::PathBuf>,
-    #[serde(default)]
-    p9_token: Option<String>,
-    #[serde(default)]
-    p9_tls_cert: Option<std::path::PathBuf>,
-    #[serde(default)]
-    p9_tls_key: Option<std::path::PathBuf>,
-    #[serde(default)]
-    squash: SquashMode,
-    #[serde(default)]
-    atime: AtimeMode,
-    #[serde(default = "default_anon_id_json")]
-    anon_uid: u32,
-    #[serde(default = "default_anon_id_json")]
-    anon_gid: u32,
-    #[serde(default = "default_enabled_json")]
-    enabled: bool,
 }
 
 impl ExportCreateRequest {
-    fn into_record(self, id: String) -> ExportRecord {
+    fn into_record(self) -> ExportRecord {
         ExportRecord::from_config(
-            id,
+            self.name,
             ExportConfig {
                 tenant: self.tenant,
                 volume: self.volume,
-                snapshot: self.snapshot,
+                snapshot: self.snapshot.0,
                 listen: self.listen,
                 allowed_clients: self.allowed_clients,
                 protocol: self.protocol,
                 read_only: self.read_only,
                 sync: self.sync,
-                nbd_tls_cert: self.nbd_tls_cert,
-                nbd_tls_key: self.nbd_tls_key,
-                nbd_tls_client_ca: self.nbd_tls_client_ca,
-                p9_token: self.p9_token,
-                p9_tls_cert: self.p9_tls_cert,
-                p9_tls_key: self.p9_tls_key,
-                squash: self.squash,
-                atime: self.atime,
-                anon_uid: self.anon_uid,
-                anon_gid: self.anon_gid,
+                nbd_tls_cert: None,
+                nbd_tls_key: None,
+                nbd_tls_client_ca: None,
+                p9_token: None,
+                p9_tls_cert: None,
+                p9_tls_key: None,
+                squash: SquashMode::default(),
+                atime: AtimeMode::default(),
+                anon_uid: default_anon_id_json(),
+                anon_gid: default_anon_id_json(),
             },
-            self.enabled,
+            true,
         )
     }
 }
@@ -1025,10 +1018,6 @@ impl TenantRatePatchRequest {
             limits.bytes_per_second = value;
         }
     }
-}
-
-fn default_enabled_json() -> bool {
-    true
 }
 
 fn default_anon_id_json() -> u32 {
@@ -1641,6 +1630,14 @@ fn export_record_json(record: &ExportRecord) -> Value {
     value
 }
 
+fn export_create_json(record: &ExportRecord) -> Value {
+    json!({
+        "name": record.id,
+        "listen": record.listen,
+        "protocol": record.protocol,
+    })
+}
+
 fn parse_json_body<T: for<'de> Deserialize<'de>>(
     request: &AdminHttpRequest,
 ) -> Result<T, AdminError> {
@@ -1649,6 +1646,78 @@ fn parse_json_body<T: for<'de> Deserialize<'de>>(
     }
     serde_json::from_str(&request.body)
         .map_err(|error| bad_request(format!("invalid JSON: {error}")))
+}
+
+fn config_export_read_only_error(id: &str) -> AdminError {
+    AdminError {
+        status: 400,
+        message: format!("export {id:?} is sourced from config and is read-only"),
+    }
+}
+
+fn export_name_exists_error(id: &str) -> AdminError {
+    AdminError {
+        status: 409,
+        message: format!("export {id:?} already exists"),
+    }
+}
+
+fn socket_addrs_conflict(left: SocketAddr, right: SocketAddr) -> bool {
+    if left.port() == 0 || right.port() == 0 {
+        return false;
+    }
+    left.port() == right.port()
+        && (left.ip() == right.ip() || left.ip().is_unspecified() || right.ip().is_unspecified())
+}
+
+fn parse_export_listen(listen: &str) -> Result<SocketAddr, AdminError> {
+    listen
+        .parse::<SocketAddr>()
+        .map_err(|error| bad_request(format!("invalid export listen: {error}")))
+}
+
+fn export_listen_conflict_error(listen: &str, source: &str, id: &str) -> AdminError {
+    bad_request(format!(
+        "listen address {listen} already used by {source} export {id}"
+    ))
+}
+
+async fn ensure_export_listen_available(
+    state: &AdminState,
+    control: &ControlPlane,
+    record: &ExportRecord,
+) -> Result<(), AdminError> {
+    let listen = parse_export_listen(&record.listen)?;
+    for config in state.config_exports.iter() {
+        let config_listen = parse_export_listen(&config.export.listen)?;
+        if socket_addrs_conflict(listen, config_listen) {
+            return Err(export_listen_conflict_error(
+                &record.listen,
+                "config",
+                &config.id,
+            ));
+        }
+    }
+    for existing in control.list_exports().await.map_err(core_error)? {
+        if existing.id == record.id || !existing.enabled {
+            continue;
+        }
+        let existing_listen = parse_export_listen(&existing.listen)?;
+        if socket_addrs_conflict(listen, existing_listen) {
+            return Err(export_listen_conflict_error(
+                &record.listen,
+                "control",
+                &existing.id,
+            ));
+        }
+    }
+    std::net::TcpListener::bind(listen).map_err(|error| {
+        bad_request(format!(
+            "listen address {} is unavailable: {error}",
+            record.listen
+        ))
+    })?;
+    Ok(())
 }
 
 fn admin_actor(request: &AdminHttpRequest) -> AuditActor {
@@ -2092,25 +2161,27 @@ async fn get_export_response(
 async fn create_export_response(
     state: &AdminState,
     request: &AdminHttpRequest,
-    id: &str,
 ) -> Result<AdminHttpResponse, AdminError> {
-    if state.config_exports.iter().any(|record| record.id == id) {
-        return Err(AdminError {
-            status: 409,
-            message: format!("export {id:?} is sourced from config and is read-only"),
-        });
-    }
     let body: ExportCreateRequest = parse_json_body(request)?;
+    if state
+        .config_exports
+        .iter()
+        .any(|record| record.id == body.name)
+    {
+        return Err(export_name_exists_error(&body.name));
+    }
+    if body.protocol != ExportProtocol::Nbd {
+        return Err(bad_request("protocol must be nbd"));
+    }
     let control = state.control_writer().await?;
-    let record = control
-        .create_export(body.into_record(id.to_string()))
-        .await
-        .map_err(core_error)?;
+    let record = body.into_record();
+    ensure_export_listen_available(state, &control, &record).await?;
+    let record = control.create_export(record).await.map_err(core_error)?;
     append_export_audit(&control, request, AuditAction::ExportCreate, &record).await?;
     control.close().await.map_err(core_error)?;
     Ok(AdminHttpResponse::json(
-        201,
-        json!({ "export": export_record_json(&record) }),
+        200,
+        json!({ "export": export_create_json(&record) }),
     ))
 }
 
@@ -2120,10 +2191,7 @@ async fn patch_export_response(
     id: &str,
 ) -> Result<AdminHttpResponse, AdminError> {
     if state.config_exports.iter().any(|record| record.id == id) {
-        return Err(AdminError {
-            status: 409,
-            message: format!("export {id:?} is sourced from config and is read-only"),
-        });
+        return Err(config_export_read_only_error(id));
     }
     let body: ExportPatchRequest = parse_json_body(request)?;
     let control = state.control_writer().await?;
@@ -2144,10 +2212,7 @@ async fn delete_export_response(
     id: &str,
 ) -> Result<AdminHttpResponse, AdminError> {
     if state.config_exports.iter().any(|record| record.id == id) {
-        return Err(AdminError {
-            status: 409,
-            message: format!("export {id:?} is sourced from config and is read-only"),
-        });
+        return Err(config_export_read_only_error(id));
     }
     let control = state.control_writer().await?;
     let record = control.remove_export(id).await.map_err(core_error)?;
@@ -2155,7 +2220,45 @@ async fn delete_export_response(
     control.close().await.map_err(core_error)?;
     Ok(AdminHttpResponse::json(
         200,
-        json!({ "export": export_record_json(&record), "deleted": true }),
+        json!({ "removed": record.id }),
+    ))
+}
+
+async fn create_clone_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    source_volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let body: CloneCreateRequest = parse_json_body(request)?;
+    if body.snapshot_id.trim().is_empty() {
+        return Err(bad_request("snapshot_id must not be empty"));
+    }
+    let control = state.control_writer().await?;
+    let record = volume::clone_volume(
+        &control,
+        Arc::clone(&state.object_store),
+        tenant,
+        source_volume,
+        &body.clone_volume,
+        volume::CloneVolumeOptions {
+            source_snapshot_id: Some(body.snapshot_id.clone()),
+            note: None,
+        },
+    )
+    .await
+    .map_err(core_error)?;
+    control.close().await.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({
+            "clone": {
+                "tenant": record.tenant,
+                "volume": record.name,
+                "source_volume": source_volume,
+                "snapshot_id": body.snapshot_id,
+            }
+        }),
     ))
 }
 
@@ -2346,10 +2449,8 @@ async fn route_admin_request(
     match (request.method.as_str(), parts.as_slice()) {
         ("GET", ["admin", "v1", "audit"]) => audit_response(state, request).await,
         ("GET", ["admin", "v1", "exports"]) => list_exports_response(state, request).await,
+        ("POST", ["admin", "v1", "exports"]) => create_export_response(state, request).await,
         ("GET", ["admin", "v1", "exports", id]) => get_export_response(state, id).await,
-        ("POST", ["admin", "v1", "exports", id]) => {
-            create_export_response(state, request, id).await
-        }
         ("PATCH", ["admin", "v1", "exports", id]) => {
             patch_export_response(state, request, id).await
         }
@@ -2369,6 +2470,18 @@ async fn route_admin_request(
         ("PATCH", ["admin", "v1", "tenants", tenant, "volumes", volume, "quota"]) => {
             patch_volume_quota_response(state, request, tenant, volume).await
         }
+        (
+            "POST",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "clones",
+            ],
+        ) => create_clone_response(state, request, tenant, volume).await,
         ("GET", ["admin", "v1", "nodes"]) => list_nodes_response(state, request).await,
         (
             "GET",
@@ -4660,6 +4773,13 @@ mod tests {
         )
     }
 
+    fn post_request(path: &str, request_id: &str, body: &str) -> String {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: {request_id}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
     struct TlsAdminServer {
         addr: SocketAddr,
         task: JoinHandle<()>,
@@ -5180,6 +5300,106 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_v1_clone_route_creates_snapshot_clone_and_reports_404_409() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([61; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "src",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        write_root_file(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "src",
+            b"file",
+            b"baseline",
+        )
+        .await;
+        let snapshot = slatefs_core::volume::create_snapshot(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "src",
+            Some("clone-source".to_string()),
+        )
+        .await
+        .unwrap();
+        control.close().await.unwrap();
+
+        let state = available_admin_state(
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            HashMap::new(),
+            None,
+        )
+        .await;
+        let body = format!(
+            r#"{{"clone_volume":"clone","snapshot_id":"{}"}}"#,
+            snapshot.id
+        );
+        let create = post_request(
+            "/admin/v1/tenants/t/volumes/src/clones",
+            "clone-create",
+            &body,
+        );
+        let create_response = admin_exchange(Arc::clone(&state), create.as_bytes()).await;
+        assert_eq!(response_status(&create_response), 200, "{create_response}");
+        assert_eq!(
+            response_header(&create_response, REQUEST_ID_HEADER).as_deref(),
+            Some("clone-create")
+        );
+        let create_body: Value = serde_json::from_str(response_body(&create_response)).unwrap();
+        assert_eq!(create_body["clone"]["tenant"], "t");
+        assert_eq!(create_body["clone"]["volume"], "clone");
+        assert_eq!(create_body["clone"]["source_volume"], "src");
+        assert_eq!(create_body["clone"]["snapshot_id"], snapshot.id);
+
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        let clone = control.get_volume("t", "clone").await.unwrap();
+        assert_eq!(
+            read_root_file(&control, Arc::clone(&object_store), &clone, b"file").await,
+            b"baseline"
+        );
+        control.close().await.unwrap();
+
+        let duplicate = admin_exchange(Arc::clone(&state), create.as_bytes()).await;
+        assert_eq!(response_status(&duplicate), 409, "{duplicate}");
+        let duplicate_body: Value = serde_json::from_str(response_body(&duplicate)).unwrap();
+        assert_eq!(duplicate_body["error"]["code"], "conflict");
+
+        let missing_snapshot_body = format!(
+            r#"{{"clone_volume":"missing-snapshot","snapshot_id":"{}"}}"#,
+            uuid::Uuid::new_v4()
+        );
+        let missing_snapshot = post_request(
+            "/admin/v1/tenants/t/volumes/src/clones",
+            "clone-missing-snapshot",
+            &missing_snapshot_body,
+        );
+        let missing_snapshot_response = admin_exchange(state, missing_snapshot.as_bytes()).await;
+        assert_eq!(
+            response_status(&missing_snapshot_response),
+            404,
+            "{missing_snapshot_response}"
+        );
+        let missing_snapshot_body: Value =
+            serde_json::from_str(response_body(&missing_snapshot_response)).unwrap();
+        assert_eq!(missing_snapshot_body["error"]["code"], "not_found");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn admin_v1_errors_echo_request_id_with_json_envelope() {
         let object_store = store::resolve_root("memory:///").unwrap();
         let state = unavailable_admin_state(object_store, HashMap::new(), None);
@@ -5604,15 +5824,16 @@ mod tests {
             .await
             .unwrap();
         control.create_tenant("t", None).await.unwrap();
-        slatefs_core::volume::create_volume(
+        slatefs_core::volume::create_block_volume(
             &control,
             Arc::clone(&object_store),
             "t",
-            "v",
-            create_opts(),
+            "b",
+            create_block_opts(4096 * 2),
         )
         .await
         .unwrap();
+        let fh_key = control.server_fh_key().await.unwrap();
         control.close().await.unwrap();
 
         let state = available_admin_state(
@@ -5622,15 +5843,41 @@ mod tests {
             None,
         )
         .await;
-        let create = admin_exchange(
-            Arc::clone(&state),
-            b"POST /admin/v1/exports/exp1 HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: export-create\r\nContent-Type: application/json\r\nContent-Length: 108\r\n\r\n{\"tenant\":\"t\",\"volume\":\"v\",\"listen\":\"127.0.0.1:12049\",\"protocol\":\"nfs\",\"allowed_clients\":[\"127.0.0.1\"]}",
-        )
-        .await;
-        assert_eq!(response_status(&create), 201, "{create}");
+        let listen = free_loopback_addr();
+        let create_body = format!(
+            r#"{{"name":"nbd1","tenant":"t","volume":"b","protocol":"nbd","listen":"{listen}","allowed_clients":[],"read_only":false,"sync":"default","snapshot":null}}"#
+        );
+        let create_request = post_request("/admin/v1/exports", "export-create", &create_body);
+        let create = admin_exchange(Arc::clone(&state), create_request.as_bytes()).await;
+        assert_eq!(response_status(&create), 200, "{create}");
         let create_body: Value = serde_json::from_str(response_body(&create)).unwrap();
-        assert_eq!(create_body["export"]["id"], "exp1");
-        assert_eq!(create_body["export"]["source"], "control");
+        assert_eq!(create_body["export"]["name"], "nbd1");
+        assert_eq!(create_body["export"]["listen"], listen);
+        assert_eq!(create_body["export"]["protocol"], "nbd");
+
+        let duplicate_listen = free_loopback_addr();
+        let duplicate_body = format!(
+            r#"{{"name":"nbd1","tenant":"t","volume":"b","protocol":"nbd","listen":"{duplicate_listen}","allowed_clients":[],"read_only":false,"sync":"default","snapshot":null}}"#
+        );
+        let duplicate_request =
+            post_request("/admin/v1/exports", "export-duplicate", &duplicate_body);
+        let duplicate = admin_exchange(Arc::clone(&state), duplicate_request.as_bytes()).await;
+        assert_eq!(response_status(&duplicate), 409, "{duplicate}");
+        let duplicate_body: Value = serde_json::from_str(response_body(&duplicate)).unwrap();
+        assert_eq!(duplicate_body["error"]["code"], "conflict");
+
+        let conflict_body = format!(
+            r#"{{"name":"nbd-conflict","tenant":"t","volume":"b","protocol":"nbd","listen":"{listen}","allowed_clients":[],"read_only":false,"sync":"default","snapshot":null}}"#
+        );
+        let conflict_request = post_request(
+            "/admin/v1/exports",
+            "export-listen-conflict",
+            &conflict_body,
+        );
+        let conflict = admin_exchange(Arc::clone(&state), conflict_request.as_bytes()).await;
+        assert_eq!(response_status(&conflict), 400, "{conflict}");
+        let conflict_body: Value = serde_json::from_str(response_body(&conflict)).unwrap();
+        assert_eq!(conflict_body["error"]["code"], "bad_request");
 
         tokio::time::sleep(Duration::from_millis(1200)).await;
         let list = admin_exchange(
@@ -5640,23 +5887,43 @@ mod tests {
         .await;
         assert_eq!(response_status(&list), 200, "{list}");
         let list_body: Value = serde_json::from_str(response_body(&list)).unwrap();
-        assert_eq!(list_body["exports"][0]["id"], "exp1");
+        assert_eq!(list_body["exports"][0]["id"], "nbd1");
+        assert_eq!(list_body["exports"][0]["source"], "control");
 
-        let patch = admin_exchange(
-            Arc::clone(&state),
-            b"PATCH /admin/v1/exports/exp1 HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: export-update\r\nContent-Type: application/json\r\nContent-Length: 17\r\n\r\n{\"enabled\":false}",
-        )
-        .await;
-        assert_eq!(response_status(&patch), 200, "{patch}");
-        let patch_body: Value = serde_json::from_str(response_body(&patch)).unwrap();
-        assert_eq!(patch_body["export"]["enabled"], false);
+        let config = test_config(Vec::new());
+        let metrics = ExportMetrics::default();
+        let mut manager = ExportManager::new(
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            fh_key,
+            &config,
+            config_export_records(&config.exports),
+            metrics.clone(),
+            ExportManagerTargets {
+                metrics: Arc::new(Mutex::new(Vec::new())),
+                admin: Arc::new(Mutex::new(HashMap::new())),
+                admin_blocks: Arc::new(Mutex::new(HashMap::new())),
+            },
+        );
+        let reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        manager.reconcile(&reader).await.unwrap();
+        assert_eq!(metrics.active_total(), 1);
 
         let delete = admin_exchange(
-            state,
-            b"DELETE /admin/v1/exports/exp1 HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: export-delete\r\n\r\n",
+            Arc::clone(&state),
+            b"DELETE /admin/v1/exports/nbd1 HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: export-delete\r\n\r\n",
         )
         .await;
         assert_eq!(response_status(&delete), 200, "{delete}");
+        let delete_body: Value = serde_json::from_str(response_body(&delete)).unwrap();
+        assert_eq!(delete_body["removed"], "nbd1");
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        manager.reconcile(&reader).await.unwrap();
+        assert_eq!(metrics.active_total(), 0);
+        manager.shutdown().await;
+        reader.close().await.unwrap();
 
         let control = ControlPlane::open(Arc::clone(&object_store), kms)
             .await
@@ -5672,6 +5939,17 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].request_id, "export-create");
         assert_eq!(records[0].scope.tenant.as_deref(), Some("t"));
+        assert_eq!(records[0].scope.volume.as_deref(), Some("b"));
+        let (delete_records, _) = control
+            .list_audit(AuditQuery {
+                action: Some(AuditAction::ExportDelete),
+                newest_first: false,
+                ..AuditQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(delete_records.len(), 1);
+        assert_eq!(delete_records[0].request_id, "export-delete");
         control.close().await.unwrap();
     }
 
@@ -5728,13 +6006,22 @@ mod tests {
         assert_eq!(get_body["export"]["read_only"], false);
 
         let patch = admin_exchange(
-            state,
+            Arc::clone(&state),
             b"PATCH /admin/v1/exports/config-0 HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 17\r\n\r\n{\"enabled\":false}",
         )
         .await;
-        assert_eq!(response_status(&patch), 409, "{patch}");
+        assert_eq!(response_status(&patch), 400, "{patch}");
         let patch_body: Value = serde_json::from_str(response_body(&patch)).unwrap();
-        assert_eq!(patch_body["error"]["code"], "conflict");
+        assert_eq!(patch_body["error"]["code"], "bad_request");
+
+        let delete = admin_exchange(
+            state,
+            b"DELETE /admin/v1/exports/config-0 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&delete), 400, "{delete}");
+        let delete_body: Value = serde_json::from_str(response_body(&delete)).unwrap();
+        assert_eq!(delete_body["error"]["code"], "bad_request");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -465,6 +465,9 @@ pub async fn clone_volume(
     };
 
     let source_path = store::volume_db_path(tenant_name, source_volume_name);
+    if let Some(checkpoint) = checkpoint {
+        ensure_checkpoint_exists(Arc::clone(&object_store), &source_path, checkpoint).await?;
+    }
     let clone_path = store::volume_db_path(tenant_name, clone_volume_name);
     let admin = AdminBuilder::new(clone_path, Arc::clone(&object_store)).build();
     let source_spec = match checkpoint {
@@ -493,6 +496,23 @@ pub async fn clone_volume(
         "volume clone created"
     );
     Ok(record)
+}
+
+async fn ensure_checkpoint_exists(
+    object_store: Arc<dyn ObjectStore>,
+    source_path: &str,
+    checkpoint: uuid::Uuid,
+) -> Result<()> {
+    let admin = AdminBuilder::new(source_path.to_string(), object_store).build();
+    if admin
+        .list_checkpoints(None)
+        .await?
+        .into_iter()
+        .any(|existing| existing.id == checkpoint)
+    {
+        return Ok(());
+    }
+    Err(Error::not_found("snapshot", checkpoint.to_string()))
 }
 
 async fn clone_parent_checkpoint_ids(
