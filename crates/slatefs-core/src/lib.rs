@@ -23,6 +23,7 @@ pub mod store;
 pub mod vfs;
 pub mod volume;
 
+mod health;
 mod vfs_impl;
 
 pub use error::{Error, Result};

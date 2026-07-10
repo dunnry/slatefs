@@ -4,14 +4,12 @@
 //! manager, quota tracker, inode allocator, name codec, and open-file table.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use slatedb::admin::{AdminBuilder, CloneSourceSpec};
 use slatedb::config::{CheckpointOptions, CheckpointScope};
 use slatedb::object_store::ObjectStore;
 use slatedb::{Checkpoint, Db, DbReader, Settings, WriteBatch};
-use tokio::sync::Notify;
 
 use crate::attrcache::AttrCache;
 use crate::config::{CacheConfig, Compression, SlateDbConfig, VolumeDefaults};
@@ -22,7 +20,8 @@ use crate::crypto::kms::contexts;
 use crate::crypto::names::NameCodec;
 use crate::crypto::transformer::{BlockTransformMetrics, SlateBlockTransformer};
 use crate::crypto::{Cipher, Secret32, aead, random_u64};
-use crate::error::{Error, Result, is_fenced_slatedb_error};
+use crate::error::{Error, Result};
+use crate::health::VolumeHealth;
 use crate::locks::{LockManager, RangeLockTable};
 use crate::meta::alloc::InodeAllocator;
 use crate::meta::dirent::Orphan;
@@ -31,7 +30,7 @@ use crate::meta::keys;
 use crate::meta::superblock::{KEY_SUPERBLOCK, Superblock, VolumeKind};
 use crate::quota::{self, CounterMergeOperator, QuotaTracker};
 use crate::store;
-use crate::vfs::{FsError, FsResult, OpenMode};
+use crate::vfs::{FsResult, OpenMode};
 
 const DEFAULT_DISK_CACHE_OPEN_FILES: usize = 256;
 pub const DEFAULT_BLOCK_CHUNK_SIZE: u32 = 32 * 1024;
@@ -1176,11 +1175,7 @@ pub struct Volume {
     pub(crate) db: Db,
     pub(crate) superblock: Superblock,
     block_metrics: BlockTransformMetrics,
-    dead: AtomicBool,
-    fencing_events: AtomicU64,
-    degraded: AtomicBool,
-    storage_errors: AtomicU64,
-    dead_notify: Notify,
+    health: VolumeHealth,
     pub(crate) names: NameCodec,
     pub(crate) locks: LockManager,
     pub(crate) range_locks: RangeLockTable,
@@ -1260,17 +1255,14 @@ impl Volume {
         let bytes_used = quota::decode_counter(db.get(keys::KEY_QUOTA_BYTES).await?.as_deref());
         let inodes_used = quota::decode_counter(db.get(keys::KEY_QUOTA_INODES).await?.as_deref());
         let alloc = InodeAllocator::load(&db).await?;
+        let fsid = superblock.fsid;
 
         Ok(Arc::new(Volume {
             db,
             chunk_size: superblock.chunk_size as u64,
             superblock,
             block_metrics,
-            dead: AtomicBool::new(false),
-            fencing_events: AtomicU64::new(0),
-            degraded: AtomicBool::new(false),
-            storage_errors: AtomicU64::new(0),
-            dead_notify: Notify::new(),
+            health: VolumeHealth::new(Some(fsid)),
             names: NameCodec::new(dek),
             locks: LockManager::default(),
             range_locks: RangeLockTable::default(),
@@ -1291,22 +1283,22 @@ impl Volume {
     }
 
     pub fn is_dead(&self) -> bool {
-        self.dead.load(Ordering::Acquire)
+        self.health.is_dead()
     }
 
     /// Count of writer-fencing transitions observed since open.
     pub fn writer_fencing_events(&self) -> u64 {
-        self.fencing_events.load(Ordering::Relaxed)
+        self.health.writer_fencing_events()
     }
 
     /// Whether the volume has observed non-fencing storage errors since open.
     pub fn is_degraded(&self) -> bool {
-        self.degraded.load(Ordering::Acquire)
+        self.health.is_degraded()
     }
 
     /// Count of non-fencing SlateDB/object-store errors observed since open.
     pub fn storage_errors(&self) -> u64 {
-        self.storage_errors.load(Ordering::Relaxed)
+        self.health.storage_errors()
     }
 
     pub fn block_decode_failures(&self) -> u64 {
@@ -1334,107 +1326,41 @@ impl Volume {
     }
 
     pub(crate) fn ensure_live(&self) -> FsResult<()> {
-        if self.is_dead() {
-            Err(FsError::Io)
-        } else {
-            Ok(())
-        }
+        self.health.ensure_live()
     }
 
+    #[allow(dead_code)]
     fn mark_fenced(&self) {
-        if !self.dead.swap(true, Ordering::AcqRel) {
-            self.fencing_events.fetch_add(1, Ordering::Relaxed);
-            tracing::error!(
-                fsid = %format!("{:016x}", self.superblock.fsid),
-                "volume fenced by newer SlateDB writer; marking export dead"
-            );
-            self.dead_notify.notify_waiters();
-        }
+        self.health.mark_fenced();
     }
 
+    #[allow(dead_code)]
     fn mark_degraded(&self, error: &str) {
-        let errors = self.storage_errors.fetch_add(1, Ordering::Relaxed) + 1;
-        if !self.degraded.swap(true, Ordering::AcqRel) {
-            tracing::warn!(
-                fsid = %format!("{:016x}", self.superblock.fsid),
-                storage_errors = errors,
-                error = %error,
-                "volume degraded after storage error"
-            );
-        } else {
-            tracing::debug!(
-                fsid = %format!("{:016x}", self.superblock.fsid),
-                storage_errors = errors,
-                error = %error,
-                "volume storage error while degraded"
-            );
-        }
+        self.health.mark_degraded(error);
     }
 
     pub async fn wait_dead(&self) {
-        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
-        while !self.is_dead() {
-            tokio::select! {
-                _ = self.dead_notify.notified() => {}
-                _ = tick.tick() => {}
-            }
-        }
+        self.health.wait_dead().await;
     }
 
     pub(crate) fn note_storage_error(&self, error: &slatedb::Error) {
-        if is_fenced_slatedb_error(error) {
-            self.mark_fenced();
-        } else {
-            self.mark_degraded(&error.to_string());
-        }
+        self.health.note_storage_error(error);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn note_core_error(&self, error: &Error) {
-        match error {
-            Error::SlateDb(error) => self.note_storage_error(error),
-            Error::ObjectStore(_) | Error::Crypto(_) | Error::Codec(_) | Error::Io(_) => {
-                self.mark_degraded(&error.to_string());
-            }
-            Error::NotFound { .. }
-            | Error::AlreadyExists { .. }
-            | Error::Invalid { .. }
-            | Error::Config(_) => {}
-        }
+        self.health.note_core_error(error);
     }
 
     pub(crate) fn map_storage<T>(
         &self,
         result: std::result::Result<T, slatedb::Error>,
     ) -> FsResult<T> {
-        if self.is_dead() {
-            return Err(FsError::Io);
-        }
-        match result {
-            Ok(value) => {
-                self.ensure_live()?;
-                Ok(value)
-            }
-            Err(error) => {
-                self.note_storage_error(&error);
-                Err(FsError::from(error))
-            }
-        }
+        self.health.map_storage(result)
     }
 
     pub(crate) fn map_core<T>(&self, result: Result<T>) -> FsResult<T> {
-        if self.is_dead() {
-            return Err(FsError::Io);
-        }
-        match result {
-            Ok(value) => {
-                self.ensure_live()?;
-                Ok(value)
-            }
-            Err(error) => {
-                self.note_core_error(&error);
-                Err(FsError::from(error))
-            }
-        }
+        self.health.map_core(result)
     }
 
     /// Flush acknowledged writes to durable storage (DD-7).

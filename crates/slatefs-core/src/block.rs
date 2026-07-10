@@ -2,7 +2,6 @@
 //! byte range backed by the existing chunk keyspace at `c/<BLOCK_INO>/<idx>`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -14,7 +13,8 @@ use crate::control::{VolumeRecord, VolumeState};
 use crate::crypto::Secret32;
 use crate::crypto::transformer::SlateBlockTransformer;
 use crate::data;
-use crate::error::{Error, Result, is_fenced_slatedb_error};
+use crate::error::{Error, Result};
+use crate::health::VolumeHealth;
 use crate::locks::LockManager;
 use crate::meta::keys;
 use crate::meta::superblock::{KEY_SUPERBLOCK, Superblock, VolumeKind};
@@ -54,11 +54,7 @@ pub struct BlockVolume {
     geometry: BlockGeometry,
     locks: LockManager,
     quota: QuotaTracker,
-    dead: AtomicBool,
-    fencing_events: AtomicU64,
-    degraded: AtomicBool,
-    storage_errors: AtomicU64,
-    dead_notify: tokio::sync::Notify,
+    health: VolumeHealth,
 }
 
 impl BlockVolume {
@@ -122,28 +118,24 @@ impl BlockVolume {
             },
             locks: LockManager::default(),
             quota: QuotaTracker::new(bytes_used, inodes_used, record.quota),
-            dead: AtomicBool::new(false),
-            fencing_events: AtomicU64::new(0),
-            degraded: AtomicBool::new(false),
-            storage_errors: AtomicU64::new(0),
-            dead_notify: tokio::sync::Notify::new(),
+            health: VolumeHealth::new(None),
         }))
     }
 
     pub fn is_dead(&self) -> bool {
-        self.dead.load(Ordering::Acquire)
+        self.health.is_dead()
     }
 
     pub fn writer_fencing_events(&self) -> u64 {
-        self.fencing_events.load(Ordering::Relaxed)
+        self.health.writer_fencing_events()
     }
 
     pub fn is_degraded(&self) -> bool {
-        self.degraded.load(Ordering::Acquire)
+        self.health.is_degraded()
     }
 
     pub fn storage_errors(&self) -> u64 {
-        self.storage_errors.load(Ordering::Relaxed)
+        self.health.storage_errors()
     }
 
     pub fn quota_usage(&self) -> (i64, i64) {
@@ -256,99 +248,38 @@ impl BlockVolume {
     }
 
     fn ensure_live(&self) -> FsResult<()> {
-        if self.is_dead() {
-            Err(FsError::Io)
-        } else {
-            Ok(())
-        }
+        self.health.ensure_live()
     }
 
+    #[allow(dead_code)]
     fn mark_fenced(&self) {
-        if !self.dead.swap(true, Ordering::AcqRel) {
-            self.fencing_events.fetch_add(1, Ordering::Relaxed);
-            tracing::error!("block volume fenced by newer SlateDB writer; marking export dead");
-            self.dead_notify.notify_waiters();
-        }
+        self.health.mark_fenced();
     }
 
+    #[allow(dead_code)]
     fn mark_degraded(&self, error: &str) {
-        let errors = self.storage_errors.fetch_add(1, Ordering::Relaxed) + 1;
-        if !self.degraded.swap(true, Ordering::AcqRel) {
-            tracing::warn!(
-                storage_errors = errors,
-                error,
-                "block volume degraded after storage error"
-            );
-        } else {
-            tracing::debug!(
-                storage_errors = errors,
-                error,
-                "block volume storage error while degraded"
-            );
-        }
+        self.health.mark_degraded(error);
     }
 
     pub async fn wait_dead(&self) {
-        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
-        while !self.is_dead() {
-            tokio::select! {
-                _ = self.dead_notify.notified() => {}
-                _ = tick.tick() => {}
-            }
-        }
+        self.health.wait_dead().await;
     }
 
     fn note_storage_error(&self, error: &slatedb::Error) {
-        if is_fenced_slatedb_error(error) {
-            self.mark_fenced();
-        } else {
-            self.mark_degraded(&error.to_string());
-        }
+        self.health.note_storage_error(error);
     }
 
+    #[allow(dead_code)]
     fn note_core_error(&self, error: &Error) {
-        match error {
-            Error::SlateDb(error) => self.note_storage_error(error),
-            Error::ObjectStore(_) | Error::Crypto(_) | Error::Codec(_) | Error::Io(_) => {
-                self.mark_degraded(&error.to_string());
-            }
-            Error::NotFound { .. }
-            | Error::AlreadyExists { .. }
-            | Error::Invalid { .. }
-            | Error::Config(_) => {}
-        }
+        self.health.note_core_error(error);
     }
 
     fn map_storage<T>(&self, result: std::result::Result<T, slatedb::Error>) -> FsResult<T> {
-        if self.is_dead() {
-            return Err(FsError::Io);
-        }
-        match result {
-            Ok(value) => {
-                self.ensure_live()?;
-                Ok(value)
-            }
-            Err(error) => {
-                self.note_storage_error(&error);
-                Err(FsError::from(error))
-            }
-        }
+        self.health.map_storage(result)
     }
 
     fn map_core<T>(&self, result: Result<T>) -> FsResult<T> {
-        if self.is_dead() {
-            return Err(FsError::Io);
-        }
-        match result {
-            Ok(value) => {
-                self.ensure_live()?;
-                Ok(value)
-            }
-            Err(error) => {
-                self.note_core_error(&error);
-                Err(FsError::from(error))
-            }
-        }
+        self.health.map_core(result)
     }
 
     async fn stage_zeroes_for_existing_chunk(
