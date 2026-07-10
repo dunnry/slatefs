@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde::{Deserialize, Serialize};
+use slatedb::bytes::Bytes;
 use slatedb::object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
-use slatedb::{Db, DbReader, Settings, WriteBatch, config::DbReaderOptions};
+use slatedb::{Db, DbIterator, DbReader, Settings, WriteBatch, config::DbReaderOptions};
 
 use crate::config::{
     AtimeMode, ClientAddrRule, Compression, ExportConfig, ExportProtocol, NbdSyncMode, SquashMode,
@@ -690,6 +691,41 @@ pub struct ControlReader {
     kms: Arc<dyn Kms>,
 }
 
+trait ControlRead {
+    async fn get_bytes(&self, key: &[u8]) -> std::result::Result<Option<Bytes>, slatedb::Error>;
+
+    async fn scan_control_prefix(
+        &self,
+        prefix: &[u8],
+    ) -> std::result::Result<DbIterator, slatedb::Error>;
+}
+
+impl ControlRead for Db {
+    async fn get_bytes(&self, key: &[u8]) -> std::result::Result<Option<Bytes>, slatedb::Error> {
+        self.get(key).await
+    }
+
+    async fn scan_control_prefix(
+        &self,
+        prefix: &[u8],
+    ) -> std::result::Result<DbIterator, slatedb::Error> {
+        self.scan_prefix(prefix, ..).await
+    }
+}
+
+impl ControlRead for DbReader {
+    async fn get_bytes(&self, key: &[u8]) -> std::result::Result<Option<Bytes>, slatedb::Error> {
+        self.get(key).await
+    }
+
+    async fn scan_control_prefix(
+        &self,
+        prefix: &[u8],
+    ) -> std::result::Result<DbIterator, slatedb::Error> {
+        self.scan_prefix(prefix, ..).await
+    }
+}
+
 impl ControlPlane {
     /// Open (initializing on first use) the control DB.
     ///
@@ -809,7 +845,7 @@ impl ControlPlane {
         &self,
         query: AuditQuery<'_>,
     ) -> Result<(Vec<AuditRecord>, Option<String>)> {
-        list_audit_from_db(&self.db, query).await
+        list_audit_impl(&self.db, query).await
     }
 
     async fn next_audit_key(&self, requested_time: u64) -> Result<(u64, u32, Vec<u8>)> {
@@ -861,16 +897,11 @@ impl ControlPlane {
     }
 
     pub async fn try_get_tenant(&self, name: &str) -> Result<Option<TenantRecord>> {
-        match self.db.get(tenant_key(name).as_bytes()).await? {
-            Some(bytes) => Ok(Some(decode_tenant_record(&bytes)?)),
-            None => Ok(None),
-        }
+        try_get_tenant_impl(&self.db, name).await
     }
 
     pub async fn get_tenant(&self, name: &str) -> Result<TenantRecord> {
-        self.try_get_tenant(name)
-            .await?
-            .ok_or_else(|| Error::not_found("tenant", name))
+        get_tenant_impl(&self.db, name).await
     }
 
     pub async fn suspend_tenant(&self, name: &str) -> Result<TenantRecord> {
@@ -911,15 +942,7 @@ impl ControlPlane {
 
     /// Unwrap a tenant's KEK via the master KMS.
     pub async fn unwrap_tenant_kek(&self, tenant: &TenantRecord) -> Result<Secret32> {
-        if tenant.wrapped_kek.is_empty() {
-            return Err(Error::invalid(
-                "tenant key",
-                format!("tenant {:?} has been crypto-shredded", tenant.name),
-            ));
-        }
-        self.kms
-            .unwrap(&tenant.wrapped_kek, &contexts::tenant_kek(&tenant.name))
-            .await
+        unwrap_tenant_kek_impl(self.kms.as_ref(), tenant).await
     }
 
     /// Rotate one tenant KEK by rewrapping every active volume DEK.
@@ -988,16 +1011,11 @@ impl ControlPlane {
     }
 
     pub async fn try_get_volume(&self, tenant: &str, volume: &str) -> Result<Option<VolumeRecord>> {
-        match self.db.get(volume_key(tenant, volume).as_bytes()).await? {
-            Some(bytes) => Ok(Some(decode_volume_record(&bytes)?)),
-            None => Ok(None),
-        }
+        try_get_volume_impl(&self.db, tenant, volume).await
     }
 
     pub async fn get_volume(&self, tenant: &str, volume: &str) -> Result<VolumeRecord> {
-        self.try_get_volume(tenant, volume)
-            .await?
-            .ok_or_else(|| Error::not_found("volume", format!("{tenant}/{volume}")))
+        get_volume_impl(&self.db, tenant, volume).await
     }
 
     pub async fn list_volumes(&self, tenant: &str) -> Result<Vec<VolumeRecord>> {
@@ -1122,21 +1140,7 @@ impl ControlPlane {
     /// lifecycle gate: suspended tenants keep their metadata and keys, but
     /// new daemon exports refuse to open them.
     pub async fn get_mountable_volume(&self, tenant: &str, volume: &str) -> Result<VolumeRecord> {
-        let tenant_record = self.get_tenant(tenant).await?;
-        if tenant_record.state != TenantState::Active {
-            return Err(Error::invalid(
-                "tenant state",
-                format!("tenant {tenant:?} is {:?}, not Active", tenant_record.state),
-            ));
-        }
-        let record = self.get_volume(tenant, volume).await?;
-        if record.state != VolumeState::Active {
-            return Err(Error::invalid(
-                "volume state",
-                format!("volume {tenant}/{volume} is {:?}, not Active", record.state),
-            ));
-        }
-        Ok(record)
+        get_mountable_volume_impl(&self.db, tenant, volume).await
     }
 
     pub async fn set_volume_quota(
@@ -1200,14 +1204,7 @@ impl ControlPlane {
         tenant: &str,
         volume: &str,
     ) -> Result<Option<SnapshotRetentionPolicy>> {
-        match self
-            .db
-            .get(snapshot_retention_key(tenant, volume).as_bytes())
-            .await?
-        {
-            Some(bytes) => Ok(Some(decode_snapshot_retention_policy(&bytes)?)),
-            None => Ok(None),
-        }
+        try_get_snapshot_retention_policy_impl(&self.db, tenant, volume).await
     }
 
     pub async fn get_snapshot_retention_policy(
@@ -1240,17 +1237,7 @@ impl ControlPlane {
     }
 
     pub async fn list_snapshot_retention_policies(&self) -> Result<Vec<SnapshotRetentionPolicy>> {
-        let mut iter = self.db.scan_prefix(b"sr/".as_slice(), ..).await?;
-        let mut policies = Vec::new();
-        while let Some(kv) = iter.next().await? {
-            policies.push(decode_snapshot_retention_policy(&kv.value)?);
-        }
-        policies.sort_by(|a, b| {
-            a.tenant
-                .cmp(&b.tenant)
-                .then_with(|| a.volume.cmp(&b.volume))
-        });
-        Ok(policies)
+        list_snapshot_retention_policies_impl(&self.db).await
     }
 
     // ---- exports (control-plane managed live export definitions) ----
@@ -1322,26 +1309,15 @@ impl ControlPlane {
     }
 
     pub async fn try_get_export(&self, id: &str) -> Result<Option<ExportRecord>> {
-        match self.db.get(export_key(id).as_bytes()).await? {
-            Some(bytes) => Ok(Some(decode_export_record(&bytes)?)),
-            None => Ok(None),
-        }
+        try_get_export_impl(&self.db, id).await
     }
 
     pub async fn get_export(&self, id: &str) -> Result<ExportRecord> {
-        self.try_get_export(id)
-            .await?
-            .ok_or_else(|| Error::not_found("export", id))
+        get_export_impl(&self.db, id).await
     }
 
     pub async fn list_exports(&self) -> Result<Vec<ExportRecord>> {
-        let mut iter = self.db.scan_prefix(b"e/".as_slice(), ..).await?;
-        let mut exports = Vec::new();
-        while let Some(kv) = iter.next().await? {
-            exports.push(decode_export_record(&kv.value)?);
-        }
-        exports.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(exports)
+        list_exports_impl(&self.db).await
     }
 
     // ---- fleet placement (nodes, stable endpoints, failover, drain) ----
@@ -1408,13 +1384,7 @@ impl ControlPlane {
     }
 
     pub async fn list_daemon_nodes(&self) -> Result<Vec<DaemonNodeRecord>> {
-        let mut iter = self.db.scan_prefix(b"dn/".as_slice(), ..).await?;
-        let mut nodes: Vec<DaemonNodeRecord> = Vec::new();
-        while let Some(kv) = iter.next().await? {
-            nodes.push(decode_versioned(DAEMON_NODE_RECORD_VERSION, &kv.value)?);
-        }
-        nodes.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(nodes)
+        list_daemon_nodes_impl(&self.db).await
     }
 
     pub async fn record_daemon_health_at(
@@ -1494,17 +1464,7 @@ impl ControlPlane {
         tenant: &str,
         volume: &str,
     ) -> Result<Option<VolumePlacementRecord>> {
-        match self
-            .db
-            .get(volume_placement_key(tenant, volume).as_bytes())
-            .await?
-        {
-            Some(bytes) => Ok(Some(decode_versioned(
-                VOLUME_PLACEMENT_RECORD_VERSION,
-                &bytes,
-            )?)),
-            None => Ok(None),
-        }
+        try_get_volume_placement_impl(&self.db, tenant, volume).await
     }
 
     pub async fn get_volume_placement(
@@ -1528,20 +1488,7 @@ impl ControlPlane {
     }
 
     pub async fn list_volume_placements(&self) -> Result<Vec<VolumePlacementRecord>> {
-        let mut iter = self.db.scan_prefix(b"vp/".as_slice(), ..).await?;
-        let mut placements: Vec<VolumePlacementRecord> = Vec::new();
-        while let Some(kv) = iter.next().await? {
-            placements.push(decode_versioned(
-                VOLUME_PLACEMENT_RECORD_VERSION,
-                &kv.value,
-            )?);
-        }
-        placements.sort_by(|a, b| {
-            a.tenant
-                .cmp(&b.tenant)
-                .then_with(|| a.volume.cmp(&b.volume))
-        });
-        Ok(placements)
+        list_volume_placements_impl(&self.db).await
     }
 
     pub async fn delete_volume_placement(&self, tenant: &str, volume: &str) -> Result<()> {
@@ -2015,22 +1962,7 @@ impl ControlPlane {
 
     /// Unwrap a volume's DEK: master KMS → tenant KEK → volume DEK (DD-8).
     pub async fn unwrap_volume_dek(&self, record: &VolumeRecord) -> Result<Secret32> {
-        if record.wrapped_dek.is_empty() {
-            return Err(Error::invalid(
-                "volume key",
-                format!(
-                    "volume {}/{} has been crypto-shredded",
-                    record.tenant, record.name
-                ),
-            ));
-        }
-        let tenant = self.get_tenant(&record.tenant).await?;
-        let kek = self.unwrap_tenant_kek(&tenant).await?;
-        crate::crypto::aead::unwrap_key(
-            &kek,
-            &contexts::volume_dek(&record.tenant, &record.name),
-            &record.wrapped_dek,
-        )
+        unwrap_volume_dek_impl(&self.db, self.kms.as_ref(), record).await
     }
 
     /// Server key that HMACs NFS file handles (plan §5) so handles can't be
@@ -2068,16 +2000,11 @@ impl ControlReader {
     }
 
     pub async fn try_get_tenant(&self, name: &str) -> Result<Option<TenantRecord>> {
-        match self.db.get(tenant_key(name).as_bytes()).await? {
-            Some(bytes) => Ok(Some(decode_tenant_record(&bytes)?)),
-            None => Ok(None),
-        }
+        try_get_tenant_impl(&self.db, name).await
     }
 
     pub async fn get_tenant(&self, name: &str) -> Result<TenantRecord> {
-        self.try_get_tenant(name)
-            .await?
-            .ok_or_else(|| Error::not_found("tenant", name))
+        get_tenant_impl(&self.db, name).await
     }
 
     pub async fn list_tenants(&self) -> Result<Vec<TenantRecord>> {
@@ -2091,65 +2018,23 @@ impl ControlReader {
     }
 
     pub async fn try_get_volume(&self, tenant: &str, volume: &str) -> Result<Option<VolumeRecord>> {
-        match self.db.get(volume_key(tenant, volume).as_bytes()).await? {
-            Some(bytes) => Ok(Some(decode_volume_record(&bytes)?)),
-            None => Ok(None),
-        }
+        try_get_volume_impl(&self.db, tenant, volume).await
     }
 
     pub async fn get_volume(&self, tenant: &str, volume: &str) -> Result<VolumeRecord> {
-        self.try_get_volume(tenant, volume)
-            .await?
-            .ok_or_else(|| Error::not_found("volume", format!("{tenant}/{volume}")))
+        get_volume_impl(&self.db, tenant, volume).await
     }
 
     pub async fn get_mountable_volume(&self, tenant: &str, volume: &str) -> Result<VolumeRecord> {
-        let tenant_record = self.get_tenant(tenant).await?;
-        if tenant_record.state != TenantState::Active {
-            return Err(Error::invalid(
-                "tenant state",
-                format!("tenant {tenant:?} is {:?}, not Active", tenant_record.state),
-            ));
-        }
-        let record = self.get_volume(tenant, volume).await?;
-        if record.state != VolumeState::Active {
-            return Err(Error::invalid(
-                "volume state",
-                format!("volume {tenant}/{volume} is {:?}, not Active", record.state),
-            ));
-        }
-        Ok(record)
+        get_mountable_volume_impl(&self.db, tenant, volume).await
     }
 
     pub async fn unwrap_tenant_kek(&self, tenant: &TenantRecord) -> Result<Secret32> {
-        if tenant.wrapped_kek.is_empty() {
-            return Err(Error::invalid(
-                "tenant key",
-                format!("tenant {:?} has been crypto-shredded", tenant.name),
-            ));
-        }
-        self.kms
-            .unwrap(&tenant.wrapped_kek, &contexts::tenant_kek(&tenant.name))
-            .await
+        unwrap_tenant_kek_impl(self.kms.as_ref(), tenant).await
     }
 
     pub async fn unwrap_volume_dek(&self, record: &VolumeRecord) -> Result<Secret32> {
-        if record.wrapped_dek.is_empty() {
-            return Err(Error::invalid(
-                "volume key",
-                format!(
-                    "volume {}/{} has been crypto-shredded",
-                    record.tenant, record.name
-                ),
-            ));
-        }
-        let tenant = self.get_tenant(&record.tenant).await?;
-        let kek = self.unwrap_tenant_kek(&tenant).await?;
-        crate::crypto::aead::unwrap_key(
-            &kek,
-            &contexts::volume_dek(&record.tenant, &record.name),
-            &record.wrapped_dek,
-        )
+        unwrap_volume_dek_impl(&self.db, self.kms.as_ref(), record).await
     }
 
     pub async fn list_volumes(&self, tenant: &str) -> Result<Vec<VolumeRecord>> {
@@ -2168,38 +2053,15 @@ impl ControlReader {
         tenant: &str,
         volume: &str,
     ) -> Result<Option<SnapshotRetentionPolicy>> {
-        match self
-            .db
-            .get(snapshot_retention_key(tenant, volume).as_bytes())
-            .await?
-        {
-            Some(bytes) => Ok(Some(decode_snapshot_retention_policy(&bytes)?)),
-            None => Ok(None),
-        }
+        try_get_snapshot_retention_policy_impl(&self.db, tenant, volume).await
     }
 
     pub async fn list_snapshot_retention_policies(&self) -> Result<Vec<SnapshotRetentionPolicy>> {
-        let mut iter = self.db.scan_prefix(b"sr/".as_slice(), ..).await?;
-        let mut policies = Vec::new();
-        while let Some(kv) = iter.next().await? {
-            policies.push(decode_snapshot_retention_policy(&kv.value)?);
-        }
-        policies.sort_by(|a, b| {
-            a.tenant
-                .cmp(&b.tenant)
-                .then_with(|| a.volume.cmp(&b.volume))
-        });
-        Ok(policies)
+        list_snapshot_retention_policies_impl(&self.db).await
     }
 
     pub async fn list_daemon_nodes(&self) -> Result<Vec<DaemonNodeRecord>> {
-        let mut iter = self.db.scan_prefix(b"dn/".as_slice(), ..).await?;
-        let mut nodes = Vec::new();
-        while let Some(kv) = iter.next().await? {
-            nodes.push(decode_daemon_node_record(&kv.value)?);
-        }
-        nodes.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(nodes)
+        list_daemon_nodes_impl(&self.db).await
     }
 
     pub async fn try_get_volume_placement(
@@ -2207,59 +2069,232 @@ impl ControlReader {
         tenant: &str,
         volume: &str,
     ) -> Result<Option<VolumePlacementRecord>> {
-        match self
-            .db
-            .get(volume_placement_key(tenant, volume).as_bytes())
-            .await?
-        {
-            Some(bytes) => Ok(Some(decode_volume_placement_record(&bytes)?)),
-            None => Ok(None),
-        }
+        try_get_volume_placement_impl(&self.db, tenant, volume).await
     }
 
     pub async fn list_volume_placements(&self) -> Result<Vec<VolumePlacementRecord>> {
-        let mut iter = self.db.scan_prefix(b"vp/".as_slice(), ..).await?;
-        let mut placements = Vec::new();
-        while let Some(kv) = iter.next().await? {
-            placements.push(decode_volume_placement_record(&kv.value)?);
-        }
-        placements.sort_by(|a, b| {
-            a.tenant
-                .cmp(&b.tenant)
-                .then_with(|| a.volume.cmp(&b.volume))
-        });
-        Ok(placements)
+        list_volume_placements_impl(&self.db).await
     }
 
     pub async fn try_get_export(&self, id: &str) -> Result<Option<ExportRecord>> {
-        match self.db.get(export_key(id).as_bytes()).await? {
-            Some(bytes) => Ok(Some(decode_export_record(&bytes)?)),
-            None => Ok(None),
-        }
+        try_get_export_impl(&self.db, id).await
     }
 
     pub async fn get_export(&self, id: &str) -> Result<ExportRecord> {
-        self.try_get_export(id)
-            .await?
-            .ok_or_else(|| Error::not_found("export", id))
+        get_export_impl(&self.db, id).await
     }
 
     pub async fn list_exports(&self) -> Result<Vec<ExportRecord>> {
-        let mut iter = self.db.scan_prefix(b"e/".as_slice(), ..).await?;
-        let mut exports = Vec::new();
-        while let Some(kv) = iter.next().await? {
-            exports.push(decode_export_record(&kv.value)?);
-        }
-        exports.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(exports)
+        list_exports_impl(&self.db).await
     }
 
     pub async fn list_audit(
         &self,
         query: AuditQuery<'_>,
     ) -> Result<(Vec<AuditRecord>, Option<String>)> {
-        list_audit_from_reader(&self.db, query).await
+        list_audit_impl(&self.db, query).await
     }
+}
+
+async fn try_get_tenant_impl<R: ControlRead>(db: &R, name: &str) -> Result<Option<TenantRecord>> {
+    let key = tenant_key(name);
+    match db.get_bytes(key.as_bytes()).await? {
+        Some(bytes) => Ok(Some(decode_tenant_record(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
+async fn get_tenant_impl<R: ControlRead>(db: &R, name: &str) -> Result<TenantRecord> {
+    try_get_tenant_impl(db, name)
+        .await?
+        .ok_or_else(|| Error::not_found("tenant", name))
+}
+
+async fn try_get_volume_impl<R: ControlRead>(
+    db: &R,
+    tenant: &str,
+    volume: &str,
+) -> Result<Option<VolumeRecord>> {
+    let key = volume_key(tenant, volume);
+    match db.get_bytes(key.as_bytes()).await? {
+        Some(bytes) => Ok(Some(decode_volume_record(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
+async fn get_volume_impl<R: ControlRead>(
+    db: &R,
+    tenant: &str,
+    volume: &str,
+) -> Result<VolumeRecord> {
+    try_get_volume_impl(db, tenant, volume)
+        .await?
+        .ok_or_else(|| Error::not_found("volume", format!("{tenant}/{volume}")))
+}
+
+async fn get_mountable_volume_impl<R: ControlRead>(
+    db: &R,
+    tenant: &str,
+    volume: &str,
+) -> Result<VolumeRecord> {
+    let tenant_record = get_tenant_impl(db, tenant).await?;
+    if tenant_record.state != TenantState::Active {
+        return Err(Error::invalid(
+            "tenant state",
+            format!("tenant {tenant:?} is {:?}, not Active", tenant_record.state),
+        ));
+    }
+    let record = get_volume_impl(db, tenant, volume).await?;
+    if record.state != VolumeState::Active {
+        return Err(Error::invalid(
+            "volume state",
+            format!("volume {tenant}/{volume} is {:?}, not Active", record.state),
+        ));
+    }
+    Ok(record)
+}
+
+async fn unwrap_tenant_kek_impl(kms: &dyn Kms, tenant: &TenantRecord) -> Result<Secret32> {
+    if tenant.wrapped_kek.is_empty() {
+        return Err(Error::invalid(
+            "tenant key",
+            format!("tenant {:?} has been crypto-shredded", tenant.name),
+        ));
+    }
+    kms.unwrap(&tenant.wrapped_kek, &contexts::tenant_kek(&tenant.name))
+        .await
+}
+
+async fn unwrap_volume_dek_impl<R: ControlRead>(
+    db: &R,
+    kms: &dyn Kms,
+    record: &VolumeRecord,
+) -> Result<Secret32> {
+    if record.wrapped_dek.is_empty() {
+        return Err(Error::invalid(
+            "volume key",
+            format!(
+                "volume {}/{} has been crypto-shredded",
+                record.tenant, record.name
+            ),
+        ));
+    }
+    let tenant = get_tenant_impl(db, &record.tenant).await?;
+    let kek = unwrap_tenant_kek_impl(kms, &tenant).await?;
+    crate::crypto::aead::unwrap_key(
+        &kek,
+        &contexts::volume_dek(&record.tenant, &record.name),
+        &record.wrapped_dek,
+    )
+}
+
+async fn try_get_snapshot_retention_policy_impl<R: ControlRead>(
+    db: &R,
+    tenant: &str,
+    volume: &str,
+) -> Result<Option<SnapshotRetentionPolicy>> {
+    let key = snapshot_retention_key(tenant, volume);
+    match db.get_bytes(key.as_bytes()).await? {
+        Some(bytes) => Ok(Some(decode_snapshot_retention_policy(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
+async fn list_snapshot_retention_policies_impl<R: ControlRead>(
+    db: &R,
+) -> Result<Vec<SnapshotRetentionPolicy>> {
+    let mut iter = db.scan_control_prefix(b"sr/").await?;
+    let mut policies = Vec::new();
+    while let Some(kv) = iter.next().await? {
+        policies.push(decode_snapshot_retention_policy(&kv.value)?);
+    }
+    policies.sort_by(|a, b| {
+        a.tenant
+            .cmp(&b.tenant)
+            .then_with(|| a.volume.cmp(&b.volume))
+    });
+    Ok(policies)
+}
+
+async fn list_daemon_nodes_impl<R: ControlRead>(db: &R) -> Result<Vec<DaemonNodeRecord>> {
+    let mut iter = db.scan_control_prefix(b"dn/").await?;
+    let mut nodes = Vec::new();
+    while let Some(kv) = iter.next().await? {
+        nodes.push(decode_daemon_node_record(&kv.value)?);
+    }
+    nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(nodes)
+}
+
+async fn try_get_volume_placement_impl<R: ControlRead>(
+    db: &R,
+    tenant: &str,
+    volume: &str,
+) -> Result<Option<VolumePlacementRecord>> {
+    let key = volume_placement_key(tenant, volume);
+    match db.get_bytes(key.as_bytes()).await? {
+        Some(bytes) => Ok(Some(decode_volume_placement_record(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
+async fn list_volume_placements_impl<R: ControlRead>(db: &R) -> Result<Vec<VolumePlacementRecord>> {
+    let mut iter = db.scan_control_prefix(b"vp/").await?;
+    let mut placements = Vec::new();
+    while let Some(kv) = iter.next().await? {
+        placements.push(decode_volume_placement_record(&kv.value)?);
+    }
+    placements.sort_by(|a, b| {
+        a.tenant
+            .cmp(&b.tenant)
+            .then_with(|| a.volume.cmp(&b.volume))
+    });
+    Ok(placements)
+}
+
+async fn try_get_export_impl<R: ControlRead>(db: &R, id: &str) -> Result<Option<ExportRecord>> {
+    let key = export_key(id);
+    match db.get_bytes(key.as_bytes()).await? {
+        Some(bytes) => Ok(Some(decode_export_record(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
+async fn get_export_impl<R: ControlRead>(db: &R, id: &str) -> Result<ExportRecord> {
+    try_get_export_impl(db, id)
+        .await?
+        .ok_or_else(|| Error::not_found("export", id))
+}
+
+async fn list_exports_impl<R: ControlRead>(db: &R) -> Result<Vec<ExportRecord>> {
+    let mut iter = db.scan_control_prefix(b"e/").await?;
+    let mut exports = Vec::new();
+    while let Some(kv) = iter.next().await? {
+        exports.push(decode_export_record(&kv.value)?);
+    }
+    exports.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(exports)
+}
+
+async fn list_audit_impl<R: ControlRead>(
+    db: &R,
+    query: AuditQuery<'_>,
+) -> Result<(Vec<AuditRecord>, Option<String>)> {
+    let mut iter = db.scan_control_prefix(b"a/").await?;
+    let mut records = Vec::new();
+    while let Some(kv) = iter.next().await? {
+        let Some((time, _)) = parse_audit_key(kv.key.as_ref()) else {
+            continue;
+        };
+        if !audit_time_matches(time, &query) {
+            continue;
+        }
+        let record = decode_audit_record(&kv.value)?;
+        if audit_record_matches(&record, &query) {
+            records.push(record);
+        }
+    }
+    page_audit_records(records, query)
 }
 
 fn validate_limit(kind: &'static str, limit: &QuotaLimit) -> Result<()> {
@@ -2445,48 +2480,6 @@ fn now_unix_nanos() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
-}
-
-async fn list_audit_from_db(
-    db: &Db,
-    query: AuditQuery<'_>,
-) -> Result<(Vec<AuditRecord>, Option<String>)> {
-    let mut iter = db.scan_prefix(b"a/".as_slice(), ..).await?;
-    let mut records = Vec::new();
-    while let Some(kv) = iter.next().await? {
-        let Some((time, _)) = parse_audit_key(kv.key.as_ref()) else {
-            continue;
-        };
-        if !audit_time_matches(time, &query) {
-            continue;
-        }
-        let record = decode_audit_record(&kv.value)?;
-        if audit_record_matches(&record, &query) {
-            records.push(record);
-        }
-    }
-    page_audit_records(records, query)
-}
-
-async fn list_audit_from_reader(
-    db: &DbReader,
-    query: AuditQuery<'_>,
-) -> Result<(Vec<AuditRecord>, Option<String>)> {
-    let mut iter = db.scan_prefix(b"a/".as_slice(), ..).await?;
-    let mut records = Vec::new();
-    while let Some(kv) = iter.next().await? {
-        let Some((time, _)) = parse_audit_key(kv.key.as_ref()) else {
-            continue;
-        };
-        if !audit_time_matches(time, &query) {
-            continue;
-        }
-        let record = decode_audit_record(&kv.value)?;
-        if audit_record_matches(&record, &query) {
-            records.push(record);
-        }
-    }
-    page_audit_records(records, query)
 }
 
 fn audit_time_matches(time: u64, query: &AuditQuery<'_>) -> bool {
