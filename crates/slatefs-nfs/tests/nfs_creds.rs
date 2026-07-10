@@ -22,7 +22,7 @@ use slatefs_core::meta::inode::{ROOT_INO, Timespec};
 use slatefs_core::store::{self, ObjectStore};
 use slatefs_core::vfs::{Credentials, SetAttrs, TimeSet, Vfs};
 use slatefs_core::volume::{self, CreateVolumeOptions, Volume};
-use slatefs_nfs::{NFSTcp, SquashPolicy};
+use slatefs_nfs::{NFSTcp, NfsExportOptions, SquashPolicy};
 
 const TEST_CHUNK: u32 = 4096;
 
@@ -61,10 +61,15 @@ async fn make_volume(object_store: Arc<dyn ObjectStore>, quota_bytes: Option<u64
 }
 
 async fn serve(volume: Arc<Volume>, policy: SquashPolicy) -> u16 {
-    let listener =
-        slatefs_nfs::bind_export(volume, Secret32::from_bytes([7; 32]), policy, "127.0.0.1:0")
-            .await
-            .expect("bind export");
+    let listener = slatefs_nfs::bind_export(
+        volume,
+        Secret32::from_bytes([7; 32]),
+        policy,
+        "127.0.0.1:0",
+        NfsExportOptions::default(),
+    )
+    .await
+    .expect("bind export");
     let port = listener.get_listen_port();
     tokio::spawn(async move {
         let _ = listener.handle_forever().await;
@@ -73,12 +78,15 @@ async fn serve(volume: Arc<Volume>, policy: SquashPolicy) -> u16 {
 }
 
 async fn serve_with_atime(volume: Arc<Volume>, policy: SquashPolicy, atime: AtimeMode) -> u16 {
-    let listener = slatefs_nfs::bind_export_with_atime_policy(
+    let listener = slatefs_nfs::bind_export(
         volume,
         Secret32::from_bytes([7; 32]),
         policy,
-        atime,
         "127.0.0.1:0",
+        NfsExportOptions {
+            atime_policy: atime,
+            ..NfsExportOptions::default()
+        },
     )
     .await
     .expect("bind export");

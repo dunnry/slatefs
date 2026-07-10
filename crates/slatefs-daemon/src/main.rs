@@ -40,8 +40,8 @@ use slatefs_core::snapshot::SnapshotVolume;
 use slatefs_core::store;
 use slatefs_core::vfs::Vfs;
 use slatefs_core::volume::{self, Volume, VolumeCaches};
-use slatefs_nbd::NbdShutdownHandle;
-use slatefs_nfs::{NFSTcp, NfsExportRuntime, QuotaRejectionAudit, SquashPolicy};
+use slatefs_nbd::{NbdExportOptions, NbdShutdownHandle, NbdTlsConfig};
+use slatefs_nfs::{NFSTcp, NfsExportOptions, QuotaRejectionAudit, SquashPolicy};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
@@ -3675,26 +3675,25 @@ impl ExportManager {
                     anon_uid: desired.config.anon_uid,
                     anon_gid: desired.config.anon_gid,
                 };
-                let listener =
-                    slatefs_nfs::bind_export_with_allowlist_and_runtime_and_atime_policy(
-                        Arc::clone(&volume),
-                        self.fh_key.clone(),
-                        policy,
-                        desired.config.allowed_clients.clone(),
-                        NfsExportRuntime {
-                            rate_limiter,
-                            quota_rejection_audit: Some(quota_rejection_audit(
-                                Arc::clone(&self.object_store),
-                                Arc::clone(&self.kms),
-                                desired.config.tenant.clone(),
-                                desired.config.volume.clone(),
-                                AuditPlane::Nfs,
-                            )),
-                        },
-                        desired.config.atime,
-                        &desired.config.listen,
-                    )
-                    .await;
+                let listener = slatefs_nfs::bind_export(
+                    Arc::clone(&volume),
+                    self.fh_key.clone(),
+                    policy,
+                    &desired.config.listen,
+                    NfsExportOptions {
+                        allowed_clients: desired.config.allowed_clients.clone(),
+                        rate_limiter,
+                        quota_rejection_audit: Some(quota_rejection_audit(
+                            Arc::clone(&self.object_store),
+                            Arc::clone(&self.kms),
+                            desired.config.tenant.clone(),
+                            desired.config.volume.clone(),
+                            AuditPlane::Nfs,
+                        )),
+                        atime_policy: desired.config.atime,
+                    },
+                )
+                .await;
                 listener.map(|listener| {
                     let port = listener.get_listen_port();
                     tracing::info!(
@@ -3744,14 +3743,16 @@ impl ExportManager {
                         };
                         let loaded = load_tls_config(&kind).map_err(std::io::Error::other)?;
                         let shared = shared_server_config(Arc::clone(&loaded.config));
-                        match slatefs_9p::bind_export_tls_with_reloadable_config_and_atime_policy(
+                        match slatefs_9p::bind_export_tls(
                             Arc::clone(&volume),
                             export_name,
-                            token,
-                            allowed_clients,
-                            rate_limiter,
-                            desired.config.atime,
                             &listen,
+                            slatefs_9p::P9ExportOptions {
+                                token,
+                                allowed_clients,
+                                rate_limiter,
+                                atime_policy: desired.config.atime,
+                            },
                             Arc::clone(&shared),
                         )
                         .await
@@ -3787,14 +3788,16 @@ impl ExportManager {
                             Err(error) => Err(error),
                         }
                     }
-                    None => slatefs_9p::bind_export_with_allowlist_and_rate_limit_and_atime_policy(
+                    None => slatefs_9p::bind_export(
                         Arc::clone(&volume),
                         export_name,
-                        token,
-                        allowed_clients,
-                        rate_limiter,
-                        desired.config.atime,
                         &listen,
+                        slatefs_9p::P9ExportOptions {
+                            token,
+                            allowed_clients,
+                            rate_limiter,
+                            atime_policy: desired.config.atime,
+                        },
                     )
                     .await
                     .map(|listener| {
@@ -3845,24 +3848,33 @@ impl ExportManager {
                     ),
                 };
                 let bind = match tls {
-                    Some(identity) => {
-                        slatefs_nbd::bind_export_tls_with_allowlist_and_rate_limit(
-                            &listen,
-                            export_name,
-                            device,
-                            allowed_clients,
-                            rate_limiter,
-                            identity,
-                        )
-                        .await
-                    }
+                    Some(identity) => match NbdTlsConfig::from_identity(&identity) {
+                        Ok(tls) => {
+                            slatefs_nbd::bind_export(
+                                &listen,
+                                export_name,
+                                device,
+                                NbdExportOptions {
+                                    allowed_clients,
+                                    rate_limiter,
+                                    tls: Some(tls),
+                                    ..NbdExportOptions::default()
+                                },
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    },
                     None => {
-                        slatefs_nbd::bind_export_with_allowlist_and_rate_limit(
+                        slatefs_nbd::bind_export(
                             &listen,
                             export_name,
                             device,
-                            allowed_clients,
-                            rate_limiter,
+                            NbdExportOptions {
+                                allowed_clients,
+                                rate_limiter,
+                                ..NbdExportOptions::default()
+                            },
                         )
                         .await
                     }
@@ -6850,11 +6862,14 @@ mod tests {
 
         assert_eq!(limiter.limits().bytes_per_second, Some(1));
         let nfs_volume: Arc<dyn Vfs> = volume.clone();
-        let nfs = SlateFsNfs::new_with_rate_limiter(
+        let nfs = SlateFsNfs::new(
             nfs_volume,
             Secret32::from_bytes([32; 32]),
             SquashPolicy::trust_as_root(),
-            Some(Arc::clone(&limiter)),
+            NfsExportOptions {
+                rate_limiter: Some(Arc::clone(&limiter)),
+                ..NfsExportOptions::default()
+            },
         );
         let root = nfs.root_dir();
         let name = filename3(Opaque::borrowed(b"rate-limited"));
@@ -6959,19 +6974,20 @@ mod tests {
         });
 
         let nfs_volume: Arc<dyn Vfs> = volume.clone();
-        let nfs = SlateFsNfs::new_with_rate_limiter_and_atime_policy_and_quota_audit(
+        let nfs = SlateFsNfs::new(
             nfs_volume,
             fh_key,
             SquashPolicy::trust_as_root(),
-            AtimeMode::Relatime,
-            None,
-            Some(quota_rejection_audit(
-                Arc::clone(&object_store),
-                Arc::clone(&kms),
-                "t".to_string(),
-                "v".to_string(),
-                AuditPlane::Nfs,
-            )),
+            NfsExportOptions {
+                quota_rejection_audit: Some(quota_rejection_audit(
+                    Arc::clone(&object_store),
+                    Arc::clone(&kms),
+                    "t".to_string(),
+                    "v".to_string(),
+                    AuditPlane::Nfs,
+                )),
+                ..NfsExportOptions::default()
+            },
         );
         let root = nfs.root_dir();
         let name = filename3(Opaque::borrowed(b"quota-live"));

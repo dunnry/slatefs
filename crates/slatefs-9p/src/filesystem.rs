@@ -24,6 +24,8 @@ use slatefs_core::vfs::{
     Credentials, FileAttr, FsError, HandleId, OpenMode, SetAttrs, TimeSet, Vfs,
 };
 
+use crate::P9ExportOptions;
+
 type P9Result = rs9p::Result<FCall>;
 
 /// First real readdir offset; 1 and 2 are the synthesized "." and "..".
@@ -112,45 +114,18 @@ impl Clone for SlateFs9p {
 }
 
 impl SlateFs9p {
-    pub fn new(volume: Arc<dyn Vfs>, export_name: String, token: Option<String>) -> SlateFs9p {
-        Self::new_with_rate_limiter_and_atime_policy(
-            volume,
-            export_name,
-            token,
-            AtimeMode::Relatime,
-            None,
-        )
-    }
-
-    pub fn new_with_rate_limiter(
+    pub(crate) fn new(
         volume: Arc<dyn Vfs>,
         export_name: String,
-        token: Option<String>,
-        rate_limiter: Option<Arc<RateLimiter>>,
-    ) -> SlateFs9p {
-        Self::new_with_rate_limiter_and_atime_policy(
-            volume,
-            export_name,
-            token,
-            AtimeMode::Relatime,
-            rate_limiter,
-        )
-    }
-
-    pub fn new_with_rate_limiter_and_atime_policy(
-        volume: Arc<dyn Vfs>,
-        export_name: String,
-        token: Option<String>,
-        atime_policy: AtimeMode,
-        rate_limiter: Option<Arc<RateLimiter>>,
+        options: P9ExportOptions,
     ) -> SlateFs9p {
         SlateFs9p {
             volume,
-            atime_policy,
-            token,
+            atime_policy: options.atime_policy,
+            token: options.token,
             export_name,
             conn_authed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            rate_limiter,
+            rate_limiter: options.rate_limiter,
         }
     }
 }

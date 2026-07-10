@@ -56,6 +56,28 @@ pub struct TlsIdentity {
     pub key_path: PathBuf,
 }
 
+pub type ReloadableTlsConfig = Arc<RwLock<Arc<ServerConfig>>>;
+
+/// Configuration for a 9P export listener.
+#[derive(Clone)]
+pub struct P9ExportOptions {
+    pub token: Option<String>,
+    pub allowed_clients: Vec<ClientAddrRule>,
+    pub rate_limiter: Option<Arc<RateLimiter>>,
+    pub atime_policy: AtimeMode,
+}
+
+impl Default for P9ExportOptions {
+    fn default() -> Self {
+        Self {
+            token: None,
+            allowed_clients: Vec::new(),
+            rate_limiter: None,
+            atime_policy: AtimeMode::Relatime,
+        }
+    }
+}
+
 pub struct P9TcpListener {
     listener: TcpListener,
     fs: SlateFs9p,
@@ -95,8 +117,6 @@ pub struct P9TlsListener {
     tls: ReloadableTlsConfig,
     allowed_clients: Vec<ClientAddrRule>,
 }
-
-pub type ReloadableTlsConfig = Arc<RwLock<Arc<ServerConfig>>>;
 
 impl P9TlsListener {
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
@@ -146,176 +166,23 @@ fn install_rustls_provider() {
 pub async fn serve_export(
     volume: Arc<dyn Vfs>,
     export_name: String,
-    token: Option<String>,
     listen: &str,
+    options: P9ExportOptions,
 ) -> std::io::Result<()> {
-    serve_export_with_allowlist(volume, export_name, token, Vec::new(), listen).await
+    bind_export(volume, export_name, listen, options)
+        .await?
+        .handle_forever()
+        .await
 }
 
-/// Serve one volume export over 9P2000.L TCP with an explicit read atime
-/// policy.
-pub async fn serve_export_with_atime_policy(
+pub async fn bind_export(
     volume: Arc<dyn Vfs>,
     export_name: String,
-    token: Option<String>,
-    atime_policy: AtimeMode,
     listen: &str,
-) -> std::io::Result<()> {
-    serve_export_with_allowlist_and_atime_policy(
-        volume,
-        export_name,
-        token,
-        Vec::new(),
-        atime_policy,
-        listen,
-    )
-    .await
-}
-
-/// Serve one volume export with a source-IP allowlist. Empty
-/// `allowed_clients` means allow all clients.
-pub async fn serve_export_with_allowlist(
-    volume: Arc<dyn Vfs>,
-    export_name: String,
-    token: Option<String>,
-    allowed_clients: Vec<ClientAddrRule>,
-    listen: &str,
-) -> std::io::Result<()> {
-    serve_export_with_allowlist_and_rate_limit(
-        volume,
-        export_name,
-        token,
-        allowed_clients,
-        None,
-        listen,
-    )
-    .await
-}
-
-/// Serve one volume export with a source-IP allowlist and explicit read atime
-/// policy. Empty `allowed_clients` means allow all clients.
-pub async fn serve_export_with_allowlist_and_atime_policy(
-    volume: Arc<dyn Vfs>,
-    export_name: String,
-    token: Option<String>,
-    allowed_clients: Vec<ClientAddrRule>,
-    atime_policy: AtimeMode,
-    listen: &str,
-) -> std::io::Result<()> {
-    serve_export_with_allowlist_and_rate_limit_and_atime_policy(
-        volume,
-        export_name,
-        token,
-        allowed_clients,
-        None,
-        atime_policy,
-        listen,
-    )
-    .await
-}
-
-/// Serve one volume export with source-IP and tenant rate-limit gates.
-pub async fn serve_export_with_allowlist_and_rate_limit(
-    volume: Arc<dyn Vfs>,
-    export_name: String,
-    token: Option<String>,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-    listen: &str,
-) -> std::io::Result<()> {
-    serve_export_with_allowlist_and_rate_limit_and_atime_policy(
-        volume,
-        export_name,
-        token,
-        allowed_clients,
-        rate_limiter,
-        AtimeMode::Relatime,
-        listen,
-    )
-    .await
-}
-
-/// Serve one volume export with source-IP, tenant rate-limit, and read atime
-/// policy gates.
-pub async fn serve_export_with_allowlist_and_rate_limit_and_atime_policy(
-    volume: Arc<dyn Vfs>,
-    export_name: String,
-    token: Option<String>,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-    atime_policy: AtimeMode,
-    listen: &str,
-) -> std::io::Result<()> {
-    bind_export_with_allowlist_and_rate_limit_and_atime_policy(
-        volume,
-        export_name,
-        token,
-        allowed_clients,
-        rate_limiter,
-        atime_policy,
-        listen,
-    )
-    .await?
-    .handle_forever()
-    .await
-}
-
-pub async fn bind_export_with_allowlist_and_atime_policy(
-    volume: Arc<dyn Vfs>,
-    export_name: String,
-    token: Option<String>,
-    allowed_clients: Vec<ClientAddrRule>,
-    atime_policy: AtimeMode,
-    listen: &str,
+    options: P9ExportOptions,
 ) -> std::io::Result<P9TcpListener> {
-    bind_export_with_allowlist_and_rate_limit_and_atime_policy(
-        volume,
-        export_name,
-        token,
-        allowed_clients,
-        None,
-        atime_policy,
-        listen,
-    )
-    .await
-}
-
-pub async fn bind_export_with_allowlist_and_rate_limit(
-    volume: Arc<dyn Vfs>,
-    export_name: String,
-    token: Option<String>,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-    listen: &str,
-) -> std::io::Result<P9TcpListener> {
-    bind_export_with_allowlist_and_rate_limit_and_atime_policy(
-        volume,
-        export_name,
-        token,
-        allowed_clients,
-        rate_limiter,
-        AtimeMode::Relatime,
-        listen,
-    )
-    .await
-}
-
-pub async fn bind_export_with_allowlist_and_rate_limit_and_atime_policy(
-    volume: Arc<dyn Vfs>,
-    export_name: String,
-    token: Option<String>,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-    atime_policy: AtimeMode,
-    listen: &str,
-) -> std::io::Result<P9TcpListener> {
-    let fs = SlateFs9p::new_with_rate_limiter_and_atime_policy(
-        volume,
-        export_name,
-        token,
-        atime_policy,
-        rate_limiter,
-    );
+    let allowed_clients = options.allowed_clients.clone();
+    let fs = SlateFs9p::new(volume, export_name, options);
     let listener = TcpListener::bind(listen).await?;
     Ok(P9TcpListener {
         listener,
@@ -359,136 +226,85 @@ fn load_tls_config(cert_path: &Path, key_path: &Path) -> std::io::Result<Arc<Ser
     Ok(Arc::new(config))
 }
 
-/// Serve one volume export over TLS-wrapped 9P2000.L TCP.
-pub async fn serve_export_tls_with_allowlist_and_rate_limit(
-    volume: Arc<dyn Vfs>,
-    export_name: String,
-    token: Option<String>,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-    listen: &str,
-    identity: TlsIdentity,
-) -> std::io::Result<()> {
-    bind_export_tls_with_allowlist_and_rate_limit(
-        volume,
-        export_name,
-        token,
-        allowed_clients,
-        rate_limiter,
-        listen,
-        identity,
-    )
-    .await?
-    .handle_forever()
-    .await
-}
-
-/// Serve one volume export over TLS-wrapped 9P2000.L TCP with an explicit
-/// read atime policy.
-#[allow(clippy::too_many_arguments)]
-pub async fn serve_export_tls_with_allowlist_and_rate_limit_and_atime_policy(
-    volume: Arc<dyn Vfs>,
-    export_name: String,
-    token: Option<String>,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-    atime_policy: AtimeMode,
-    listen: &str,
-    identity: TlsIdentity,
-) -> std::io::Result<()> {
-    bind_export_tls_with_allowlist_and_rate_limit_and_atime_policy(
-        volume,
-        export_name,
-        token,
-        allowed_clients,
-        rate_limiter,
-        atime_policy,
-        listen,
-        identity,
-    )
-    .await?
-    .handle_forever()
-    .await
-}
-
-pub async fn bind_export_tls_with_allowlist_and_rate_limit(
-    volume: Arc<dyn Vfs>,
-    export_name: String,
-    token: Option<String>,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-    listen: &str,
-    identity: TlsIdentity,
-) -> std::io::Result<P9TlsListener> {
-    bind_export_tls_with_allowlist_and_rate_limit_and_atime_policy(
-        volume,
-        export_name,
-        token,
-        allowed_clients,
-        rate_limiter,
-        AtimeMode::Relatime,
-        listen,
-        identity,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn bind_export_tls_with_allowlist_and_rate_limit_and_atime_policy(
-    volume: Arc<dyn Vfs>,
-    export_name: String,
-    token: Option<String>,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-    atime_policy: AtimeMode,
-    listen: &str,
-    identity: TlsIdentity,
-) -> std::io::Result<P9TlsListener> {
-    let fs = SlateFs9p::new_with_rate_limiter_and_atime_policy(
-        volume,
-        export_name,
-        token,
-        atime_policy,
-        rate_limiter,
-    );
-    let tls = Arc::new(RwLock::new(load_tls_config(
+pub fn reloadable_tls_config_from_identity(
+    identity: &TlsIdentity,
+) -> std::io::Result<ReloadableTlsConfig> {
+    Ok(Arc::new(RwLock::new(load_tls_config(
         &identity.cert_path,
         &identity.key_path,
-    )?));
-    let listener = TcpListener::bind(listen).await?;
-    tracing::info!(
-        listen,
-        cert = %identity.cert_path.display(),
-        "9p TLS listener ready"
-    );
-    Ok(P9TlsListener {
-        listener,
-        fs,
-        tls,
-        allowed_clients,
-    })
+    )?)))
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn bind_export_tls_with_reloadable_config_and_atime_policy(
+enum P9TlsReadyLog {
+    Reloadable,
+    Identity { cert_path: PathBuf },
+}
+
+/// Serve one volume export over TLS-wrapped 9P2000.L TCP.
+pub async fn serve_export_tls(
     volume: Arc<dyn Vfs>,
     export_name: String,
-    token: Option<String>,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-    atime_policy: AtimeMode,
     listen: &str,
-    tls: ReloadableTlsConfig,
-) -> std::io::Result<P9TlsListener> {
-    let fs = SlateFs9p::new_with_rate_limiter_and_atime_policy(
+    options: P9ExportOptions,
+    identity: TlsIdentity,
+) -> std::io::Result<()> {
+    let tls = reloadable_tls_config_from_identity(&identity)?;
+    bind_export_tls_with_log(
         volume,
         export_name,
-        token,
-        atime_policy,
-        rate_limiter,
-    );
+        listen,
+        options,
+        tls,
+        P9TlsReadyLog::Identity {
+            cert_path: identity.cert_path,
+        },
+    )
+    .await?
+    .handle_forever()
+    .await
+}
+
+pub async fn bind_export_tls(
+    volume: Arc<dyn Vfs>,
+    export_name: String,
+    listen: &str,
+    options: P9ExportOptions,
+    tls: ReloadableTlsConfig,
+) -> std::io::Result<P9TlsListener> {
+    bind_export_tls_with_log(
+        volume,
+        export_name,
+        listen,
+        options,
+        tls,
+        P9TlsReadyLog::Reloadable,
+    )
+    .await
+}
+
+async fn bind_export_tls_with_log(
+    volume: Arc<dyn Vfs>,
+    export_name: String,
+    listen: &str,
+    options: P9ExportOptions,
+    tls: ReloadableTlsConfig,
+    ready_log: P9TlsReadyLog,
+) -> std::io::Result<P9TlsListener> {
+    let allowed_clients = options.allowed_clients.clone();
+    let fs = SlateFs9p::new(volume, export_name, options);
     let listener = TcpListener::bind(listen).await?;
-    tracing::info!(listen, "9p TLS listener ready");
+    match ready_log {
+        P9TlsReadyLog::Reloadable => {
+            tracing::info!(listen, "9p TLS listener ready");
+        }
+        P9TlsReadyLog::Identity { cert_path } => {
+            tracing::info!(
+                listen,
+                cert = %cert_path.display(),
+                "9p TLS listener ready"
+            );
+        }
+    }
     Ok(P9TlsListener {
         listener,
         fs,

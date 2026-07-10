@@ -41,10 +41,24 @@ use slatefs_core::vfs::Vfs;
 pub use adapter::{QuotaRejectionAudit, SlateFsNfs, SquashPolicy};
 pub use nfs3_server::tcp::NFSTcp;
 
-#[derive(Clone, Default)]
-pub struct NfsExportRuntime {
+/// Configuration for an NFS export listener.
+#[derive(Clone)]
+pub struct NfsExportOptions {
+    pub allowed_clients: Vec<ClientAddrRule>,
     pub rate_limiter: Option<Arc<RateLimiter>>,
     pub quota_rejection_audit: Option<QuotaRejectionAudit>,
+    pub atime_policy: AtimeMode,
+}
+
+impl Default for NfsExportOptions {
+    fn default() -> Self {
+        Self {
+            allowed_clients: Vec::new(),
+            rate_limiter: None,
+            quota_rejection_audit: None,
+            atime_policy: AtimeMode::Relatime,
+        }
+    }
 }
 
 /// Bind an NFS listener for one volume export.
@@ -56,139 +70,11 @@ pub async fn bind_export(
     fh_key: Secret32,
     policy: SquashPolicy,
     listen: &str,
-) -> io::Result<NFSTcpListener<SlateFsNfs>> {
-    bind_export_with_atime_policy(volume, fh_key, policy, AtimeMode::Relatime, listen).await
-}
-
-/// Bind an NFS listener for one volume export with an explicit read atime
-/// policy.
-pub async fn bind_export_with_atime_policy(
-    volume: Arc<dyn Vfs>,
-    fh_key: Secret32,
-    policy: SquashPolicy,
-    atime_policy: AtimeMode,
-    listen: &str,
-) -> io::Result<NFSTcpListener<SlateFsNfs>> {
-    bind_export_with_allowlist_and_atime_policy(
-        volume,
-        fh_key,
-        policy,
-        Vec::new(),
-        atime_policy,
-        listen,
-    )
-    .await
-}
-
-/// Bind an NFS listener with a source-IP allowlist. Empty `allowed_clients`
-/// means allow all clients.
-pub async fn bind_export_with_allowlist(
-    volume: Arc<dyn Vfs>,
-    fh_key: Secret32,
-    policy: SquashPolicy,
-    allowed_clients: Vec<ClientAddrRule>,
-    listen: &str,
-) -> io::Result<NFSTcpListener<SlateFsNfs>> {
-    bind_export_with_allowlist_and_atime_policy(
-        volume,
-        fh_key,
-        policy,
-        allowed_clients,
-        AtimeMode::Relatime,
-        listen,
-    )
-    .await
-}
-
-/// Bind an NFS listener with a source-IP allowlist and explicit read atime
-/// policy. Empty `allowed_clients` means allow all clients.
-pub async fn bind_export_with_allowlist_and_atime_policy(
-    volume: Arc<dyn Vfs>,
-    fh_key: Secret32,
-    policy: SquashPolicy,
-    allowed_clients: Vec<ClientAddrRule>,
-    atime_policy: AtimeMode,
-    listen: &str,
-) -> io::Result<NFSTcpListener<SlateFsNfs>> {
-    bind_export_with_allowlist_and_rate_limit_and_atime_policy(
-        volume,
-        fh_key,
-        policy,
-        allowed_clients,
-        None,
-        atime_policy,
-        listen,
-    )
-    .await
-}
-
-/// Bind an NFS listener with source-IP and tenant rate-limit gates.
-pub async fn bind_export_with_allowlist_and_rate_limit(
-    volume: Arc<dyn Vfs>,
-    fh_key: Secret32,
-    policy: SquashPolicy,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-    listen: &str,
-) -> io::Result<NFSTcpListener<SlateFsNfs>> {
-    bind_export_with_allowlist_and_rate_limit_and_atime_policy(
-        volume,
-        fh_key,
-        policy,
-        allowed_clients,
-        rate_limiter,
-        AtimeMode::Relatime,
-        listen,
-    )
-    .await
-}
-
-/// Bind an NFS listener with source-IP, tenant rate-limit, and read atime
-/// policy gates.
-pub async fn bind_export_with_allowlist_and_rate_limit_and_atime_policy(
-    volume: Arc<dyn Vfs>,
-    fh_key: Secret32,
-    policy: SquashPolicy,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-    atime_policy: AtimeMode,
-    listen: &str,
-) -> io::Result<NFSTcpListener<SlateFsNfs>> {
-    bind_export_with_allowlist_and_runtime_and_atime_policy(
-        volume,
-        fh_key,
-        policy,
-        allowed_clients,
-        NfsExportRuntime {
-            rate_limiter,
-            quota_rejection_audit: None,
-        },
-        atime_policy,
-        listen,
-    )
-    .await
-}
-
-/// Bind an NFS listener with source-IP, tenant rate-limit, read atime policy,
-/// and an optional best-effort hook for durable quota-rejection audit records.
-pub async fn bind_export_with_allowlist_and_runtime_and_atime_policy(
-    volume: Arc<dyn Vfs>,
-    fh_key: Secret32,
-    policy: SquashPolicy,
-    allowed_clients: Vec<ClientAddrRule>,
-    runtime: NfsExportRuntime,
-    atime_policy: AtimeMode,
-    listen: &str,
+    options: NfsExportOptions,
 ) -> io::Result<NFSTcpListener<SlateFsNfs>> {
     let fsid = volume.fsid();
-    let fs = SlateFsNfs::new_with_rate_limiter_and_atime_policy_and_quota_audit(
-        volume,
-        fh_key,
-        policy,
-        atime_policy,
-        runtime.rate_limiter,
-        runtime.quota_rejection_audit,
-    );
+    let allowed_clients = options.allowed_clients.clone();
+    let fs = SlateFsNfs::new(volume, fh_key, policy, options);
     let mut listener = NFSTcpListener::bind_with_generation(listen, fs, fsid).await?;
     if !allowed_clients.is_empty() {
         listener.with_client_filter(move |peer| {

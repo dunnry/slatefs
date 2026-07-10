@@ -126,14 +126,15 @@ async fn serve_9p_with_atime(volume: Arc<Volume>, token: Option<String>, atime: 
     let port = free_port();
     let listen = format!("127.0.0.1:{port}");
     tokio::spawn(async move {
-        let _ = slatefs_9p::serve_export_with_allowlist_and_rate_limit_and_atime_policy(
+        let _ = slatefs_9p::serve_export(
             volume,
             "/t/v".to_string(),
-            token,
-            Vec::new(),
-            None,
-            atime,
             &listen,
+            slatefs_9p::P9ExportOptions {
+                token,
+                atime_policy: atime,
+                ..slatefs_9p::P9ExportOptions::default()
+            },
         )
         .await;
     });
@@ -177,13 +178,16 @@ async fn serve_9p_with_allowlist_and_rate_limit(
     let port = free_port();
     let listen = format!("127.0.0.1:{port}");
     tokio::spawn(async move {
-        let _ = slatefs_9p::serve_export_with_allowlist_and_rate_limit(
+        let _ = slatefs_9p::serve_export(
             volume,
             "/t/v".to_string(),
-            token,
-            allowed_clients,
-            rate_limiter,
             &listen,
+            slatefs_9p::P9ExportOptions {
+                token,
+                allowed_clients,
+                rate_limiter,
+                ..slatefs_9p::P9ExportOptions::default()
+            },
         )
         .await;
     });
@@ -206,13 +210,14 @@ async fn serve_9p_tls(volume: Arc<Volume>, token: Option<String>) -> (u16, tempf
     let port = free_port();
     let listen = format!("127.0.0.1:{port}");
     tokio::spawn(async move {
-        let _ = slatefs_9p::serve_export_tls_with_allowlist_and_rate_limit(
+        let _ = slatefs_9p::serve_export_tls(
             volume,
             "/t/v".to_string(),
-            token,
-            Vec::new(),
-            None,
             &listen,
+            slatefs_9p::P9ExportOptions {
+                token,
+                ..slatefs_9p::P9ExportOptions::default()
+            },
             slatefs_9p::TlsIdentity {
                 cert_path,
                 key_path,
@@ -833,6 +838,7 @@ async fn cross_protocol_coherence() {
         Secret32::from_bytes([7; 32]),
         slatefs_nfs::SquashPolicy::trust_as_root(),
         "127.0.0.1:0",
+        slatefs_nfs::NfsExportOptions::default(),
     )
     .await
     .expect("bind nfs");

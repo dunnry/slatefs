@@ -108,9 +108,15 @@ pub struct NbdTlsIdentity {
 }
 
 #[derive(Clone)]
-struct NbdTlsConfig {
+pub struct NbdTlsConfig {
     acceptor: TlsAcceptor,
     requires_client_auth: bool,
+}
+
+impl NbdTlsConfig {
+    pub fn from_identity(identity: &NbdTlsIdentity) -> io::Result<Self> {
+        load_tls_config(identity)
+    }
 }
 
 trait NbdStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -385,6 +391,15 @@ impl Default for NbdServerOptions {
     }
 }
 
+/// Configuration for an NBD export listener.
+#[derive(Clone, Default)]
+pub struct NbdExportOptions {
+    pub allowed_clients: Vec<ClientAddrRule>,
+    pub rate_limiter: Option<Arc<RateLimiter>>,
+    pub server: NbdServerOptions,
+    pub tls: Option<NbdTlsConfig>,
+}
+
 /// A bound NBD listener for one SlateFS block export.
 pub struct NbdTcpListener {
     listener: TcpListener,
@@ -436,7 +451,7 @@ impl NbdTcpListener {
     }
 }
 
-/// Handle returned by [`serve_export_with_allowlist_and_rate_limit`].
+/// Handle returned by [`serve_export`].
 pub struct NbdServerHandle {
     local_addr: SocketAddr,
     shutdown: NbdShutdownHandle,
@@ -568,109 +583,9 @@ pub async fn serve_export(
     listen: &str,
     export_name: String,
     device: Arc<dyn BlockDev>,
+    options: NbdExportOptions,
 ) -> io::Result<NbdServerHandle> {
-    serve_export_with_allowlist_and_rate_limit(listen, export_name, device, Vec::new(), None).await
-}
-
-/// Bind and spawn an NBD export listener with source-IP allowlist rules.
-pub async fn serve_export_with_allowlist(
-    listen: &str,
-    export_name: String,
-    device: Arc<dyn BlockDev>,
-    allowed_clients: Vec<ClientAddrRule>,
-) -> io::Result<NbdServerHandle> {
-    serve_export_with_allowlist_and_rate_limit(listen, export_name, device, allowed_clients, None)
-        .await
-}
-
-/// Bind and spawn an NBD export listener with source-IP and tenant rate gates.
-pub async fn serve_export_with_allowlist_and_rate_limit(
-    listen: &str,
-    export_name: String,
-    device: Arc<dyn BlockDev>,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-) -> io::Result<NbdServerHandle> {
-    serve_export_with_options(
-        listen,
-        export_name,
-        device,
-        allowed_clients,
-        rate_limiter,
-        NbdServerOptions::default(),
-    )
-    .await
-}
-
-/// Bind and spawn an NBD export listener that requires STARTTLS.
-pub async fn serve_export_tls_with_allowlist_and_rate_limit(
-    listen: &str,
-    export_name: String,
-    device: Arc<dyn BlockDev>,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-    identity: NbdTlsIdentity,
-) -> io::Result<NbdServerHandle> {
-    serve_export_tls_with_options(
-        listen,
-        export_name,
-        device,
-        allowed_clients,
-        rate_limiter,
-        NbdServerOptions::default(),
-        identity,
-    )
-    .await
-}
-
-/// Bind and spawn an NBD export listener with explicit server options.
-pub async fn serve_export_with_options(
-    listen: &str,
-    export_name: String,
-    device: Arc<dyn BlockDev>,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-    options: NbdServerOptions,
-) -> io::Result<NbdServerHandle> {
-    let listener = bind_export_with_options(
-        listen,
-        export_name,
-        device,
-        allowed_clients,
-        rate_limiter,
-        options,
-    )
-    .await?;
-    let local_addr = listener.local_addr()?;
-    let shutdown = listener.shutdown_handle();
-    let join = tokio::spawn(listener.handle_forever());
-    Ok(NbdServerHandle {
-        local_addr,
-        shutdown,
-        join,
-    })
-}
-
-/// Bind and spawn an NBD STARTTLS-required listener with explicit server options.
-pub async fn serve_export_tls_with_options(
-    listen: &str,
-    export_name: String,
-    device: Arc<dyn BlockDev>,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-    options: NbdServerOptions,
-    identity: NbdTlsIdentity,
-) -> io::Result<NbdServerHandle> {
-    let listener = bind_export_tls_with_options(
-        listen,
-        export_name,
-        device,
-        allowed_clients,
-        rate_limiter,
-        options,
-        identity,
-    )
-    .await?;
+    let listener = bind_export(listen, export_name, device, options).await?;
     let local_addr = listener.local_addr()?;
     let shutdown = listener.shutdown_handle();
     let join = tokio::spawn(listener.handle_forever());
@@ -682,97 +597,11 @@ pub async fn serve_export_tls_with_options(
 }
 
 /// Bind an NBD listener without spawning its accept loop.
-pub async fn bind_export_with_allowlist_and_rate_limit(
+pub async fn bind_export(
     listen: &str,
     export_name: String,
     device: Arc<dyn BlockDev>,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-) -> io::Result<NbdTcpListener> {
-    bind_export_with_options(
-        listen,
-        export_name,
-        device,
-        allowed_clients,
-        rate_limiter,
-        NbdServerOptions::default(),
-    )
-    .await
-}
-
-/// Bind an NBD STARTTLS-required listener without spawning its accept loop.
-pub async fn bind_export_tls_with_allowlist_and_rate_limit(
-    listen: &str,
-    export_name: String,
-    device: Arc<dyn BlockDev>,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-    identity: NbdTlsIdentity,
-) -> io::Result<NbdTcpListener> {
-    bind_export_tls_with_options(
-        listen,
-        export_name,
-        device,
-        allowed_clients,
-        rate_limiter,
-        NbdServerOptions::default(),
-        identity,
-    )
-    .await
-}
-
-/// Bind an NBD listener with explicit server options.
-pub async fn bind_export_with_options(
-    listen: &str,
-    export_name: String,
-    device: Arc<dyn BlockDev>,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-    options: NbdServerOptions,
-) -> io::Result<NbdTcpListener> {
-    bind_export_with_options_and_tls(
-        listen,
-        export_name,
-        device,
-        allowed_clients,
-        rate_limiter,
-        options,
-        None,
-    )
-    .await
-}
-
-/// Bind an NBD STARTTLS-required listener with explicit server options.
-pub async fn bind_export_tls_with_options(
-    listen: &str,
-    export_name: String,
-    device: Arc<dyn BlockDev>,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-    options: NbdServerOptions,
-    identity: NbdTlsIdentity,
-) -> io::Result<NbdTcpListener> {
-    let tls = Some(load_tls_config(&identity)?);
-    bind_export_with_options_and_tls(
-        listen,
-        export_name,
-        device,
-        allowed_clients,
-        rate_limiter,
-        options,
-        tls,
-    )
-    .await
-}
-
-async fn bind_export_with_options_and_tls(
-    listen: &str,
-    export_name: String,
-    device: Arc<dyn BlockDev>,
-    allowed_clients: Vec<ClientAddrRule>,
-    rate_limiter: Option<Arc<RateLimiter>>,
-    options: NbdServerOptions,
-    tls: Option<NbdTlsConfig>,
+    options: NbdExportOptions,
 ) -> io::Result<NbdTcpListener> {
     if export_name.is_empty() {
         return Err(io::Error::new(
@@ -780,7 +609,7 @@ async fn bind_export_with_options_and_tls(
             "NBD export name must not be empty",
         ));
     }
-    if options.max_inflight == 0 {
+    if options.server.max_inflight == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "NBD max_inflight must be greater than zero",
@@ -790,6 +619,12 @@ async fn bind_export_with_options_and_tls(
     let listener = TcpListener::bind(listen).await?;
     let geometry = device.geometry();
     let (shutdown, _) = broadcast::channel(16);
+    let NbdExportOptions {
+        allowed_clients,
+        rate_limiter,
+        server,
+        tls,
+    } = options;
     Ok(NbdTcpListener {
         listener,
         state: Arc::new(ServerState {
@@ -797,7 +632,7 @@ async fn bind_export_with_options_and_tls(
             device,
             rate_limiter,
             leases: SessionLeases::new(export_name.clone(), geometry.read_only),
-            options,
+            options: server,
             metrics: nbd_metrics_for_export(&export_name),
             tls,
         }),
@@ -2413,12 +2248,11 @@ mod tests {
     }
 
     async fn serve_dev(device: Arc<dyn BlockDev>) -> NbdServerHandle {
-        serve_export_with_allowlist_and_rate_limit(
+        serve_export(
             "127.0.0.1:0",
             EXPORT.to_string(),
             device,
-            Vec::new(),
-            None,
+            NbdExportOptions::default(),
         )
         .await
         .expect("serve nbd")
@@ -2428,16 +2262,19 @@ mod tests {
         device: Arc<dyn BlockDev>,
         require_client_cert: bool,
     ) -> NbdServerHandle {
-        serve_export_tls_with_allowlist_and_rate_limit(
+        let identity = NbdTlsIdentity {
+            cert_path: cert_path("server.pem"),
+            key_path: cert_path("server.key"),
+            client_ca_path: require_client_cert.then(|| cert_path("ca.pem")),
+        };
+        let tls = NbdTlsConfig::from_identity(&identity).expect("tls config");
+        serve_export(
             "127.0.0.1:0",
             EXPORT.to_string(),
             device,
-            Vec::new(),
-            None,
-            NbdTlsIdentity {
-                cert_path: cert_path("server.pem"),
-                key_path: cert_path("server.key"),
-                client_ca_path: require_client_cert.then(|| cert_path("ca.pem")),
+            NbdExportOptions {
+                tls: Some(tls),
+                ..NbdExportOptions::default()
             },
         )
         .await
@@ -3055,10 +2892,17 @@ mod tests {
         let (_store, _record, _dek, block) = fresh_block(CHUNK as u64, None).await;
         let dev: Arc<dyn BlockDev> = block;
         let denied: ClientAddrRule = "192.0.2.0/24".parse().expect("rule");
-        let server =
-            serve_export_with_allowlist("127.0.0.1:0", EXPORT.to_string(), dev, vec![denied])
-                .await
-                .expect("serve");
+        let server = serve_export(
+            "127.0.0.1:0",
+            EXPORT.to_string(),
+            dev,
+            NbdExportOptions {
+                allowed_clients: vec![denied],
+                ..NbdExportOptions::default()
+            },
+        )
+        .await
+        .expect("serve");
 
         let mut stream = tokio::net::TcpStream::connect(server.local_addr())
             .await
@@ -3078,18 +2922,20 @@ mod tests {
     async fn rate_limit_timeout_fails_request_with_eio() {
         let (_store, _record, _dek, block) = fresh_block(CHUNK as u64, None).await;
         let dev: Arc<dyn BlockDev> = block;
-        let server = serve_export_with_options(
+        let server = serve_export(
             "127.0.0.1:0",
             EXPORT.to_string(),
             dev,
-            Vec::new(),
-            Some(Arc::new(RateLimiter::new(RateLimits {
-                ops_per_second: None,
-                bytes_per_second: Some(1),
-            }))),
-            NbdServerOptions {
-                rate_limit_wait: Duration::from_millis(50),
-                ..NbdServerOptions::default()
+            NbdExportOptions {
+                rate_limiter: Some(Arc::new(RateLimiter::new(RateLimits {
+                    ops_per_second: None,
+                    bytes_per_second: Some(1),
+                }))),
+                server: NbdServerOptions {
+                    rate_limit_wait: Duration::from_millis(50),
+                    ..NbdServerOptions::default()
+                },
+                ..NbdExportOptions::default()
             },
         )
         .await

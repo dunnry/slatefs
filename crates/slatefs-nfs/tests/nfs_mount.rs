@@ -28,7 +28,7 @@ use slatefs_core::snapshot::SnapshotVolume;
 use slatefs_core::store::{self, ObjectStore};
 use slatefs_core::vfs::{Credentials, Vfs};
 use slatefs_core::volume::{self, CreateVolumeOptions, Volume};
-use slatefs_nfs::{NFSTcp, SquashPolicy};
+use slatefs_nfs::{NFSTcp, NfsExportOptions, SquashPolicy};
 
 const TEST_CHUNK: u32 = 4096;
 
@@ -92,6 +92,7 @@ async fn serve(volume: Arc<Volume>) -> (u16, tokio::task::JoinHandle<()>) {
         fh_key(),
         SquashPolicy::trust_as_root(),
         "127.0.0.1:0",
+        NfsExportOptions::default(),
     )
     .await
     .expect("bind export");
@@ -106,12 +107,15 @@ async fn serve_with_allowlist(
     volume: Arc<Volume>,
     allowed_clients: Vec<ClientAddrRule>,
 ) -> (u16, tokio::task::JoinHandle<()>) {
-    let listener = slatefs_nfs::bind_export_with_allowlist(
+    let listener = slatefs_nfs::bind_export(
         volume,
         fh_key(),
         SquashPolicy::trust_as_root(),
-        allowed_clients,
         "127.0.0.1:0",
+        NfsExportOptions {
+            allowed_clients,
+            ..NfsExportOptions::default()
+        },
     )
     .await
     .expect("bind export");
@@ -126,13 +130,15 @@ async fn serve_with_rate_limit(
     volume: Arc<Volume>,
     limits: RateLimits,
 ) -> (u16, tokio::task::JoinHandle<()>) {
-    let listener = slatefs_nfs::bind_export_with_allowlist_and_rate_limit(
+    let listener = slatefs_nfs::bind_export(
         volume,
         fh_key(),
         SquashPolicy::trust_as_root(),
-        Vec::new(),
-        Some(Arc::new(RateLimiter::new(limits))),
         "127.0.0.1:0",
+        NfsExportOptions {
+            rate_limiter: Some(Arc::new(RateLimiter::new(limits))),
+            ..NfsExportOptions::default()
+        },
     )
     .await
     .expect("bind export");
@@ -149,6 +155,7 @@ async fn serve_backend(volume: Arc<dyn Vfs>) -> (u16, tokio::task::JoinHandle<()
         fh_key(),
         SquashPolicy::trust_as_root(),
         "127.0.0.1:0",
+        NfsExportOptions::default(),
     )
     .await
     .expect("bind export");

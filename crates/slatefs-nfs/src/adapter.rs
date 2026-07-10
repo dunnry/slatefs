@@ -28,6 +28,7 @@ use slatefs_core::meta::inode::{FileKind, ROOT_INO, Timespec};
 use slatefs_core::rate::RateLimiter;
 use slatefs_core::vfs::{Credentials, FileAttr, FsError, SetAttrs, TimeSet, Vfs};
 
+use crate::NfsExportOptions;
 use crate::fh::{FhCodec, SlateFsHandle};
 
 /// Verifier stored at exclusive create so retransmitted CREATE(EXCLUSIVE)
@@ -113,64 +114,20 @@ pub struct SlateFsNfs {
 }
 
 impl SlateFsNfs {
-    pub fn new(volume: Arc<dyn Vfs>, fh_key: Secret32, policy: SquashPolicy) -> SlateFsNfs {
-        Self::new_with_rate_limiter_and_atime_policy(
-            volume,
-            fh_key,
-            policy,
-            AtimeMode::Relatime,
-            None,
-        )
-    }
-
-    pub fn new_with_rate_limiter(
+    pub fn new(
         volume: Arc<dyn Vfs>,
         fh_key: Secret32,
         policy: SquashPolicy,
-        rate_limiter: Option<Arc<RateLimiter>>,
-    ) -> SlateFsNfs {
-        Self::new_with_rate_limiter_and_atime_policy(
-            volume,
-            fh_key,
-            policy,
-            AtimeMode::Relatime,
-            rate_limiter,
-        )
-    }
-
-    pub fn new_with_rate_limiter_and_atime_policy(
-        volume: Arc<dyn Vfs>,
-        fh_key: Secret32,
-        policy: SquashPolicy,
-        atime_policy: AtimeMode,
-        rate_limiter: Option<Arc<RateLimiter>>,
-    ) -> SlateFsNfs {
-        Self::new_with_rate_limiter_and_atime_policy_and_quota_audit(
-            volume,
-            fh_key,
-            policy,
-            atime_policy,
-            rate_limiter,
-            None,
-        )
-    }
-
-    pub fn new_with_rate_limiter_and_atime_policy_and_quota_audit(
-        volume: Arc<dyn Vfs>,
-        fh_key: Secret32,
-        policy: SquashPolicy,
-        atime_policy: AtimeMode,
-        rate_limiter: Option<Arc<RateLimiter>>,
-        quota_rejection_audit: Option<QuotaRejectionAudit>,
+        options: NfsExportOptions,
     ) -> SlateFsNfs {
         let fh = FhCodec::new(volume.fsid(), fh_key);
         SlateFsNfs {
             volume,
             fh,
             policy,
-            atime_policy,
-            rate_limiter,
-            quota_rejection_audit,
+            atime_policy: options.atime_policy,
+            rate_limiter: options.rate_limiter,
+            quota_rejection_audit: options.quota_rejection_audit,
         }
     }
 
