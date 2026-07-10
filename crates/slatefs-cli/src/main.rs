@@ -113,6 +113,52 @@ enum VolumeCreateKind {
     Block,
 }
 
+enum FieldUpdate<T> {
+    Leave,
+    Clear,
+    Set(T),
+}
+
+impl<T> FieldUpdate<T> {
+    fn from_option(value: Option<T>, clear: bool) -> Self {
+        if clear {
+            Self::Clear
+        } else if let Some(value) = value {
+            Self::Set(value)
+        } else {
+            Self::Leave
+        }
+    }
+
+    fn apply_option(self, target: &mut Option<T>) {
+        match self {
+            Self::Leave => {}
+            Self::Clear => *target = None,
+            Self::Set(value) => *target = Some(value),
+        }
+    }
+}
+
+impl<T> FieldUpdate<Vec<T>> {
+    fn from_vec(value: Vec<T>, clear: bool) -> Self {
+        if clear {
+            Self::Clear
+        } else if value.is_empty() {
+            Self::Leave
+        } else {
+            Self::Set(value)
+        }
+    }
+
+    fn apply_vec(self, target: &mut Vec<T>) {
+        match self {
+            Self::Leave => {}
+            Self::Clear => target.clear(),
+            Self::Set(value) => *target = value,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum VolumeCmd {
     /// Create a volume: control record + encrypted mkfs.
@@ -319,9 +365,9 @@ enum ExportCmd {
         tenant: Option<String>,
         #[arg(long)]
         volume: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "clear_snapshot")]
         snapshot: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "snapshot")]
         clear_snapshot: bool,
         #[arg(long, value_parser = parse_export_protocol)]
         protocol: Option<config::ExportProtocol>,
@@ -331,9 +377,13 @@ enum ExportCmd {
         sync: Option<config::NbdSyncMode>,
         #[arg(long)]
         listen: Option<String>,
-        #[arg(long = "allowed-client", value_parser = parse_client_addr_rule)]
+        #[arg(
+            long = "allowed-client",
+            value_parser = parse_client_addr_rule,
+            conflicts_with = "clear_allowed_clients"
+        )]
         allowed_clients: Vec<ClientAddrRule>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "allowed_clients")]
         clear_allowed_clients: bool,
         #[arg(long, value_parser = parse_squash_mode)]
         squash: Option<config::SquashMode>,
@@ -343,29 +393,29 @@ enum ExportCmd {
         anon_uid: Option<u32>,
         #[arg(long)]
         anon_gid: Option<u32>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "clear_p9_token")]
         p9_token: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "p9_token")]
         clear_p9_token: bool,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "clear_p9_tls_cert")]
         p9_tls_cert: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "p9_tls_cert")]
         clear_p9_tls_cert: bool,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "clear_p9_tls_key")]
         p9_tls_key: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "p9_tls_key")]
         clear_p9_tls_key: bool,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "clear_nbd_tls_cert")]
         nbd_tls_cert: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "nbd_tls_cert")]
         clear_nbd_tls_cert: bool,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "clear_nbd_tls_key")]
         nbd_tls_key: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "nbd_tls_key")]
         clear_nbd_tls_key: bool,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "clear_nbd_tls_client_ca")]
         nbd_tls_client_ca: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "nbd_tls_client_ca")]
         clear_nbd_tls_client_ca: bool,
         #[arg(long)]
         enabled: Option<bool>,
@@ -1601,12 +1651,8 @@ async fn run(
                 if let Some(volume) = volume {
                     record.volume = volume.clone();
                 }
-                if *clear_snapshot {
-                    record.snapshot = None;
-                }
-                if let Some(snapshot) = snapshot {
-                    record.snapshot = Some(snapshot.clone());
-                }
+                FieldUpdate::from_option(snapshot.clone(), *clear_snapshot)
+                    .apply_option(&mut record.snapshot);
                 if let Some(protocol) = protocol {
                     record.protocol = *protocol;
                 }
@@ -1619,12 +1665,8 @@ async fn run(
                 if let Some(listen) = listen {
                     record.listen = listen.clone();
                 }
-                if *clear_allowed_clients {
-                    record.allowed_clients.clear();
-                }
-                if !allowed_clients.is_empty() {
-                    record.allowed_clients = allowed_clients.clone();
-                }
+                FieldUpdate::from_vec(allowed_clients.clone(), *clear_allowed_clients)
+                    .apply_vec(&mut record.allowed_clients);
                 if let Some(squash) = squash {
                     record.squash = *squash;
                 }
@@ -1637,42 +1679,18 @@ async fn run(
                 if let Some(anon_gid) = anon_gid {
                     record.anon_gid = *anon_gid;
                 }
-                if *clear_p9_token {
-                    record.p9_token = None;
-                }
-                if let Some(p9_token) = p9_token {
-                    record.p9_token = Some(p9_token.clone());
-                }
-                if *clear_p9_tls_cert {
-                    record.p9_tls_cert = None;
-                }
-                if let Some(p9_tls_cert) = p9_tls_cert {
-                    record.p9_tls_cert = Some(p9_tls_cert.clone());
-                }
-                if *clear_p9_tls_key {
-                    record.p9_tls_key = None;
-                }
-                if let Some(p9_tls_key) = p9_tls_key {
-                    record.p9_tls_key = Some(p9_tls_key.clone());
-                }
-                if *clear_nbd_tls_cert {
-                    record.nbd_tls_cert = None;
-                }
-                if let Some(nbd_tls_cert) = nbd_tls_cert {
-                    record.nbd_tls_cert = Some(nbd_tls_cert.clone());
-                }
-                if *clear_nbd_tls_key {
-                    record.nbd_tls_key = None;
-                }
-                if let Some(nbd_tls_key) = nbd_tls_key {
-                    record.nbd_tls_key = Some(nbd_tls_key.clone());
-                }
-                if *clear_nbd_tls_client_ca {
-                    record.nbd_tls_client_ca = None;
-                }
-                if let Some(nbd_tls_client_ca) = nbd_tls_client_ca {
-                    record.nbd_tls_client_ca = Some(nbd_tls_client_ca.clone());
-                }
+                FieldUpdate::from_option(p9_token.clone(), *clear_p9_token)
+                    .apply_option(&mut record.p9_token);
+                FieldUpdate::from_option(p9_tls_cert.clone(), *clear_p9_tls_cert)
+                    .apply_option(&mut record.p9_tls_cert);
+                FieldUpdate::from_option(p9_tls_key.clone(), *clear_p9_tls_key)
+                    .apply_option(&mut record.p9_tls_key);
+                FieldUpdate::from_option(nbd_tls_cert.clone(), *clear_nbd_tls_cert)
+                    .apply_option(&mut record.nbd_tls_cert);
+                FieldUpdate::from_option(nbd_tls_key.clone(), *clear_nbd_tls_key)
+                    .apply_option(&mut record.nbd_tls_key);
+                FieldUpdate::from_option(nbd_tls_client_ca.clone(), *clear_nbd_tls_client_ca)
+                    .apply_option(&mut record.nbd_tls_client_ca);
                 if let Some(enabled) = enabled {
                     record.enabled = *enabled;
                 }
