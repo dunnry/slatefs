@@ -151,24 +151,7 @@ impl SlateFsNfs {
     }
 
     fn fattr(&self, attr: &FileAttr) -> fattr3 {
-        fattr3 {
-            type_: kind_to_ftype(attr.kind),
-            mode: attr.mode,
-            nlink: attr.nlink,
-            uid: attr.uid,
-            gid: attr.gid,
-            size: wire_size(attr),
-            used: wire_used(attr),
-            rdev: specdata3 {
-                specdata1: (attr.rdev >> 32) as u32,
-                specdata2: attr.rdev as u32,
-            },
-            fsid: self.volume.fsid(),
-            fileid: attr.ino,
-            atime: to_nfstime(attr.atime),
-            mtime: to_nfstime(attr.mtime),
-            ctime: to_nfstime(attr.ctime),
-        }
+        fattr_for(self.volume.as_ref(), attr)
     }
 
     async fn map_vfs_result<T>(

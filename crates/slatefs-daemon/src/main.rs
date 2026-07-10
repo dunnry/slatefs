@@ -91,8 +91,24 @@ enum MetricsTarget {
     },
 }
 
-type AdminTargets = Arc<Mutex<HashMap<(String, String), Arc<Volume>>>>;
-type AdminBlockTargets = Arc<Mutex<HashMap<(String, String), Arc<BlockVolume>>>>;
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct VolumeId {
+    tenant: String,
+    volume: String,
+}
+
+impl VolumeId {
+    fn new(tenant: String, volume: String) -> Self {
+        Self { tenant, volume }
+    }
+
+    fn from_parts(tenant: &str, volume: &str) -> Self {
+        Self::new(tenant.to_string(), volume.to_string())
+    }
+}
+
+type AdminTargets = Arc<Mutex<HashMap<VolumeId, Arc<Volume>>>>;
+type AdminBlockTargets = Arc<Mutex<HashMap<VolumeId, Arc<BlockVolume>>>>;
 
 #[derive(Clone)]
 struct ExportManagerTargets {
@@ -132,7 +148,7 @@ struct DesiredExport {
 struct ExportMetrics {
     active: Arc<Mutex<HashMap<(ExportProtocol, ExportSource), usize>>>,
     reconcile_failures: Arc<AtomicU64>,
-    snapshot_retention_deleted: Arc<Mutex<HashMap<(String, String), u64>>>,
+    snapshot_retention_deleted: Arc<Mutex<HashMap<VolumeId, u64>>>,
     tls_reloads: Arc<Mutex<HashMap<String, u64>>>,
     tls_reload_failures: Arc<Mutex<HashMap<String, u64>>>,
     tls_expiry: Arc<Mutex<HashMap<String, i64>>>,
@@ -163,7 +179,7 @@ impl ExportMetrics {
             .lock()
             .expect("snapshot retention metrics poisoned");
         *deleted
-            .entry((tenant.to_string(), volume.to_string()))
+            .entry(VolumeId::from_parts(tenant, volume))
             .or_insert(0) += count;
     }
 
@@ -254,10 +270,13 @@ impl ExportMetrics {
             .snapshot_retention_deleted
             .lock()
             .expect("snapshot retention metrics poisoned");
-        for ((tenant, volume), value) in deleted.iter() {
+        for (volume_id, value) in deleted.iter() {
             samples.push(PrometheusSample::new(
                 "slatefs_snapshots_retention_deleted_total",
-                [("tenant", tenant.as_str()), ("volume", volume.as_str())],
+                [
+                    ("tenant", volume_id.tenant.as_str()),
+                    ("volume", volume_id.volume.as_str()),
+                ],
                 *value as f64,
             ));
         }
@@ -323,6 +342,10 @@ impl BackendKey {
             volume: export.volume.clone(),
             snapshot: export.snapshot.clone(),
         }
+    }
+
+    fn volume_id(&self) -> VolumeId {
+        VolumeId::new(self.tenant.clone(), self.volume.clone())
     }
 }
 
@@ -1132,6 +1155,14 @@ impl AdminState {
             .await
             .map_err(core_error)
     }
+
+    fn serving_export_count(&self) -> usize {
+        self.export_metrics.active_total().max(self.export_count)
+    }
+
+    fn serving_snapshot_export_count(&self) -> usize {
+        self.snapshot_export_count
+    }
 }
 
 impl AdminHttpResponse {
@@ -1549,12 +1580,13 @@ async fn create_live_snapshot_response(
     name: Option<String>,
     json_body: bool,
 ) -> Result<AdminHttpResponse, AdminError> {
+    let target_id = VolumeId::new(tenant.clone(), volume.clone());
     let target = {
         state
             .targets
             .lock()
             .expect("admin targets poisoned")
-            .get(&(tenant.clone(), volume.clone()))
+            .get(&target_id)
             .cloned()
     };
     if let Some(target) = target {
@@ -1570,7 +1602,7 @@ async fn create_live_snapshot_response(
             .block_targets
             .lock()
             .expect("admin block targets poisoned")
-            .get(&(tenant.clone(), volume.clone()))
+            .get(&target_id)
             .cloned()
     };
     let Some(target) = target else {
@@ -1608,10 +1640,11 @@ fn quota_limits_json(record: &VolumeRecord) -> Value {
 }
 
 fn quota_json(record: &VolumeRecord, targets: &AdminTargets) -> Value {
+    let volume_id = VolumeId::new(record.tenant.clone(), record.name.clone());
     let quota_usage = targets
         .lock()
         .expect("admin targets poisoned")
-        .get(&(record.tenant.clone(), record.name.clone()))
+        .get(&volume_id)
         .map(|volume| {
             let (bytes, inodes) = volume.quota_usage();
             json!({ "bytes": bytes, "inodes": inodes })
@@ -1655,13 +1688,14 @@ fn volume_json(
     block_targets: &AdminBlockTargets,
 ) -> Result<Value, AdminError> {
     let quota = quota_json(&record, targets);
+    let volume_id = VolumeId::new(record.tenant.clone(), record.name.clone());
     let (kind, size_bytes, allocated_bytes) = match record.kind {
         VolumeKind::Filesystem => ("filesystem", Value::Null, Value::Null),
         VolumeKind::Block { size_bytes } => {
             let allocated = block_targets
                 .lock()
                 .expect("admin block targets poisoned")
-                .get(&(record.tenant.clone(), record.name.clone()))
+                .get(&volume_id)
                 .map(|volume| json!(volume.quota_usage().0))
                 .unwrap_or(Value::Null);
             ("block", json!(size_bytes), allocated)
@@ -2399,13 +2433,15 @@ async fn audit_response(
 }
 
 fn legacy_status_response(state: &AdminState) -> AdminHttpResponse {
-    let export_count = state.export_metrics.active_total().max(state.export_count);
+    let export_count = state.serving_export_count();
     let writable_volumes = state.targets.lock().expect("admin targets poisoned").len();
     AdminHttpResponse::text(
         200,
         format!(
             "status=ok\nexports={}\nwritable_volumes={}\nsnapshot_exports={}\n",
-            export_count, writable_volumes, state.snapshot_export_count
+            export_count,
+            writable_volumes,
+            state.serving_snapshot_export_count()
         ),
     )
 }
@@ -2449,7 +2485,8 @@ async fn health_response(state: &AdminState, ready: bool, verbose: bool) -> Admi
         let writable_volumes = targets.len();
         let dead_writers = targets.values().filter(|volume| volume.is_dead()).count();
         drop(targets);
-        let export_count = state.export_metrics.active_total().max(state.export_count);
+        let export_count = state.serving_export_count();
+        let snapshot_export_count = state.serving_snapshot_export_count();
         let exports_ok = export_count > 0 && dead_writers == 0;
         checks.push(json!({
             "name": "exports_serving",
@@ -2459,7 +2496,7 @@ async fn health_response(state: &AdminState, ready: bool, verbose: bool) -> Admi
                     "exports serving; exports={} writable_volumes={} snapshot_exports={}",
                     export_count,
                     writable_volumes,
-                    state.snapshot_export_count
+                    snapshot_export_count
                 )
             } else {
                 format!("exports unavailable; dead_writable_volumes={dead_writers}")
@@ -2482,8 +2519,8 @@ async fn health_response(state: &AdminState, ready: bool, verbose: bool) -> Admi
             "uptime_seconds": state.started_at.elapsed().as_secs(),
             "open_repos": writable_volumes,
             "open_volumes": writable_volumes,
-            "snapshot_exports": state.snapshot_export_count,
-            "exports": state.export_metrics.active_total().max(state.export_count),
+            "snapshot_exports": state.serving_snapshot_export_count(),
+            "exports": state.serving_export_count(),
         });
         if let Some(node_id) = &state.node_id {
             identity["node_id"] = json!(node_id);
@@ -3246,21 +3283,21 @@ fn checkpoint_age_secs(checkpoint: &slatedb::Checkpoint, now: u64) -> Option<u64
 
 #[derive(Default)]
 struct CloneParentCheckpointPins {
-    pinned: HashMap<(String, String), HashSet<String>>,
-    conservative: HashSet<(String, String)>,
+    pinned: HashMap<VolumeId, HashSet<String>>,
+    conservative: HashSet<VolumeId>,
 }
 
 impl CloneParentCheckpointPins {
     fn pinned_for(&self, tenant: &str, volume: &str) -> HashSet<String> {
         self.pinned
-            .get(&(tenant.to_string(), volume.to_string()))
+            .get(&VolumeId::from_parts(tenant, volume))
             .cloned()
             .unwrap_or_default()
     }
 
     fn requires_conservative_skip(&self, tenant: &str, volume: &str) -> bool {
         self.conservative
-            .contains(&(tenant.to_string(), volume.to_string()))
+            .contains(&VolumeId::from_parts(tenant, volume))
     }
 }
 
@@ -3276,7 +3313,7 @@ async fn active_clone_parent_checkpoint_pins(
             if matches!(volume.state, slatefs_core::control::VolumeState::Deleting) {
                 continue;
             }
-            let parent_key = (parent.tenant.clone(), parent.volume.clone());
+            let parent_key = VolumeId::new(parent.tenant.clone(), parent.volume.clone());
             if !matches!(volume.state, slatefs_core::control::VolumeState::Active) {
                 pins.conservative.insert(parent_key);
                 continue;
@@ -4041,7 +4078,7 @@ impl ExportManager {
                 .lock()
                 .expect("admin targets poisoned")
                 .insert(
-                    (export.tenant.clone(), export.volume.clone()),
+                    VolumeId::new(export.tenant.clone(), export.volume.clone()),
                     Arc::clone(&volume),
                 );
             Ok(OpenBackend {
@@ -4133,7 +4170,7 @@ impl ExportManager {
                 .lock()
                 .expect("admin block targets poisoned")
                 .insert(
-                    (export.tenant.clone(), export.volume.clone()),
+                    VolumeId::new(export.tenant.clone(), export.volume.clone()),
                     Arc::clone(&volume),
                 );
             Ok(OpenBackend {
@@ -4269,13 +4306,14 @@ impl ExportManager {
             return;
         };
         self.remove_metrics_target(backend_key);
+        let volume_id = backend_key.volume_id();
         match backend.volume {
             OpenVolume::FsWritable(volume) => {
                 if let Err(error) = volume.shutdown().await {
                     self.admin_targets
                         .lock()
                         .expect("admin targets poisoned")
-                        .remove(&(backend_key.tenant.clone(), backend_key.volume.clone()));
+                        .remove(&volume_id);
                     tracing::error!(
                         tenant = backend_key.tenant,
                         volume = backend_key.volume,
@@ -4286,7 +4324,7 @@ impl ExportManager {
                     self.admin_targets
                         .lock()
                         .expect("admin targets poisoned")
-                        .remove(&(backend_key.tenant.clone(), backend_key.volume.clone()));
+                        .remove(&volume_id);
                 }
             }
             OpenVolume::FsSnapshot(snapshot) => {
@@ -4294,7 +4332,7 @@ impl ExportManager {
                     self.admin_targets
                         .lock()
                         .expect("admin targets poisoned")
-                        .remove(&(backend_key.tenant.clone(), backend_key.volume.clone()));
+                        .remove(&volume_id);
                 }
                 if let Err(error) = snapshot.shutdown().await {
                     tracing::error!(
@@ -4310,12 +4348,12 @@ impl ExportManager {
                     self.admin_targets
                         .lock()
                         .expect("admin targets poisoned")
-                        .remove(&(backend_key.tenant.clone(), backend_key.volume.clone()));
+                        .remove(&volume_id);
                 }
                 self.admin_block_targets
                     .lock()
                     .expect("admin block targets poisoned")
-                    .remove(&(backend_key.tenant.clone(), backend_key.volume.clone()));
+                    .remove(&volume_id);
                 if let Err(error) = volume.shutdown().await {
                     tracing::error!(
                         tenant = backend_key.tenant,
@@ -4329,7 +4367,7 @@ impl ExportManager {
                     self.admin_targets
                         .lock()
                         .expect("admin targets poisoned")
-                        .remove(&(backend_key.tenant.clone(), backend_key.volume.clone()));
+                        .remove(&volume_id);
                 }
                 if let Err(error) = snapshot.shutdown().await {
                     tracing::error!(
@@ -4735,7 +4773,7 @@ mod tests {
     async fn available_admin_state(
         object_store: Arc<dyn ObjectStore>,
         kms: Arc<dyn Kms>,
-        targets: HashMap<(String, String), Arc<Volume>>,
+        targets: HashMap<VolumeId, Arc<Volume>>,
         auth_token: Option<String>,
     ) -> Arc<AdminState> {
         available_admin_state_with_blocks(object_store, kms, targets, HashMap::new(), auth_token)
@@ -4745,8 +4783,8 @@ mod tests {
     async fn available_admin_state_with_blocks(
         object_store: Arc<dyn ObjectStore>,
         kms: Arc<dyn Kms>,
-        targets: HashMap<(String, String), Arc<Volume>>,
-        block_targets: HashMap<(String, String), Arc<BlockVolume>>,
+        targets: HashMap<VolumeId, Arc<Volume>>,
+        block_targets: HashMap<VolumeId, Arc<BlockVolume>>,
         auth_token: Option<String>,
     ) -> Arc<AdminState> {
         Arc::new(AdminState {
@@ -4772,7 +4810,7 @@ mod tests {
 
     fn unavailable_admin_state(
         object_store: Arc<dyn ObjectStore>,
-        targets: HashMap<(String, String), Arc<Volume>>,
+        targets: HashMap<VolumeId, Arc<Volume>>,
         auth_token: Option<String>,
     ) -> Arc<AdminState> {
         Arc::new(AdminState {
@@ -5211,7 +5249,10 @@ mod tests {
         );
 
         let mut targets = HashMap::new();
-        targets.insert(("t".to_string(), "v".to_string()), Arc::clone(&volume));
+        targets.insert(
+            VolumeId::new("t".to_string(), "v".to_string()),
+            Arc::clone(&volume),
+        );
         let state =
             available_admin_state(Arc::clone(&object_store), Arc::clone(&kms), targets, None).await;
 
@@ -5307,7 +5348,10 @@ mod tests {
             .unwrap();
 
         let mut block_targets = HashMap::new();
-        block_targets.insert(("t".to_string(), "b".to_string()), Arc::clone(&block));
+        block_targets.insert(
+            VolumeId::new("t".to_string(), "b".to_string()),
+            Arc::clone(&block),
+        );
         let state = available_admin_state_with_blocks(
             Arc::clone(&object_store),
             Arc::clone(&kms),
@@ -5845,7 +5889,10 @@ mod tests {
             .await
             .unwrap();
         let mut targets = HashMap::new();
-        targets.insert(("t".to_string(), "v".to_string()), Arc::clone(&volume));
+        targets.insert(
+            VolumeId::new("t".to_string(), "v".to_string()),
+            Arc::clone(&volume),
+        );
         let state = available_admin_state(Arc::clone(&object_store), kms, targets, None).await;
 
         let tenants = admin_exchange(

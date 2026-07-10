@@ -138,18 +138,68 @@ impl NbdMetricSeries {
     }
 }
 
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum NbdCmdKind {
+    Read = 0,
+    Write = 1,
+    Disc = 2,
+    Flush = 3,
+    Trim = 4,
+    Cache = 5,
+    WriteZeroes = 6,
+    Unknown = 7,
+}
+
+impl NbdCmdKind {
+    const ALL: [Self; 8] = [
+        Self::Read,
+        Self::Write,
+        Self::Disc,
+        Self::Flush,
+        Self::Trim,
+        Self::Cache,
+        Self::WriteZeroes,
+        Self::Unknown,
+    ];
+    const COUNT: usize = Self::ALL.len();
+
+    fn from_wire(command: u16) -> Self {
+        match command {
+            NBD_CMD_READ => Self::Read,
+            NBD_CMD_WRITE => Self::Write,
+            NBD_CMD_DISC => Self::Disc,
+            NBD_CMD_FLUSH => Self::Flush,
+            NBD_CMD_TRIM => Self::Trim,
+            NBD_CMD_CACHE => Self::Cache,
+            NBD_CMD_WRITE_ZEROES => Self::WriteZeroes,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Disc => "disc",
+            Self::Flush => "flush",
+            Self::Trim => "trim",
+            Self::Cache => "cache",
+            Self::WriteZeroes => "write_zeroes",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn as_index(self) -> usize {
+        self as usize
+    }
+}
+
 #[derive(Debug, Default)]
 struct NbdExportMetrics {
     tenant: String,
     volume: String,
-    read: NbdMetricSeries,
-    write: NbdMetricSeries,
-    disc: NbdMetricSeries,
-    flush: NbdMetricSeries,
-    trim: NbdMetricSeries,
-    cache: NbdMetricSeries,
-    write_zeroes: NbdMetricSeries,
-    unknown: NbdMetricSeries,
+    commands: [NbdMetricSeries; NbdCmdKind::COUNT],
     bytes_read: AtomicU64,
     bytes_written: AtomicU64,
     inflight: AtomicU64,
@@ -170,29 +220,20 @@ impl NbdExportMetrics {
         }
     }
 
-    fn series(&self, cmd: &str) -> &NbdMetricSeries {
-        match cmd {
-            "read" => &self.read,
-            "write" => &self.write,
-            "disc" => &self.disc,
-            "flush" => &self.flush,
-            "trim" => &self.trim,
-            "cache" => &self.cache,
-            "write_zeroes" => &self.write_zeroes,
-            _ => &self.unknown,
-        }
+    fn series(&self, cmd: NbdCmdKind) -> &NbdMetricSeries {
+        &self.commands[cmd.as_index()]
     }
 
-    fn request_finished(&self, cmd: &str, latency: Duration, command: u16, bytes: u64, ok: bool) {
+    fn request_finished(&self, cmd: NbdCmdKind, latency: Duration, bytes: u64, ok: bool) {
         self.series(cmd).observe(latency);
         if !ok {
             return;
         }
-        match command {
-            NBD_CMD_READ => {
+        match cmd {
+            NbdCmdKind::Read => {
                 self.bytes_read.fetch_add(bytes, Ordering::Relaxed);
             }
-            NBD_CMD_WRITE | NBD_CMD_WRITE_ZEROES => {
+            NbdCmdKind::Write | NbdCmdKind::WriteZeroes => {
                 self.bytes_written.fetch_add(bytes, Ordering::Relaxed);
             }
             _ => {}
@@ -229,20 +270,13 @@ impl NbdExportMetrics {
             ("tenant", self.tenant.as_str()),
             ("volume", self.volume.as_str()),
         ];
-        for (cmd, series) in [
-            ("read", &self.read),
-            ("write", &self.write),
-            ("disc", &self.disc),
-            ("flush", &self.flush),
-            ("trim", &self.trim),
-            ("cache", &self.cache),
-            ("write_zeroes", &self.write_zeroes),
-            ("unknown", &self.unknown),
-        ] {
+        for cmd in NbdCmdKind::ALL {
+            let series = self.series(cmd);
             let requests = series.requests_total.load(Ordering::Relaxed);
             if requests == 0 {
                 continue;
             }
+            let cmd = cmd.label();
             samples.push(PrometheusSample::new(
                 "slatefs_nbd_requests_total",
                 [
@@ -1050,11 +1084,11 @@ async fn execute_request(
     payload: Option<Bytes>,
     permit: OwnedSemaphorePermit,
 ) -> Response {
-    let cmd = cmd_label(header.command);
+    let cmd = NbdCmdKind::from_wire(header.command);
     let started = Instant::now();
     let _inflight = state.metrics.inflight_guard();
-    let metric_bytes = match header.command {
-        NBD_CMD_READ | NBD_CMD_WRITE | NBD_CMD_WRITE_ZEROES => header.length as u64,
+    let metric_bytes = match cmd {
+        NbdCmdKind::Read | NbdCmdKind::Write | NbdCmdKind::WriteZeroes => header.length as u64,
         _ => 0,
     };
     let result = match header.command {
@@ -1156,7 +1190,7 @@ async fn execute_request(
     let ok = result.is_ok();
     state
         .metrics
-        .request_finished(cmd, started.elapsed(), header.command, metric_bytes, ok);
+        .request_finished(cmd, started.elapsed(), metric_bytes, ok);
 
     match result {
         Ok(data) => Response {
@@ -1173,19 +1207,6 @@ async fn execute_request(
             fatal: failure.fatal,
             _permit: permit,
         },
-    }
-}
-
-fn cmd_label(command: u16) -> &'static str {
-    match command {
-        NBD_CMD_READ => "read",
-        NBD_CMD_WRITE => "write",
-        NBD_CMD_DISC => "disc",
-        NBD_CMD_FLUSH => "flush",
-        NBD_CMD_TRIM => "trim",
-        NBD_CMD_CACHE => "cache",
-        NBD_CMD_WRITE_ZEROES => "write_zeroes",
-        _ => "unknown",
     }
 }
 
