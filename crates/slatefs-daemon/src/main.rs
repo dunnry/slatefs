@@ -147,6 +147,7 @@ struct DesiredExport {
 #[derive(Clone, Default)]
 struct ExportMetrics {
     active: Arc<Mutex<HashMap<(ExportProtocol, ExportSource), usize>>>,
+    active_snapshots: Arc<Mutex<usize>>,
     reconcile_failures: Arc<AtomicU64>,
     snapshot_retention_deleted: Arc<Mutex<HashMap<VolumeId, u64>>>,
     tls_reloads: Arc<Mutex<HashMap<String, u64>>>,
@@ -155,15 +156,30 @@ struct ExportMetrics {
 }
 
 impl ExportMetrics {
-    fn started(&self, protocol: ExportProtocol, source: ExportSource) {
+    fn started(&self, protocol: ExportProtocol, source: ExportSource, snapshot: bool) {
         let mut active = self.active.lock().expect("export metrics poisoned");
         *active.entry((protocol, source)).or_insert(0) += 1;
+        drop(active);
+        if snapshot {
+            *self
+                .active_snapshots
+                .lock()
+                .expect("export metrics poisoned") += 1;
+        }
     }
 
-    fn stopped(&self, protocol: ExportProtocol, source: ExportSource) {
+    fn stopped(&self, protocol: ExportProtocol, source: ExportSource, snapshot: bool) {
         let mut active = self.active.lock().expect("export metrics poisoned");
         let count = active.entry((protocol, source)).or_insert(0);
         *count = count.saturating_sub(1);
+        drop(active);
+        if snapshot {
+            let mut snapshots = self
+                .active_snapshots
+                .lock()
+                .expect("export metrics poisoned");
+            *snapshots = snapshots.saturating_sub(1);
+        }
     }
 
     fn failure(&self) {
@@ -243,6 +259,13 @@ impl ExportMetrics {
             .expect("export metrics poisoned")
             .values()
             .sum()
+    }
+
+    fn active_snapshot_total(&self) -> usize {
+        *self
+            .active_snapshots
+            .lock()
+            .expect("export metrics poisoned")
     }
 
     fn samples(&self) -> Vec<PrometheusSample> {
@@ -846,8 +869,6 @@ struct AdminState {
     config_exports: Arc<Vec<ConfigExportRecord>>,
     export_metrics: ExportMetrics,
     started_at: Instant,
-    export_count: usize,
-    snapshot_export_count: usize,
     auth_token: Option<String>,
     allow_cert_auth: bool,
     node_id: Option<String>,
@@ -1157,11 +1178,11 @@ impl AdminState {
     }
 
     fn serving_export_count(&self) -> usize {
-        self.export_metrics.active_total().max(self.export_count)
+        self.export_metrics.active_total()
     }
 
     fn serving_snapshot_export_count(&self) -> usize {
-        self.snapshot_export_count
+        self.export_metrics.active_snapshot_total()
     }
 }
 
@@ -3951,8 +3972,11 @@ impl ExportManager {
         if let Some(backend) = self.open_backends.get_mut(&backend_key) {
             backend.ref_count += 1;
         }
-        self.metrics
-            .started(desired.config.protocol, desired.key.source);
+        self.metrics.started(
+            desired.config.protocol,
+            desired.key.source,
+            desired.config.snapshot.is_some(),
+        );
         self.running.insert(
             desired.key.clone(),
             RunningExport {
@@ -4281,8 +4305,11 @@ impl ExportManager {
             target.unregister();
         }
         running.task.abort();
-        self.metrics
-            .stopped(running.desired.config.protocol, running.desired.key.source);
+        self.metrics.stopped(
+            running.desired.config.protocol,
+            running.desired.key.source,
+            running.desired.config.snapshot.is_some(),
+        );
         if let Some(backend) = self.open_backends.get_mut(&running.backend_key) {
             backend.ref_count = backend.ref_count.saturating_sub(1);
         }
@@ -4644,12 +4671,6 @@ async fn main() -> anyhow::Result<()> {
             config_exports: Arc::clone(&config_exports),
             export_metrics: export_metrics.clone(),
             started_at: Instant::now(),
-            export_count: export_metrics.active_total(),
-            snapshot_export_count: config
-                .exports
-                .iter()
-                .filter(|export| export.snapshot.is_some())
-                .count(),
             auth_token: admin_token,
             allow_cert_auth: admin_cert_auth_allowed,
             node_id: None,
@@ -4800,8 +4821,6 @@ mod tests {
             config_exports: Arc::new(Vec::new()),
             export_metrics: ExportMetrics::default(),
             started_at: Instant::now(),
-            export_count: 1,
-            snapshot_export_count: 0,
             auth_token,
             allow_cert_auth: false,
             node_id: None,
@@ -4822,8 +4841,6 @@ mod tests {
             config_exports: Arc::new(Vec::new()),
             export_metrics: ExportMetrics::default(),
             started_at: Instant::now(),
-            export_count: 1,
-            snapshot_export_count: 0,
             auth_token,
             allow_cert_auth: false,
             node_id: None,
@@ -5780,6 +5797,88 @@ mod tests {
         assert_eq!(control["ok"], false);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_and_readyz_track_live_export_counts() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([73; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.close().await.unwrap();
+
+        let metrics = ExportMetrics::default();
+        metrics.started(ExportProtocol::Nfs, ExportSource::Control, false);
+        metrics.started(ExportProtocol::Nbd, ExportSource::Control, true);
+
+        let state = Arc::new(AdminState {
+            targets: Arc::new(Mutex::new(HashMap::new())),
+            block_targets: Arc::new(Mutex::new(HashMap::new())),
+            control: AdminControl::Available(Arc::new(
+                ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+                    .await
+                    .unwrap(),
+            )),
+            object_store,
+            kms,
+            config_exports: Arc::new(Vec::new()),
+            export_metrics: metrics.clone(),
+            started_at: Instant::now(),
+            auth_token: None,
+            allow_cert_auth: false,
+            node_id: None,
+        });
+
+        let status = admin_exchange(
+            Arc::clone(&state),
+            b"GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&status), 200, "{status}");
+        assert!(response_body(&status).contains("exports=2\n"), "{status}");
+        assert!(
+            response_body(&status).contains("snapshot_exports=1\n"),
+            "{status}"
+        );
+
+        let ready = admin_exchange(
+            Arc::clone(&state),
+            b"GET /readyz?verbose=1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&ready), 200, "{ready}");
+        let ready_body: Value = serde_json::from_str(response_body(&ready)).unwrap();
+        assert_eq!(ready_body["identity"]["exports"], 2);
+        assert_eq!(ready_body["identity"]["snapshot_exports"], 1);
+
+        metrics.stopped(ExportProtocol::Nbd, ExportSource::Control, true);
+        let status = admin_exchange(
+            Arc::clone(&state),
+            b"GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(response_body(&status).contains("exports=1\n"), "{status}");
+        assert!(
+            response_body(&status).contains("snapshot_exports=0\n"),
+            "{status}"
+        );
+
+        metrics.stopped(ExportProtocol::Nfs, ExportSource::Control, false);
+        let ready = admin_exchange(
+            Arc::clone(&state),
+            b"GET /readyz?verbose=1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&ready), 503, "{ready}");
+        let ready_body: Value = serde_json::from_str(response_body(&ready)).unwrap();
+        let exports_check = ready_body["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "exports_serving")
+            .unwrap();
+        assert_eq!(exports_check["ok"], false);
+    }
+
     fn audit_record(
         time: u64,
         request_id: &str,
@@ -6102,8 +6201,6 @@ mod tests {
             }]),
             export_metrics: ExportMetrics::default(),
             started_at: Instant::now(),
-            export_count: 1,
-            snapshot_export_count: 0,
             auth_token: None,
             allow_cert_auth: false,
             node_id: None,
@@ -6853,8 +6950,6 @@ mod tests {
             config_exports: Arc::new(Vec::new()),
             export_metrics: ExportMetrics::default(),
             started_at: Instant::now(),
-            export_count: 1,
-            snapshot_export_count: 0,
             auth_token: None,
             allow_cert_auth: false,
             node_id: None,
@@ -7013,8 +7108,6 @@ mod tests {
             config_exports: Arc::new(Vec::new()),
             export_metrics: ExportMetrics::default(),
             started_at: Instant::now(),
-            export_count: 1,
-            snapshot_export_count: 0,
             auth_token: None,
             allow_cert_auth: false,
             node_id: None,
