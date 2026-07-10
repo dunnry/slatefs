@@ -303,21 +303,113 @@ impl ExportMetrics {
 
 struct RunningExport {
     desired: DesiredExport,
-    backend_key: (String, String, Option<String>),
+    backend_key: BackendKey,
     nbd_shutdown: Option<NbdShutdownHandle>,
     tls_reload: Option<Arc<TlsReloadTarget>>,
     task: tokio::task::JoinHandle<()>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BackendKey {
+    tenant: String,
+    volume: String,
+    snapshot: Option<String>,
+}
+
+impl BackendKey {
+    fn from_export(export: &ExportConfig) -> Self {
+        Self {
+            tenant: export.tenant.clone(),
+            volume: export.volume.clone(),
+            snapshot: export.snapshot.clone(),
+        }
+    }
+}
+
+enum OpenVolume {
+    FsWritable(Arc<Volume>),
+    FsSnapshot(Arc<SnapshotVolume>),
+    BlockWritable(Arc<BlockVolume>),
+    BlockSnapshot(Arc<SnapshotBlockVolume>),
+}
+
+impl OpenVolume {
+    fn vfs(&self) -> Option<Arc<dyn Vfs>> {
+        match self {
+            Self::FsWritable(volume) => {
+                let volume: Arc<dyn Vfs> = volume.clone();
+                Some(volume)
+            }
+            Self::FsSnapshot(snapshot) => {
+                let snapshot: Arc<dyn Vfs> = snapshot.clone();
+                Some(snapshot)
+            }
+            Self::BlockWritable(_) | Self::BlockSnapshot(_) => None,
+        }
+    }
+
+    fn block(&self) -> Option<Arc<dyn BlockDev>> {
+        match self {
+            Self::BlockWritable(volume) => {
+                let volume: Arc<dyn BlockDev> = volume.clone();
+                Some(volume)
+            }
+            Self::BlockSnapshot(snapshot) => {
+                let snapshot: Arc<dyn BlockDev> = snapshot.clone();
+                Some(snapshot)
+            }
+            Self::FsWritable(_) | Self::FsSnapshot(_) => None,
+        }
+    }
+
+    fn writable(&self) -> Option<&Arc<Volume>> {
+        match self {
+            Self::FsWritable(volume) => Some(volume),
+            Self::FsSnapshot(_) | Self::BlockWritable(_) | Self::BlockSnapshot(_) => None,
+        }
+    }
+
+    fn block_writable(&self) -> Option<&Arc<BlockVolume>> {
+        match self {
+            Self::BlockWritable(volume) => Some(volume),
+            Self::FsWritable(_) | Self::FsSnapshot(_) | Self::BlockSnapshot(_) => None,
+        }
+    }
+}
+
 struct OpenBackend {
-    vfs: Option<Arc<dyn Vfs>>,
-    block: Option<Arc<dyn BlockDev>>,
-    writable: Option<Arc<Volume>>,
-    snapshot: Option<Arc<SnapshotVolume>>,
-    block_writable: Option<Arc<BlockVolume>>,
-    block_snapshot: Option<Arc<SnapshotBlockVolume>>,
+    volume: OpenVolume,
     nbd_shutdowns: Arc<Mutex<Vec<NbdShutdownHandle>>>,
     ref_count: usize,
+}
+
+impl OpenBackend {
+    fn export_backend(&self, export: &ExportConfig, state: &str) -> anyhow::Result<BackendExport> {
+        match export.protocol {
+            ExportProtocol::Nfs | ExportProtocol::P9 => {
+                Ok(BackendExport::Fs(self.volume.vfs().ok_or_else(|| {
+                    anyhow::anyhow!("{state} backend is not a filesystem")
+                })?))
+            }
+            ExportProtocol::Nbd => Ok(BackendExport::Block {
+                device: block_export_device(
+                    self.volume
+                        .block()
+                        .ok_or_else(|| anyhow::anyhow!("{state} backend is not a block device"))?,
+                    export,
+                ),
+                shutdowns: Arc::clone(&self.nbd_shutdowns),
+            }),
+        }
+    }
+
+    fn writable(&self) -> Option<&Arc<Volume>> {
+        self.volume.writable()
+    }
+
+    fn block_writable(&self) -> Option<&Arc<BlockVolume>> {
+        self.volume.block_writable()
+    }
 }
 
 enum BackendExport {
@@ -340,7 +432,7 @@ struct ExportManager {
     admin_targets: AdminTargets,
     admin_block_targets: AdminBlockTargets,
     running: HashMap<ExportKey, RunningExport>,
-    open_backends: HashMap<(String, String, Option<String>), OpenBackend>,
+    open_backends: HashMap<BackendKey, OpenBackend>,
     rate_limiters: HashMap<String, Arc<RateLimiter>>,
     live_share_count: usize,
 }
@@ -3829,32 +3921,11 @@ impl ExportManager {
         &mut self,
         reader: &ControlReader,
         export: &ExportConfig,
-    ) -> anyhow::Result<((String, String, Option<String>), BackendExport, RateLimits)> {
-        let backend_key = (
-            export.tenant.clone(),
-            export.volume.clone(),
-            export.snapshot.clone(),
-        );
+    ) -> anyhow::Result<(BackendKey, BackendExport, RateLimits)> {
+        let backend_key = BackendKey::from_export(export);
         let tenant = reader.get_tenant(&export.tenant).await?;
         if let Some(backend) = self.open_backends.get(&backend_key) {
-            let export_backend = match export.protocol {
-                ExportProtocol::Nfs | ExportProtocol::P9 => BackendExport::Fs(
-                    backend
-                        .vfs
-                        .as_ref()
-                        .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("cached backend is not a filesystem"))?,
-                ),
-                ExportProtocol::Nbd => BackendExport::Block {
-                    device: block_export_device(
-                        backend.block.as_ref().cloned().ok_or_else(|| {
-                            anyhow::anyhow!("cached backend is not a block device")
-                        })?,
-                        export,
-                    ),
-                    shutdowns: Arc::clone(&backend.nbd_shutdowns),
-                },
-            };
+            let export_backend = backend.export_backend(export, "cached")?;
             return Ok((backend_key, export_backend, tenant.rate_limits));
         }
 
@@ -3877,25 +3948,7 @@ impl ExportManager {
                     .await?
             }
         };
-        let export_backend =
-            match export.protocol {
-                ExportProtocol::Nfs | ExportProtocol::P9 => BackendExport::Fs(
-                    backend
-                        .vfs
-                        .as_ref()
-                        .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("opened backend is not a filesystem"))?,
-                ),
-                ExportProtocol::Nbd => BackendExport::Block {
-                    device: block_export_device(
-                        backend.block.as_ref().cloned().ok_or_else(|| {
-                            anyhow::anyhow!("opened backend is not a block device")
-                        })?,
-                        export,
-                    ),
-                    shutdowns: Arc::clone(&backend.nbd_shutdowns),
-                },
-            };
+        let export_backend = backend.export_backend(export, "opened")?;
         self.open_backends.insert(backend_key.clone(), backend);
         Ok((backend_key, export_backend, tenant.rate_limits))
     }
@@ -3932,12 +3985,7 @@ impl ExportManager {
                     volume: Arc::clone(&snapshot_volume),
                 });
             Ok(OpenBackend {
-                vfs: Some(snapshot_volume.clone()),
-                block: None,
-                writable: None,
-                snapshot: Some(snapshot_volume),
-                block_writable: None,
-                block_snapshot: None,
+                volume: OpenVolume::FsSnapshot(snapshot_volume),
                 nbd_shutdowns: Arc::new(Mutex::new(Vec::new())),
                 ref_count: 0,
             })
@@ -3985,12 +4033,7 @@ impl ExportManager {
                     Arc::clone(&volume),
                 );
             Ok(OpenBackend {
-                vfs: Some(volume.clone()),
-                block: None,
-                writable: Some(volume),
-                snapshot: None,
-                block_writable: None,
-                block_snapshot: None,
+                volume: OpenVolume::FsWritable(volume),
                 nbd_shutdowns: Arc::new(Mutex::new(Vec::new())),
                 ref_count: 0,
             })
@@ -4020,7 +4063,6 @@ impl ExportManager {
                     export.tenant, export.volume
                 )
             })?;
-            let device: Arc<dyn BlockDev> = snapshot_volume.clone();
             self.metrics_targets
                 .lock()
                 .expect("metrics targets poisoned")
@@ -4030,12 +4072,7 @@ impl ExportManager {
                     snapshot_id: snapshot.clone(),
                 });
             Ok(OpenBackend {
-                vfs: None,
-                block: Some(device),
-                writable: None,
-                snapshot: None,
-                block_writable: None,
-                block_snapshot: Some(snapshot_volume),
+                volume: OpenVolume::BlockSnapshot(snapshot_volume),
                 nbd_shutdowns,
                 ref_count: 0,
             })
@@ -4072,7 +4109,6 @@ impl ExportManager {
                     shutdown.kill();
                 }
             });
-            let device: Arc<dyn BlockDev> = volume.clone();
             self.metrics_targets
                 .lock()
                 .expect("metrics targets poisoned")
@@ -4089,12 +4125,7 @@ impl ExportManager {
                     Arc::clone(&volume),
                 );
             Ok(OpenBackend {
-                vfs: None,
-                block: Some(device),
-                writable: None,
-                snapshot: None,
-                block_writable: Some(volume),
-                block_snapshot: None,
+                volume: OpenVolume::BlockWritable(volume),
                 nbd_shutdowns,
                 ref_count: 0,
             })
@@ -4136,27 +4167,27 @@ impl ExportManager {
         let open_writable = self
             .open_backends
             .iter()
-            .filter_map(|((tenant, volume, snapshot), backend)| {
-                if snapshot.is_some() {
-                    return None;
-                }
-                backend
-                    .writable
-                    .as_ref()
-                    .map(|writable| (tenant.clone(), volume.clone(), Arc::clone(writable)))
+            .filter_map(|(backend_key, backend)| {
+                backend.writable().map(|writable| {
+                    (
+                        backend_key.tenant.clone(),
+                        backend_key.volume.clone(),
+                        Arc::clone(writable),
+                    )
+                })
             })
             .collect::<Vec<_>>();
         let open_block_writable = self
             .open_backends
             .iter()
-            .filter_map(|((tenant, volume, snapshot), backend)| {
-                if snapshot.is_some() {
-                    return None;
-                }
-                backend
-                    .block_writable
-                    .as_ref()
-                    .map(|writable| (tenant.clone(), volume.clone(), Arc::clone(writable)))
+            .filter_map(|(backend_key, backend)| {
+                backend.block_writable().map(|writable| {
+                    (
+                        backend_key.tenant.clone(),
+                        backend_key.volume.clone(),
+                        Arc::clone(writable),
+                    )
+                })
             })
             .collect::<Vec<_>>();
 
@@ -4214,7 +4245,7 @@ impl ExportManager {
         );
     }
 
-    async fn close_backend_if_unused(&mut self, backend_key: &(String, String, Option<String>)) {
+    async fn close_backend_if_unused(&mut self, backend_key: &BackendKey) {
         if self
             .open_backends
             .get(backend_key)
@@ -4226,61 +4257,81 @@ impl ExportManager {
             return;
         };
         self.remove_metrics_target(backend_key);
-        if let Some(volume) = backend.writable
-            && let Err(error) = volume.shutdown().await
-        {
-            self.admin_targets
-                .lock()
-                .expect("admin targets poisoned")
-                .remove(&(backend_key.0.clone(), backend_key.1.clone()));
-            tracing::error!(
-                tenant = backend_key.0,
-                volume = backend_key.1,
-                "volume shutdown: {error}"
-            );
-        }
-        if backend_key.2.is_none() {
-            self.admin_targets
-                .lock()
-                .expect("admin targets poisoned")
-                .remove(&(backend_key.0.clone(), backend_key.1.clone()));
-        }
-        if let Some(snapshot) = backend.snapshot
-            && let Err(error) = snapshot.shutdown().await
-        {
-            tracing::error!(
-                tenant = backend_key.0,
-                volume = backend_key.1,
-                snapshot = backend_key.2.as_deref().unwrap_or("-"),
-                "snapshot shutdown: {error}"
-            );
-        }
-        if let Some(volume) = backend.block_writable {
-            self.admin_block_targets
-                .lock()
-                .expect("admin block targets poisoned")
-                .remove(&(backend_key.0.clone(), backend_key.1.clone()));
-            if let Err(error) = volume.shutdown().await {
-                tracing::error!(
-                    tenant = backend_key.0,
-                    volume = backend_key.1,
-                    "block volume shutdown: {error}"
-                );
+        match backend.volume {
+            OpenVolume::FsWritable(volume) => {
+                if let Err(error) = volume.shutdown().await {
+                    self.admin_targets
+                        .lock()
+                        .expect("admin targets poisoned")
+                        .remove(&(backend_key.tenant.clone(), backend_key.volume.clone()));
+                    tracing::error!(
+                        tenant = backend_key.tenant,
+                        volume = backend_key.volume,
+                        "volume shutdown: {error}"
+                    );
+                }
+                if backend_key.snapshot.is_none() {
+                    self.admin_targets
+                        .lock()
+                        .expect("admin targets poisoned")
+                        .remove(&(backend_key.tenant.clone(), backend_key.volume.clone()));
+                }
             }
-        }
-        if let Some(snapshot) = backend.block_snapshot
-            && let Err(error) = snapshot.shutdown().await
-        {
-            tracing::error!(
-                tenant = backend_key.0,
-                volume = backend_key.1,
-                snapshot = backend_key.2.as_deref().unwrap_or("-"),
-                "block snapshot shutdown: {error}"
-            );
+            OpenVolume::FsSnapshot(snapshot) => {
+                if backend_key.snapshot.is_none() {
+                    self.admin_targets
+                        .lock()
+                        .expect("admin targets poisoned")
+                        .remove(&(backend_key.tenant.clone(), backend_key.volume.clone()));
+                }
+                if let Err(error) = snapshot.shutdown().await {
+                    tracing::error!(
+                        tenant = backend_key.tenant,
+                        volume = backend_key.volume,
+                        snapshot = backend_key.snapshot.as_deref().unwrap_or("-"),
+                        "snapshot shutdown: {error}"
+                    );
+                }
+            }
+            OpenVolume::BlockWritable(volume) => {
+                if backend_key.snapshot.is_none() {
+                    self.admin_targets
+                        .lock()
+                        .expect("admin targets poisoned")
+                        .remove(&(backend_key.tenant.clone(), backend_key.volume.clone()));
+                }
+                self.admin_block_targets
+                    .lock()
+                    .expect("admin block targets poisoned")
+                    .remove(&(backend_key.tenant.clone(), backend_key.volume.clone()));
+                if let Err(error) = volume.shutdown().await {
+                    tracing::error!(
+                        tenant = backend_key.tenant,
+                        volume = backend_key.volume,
+                        "block volume shutdown: {error}"
+                    );
+                }
+            }
+            OpenVolume::BlockSnapshot(snapshot) => {
+                if backend_key.snapshot.is_none() {
+                    self.admin_targets
+                        .lock()
+                        .expect("admin targets poisoned")
+                        .remove(&(backend_key.tenant.clone(), backend_key.volume.clone()));
+                }
+                if let Err(error) = snapshot.shutdown().await {
+                    tracing::error!(
+                        tenant = backend_key.tenant,
+                        volume = backend_key.volume,
+                        snapshot = backend_key.snapshot.as_deref().unwrap_or("-"),
+                        "block snapshot shutdown: {error}"
+                    );
+                }
+            }
         }
     }
 
-    fn remove_metrics_target(&self, backend_key: &(String, String, Option<String>)) {
+    fn remove_metrics_target(&self, backend_key: &BackendKey) {
         let mut targets = self
             .metrics_targets
             .lock()
@@ -4291,7 +4342,9 @@ impl ExportManager {
                 volume_name,
                 ..
             } => {
-                backend_key.2.is_some() || tenant != &backend_key.0 || volume_name != &backend_key.1
+                backend_key.snapshot.is_some()
+                    || tenant != &backend_key.tenant
+                    || volume_name != &backend_key.volume
             }
             MetricsTarget::Snapshot {
                 tenant,
@@ -4299,25 +4352,27 @@ impl ExportManager {
                 snapshot_id,
                 ..
             } => {
-                backend_key.2.as_ref() != Some(snapshot_id)
-                    || tenant != &backend_key.0
-                    || volume_name != &backend_key.1
+                backend_key.snapshot.as_ref() != Some(snapshot_id)
+                    || tenant != &backend_key.tenant
+                    || volume_name != &backend_key.volume
             }
             MetricsTarget::BlockWritable {
                 tenant,
                 volume_name,
                 ..
             } => {
-                backend_key.2.is_some() || tenant != &backend_key.0 || volume_name != &backend_key.1
+                backend_key.snapshot.is_some()
+                    || tenant != &backend_key.tenant
+                    || volume_name != &backend_key.volume
             }
             MetricsTarget::BlockSnapshot {
                 tenant,
                 volume_name,
                 snapshot_id,
             } => {
-                backend_key.2.as_ref() != Some(snapshot_id)
-                    || tenant != &backend_key.0
-                    || volume_name != &backend_key.1
+                backend_key.snapshot.as_ref() != Some(snapshot_id)
+                    || tenant != &backend_key.tenant
+                    || volume_name != &backend_key.volume
             }
             MetricsTarget::TenantRateLimiter { .. } => true,
         });
@@ -6563,8 +6618,12 @@ mod tests {
         manager.reconcile(&reader).await.unwrap();
         let volume = manager
             .open_backends
-            .get(&("t".to_string(), "v".to_string(), None))
-            .and_then(|backend| backend.writable.as_ref())
+            .get(&BackendKey {
+                tenant: "t".to_string(),
+                volume: "v".to_string(),
+                snapshot: None,
+            })
+            .and_then(OpenBackend::writable)
             .cloned()
             .expect("writable backend");
         let limiter = manager
@@ -6706,8 +6765,12 @@ mod tests {
             let manager = manager.lock().await;
             let volume = manager
                 .open_backends
-                .get(&("t".to_string(), "v".to_string(), None))
-                .and_then(|backend| backend.writable.as_ref())
+                .get(&BackendKey {
+                    tenant: "t".to_string(),
+                    volume: "v".to_string(),
+                    snapshot: None,
+                })
+                .and_then(OpenBackend::writable)
                 .cloned()
                 .expect("writable backend");
             let limiter = manager
@@ -6866,8 +6929,12 @@ mod tests {
             let manager = manager.lock().await;
             manager
                 .open_backends
-                .get(&("t".to_string(), "v".to_string(), None))
-                .and_then(|backend| backend.writable.as_ref())
+                .get(&BackendKey {
+                    tenant: "t".to_string(),
+                    volume: "v".to_string(),
+                    snapshot: None,
+                })
+                .and_then(OpenBackend::writable)
                 .cloned()
                 .expect("writable backend")
         };
