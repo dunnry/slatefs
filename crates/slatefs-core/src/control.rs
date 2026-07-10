@@ -932,12 +932,7 @@ impl ControlPlane {
     }
 
     pub async fn list_tenants(&self) -> Result<Vec<TenantRecord>> {
-        let mut iter = self.db.scan_prefix(b"t/".as_slice(), ..).await?;
-        let mut tenants = Vec::new();
-        while let Some(kv) = iter.next().await? {
-            tenants.push(decode_tenant_record(&kv.value)?);
-        }
-        Ok(tenants)
+        list_tenants_impl(&self.db).await
     }
 
     /// Unwrap a tenant's KEK via the master KMS.
@@ -1019,13 +1014,7 @@ impl ControlPlane {
     }
 
     pub async fn list_volumes(&self, tenant: &str) -> Result<Vec<VolumeRecord>> {
-        let prefix = format!("v/{tenant}/");
-        let mut iter = self.db.scan_prefix(prefix.as_bytes(), ..).await?;
-        let mut volumes = Vec::new();
-        while let Some(kv) = iter.next().await? {
-            volumes.push(decode_volume_record(&kv.value)?);
-        }
-        Ok(volumes)
+        list_volumes_impl(&self.db, tenant).await
     }
 
     /// Mark one volume deleted and drop its wrapped DEK from the current
@@ -2008,13 +1997,7 @@ impl ControlReader {
     }
 
     pub async fn list_tenants(&self) -> Result<Vec<TenantRecord>> {
-        let mut iter = self.db.scan_prefix(b"t/".as_slice(), ..).await?;
-        let mut tenants = Vec::new();
-        while let Some(kv) = iter.next().await? {
-            tenants.push(decode_tenant_record(&kv.value)?);
-        }
-        tenants.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(tenants)
+        list_tenants_impl(&self.db).await
     }
 
     pub async fn try_get_volume(&self, tenant: &str, volume: &str) -> Result<Option<VolumeRecord>> {
@@ -2038,14 +2021,7 @@ impl ControlReader {
     }
 
     pub async fn list_volumes(&self, tenant: &str) -> Result<Vec<VolumeRecord>> {
-        let prefix = format!("v/{tenant}/");
-        let mut iter = self.db.scan_prefix(prefix.as_bytes(), ..).await?;
-        let mut volumes = Vec::new();
-        while let Some(kv) = iter.next().await? {
-            volumes.push(decode_volume_record(&kv.value)?);
-        }
-        volumes.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(volumes)
+        list_volumes_impl(&self.db, tenant).await
     }
 
     pub async fn try_get_snapshot_retention_policy(
@@ -2110,6 +2086,17 @@ async fn get_tenant_impl<R: ControlRead>(db: &R, name: &str) -> Result<TenantRec
         .ok_or_else(|| Error::not_found("tenant", name))
 }
 
+/// List tenants sorted by tenant name.
+async fn list_tenants_impl<R: ControlRead>(db: &R) -> Result<Vec<TenantRecord>> {
+    let mut iter = db.scan_control_prefix(b"t/").await?;
+    let mut tenants = Vec::new();
+    while let Some(kv) = iter.next().await? {
+        tenants.push(decode_tenant_record(&kv.value)?);
+    }
+    tenants.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(tenants)
+}
+
 async fn try_get_volume_impl<R: ControlRead>(
     db: &R,
     tenant: &str,
@@ -2130,6 +2117,18 @@ async fn get_volume_impl<R: ControlRead>(
     try_get_volume_impl(db, tenant, volume)
         .await?
         .ok_or_else(|| Error::not_found("volume", format!("{tenant}/{volume}")))
+}
+
+/// List a tenant's volumes sorted by volume name.
+async fn list_volumes_impl<R: ControlRead>(db: &R, tenant: &str) -> Result<Vec<VolumeRecord>> {
+    let prefix = format!("v/{tenant}/");
+    let mut iter = db.scan_control_prefix(prefix.as_bytes()).await?;
+    let mut volumes = Vec::new();
+    while let Some(kv) = iter.next().await? {
+        volumes.push(decode_volume_record(&kv.value)?);
+    }
+    volumes.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(volumes)
 }
 
 async fn get_mountable_volume_impl<R: ControlRead>(

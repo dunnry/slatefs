@@ -14,7 +14,7 @@ use futures::TryStreamExt;
 use slatedb::object_store::ObjectStoreExt;
 use slatefs_core::config::{Compression, VolumeDefaults};
 use slatefs_core::control::{
-    ControlPlane, QuotaLimit, QuotaLimits, TenantState, VolumeRecord, VolumeState,
+    ControlPlane, ControlReader, QuotaLimit, QuotaLimits, TenantState, VolumeRecord, VolumeState,
 };
 use slatefs_core::crypto::Secret32;
 use slatefs_core::crypto::kms::{Kms, StaticKms};
@@ -666,6 +666,74 @@ fn marker_scan_detects_plaintext() {
         TENANT_MARKER.as_bytes()
     ));
     assert!(!contains(b"nothing here", TENANT_MARKER.as_bytes()));
+}
+
+#[tokio::test]
+async fn control_lists_are_sorted_by_name_for_writer_and_reader() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let url = format!("file://{}", dir.path().display());
+    let object_store = store::resolve_root(&url).expect("resolve file store");
+    let kms = static_kms(7);
+    let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+        .await
+        .expect("open control plane");
+
+    for tenant in ["m", "a", "z"] {
+        control
+            .create_tenant(tenant, None)
+            .await
+            .expect("create tenant");
+    }
+    for volume in ["m", "a", "z"] {
+        volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "m",
+            volume,
+            default_create_opts(),
+        )
+        .await
+        .expect("create volume");
+    }
+
+    let tenant_names = control
+        .list_tenants()
+        .await
+        .expect("list tenants from control plane")
+        .into_iter()
+        .map(|tenant| tenant.name)
+        .collect::<Vec<_>>();
+    assert_eq!(tenant_names, vec!["a", "m", "z"]);
+    let volume_names = control
+        .list_volumes("m")
+        .await
+        .expect("list volumes from control plane")
+        .into_iter()
+        .map(|volume| volume.name)
+        .collect::<Vec<_>>();
+    assert_eq!(volume_names, vec!["a", "m", "z"]);
+    control.close().await.expect("close control plane");
+
+    let reader = ControlReader::open(Arc::clone(&object_store), kms)
+        .await
+        .expect("open control reader");
+    let tenant_names = reader
+        .list_tenants()
+        .await
+        .expect("list tenants from control reader")
+        .into_iter()
+        .map(|tenant| tenant.name)
+        .collect::<Vec<_>>();
+    assert_eq!(tenant_names, vec!["a", "m", "z"]);
+    let volume_names = reader
+        .list_volumes("m")
+        .await
+        .expect("list volumes from control reader")
+        .into_iter()
+        .map(|volume| volume.name)
+        .collect::<Vec<_>>();
+    assert_eq!(volume_names, vec!["a", "m", "z"]);
+    reader.close().await.expect("close control reader");
 }
 
 #[tokio::test]
