@@ -1,0 +1,10 @@
+FROM rust:1.95-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p slatefs-daemon -p slatefs-cli
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/slatefsd /usr/local/bin/slatefsd
+COPY --from=build /src/target/release/slatefs /usr/local/bin/slatefs
+ENTRYPOINT ["/usr/local/bin/slatefsd"]
