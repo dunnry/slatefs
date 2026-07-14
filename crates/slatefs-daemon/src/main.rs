@@ -2262,6 +2262,20 @@ async fn list_version_commits_response(
     ))
 }
 
+async fn get_version_commit_response(
+    state: &AdminState,
+    tenant: &str,
+    volume: &str,
+    reference: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository.inspect_commit(reference).await;
+    let commit = finish_version_repository(control, repository, result).await?;
+    Ok(AdminHttpResponse::json(200, json!({ "commit": commit })))
+}
+
 async fn diff_version_commits_response(
     state: &AdminState,
     request: &AdminHttpRequest,
@@ -4206,6 +4220,20 @@ async fn route_admin_request(
                 "commits",
             ],
         ) => commit_live_version_response(state, request, tenant, volume).await,
+        (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "commits",
+                reference,
+            ],
+        ) => get_version_commit_response(state, tenant, volume, reference).await,
         (
             "GET",
             [
@@ -7355,6 +7383,15 @@ mod tests {
             serde_json::from_str(response_body(&branch_commit_response)).unwrap();
         assert_eq!(branch_commit["branch"], "release");
         assert_eq!(branch_commit["commit"]["parents"][0], commit_id);
+        let inspected = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning/commits/release HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&inspected), 200, "{inspected}");
+        let inspected: Value = serde_json::from_str(response_body(&inspected)).unwrap();
+        assert_eq!(inspected["commit"]["id"], branch_commit["commit"]["id"]);
+        assert_eq!(inspected["commit"]["parents"][0], commit_id);
         assert_ne!(branch_commit["commit"]["id"], commit_id);
         let branch_history_response = admin_exchange(
             Arc::clone(&state),

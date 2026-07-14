@@ -93,6 +93,9 @@ successful divergent result is published as a two-parent commit. First-parent
 order drives log and retention pagination, while verification and ancestry
 traverse the full DAG. Merge preview runs the same diff planner without
 applying mutations and folds metadata/chunk conflicts into logical file paths.
+Commit inspection resolves an ID, tag, or branch to its immutable commit and
+exposes the complete parent list so merge ancestry remains directly navigable
+even though ordinary log pagination follows first parents.
 An unbounded GC retains the full reachable DAG; bounded retention evaluates
 first-parent history per branch and may prune older secondary ancestry.
 

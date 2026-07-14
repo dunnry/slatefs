@@ -2424,6 +2424,12 @@ impl VersionRepository {
         Ok(self.history_page(path, limit, None).await?.0)
     }
 
+    /// Resolve a commit ID, immutable tag, or branch and return the referenced
+    /// commit, including every parent of a merge commit.
+    pub async fn inspect_commit(&self, reference: &str) -> Result<VersionCommitInfo> {
+        Ok(self.resolve_commit(reference).await?.into())
+    }
+
     /// Return newest-first history for a named branch.
     pub async fn history_on_branch(
         &self,

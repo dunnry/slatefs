@@ -367,6 +367,14 @@ enum VersioningCmd {
         #[arg(long)]
         live: bool,
     },
+    /// Resolve a commit ID, tag, or branch and show the commit and all parents.
+    Inspect {
+        tenant: String,
+        volume: String,
+        reference: String,
+        #[arg(long)]
+        live: bool,
+    },
     /// Compare two commits and list changed paths.
     Diff {
         tenant: String,
@@ -2291,6 +2299,35 @@ async fn run(
             }
             repository_close?;
         }
+        Command::Versioning(VersioningCmd::Inspect {
+            tenant,
+            volume,
+            reference,
+            live,
+        }) => {
+            if *live {
+                let response = live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    "GET",
+                    &format!("commits/{reference}"),
+                    &[],
+                    None,
+                )
+                .await?;
+                let commit: VersionCommitInfo = serde_json::from_value(response["commit"].clone())
+                    .context("parsing admin version commit")?;
+                print_version_commit(&commit);
+                return Ok(());
+            }
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let result = repository.inspect_commit(reference).await;
+            let repository_close = repository.close().await;
+            let commit = result?;
+            repository_close?;
+            print_version_commit(&commit);
+        }
         Command::Versioning(VersioningCmd::Diff {
             tenant,
             volume,
@@ -3886,6 +3923,25 @@ mod tests {
                 live: true,
                 ..
             }) if key == "retry-1" && branch == "draft"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "inspect",
+            "tenant-a",
+            "docs",
+            "release",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::Inspect {
+                reference,
+                live: true,
+                ..
+            }) if reference == "release"
         ));
 
         let cli = Cli::try_parse_from([

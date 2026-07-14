@@ -357,6 +357,12 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
             .as_ref(),
         b"feature contents"
     );
+    let inspected = repository.inspect_commit("theirs-target").await.unwrap();
+    assert_eq!(inspected.id, theirs.commit());
+    assert_eq!(
+        inspected.parents,
+        vec![three_way.commit().to_string(), branch_commit.id.clone()]
+    );
     let verified = repository.verify().await.unwrap();
     assert_eq!(verified.commits, 7);
     assert!(verified.nodes > 0);
