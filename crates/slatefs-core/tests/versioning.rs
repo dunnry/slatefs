@@ -327,6 +327,107 @@ async fn fenced_live_writer_cannot_publish_a_version_commit() {
     control.close().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_commits_preserve_a_linear_complete_history() {
+    let object_store: Arc<dyn ObjectStore> = store::resolve_root("memory:///").unwrap();
+    let control = ControlPlane::open(Arc::clone(&object_store), common::test_kms())
+        .await
+        .unwrap();
+    control.create_tenant("t", None).await.unwrap();
+    let record = volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "v",
+        common::create_opts(None, None),
+    )
+    .await
+    .unwrap();
+    control
+        .set_versioning_enabled("t", "v", true)
+        .await
+        .unwrap();
+    let dek = control.unwrap_volume_dek(&record).await.unwrap();
+    let live = Volume::open(&record, dek, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let creds = Credentials::root();
+    for (name, contents) in [
+        (b"a.txt".as_slice(), b"alpha".as_slice()),
+        (b"b.txt", b"bravo"),
+    ] {
+        let file = live
+            .create(&creds, ROOT_INO, name, 0o640, true)
+            .await
+            .unwrap();
+        live.write(&creds, file.ino, 0, contents).await.unwrap();
+    }
+    live.validate_writer_lease().await.unwrap();
+
+    let repository = Arc::new(
+        VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
+            .await
+            .unwrap(),
+    );
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut tasks = Vec::new();
+    for (path, message) in [("/a.txt", "commit a"), ("/b.txt", "commit b")] {
+        let repository = Arc::clone(&repository);
+        let live = Arc::clone(&live);
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let result = repository
+                .commit_volume_paths(live.as_ref(), &[path.to_string()], message.to_string())
+                .await;
+            (path.to_string(), message.to_string(), result)
+        }));
+    }
+    barrier.wait().await;
+
+    for task in tasks {
+        let (path, message, result) = task.await.unwrap();
+        if let Err(error) = result {
+            assert!(
+                error.to_string().contains("branch moved"),
+                "unexpected concurrent commit failure: {error}"
+            );
+            repository
+                .commit_volume_paths(live.as_ref(), &[path], format!("retry {message}"))
+                .await
+                .unwrap();
+        }
+    }
+
+    let history = repository.history(None, 10).await.unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].parent.as_deref(), Some(history[1].id.as_str()));
+    assert_eq!(
+        repository
+            .read_file(&history[0].id, "/a.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"alpha"
+    );
+    assert_eq!(
+        repository
+            .read_file(&history[0].id, "/b.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"bravo"
+    );
+
+    let repository = match Arc::try_unwrap(repository) {
+        Ok(repository) => repository,
+        Err(_) => panic!("repository task references leaked"),
+    };
+    repository.close().await.unwrap();
+    live.shutdown().await.unwrap();
+    control.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn commits_directories_symlinks_renames_and_deletions_atomically() {
     let object_store: Arc<dyn ObjectStore> = store::resolve_root("memory:///").unwrap();
@@ -544,6 +645,7 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
     let quota_repository = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
         .await
         .unwrap();
+    let before_rejected_commit = quota_repository.stats().await.unwrap();
     live.write(&creds, file.ino, 0, b"quota").await.unwrap();
     assert!(
         quota_repository
@@ -553,6 +655,20 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
             .to_string()
             .contains("quota exceeded")
     );
+    let with_unpublished_objects = quota_repository.stats().await.unwrap();
+    assert!(with_unpublished_objects.bytes > before_rejected_commit.bytes);
+    assert_eq!(
+        with_unpublished_objects.commits,
+        before_rejected_commit.commits
+    );
+    let recovered = quota_repository
+        .garbage_collect(Some(1), None, false)
+        .await
+        .unwrap();
+    assert_eq!(recovered.deleted_commits, 0);
+    assert!(recovered.deleted_nodes + recovered.deleted_blobs > 0);
+    assert!(quota_repository.stats().await.unwrap().bytes < with_unpublished_objects.bytes);
+    assert_eq!(quota_repository.history(None, 10).await.unwrap().len(), 1);
     quota_repository.close().await.unwrap();
     live.shutdown().await.unwrap();
 
