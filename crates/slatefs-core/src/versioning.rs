@@ -267,7 +267,7 @@ struct VersionRef {
     tree: RootManifest,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionCommitInfo {
     pub id: String,
     pub parent: Option<String>,

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
+use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use slatefs_core::config::{ClientAddrRule, Config};
 use slatefs_core::control::{
@@ -300,11 +301,26 @@ enum SnapshotRetentionCmd {
 #[derive(Subcommand)]
 enum VersioningCmd {
     /// Enable explicit file versioning for a filesystem volume.
-    Enable { tenant: String, volume: String },
+    Enable {
+        tenant: String,
+        volume: String,
+        #[arg(long)]
+        live: bool,
+    },
     /// Disable versioning without deleting existing history.
-    Disable { tenant: String, volume: String },
+    Disable {
+        tenant: String,
+        volume: String,
+        #[arg(long)]
+        live: bool,
+    },
     /// Show whether versioning is enabled. This does not open a version store.
-    Status { tenant: String, volume: String },
+    Status {
+        tenant: String,
+        volume: String,
+        #[arg(long)]
+        live: bool,
+    },
     /// Commit selected files, symlinks, or directory trees.
     Commit {
         tenant: String,
@@ -326,6 +342,8 @@ enum VersioningCmd {
         path: Option<String>,
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        #[arg(long)]
+        live: bool,
     },
     /// Read a file from a commit, writing it to stdout unless --out is given.
     Show {
@@ -335,6 +353,8 @@ enum VersioningCmd {
         path: String,
         #[arg(long)]
         out: Option<PathBuf>,
+        #[arg(long)]
+        live: bool,
     },
     /// Restore a file, symlink, or directory tree from a commit.
     Restore {
@@ -358,15 +378,24 @@ enum VersioningCmd {
         max_bytes: Option<u64>,
         #[arg(long)]
         clear: bool,
+        #[arg(long)]
+        live: bool,
     },
     /// Show logical version-store usage.
-    Stats { tenant: String, volume: String },
+    Stats {
+        tenant: String,
+        volume: String,
+        #[arg(long)]
+        live: bool,
+    },
     /// Remove commits, nodes, and blobs unreachable under the retention policy.
     Gc {
         tenant: String,
         volume: String,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long)]
+        live: bool,
     },
     /// Permanently delete all version history while leaving versioning enabled.
     Purge {
@@ -374,6 +403,8 @@ enum VersioningCmd {
         volume: String,
         #[arg(long)]
         yes: bool,
+        #[arg(long)]
+        live: bool,
     },
 }
 
@@ -890,6 +921,65 @@ async fn stream_version_file<W: AsyncWrite + Unpin>(
     }
 }
 
+async fn stream_live_version_file<W: AsyncWrite + Unpin>(
+    config: &Config,
+    tenant: &str,
+    volume: &str,
+    commit: &str,
+    path: &str,
+    writer: &mut W,
+) -> anyhow::Result<u64> {
+    const READ_SIZE: u64 = 4 * 1024 * 1024;
+    let mut offset = 0;
+    loop {
+        let response = live_versioning_json(
+            config,
+            tenant,
+            volume,
+            "GET",
+            &format!("commits/{commit}/content"),
+            &[
+                ("path", path.to_string()),
+                ("offset", offset.to_string()),
+                ("length", READ_SIZE.to_string()),
+            ],
+            None,
+        )
+        .await?;
+        let content = &response["content"];
+        let returned_offset = content["offset"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("admin response omitted content offset"))?;
+        if returned_offset != offset {
+            anyhow::bail!(
+                "admin content response returned offset {returned_offset}, expected {offset}"
+            );
+        }
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(
+                content["data"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("admin response omitted content data"))?,
+            )
+            .context("decoding admin version content")?;
+        writer.write_all(&data).await?;
+        let total_size = content["total_size"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("admin response omitted total_size"))?;
+        let eof = content["eof"]
+            .as_bool()
+            .ok_or_else(|| anyhow::anyhow!("admin response omitted eof"))?;
+        if eof {
+            writer.flush().await?;
+            return Ok(total_size);
+        }
+        if data.is_empty() {
+            anyhow::bail!("admin version content did not advance at offset {offset}");
+        }
+        offset = offset.saturating_add(data.len() as u64);
+    }
+}
+
 async fn append_cli_version_audit(
     control: &ControlPlane,
     action: AuditAction,
@@ -1217,12 +1307,14 @@ fn admin_bearer_token(config: &Config, tenant: &str) -> anyhow::Result<Option<St
     }
 }
 
-async fn post_live_versioning_json(
+async fn live_versioning_json(
     config: &Config,
     tenant: &str,
     volume: &str,
-    operation: &str,
-    body: serde_json::Value,
+    method: &str,
+    suffix: &str,
+    query: &[(&str, String)],
+    body: Option<serde_json::Value>,
 ) -> anyhow::Result<serde_json::Value> {
     if config.admin.tls_cert.is_some() {
         anyhow::bail!(
@@ -1234,13 +1326,31 @@ async fn post_live_versioning_json(
         .listen
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("--live requires [admin].listen"))?;
-    let body = serde_json::to_string(&body)?;
-    let path = format!("/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/{operation}");
+    let body = body
+        .map(|body| serde_json::to_string(&body))
+        .transpose()?
+        .unwrap_or_default();
+    let mut path = format!("/admin/v1/tenants/{tenant}/volumes/{volume}/versioning");
+    if !suffix.is_empty() {
+        path.push('/');
+        path.push_str(suffix);
+    }
+    if !query.is_empty() {
+        path.push('?');
+        for (index, (key, value)) in query.iter().enumerate() {
+            if index > 0 {
+                path.push('&');
+            }
+            path.push_str(key);
+            path.push('=');
+            path.push_str(&percent_encode_query_value(value));
+        }
+    }
     let authorization = admin_bearer_token(config, tenant)?
         .map(|token| format!("Authorization: Bearer {token}\r\n"))
         .unwrap_or_default();
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {listen}\r\nContent-Type: application/json\r\n{authorization}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: {listen}\r\nContent-Type: application/json\r\n{authorization}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let mut stream = TcpStream::connect(listen)
@@ -1263,6 +1373,16 @@ async fn post_live_versioning_json(
         anyhow::bail!("admin versioning request failed: {detail}");
     }
     serde_json::from_str(body).context("parsing admin versioning response")
+}
+
+async fn post_live_versioning_json(
+    config: &Config,
+    tenant: &str,
+    volume: &str,
+    operation: &str,
+    body: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    live_versioning_json(config, tenant, volume, "POST", operation, &[], Some(body)).await
 }
 
 #[tokio::main]
@@ -1634,14 +1754,52 @@ async fn run(
                 "note: slatefsd reloads served-volume quota limits on the export-control poll interval"
             );
         }
-        Command::Versioning(VersioningCmd::Enable { tenant, volume }) => {
+        Command::Versioning(VersioningCmd::Enable {
+            tenant,
+            volume,
+            live,
+        }) => {
+            if *live {
+                live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    "PATCH",
+                    "",
+                    &[],
+                    Some(serde_json::json!({ "enabled": true })),
+                )
+                .await?;
+                println!(
+                    "versioning enabled for {tenant}/{volume} (history is created only by explicit commits)"
+                );
+                return Ok(());
+            }
             let policy = control.set_versioning_enabled(tenant, volume, true).await?;
             println!(
                 "versioning enabled for {}/{} (history is created only by explicit commits)",
                 policy.tenant, policy.volume
             );
         }
-        Command::Versioning(VersioningCmd::Disable { tenant, volume }) => {
+        Command::Versioning(VersioningCmd::Disable {
+            tenant,
+            volume,
+            live,
+        }) => {
+            if *live {
+                live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    "PATCH",
+                    "",
+                    &[],
+                    Some(serde_json::json!({ "enabled": false })),
+                )
+                .await?;
+                println!("versioning disabled for {tenant}/{volume} (existing history retained)");
+                return Ok(());
+            }
             let policy = control
                 .set_versioning_enabled(tenant, volume, false)
                 .await?;
@@ -1650,7 +1808,28 @@ async fn run(
                 policy.tenant, policy.volume
             );
         }
-        Command::Versioning(VersioningCmd::Status { tenant, volume }) => {
+        Command::Versioning(VersioningCmd::Status {
+            tenant,
+            volume,
+            live,
+        }) => {
+            if *live {
+                let response =
+                    live_versioning_json(config, tenant, volume, "GET", "", &[], None).await?;
+                let versioning = &response["versioning"];
+                println!(
+                    "versioning:  {}",
+                    if versioning["enabled"].as_bool().unwrap_or(false) {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                if let Some(updated_at) = versioning["updated_at"].as_u64() {
+                    println!("updated_at:  {updated_at}");
+                }
+                return Ok(());
+            }
             let policy = control.try_get_versioning_policy(tenant, volume).await?;
             println!(
                 "versioning:  {}",
@@ -1720,7 +1899,24 @@ async fn run(
             volume,
             path,
             limit,
+            live,
         }) => {
+            if *live {
+                let mut query = vec![("limit", limit.to_string())];
+                if let Some(path) = path {
+                    query.push(("path", path.clone()));
+                }
+                let response =
+                    live_versioning_json(config, tenant, volume, "GET", "commits", &query, None)
+                        .await?;
+                let commits: Vec<VersionCommitInfo> =
+                    serde_json::from_value(response["commits"].clone())
+                        .context("parsing admin version history")?;
+                for commit in commits {
+                    print_version_commit(&commit);
+                }
+                return Ok(());
+            }
             let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
             let history = repository.history(path.as_deref(), *limit).await;
             let repository_close = repository.close().await;
@@ -1735,7 +1931,31 @@ async fn run(
             commit,
             path,
             out,
+            live,
         }) => {
+            if *live {
+                let bytes = if let Some(out) = out {
+                    let mut file = tokio::fs::File::create(out)
+                        .await
+                        .with_context(|| format!("creating {}", out.display()))?;
+                    stream_live_version_file(config, tenant, volume, commit, path, &mut file)
+                        .await?
+                } else {
+                    stream_live_version_file(
+                        config,
+                        tenant,
+                        volume,
+                        commit,
+                        path,
+                        &mut tokio::io::stdout(),
+                    )
+                    .await?
+                };
+                if let Some(out) = out {
+                    println!("wrote {bytes} bytes to {}", out.display());
+                }
+                return Ok(());
+            }
             let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
             let streamed = if let Some(out) = out {
                 let mut file = tokio::fs::File::create(out)
@@ -1803,7 +2023,60 @@ async fn run(
             max_age,
             max_bytes,
             clear,
+            live,
         }) => {
+            if *live {
+                if *clear && (keep_last.is_some() || max_age.is_some() || max_bytes.is_some()) {
+                    anyhow::bail!(
+                        "--clear cannot be combined with --keep-last, --max-age, or --max-bytes"
+                    );
+                }
+                let response =
+                    if *clear || keep_last.is_some() || max_age.is_some() || max_bytes.is_some() {
+                        live_versioning_json(
+                            config,
+                            tenant,
+                            volume,
+                            "PATCH",
+                            "retention",
+                            &[],
+                            Some(serde_json::json!({
+                                "keep_last": keep_last,
+                                "max_age_secs": max_age,
+                                "max_bytes": max_bytes,
+                                "clear": clear,
+                            })),
+                        )
+                        .await?
+                    } else {
+                        live_versioning_json(config, tenant, volume, "GET", "retention", &[], None)
+                            .await?
+                    };
+                let policy = &response["retention"];
+                println!("versioning_retention: {tenant}/{volume}");
+                println!(
+                    "keep_last: {}",
+                    policy["keep_last"]
+                        .as_u64()
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unlimited".to_string())
+                );
+                println!(
+                    "max_age_secs: {}",
+                    policy["max_age_secs"]
+                        .as_u64()
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unlimited".to_string())
+                );
+                println!(
+                    "max_bytes: {}",
+                    policy["max_bytes"]
+                        .as_u64()
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unlimited".to_string())
+                );
+                return Ok(());
+            }
             let mut changed = false;
             if *clear {
                 if keep_last.is_some() || max_age.is_some() || max_bytes.is_some() {
@@ -1854,7 +2127,21 @@ async fn run(
                 .await?;
             }
         }
-        Command::Versioning(VersioningCmd::Stats { tenant, volume }) => {
+        Command::Versioning(VersioningCmd::Stats {
+            tenant,
+            volume,
+            live,
+        }) => {
+            if *live {
+                let response =
+                    live_versioning_json(config, tenant, volume, "GET", "stats", &[], None).await?;
+                let stats = &response["stats"];
+                println!("bytes: {}", stats["bytes"]);
+                println!("commits: {}", stats["commits"]);
+                println!("nodes: {}", stats["nodes"]);
+                println!("blobs: {}", stats["blobs"]);
+                return Ok(());
+            }
             let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
             let stats = repository.stats().await;
             let close = repository.close().await;
@@ -1869,7 +2156,28 @@ async fn run(
             tenant,
             volume,
             dry_run,
+            live,
         }) => {
+            if *live {
+                let response = live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    "POST",
+                    "gc",
+                    &[],
+                    Some(serde_json::json!({ "dry_run": dry_run })),
+                )
+                .await?;
+                let report = &response["gc"];
+                println!("retained_commits: {}", report["retained_commits"]);
+                println!("deleted_commits: {}", report["deleted_commits"]);
+                println!("deleted_nodes: {}", report["deleted_nodes"]);
+                println!("deleted_blobs: {}", report["deleted_blobs"]);
+                println!("reclaimed_bytes: {}", report["reclaimed_bytes"]);
+                println!("dry_run: {}", report["dry_run"]);
+                return Ok(());
+            }
             let policy = control
                 .try_get_versioning_retention_policy(tenant, volume)
                 .await?;
@@ -1908,9 +2216,27 @@ async fn run(
             tenant,
             volume,
             yes,
+            live,
         }) => {
             if !yes {
                 anyhow::bail!("versioning purge requires --yes");
+            }
+            if *live {
+                let response = live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    "DELETE",
+                    "history",
+                    &[],
+                    Some(serde_json::json!({ "confirm": true })),
+                )
+                .await?;
+                println!(
+                    "purged version history for {tenant}/{volume}: {} objects deleted",
+                    response["purged"]["deleted_objects"]
+                );
+                return Ok(());
             }
             let deleted = purge_version_history(control, object_store, tenant, volume).await?;
             append_cli_version_audit(
@@ -2415,6 +2741,73 @@ async fn run(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn live_versioning_client_sends_tenant_auth_and_encoded_query() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0; 8192];
+            let read = stream.read(&mut bytes).await.unwrap();
+            let request = String::from_utf8(bytes[..read].to_vec()).unwrap();
+            let body = r#"{"commits":[]}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            request
+        });
+        let config = Config::parse(&format!(
+            r#"
+                [object_store]
+                url = "memory:///"
+
+                [kms]
+                provider = "static"
+                key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+                [admin]
+                listen = "{listen}"
+
+                [admin.tenant_tokens]
+                tenant-a = "tenant-secret"
+            "#
+        ))
+        .unwrap();
+        let response = live_versioning_json(
+            &config,
+            "tenant-a",
+            "docs",
+            "GET",
+            "commits",
+            &[
+                ("path", "/docs/a file.txt".to_string()),
+                ("limit", "25".to_string()),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["commits"], serde_json::json!([]));
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with(
+                "GET /admin/v1/tenants/tenant-a/volumes/docs/versioning/commits?path=%2Fdocs%2Fa%20file.txt&limit=25 HTTP/1.1\r\n"
+            ),
+            "{request}"
+        );
+        assert!(
+            request.contains("Authorization: Bearer tenant-secret\r\n"),
+            "{request}"
+        );
+    }
+
     #[test]
     fn parse_size_bytes_accepts_plain_bytes_and_binary_suffixes() {
         assert_eq!(parse_size_bytes("4096").unwrap(), 4096);
@@ -2444,5 +2837,27 @@ mod tests {
             config::NbdSyncMode::Strict
         );
         assert!(parse_nbd_sync_mode("always").is_err());
+    }
+
+    #[test]
+    fn parses_live_versioning_lifecycle_flags() {
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "gc",
+            "tenant-a",
+            "docs",
+            "--dry-run",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::Gc {
+                dry_run: true,
+                live: true,
+                ..
+            })
+        ));
     }
 }

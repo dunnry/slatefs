@@ -200,13 +200,18 @@ and restore through that daemon's configured admin listener:
 ```sh
 slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path>... -m <message> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning restore <tenant> <volume> <commit> <path> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning log <tenant> <volume> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning show <tenant> <volume> <commit> <path> --out restored.bin --live
+slatefs -c /etc/slatefs/slatefs.toml versioning retention <tenant> <volume> --keep-last 100 --live
+slatefs -c /etc/slatefs/slatefs.toml versioning gc <tenant> <volume> --dry-run --live
+slatefs -c /etc/slatefs/slatefs.toml versioning stats <tenant> <volume> --live
 ```
 
 The CLI supplies the matching `[admin.tenant_tokens]` credential when present,
 otherwise `admin.token` or `admin.token_file`, as a bearer token. Tenant tokens
-cannot access another tenant or global admin routes. The
-direct commands without `--live` acquire the volume writer and must not be run
-while `slatefsd` serves that volume.
+cannot access another tenant or global admin routes. All versioning subcommands
+accept `--live`; direct repository commands without it must not be run while
+`slatefsd` serves that volume.
 
 Live version commits flush and validate the SlateDB writer lease before file
 capture and immediately before publishing history. HTTP `503` means that

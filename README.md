@@ -152,10 +152,11 @@ ordinary filesystem I/O continues unchanged. A commit accepts multiple paths
 and recursively captures directories, regular files, and symlinks in one
 Prolly-root update. Selecting a missing path records its deletion; passing both
 old and new paths records a rename as delete-plus-add. For a volume currently
-served by `slatefsd`, use `versioning commit --live` or `versioning restore
---live`; the authenticated admin API executes the operation against the
-daemon's existing writer. Without `--live`, commit and restore remain offline
-operations and must use a stopped or otherwise quiesced volume.
+served by `slatefsd`, pass `--live` to any versioning command; the CLI uses the
+tenant-scoped authenticated admin API for policy, history, ranged content,
+commits, restores, retention, stats, GC, and purge. Without `--live`,
+repository operations are offline and must use a stopped or otherwise
+quiesced volume.
 Live commits verify and flush the volume writer lease before capture and again
 before publishing the Prolly head. A fenced daemon returns `503` without
 creating a commit so the caller can retry the promoted primary.
