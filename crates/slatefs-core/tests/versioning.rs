@@ -168,6 +168,18 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
     assert_eq!(branch_history.len(), 2);
     assert_eq!(branch_history[0].id, branch_commit.id);
     assert_eq!(branch_history[1].id, first.id);
+    repository
+        .create_branch("release", &first.id)
+        .await
+        .unwrap();
+    let merged = repository.merge_branch("main", "release").await.unwrap();
+    assert!(merged.fast_forward());
+    assert!(!merged.already_up_to_date());
+    assert_eq!(merged.commit(), second.id);
+    let unchanged = repository.merge_branch("main", "release").await.unwrap();
+    assert!(!unchanged.fast_forward());
+    assert!(unchanged.already_up_to_date());
+    assert!(repository.merge_branch("draft", "main").await.is_err());
     let verified = repository.verify().await.unwrap();
     assert_eq!(verified.commits, 3);
     assert!(verified.nodes > 0);

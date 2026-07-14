@@ -17,9 +17,9 @@ use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{
-    VersionBranchInfo, VersionCommitInfo, VersionPathChangeKind, VersionRepository, VersionTagInfo,
-    force_break_expired_version_maintenance_lease, purge_version_history,
-    try_get_version_maintenance_lease,
+    VersionBranchInfo, VersionCommitInfo, VersionMergeInfo, VersionPathChangeKind,
+    VersionRepository, VersionTagInfo, force_break_expired_version_maintenance_lease,
+    purge_version_history, try_get_version_maintenance_lease,
 };
 use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
 use slatefs_core::{config, store};
@@ -425,6 +425,15 @@ enum VersioningCmd {
         tenant: String,
         volume: String,
         name: String,
+        #[arg(long)]
+        live: bool,
+    },
+    /// Fast-forward a target branch to a source branch.
+    Merge {
+        tenant: String,
+        volume: String,
+        source: String,
+        target: String,
         #[arg(long)]
         live: bool,
     },
@@ -1019,6 +1028,20 @@ fn print_version_tag(tag: &VersionTagInfo) {
 
 fn print_version_branch(branch: &VersionBranchInfo) {
     println!("{}\t{}", branch.name(), branch.commit());
+}
+
+fn print_version_merge(merge: &VersionMergeInfo) {
+    println!(
+        "{} -> {}\t{}\t{}",
+        merge.source(),
+        merge.target(),
+        merge.commit(),
+        if merge.fast_forward() {
+            "fast-forward"
+        } else {
+            "already-up-to-date"
+        }
+    );
 }
 
 async fn stream_version_file<W: AsyncWrite + Unpin>(
@@ -2508,6 +2531,64 @@ async fn run(
             .await?;
             print_version_branch(&branch);
         }
+        Command::Versioning(VersioningCmd::Merge {
+            tenant,
+            volume,
+            source,
+            target,
+            live,
+        }) => {
+            if *live {
+                let endpoint = format!("branches/{target}/merge");
+                let response = post_live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    &endpoint,
+                    serde_json::json!({ "source": source }),
+                )
+                .await?;
+                let merge: VersionMergeInfo = serde_json::from_value(response["merge"].clone())
+                    .context("parsing admin version merge")?;
+                print_version_merge(&merge);
+                return Ok(());
+            }
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let result = repository.merge_branch(source, target).await;
+            let repository_close = repository.close().await;
+            let merge = result?;
+            repository_close?;
+            append_cli_version_audit(
+                control,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-branch-merge".to_string()),
+                    ),
+                    (
+                        "source".to_string(),
+                        AuditDetailValue::String(merge.source().to_string()),
+                    ),
+                    (
+                        "target".to_string(),
+                        AuditDetailValue::String(merge.target().to_string()),
+                    ),
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(merge.commit().to_string()),
+                    ),
+                    (
+                        "fast_forward".to_string(),
+                        AuditDetailValue::Bool(merge.fast_forward()),
+                    ),
+                ],
+            )
+            .await?;
+            print_version_merge(&merge);
+        }
         Command::Versioning(VersioningCmd::Show {
             tenant,
             volume,
@@ -3800,6 +3881,27 @@ mod tests {
                 live: true,
                 ..
             }) if name == "release"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "merge",
+            "tenant-a",
+            "docs",
+            "draft",
+            "main",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::Merge {
+                source,
+                target,
+                live: true,
+                ..
+            }) if source == "draft" && target == "main"
         ));
     }
 }

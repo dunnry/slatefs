@@ -83,6 +83,12 @@ and blobs have been written. Disabling versioning blocks repository operations
 without deleting its history. Volume deletion removes both the live and
 optional version-store prefixes.
 
+Branch merge is conservative: SlateFS atomically fast-forwards the target when
+its head is an ancestor of the source, reports an already-current target as a
+no-op, and rejects divergent histories. This preserves the single-parent
+commit format while leaving conflict-aware three-way merge as a future format
+evolution.
+
 Explicit version operations are serialized across processes before a SlateDB
 version writer is opened. SlateFS creates or conditionally replaces the
 per-volume `version-leases` record, renews it during the operation, and expires

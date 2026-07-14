@@ -688,6 +688,37 @@ impl VersionStore {
         self.db.flush().await?;
         Ok(reference)
     }
+
+    async fn fast_forward_branch(
+        &self,
+        source: &str,
+        target: &str,
+        expected_source: [u8; 32],
+        expected_target: [u8; 32],
+    ) -> Result<VersionRef> {
+        let _guard = self.ref_lock.lock().await;
+        let source_ref = self
+            .get_branch(source)
+            .await?
+            .ok_or_else(|| Error::not_found("version branch", source))?;
+        let target_ref = self
+            .get_branch(target)
+            .await?
+            .ok_or_else(|| Error::not_found("version branch", target))?;
+        if source_ref.commit_id != expected_source || target_ref.commit_id != expected_target {
+            return Err(Error::Versioning(
+                "branch moved while preparing fast-forward merge".into(),
+            ));
+        }
+        self.db
+            .put_bytes(
+                branch_key(target).into(),
+                encode_versioned(REF_VERSION, &source_ref)?.into(),
+            )
+            .await?;
+        self.db.flush().await?;
+        Ok(source_ref)
+    }
 }
 
 impl AsyncStore for VersionStore {
@@ -882,6 +913,38 @@ pub struct VersionTagInfo {
 pub struct VersionBranchInfo {
     name: String,
     commit: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionMergeInfo {
+    source: String,
+    target: String,
+    commit: String,
+    fast_forward: bool,
+    already_up_to_date: bool,
+}
+
+impl VersionMergeInfo {
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
+
+    pub fn fast_forward(&self) -> bool {
+        self.fast_forward
+    }
+
+    pub fn already_up_to_date(&self) -> bool {
+        self.already_up_to_date
+    }
 }
 
 impl VersionBranchInfo {
@@ -1977,6 +2040,82 @@ impl VersionRepository {
             name: name.to_string(),
             commit: hex::encode(reference.commit_id),
         })
+    }
+
+    /// Merge `source` into `target` when the target can be fast-forwarded.
+    /// Divergent histories are rejected without changing either branch.
+    pub async fn merge_branch(&self, source: &str, target: &str) -> Result<VersionMergeInfo> {
+        validate_version_branch_name(source)?;
+        validate_version_branch_name(target)?;
+        if source == target {
+            return Err(Error::invalid(
+                "version branch merge",
+                "source and target must differ",
+            ));
+        }
+        let source_ref = self
+            .store
+            .get_branch(source)
+            .await?
+            .ok_or_else(|| Error::not_found("version branch", source))?;
+        let target_ref = self
+            .store
+            .get_branch(target)
+            .await?
+            .ok_or_else(|| Error::not_found("version branch", target))?;
+        if source_ref.commit_id == target_ref.commit_id
+            || self
+                .commit_is_ancestor(source_ref.commit_id, target_ref.commit_id)
+                .await?
+        {
+            return Ok(VersionMergeInfo {
+                source: source.to_string(),
+                target: target.to_string(),
+                commit: hex::encode(target_ref.commit_id),
+                fast_forward: false,
+                already_up_to_date: true,
+            });
+        }
+        if !self
+            .commit_is_ancestor(target_ref.commit_id, source_ref.commit_id)
+            .await?
+        {
+            return Err(Error::Versioning(format!(
+                "branches {source} and {target} have diverged; a fast-forward merge is not possible"
+            )));
+        }
+        let merged = self
+            .store
+            .fast_forward_branch(source, target, source_ref.commit_id, target_ref.commit_id)
+            .await?;
+        Ok(VersionMergeInfo {
+            source: source.to_string(),
+            target: target.to_string(),
+            commit: hex::encode(merged.commit_id),
+            fast_forward: true,
+            already_up_to_date: false,
+        })
+    }
+
+    async fn commit_is_ancestor(&self, ancestor: [u8; 32], descendant: [u8; 32]) -> Result<bool> {
+        let mut next = Some(descendant);
+        let mut seen = HashSet::new();
+        while let Some(id) = next {
+            if id == ancestor {
+                return Ok(true);
+            }
+            if !seen.insert(id) {
+                return Err(Error::Versioning(format!(
+                    "commit chain contains a cycle at {}",
+                    hex::encode(id)
+                )));
+            }
+            let Some(commit) = self.store.try_get_commit(&id).await? else {
+                return Ok(false);
+            };
+            next = commit.parent;
+        }
+        Ok(false)
     }
 
     pub async fn history(

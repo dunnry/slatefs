@@ -1004,6 +1004,12 @@ struct VersionBranchCreateRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct VersionBranchMergeRequest {
+    source: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VersionPolicyPatchRequest {
     enabled: bool,
 }
@@ -2499,6 +2505,62 @@ async fn delete_version_branch_response(
     repository_close.map_err(core_error)?;
     control_close.map_err(core_error)?;
     Ok(AdminHttpResponse::json(200, json!({ "branch": branch })))
+}
+
+async fn merge_version_branch_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+    target: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let body: VersionBranchMergeRequest = parse_json_body(request)?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository.merge_branch(&body.source, target).await;
+    let audit = match &result {
+        Ok(merge) => {
+            append_version_audit(
+                &control,
+                request,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-branch-merge".to_string()),
+                    ),
+                    (
+                        "source".to_string(),
+                        AuditDetailValue::String(merge.source().to_string()),
+                    ),
+                    (
+                        "target".to_string(),
+                        AuditDetailValue::String(merge.target().to_string()),
+                    ),
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(merge.commit().to_string()),
+                    ),
+                    (
+                        "fast_forward".to_string(),
+                        AuditDetailValue::Bool(merge.fast_forward()),
+                    ),
+                ],
+            )
+            .await
+        }
+        Err(_) => Ok(()),
+    };
+    let repository_close = repository.close().await;
+    let control_close = control.close().await;
+    let merge = result.map_err(core_error)?;
+    audit?;
+    repository_close.map_err(core_error)?;
+    control_close.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(200, json!({ "merge": merge })))
 }
 
 async fn get_version_content_response(
@@ -4062,6 +4124,21 @@ async fn route_admin_request(
                 name,
             ],
         ) => delete_version_branch_response(state, request, tenant, volume, name).await,
+        (
+            "POST",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "branches",
+                target,
+                "merge",
+            ],
+        ) => merge_version_branch_response(state, request, tenant, volume, target).await,
         (
             "POST",
             [
@@ -7172,6 +7249,16 @@ mod tests {
         );
         let branches: Value = serde_json::from_str(response_body(&branches_response)).unwrap();
         assert_eq!(branches["branches"].as_array().unwrap().len(), 2);
+        let merge_body = r#"{"source":"main"}"#;
+        let merge_request = format!(
+            "POST /admin/v1/tenants/t/volumes/v/versioning/branches/release/merge HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            merge_body.len(),
+            merge_body
+        );
+        let merge_response = admin_exchange(Arc::clone(&state), merge_request.as_bytes()).await;
+        assert_eq!(response_status(&merge_response), 200, "{merge_response}");
+        let merge: Value = serde_json::from_str(response_body(&merge_response)).unwrap();
+        assert_eq!(merge["merge"]["already_up_to_date"], true);
         volume
             .write(&creds, file.ino, 0, b"branch update")
             .await
@@ -7448,7 +7535,7 @@ mod tests {
             let expected = if action == AuditAction::VersionCommit {
                 3
             } else if action == AuditAction::Maintain {
-                5
+                6
             } else {
                 1
             };

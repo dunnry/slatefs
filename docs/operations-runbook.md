@@ -210,6 +210,7 @@ slatefs -c /etc/slatefs/slatefs.toml versioning branches <tenant> <volume> --liv
 slatefs -c /etc/slatefs/slatefs.toml versioning delete-branch <tenant> <volume> <name> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path>... -m <message> --branch <name> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning log <tenant> <volume> --branch <name> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning merge <tenant> <volume> <source> <target> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning show <tenant> <volume> <commit> <path> --out restored.bin --live
 slatefs -c /etc/slatefs/slatefs.toml versioning retention <tenant> <volume> --keep-last 100 --live
 slatefs -c /etc/slatefs/slatefs.toml versioning gc <tenant> <volume> --dry-run --live
