@@ -16,7 +16,9 @@ use slatefs_core::control::{
 use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
-use slatefs_core::versioning::{VersionCommitInfo, VersionRepository, purge_version_history};
+use slatefs_core::versioning::{
+    VersionCommitInfo, VersionRepository, purge_version_history, try_get_version_maintenance_lease,
+};
 use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
 use slatefs_core::{config, store};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -1924,6 +1926,26 @@ async fn run(
                 if let Some(updated_at) = versioning["updated_at"].as_u64() {
                     println!("updated_at:  {updated_at}");
                 }
+                if let Some(lease) = versioning["lease"].as_object() {
+                    println!(
+                        "lease:       {} ({})",
+                        if lease["expired"].as_bool().unwrap_or(true) {
+                            "expired"
+                        } else {
+                            "active"
+                        },
+                        lease["operation"].as_str().unwrap_or("unknown")
+                    );
+                    println!(
+                        "lease_owner: {}",
+                        lease["owner"].as_str().unwrap_or("unknown")
+                    );
+                    if let Some(expires_at) = lease["expires_at"].as_u64() {
+                        println!("lease_until: {expires_at}");
+                    }
+                } else {
+                    println!("lease:       none");
+                }
                 return Ok(());
             }
             let policy = control.try_get_versioning_policy(tenant, volume).await?;
@@ -1937,6 +1959,22 @@ async fn run(
             );
             if let Some(policy) = policy {
                 println!("updated_at:  {}", policy.updated_at);
+            }
+            match try_get_version_maintenance_lease(object_store, tenant, volume).await? {
+                Some(lease) => {
+                    println!(
+                        "lease:       {} ({})",
+                        if lease.is_expired_at(slatefs_core::control::now_unix()) {
+                            "expired"
+                        } else {
+                            "active"
+                        },
+                        lease.operation()
+                    );
+                    println!("lease_owner: {}", lease.owner());
+                    println!("lease_until: {}", lease.expires_at());
+                }
+                None => println!("lease:       none"),
             }
         }
         Command::Versioning(VersioningCmd::Commit {

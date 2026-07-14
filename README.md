@@ -240,7 +240,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshots` | Checkpoint inventory with `limit`, `page_token`, and optional `name`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshot-retention` | Snapshot retention policy; named snapshots are not exempt. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshot-retention` | Set nullable `keep_last` and/or `max_age_secs`, or `{"clear":true}`. |
-| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Opt-in state and retention policy. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Opt-in state, retention policy, and current or last repository lease. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Enable or disable with `{"enabled":true|false}`; disabling retains history. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Commit history with optional `path` and `limit`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"..."}`; singular `path` remains accepted. |

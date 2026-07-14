@@ -249,6 +249,11 @@ slatefs -c /etc/slatefs/slatefs.toml versioning verify <tenant> <volume>
 API content reads are paged with `offset` and `length` (1 MiB default, 4 MiB
 maximum) and return `total_size`, `eof`, and `next_offset`.
 
+`versioning status <tenant> <volume> [--live]` also reports the current or most
+recent repository lease, including owner UUID, operation, expiry, and whether
+it is expired. Use this before diagnosing a `409` conflict or removing an
+orphaned local lease.
+
 `versioning purge <tenant> <volume> --yes` is irreversible. SlateFS acquires
 the same deployment-wide per-volume lease used by repository reads, commits,
 verification, and GC, so a concurrent operation returns a conflict instead of

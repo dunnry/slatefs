@@ -9,7 +9,9 @@ use slatefs_core::control::ControlPlane;
 use slatefs_core::error::Error;
 use slatefs_core::meta::inode::ROOT_INO;
 use slatefs_core::store::{self, ObjectStore};
-use slatefs_core::versioning::{VersionRepository, purge_version_history};
+use slatefs_core::versioning::{
+    VersionRepository, purge_version_history, try_get_version_maintenance_lease,
+};
 use slatefs_core::vfs::{Credentials, Vfs};
 use slatefs_core::volume::{self, Volume};
 
@@ -189,6 +191,16 @@ async fn version_repository_lease_coordinates_open_and_purge() {
     let first = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
         .await
         .unwrap();
+    let active = try_get_version_maintenance_lease(Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.tenant(), "t");
+    assert_eq!(active.volume(), "v");
+    assert_eq!(active.operation(), "repository");
+    assert!(!active.owner().is_empty());
+    assert!(active.acquired_at() <= active.expires_at());
+    assert!(!active.is_expired_at(slatefs_core::control::now_unix()));
     let second = match VersionRepository::open(&control, Arc::clone(&object_store), "t", "v").await
     {
         Ok(_) => panic!("second repository unexpectedly acquired the lease"),
@@ -201,6 +213,11 @@ async fn version_repository_lease_coordinates_open_and_purge() {
     assert!(matches!(purge, Error::AlreadyExists { .. }));
 
     first.close().await.unwrap();
+    let released = try_get_version_maintenance_lease(Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(released.is_expired_at(slatefs_core::control::now_unix()));
     let second = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
         .await
         .unwrap();

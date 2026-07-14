@@ -43,13 +43,70 @@ const MAINTENANCE_LEASE_TTL_SECS: u64 = 120;
 const MAINTENANCE_LEASE_RENEW_SECS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct VersionMaintenanceLeaseRecord {
+#[non_exhaustive]
+pub struct VersionMaintenanceLeaseInfo {
     tenant: String,
     volume: String,
     owner: String,
     operation: String,
     acquired_at: u64,
     expires_at: u64,
+}
+
+impl VersionMaintenanceLeaseInfo {
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
+    pub fn volume(&self) -> &str {
+        &self.volume
+    }
+
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    pub fn operation(&self) -> &str {
+        &self.operation
+    }
+
+    pub fn acquired_at(&self) -> u64 {
+        self.acquired_at
+    }
+
+    pub fn expires_at(&self) -> u64 {
+        self.expires_at
+    }
+
+    pub fn is_expired_at(&self, now: u64) -> bool {
+        self.expires_at <= now
+    }
+}
+
+/// Read the current or most recently released coordination lease without
+/// opening the version repository. CAS-capable stores retain expired records;
+/// local stores remove them on release.
+pub async fn try_get_version_maintenance_lease(
+    object_store: Arc<dyn ObjectStore>,
+    tenant: &str,
+    volume: &str,
+) -> Result<Option<VersionMaintenanceLeaseInfo>> {
+    store::validate_name("tenant name", tenant)?;
+    store::validate_name("volume name", volume)?;
+    let path = store::version_lease_path(tenant, volume);
+    match object_store.get(&path).await {
+        Ok(result) => {
+            let bytes = result.bytes().await?;
+            decode_versioned(
+                MAINTENANCE_LEASE_VERSION,
+                &bytes,
+                "version maintenance lease",
+            )
+            .map(Some)
+        }
+        Err(slatedb::object_store::Error::NotFound { .. }) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[derive(Clone)]
@@ -60,7 +117,7 @@ struct VersionMaintenanceLease {
 }
 
 struct VersionMaintenanceLeaseState {
-    record: VersionMaintenanceLeaseRecord,
+    record: VersionMaintenanceLeaseInfo,
     revision: UpdateVersion,
     conditional_updates: bool,
 }
@@ -75,7 +132,7 @@ impl VersionMaintenanceLease {
     ) -> Result<Self> {
         let path = store::version_lease_path(tenant, volume);
         let now = crate::control::now_unix();
-        let record = VersionMaintenanceLeaseRecord {
+        let record = VersionMaintenanceLeaseInfo {
             tenant: tenant.to_string(),
             volume: volume.to_string(),
             owner,
@@ -99,7 +156,7 @@ impl VersionMaintenanceLease {
                     e_tag: current.meta.e_tag.clone(),
                     version: current.meta.version.clone(),
                 };
-                let current_record: VersionMaintenanceLeaseRecord = decode_versioned(
+                let current_record: VersionMaintenanceLeaseInfo = decode_versioned(
                     MAINTENANCE_LEASE_VERSION,
                     &current.bytes().await?,
                     "version maintenance lease",

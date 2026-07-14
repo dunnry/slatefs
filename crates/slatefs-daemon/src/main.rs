@@ -39,7 +39,10 @@ use slatefs_core::metrics::{AggregatingRecorder, PrometheusSample, render_promet
 use slatefs_core::rate::{RateLimiter, RateLimits};
 use slatefs_core::snapshot::SnapshotVolume;
 use slatefs_core::store;
-use slatefs_core::versioning::{VersionRepository, purge_version_history};
+use slatefs_core::versioning::{
+    VersionMaintenanceLeaseInfo, VersionRepository, purge_version_history,
+    try_get_version_maintenance_lease,
+};
 use slatefs_core::vfs::Vfs;
 use slatefs_core::volume::{self, Volume, VolumeCaches};
 use slatefs_nbd::{NbdExportOptions, NbdShutdownHandle, NbdTlsConfig};
@@ -2053,6 +2056,23 @@ fn version_retention_json(policy: Option<&VersioningRetentionPolicy>) -> Value {
         .unwrap_or(Value::Null)
 }
 
+fn version_lease_json(lease: Option<&VersionMaintenanceLeaseInfo>) -> Value {
+    lease
+        .map(|lease| {
+            let now = slatefs_core::control::now_unix();
+            json!({
+                "tenant": lease.tenant(),
+                "volume": lease.volume(),
+                "owner": lease.owner(),
+                "operation": lease.operation(),
+                "acquired_at": lease.acquired_at(),
+                "expires_at": lease.expires_at(),
+                "expired": lease.is_expired_at(now),
+            })
+        })
+        .unwrap_or(Value::Null)
+}
+
 async fn get_versioning_response(
     state: &AdminState,
     tenant: &str,
@@ -2068,6 +2088,9 @@ async fn get_versioning_response(
         .await
         .map_err(core_error)?;
     control.close().await.map_err(core_error)?;
+    let lease = try_get_version_maintenance_lease(Arc::clone(&state.object_store), tenant, volume)
+        .await
+        .map_err(core_error)?;
     Ok(AdminHttpResponse::json(
         200,
         json!({
@@ -2075,6 +2098,7 @@ async fn get_versioning_response(
                 "enabled": policy.as_ref().is_some_and(|policy| policy.enabled),
                 "updated_at": policy.as_ref().map(|policy| policy.updated_at),
                 "retention": version_retention_json(retention.as_ref()),
+                "lease": version_lease_json(lease.as_ref()),
             }
         }),
     ))
@@ -6499,6 +6523,21 @@ mod tests {
                 .await
                 .unwrap();
         competing_control.close().await.unwrap();
+        let lease_response = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&lease_response), 200, "{lease_response}");
+        let lease: Value = serde_json::from_str(response_body(&lease_response)).unwrap();
+        assert_eq!(lease["versioning"]["lease"]["expired"], false);
+        assert_eq!(lease["versioning"]["lease"]["operation"], "repository");
+        assert!(
+            !lease["versioning"]["lease"]["owner"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
         let conflict_response = admin_exchange(
             Arc::clone(&state),
             b"GET /admin/v1/tenants/t/volumes/v/versioning/stats HTTP/1.1\r\nHost: localhost\r\n\r\n",
