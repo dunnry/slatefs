@@ -26,6 +26,7 @@ use crate::error::{Error, Result};
 use crate::meta::inode::{FileKind, ROOT_INO, Timespec};
 use crate::store;
 use crate::vfs::{Credentials, FileAttr, SetAttrs, TimeSet, Vfs};
+use crate::volume::Volume;
 
 const NODE_PREFIX: &[u8] = b"pn/";
 const BLOB_PREFIX: &[u8] = b"pb/";
@@ -529,6 +530,29 @@ impl VersionRepository {
         paths: &[String],
         message: String,
     ) -> Result<VersionCommitInfo> {
+        self.commit_paths_inner(live, None, paths, message).await
+    }
+
+    /// Commit from a live SlateFS volume while validating its writer lease
+    /// before capture and again immediately before publishing the new head.
+    pub async fn commit_volume_paths(
+        &self,
+        live: &Volume,
+        paths: &[String],
+        message: String,
+    ) -> Result<VersionCommitInfo> {
+        live.validate_writer_lease().await?;
+        self.commit_paths_inner(live, Some(live), paths, message)
+            .await
+    }
+
+    async fn commit_paths_inner(
+        &self,
+        live: &dyn Vfs,
+        writer_guard: Option<&Volume>,
+        paths: &[String],
+        message: String,
+    ) -> Result<VersionCommitInfo> {
         let canonical = canonicalize_path_set(paths)?;
 
         let head = self.store.get_head().await?;
@@ -600,6 +624,9 @@ impl VersionRepository {
                     "version history quota exceeded: {projected} bytes projected, {max_bytes} bytes allowed"
                 )));
             }
+        }
+        if let Some(writer_guard) = writer_guard {
+            writer_guard.validate_writer_lease().await?;
         }
         self.store
             .publish_commit(head.map(|head| head.commit_id), &commit, encoded)

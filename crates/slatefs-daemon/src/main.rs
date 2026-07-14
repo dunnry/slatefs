@@ -1786,13 +1786,40 @@ fn live_filesystem_target(
     tenant: &str,
     volume: &str,
 ) -> Result<Arc<Volume>, AdminError> {
-    state
+    let target = state
         .targets
         .lock()
         .expect("admin targets poisoned")
         .get(&VolumeId::from_parts(tenant, volume))
         .cloned()
-        .ok_or_else(|| not_found(format!("no live writable volume {tenant}/{volume}")))
+        .ok_or_else(|| not_found(format!("no live writable volume {tenant}/{volume}")))?;
+    if target.is_dead() {
+        return Err(AdminError {
+            status: 503,
+            message: format!(
+                "live writer for {tenant}/{volume} has been fenced; retry its current primary"
+            ),
+        });
+    }
+    Ok(target)
+}
+
+fn live_version_error(
+    target: &Volume,
+    tenant: &str,
+    volume: &str,
+    error: slatefs_core::error::Error,
+) -> AdminError {
+    if target.is_dead() {
+        AdminError {
+            status: 503,
+            message: format!(
+                "live writer for {tenant}/{volume} was fenced; retry its current primary"
+            ),
+        }
+    } else {
+        core_error(error)
+    }
 }
 
 async fn open_version_repository(
@@ -1834,6 +1861,10 @@ async fn commit_live_version_response(
     let target = live_filesystem_target(state, tenant, volume)?;
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
+    target
+        .validate_writer_lease()
+        .await
+        .map_err(|error| live_version_error(&target, tenant, volume, error))?;
     let control = state.control_writer().await?;
     let repository =
         match VersionRepository::open(&control, Arc::clone(&state.object_store), tenant, volume)
@@ -1847,7 +1878,7 @@ async fn commit_live_version_response(
         };
 
     let commit = repository
-        .commit_paths(target.as_ref(), &paths, message)
+        .commit_volume_paths(target.as_ref(), &paths, message)
         .await;
     let audit = match &commit {
         Ok(commit) => {
@@ -1881,7 +1912,7 @@ async fn commit_live_version_response(
     };
     let repository_close = repository.close().await;
     let control_close = control.close().await;
-    let commit = commit.map_err(core_error)?;
+    let commit = commit.map_err(|error| live_version_error(&target, tenant, volume, error))?;
     audit?;
     repository_close.map_err(core_error)?;
     control_close.map_err(core_error)?;
@@ -1911,6 +1942,10 @@ async fn restore_live_version_response(
 ) -> Result<AdminHttpResponse, AdminError> {
     let body: VersionRestoreRequest = parse_json_body(request)?;
     let target = live_filesystem_target(state, tenant, volume)?;
+    target
+        .validate_writer_lease()
+        .await
+        .map_err(|error| live_version_error(&target, tenant, volume, error))?;
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
     let control = state.control_writer().await?;
@@ -1952,7 +1987,7 @@ async fn restore_live_version_response(
     };
     let repository_close = repository.close().await;
     let control_close = control.close().await;
-    restore.map_err(core_error)?;
+    restore.map_err(|error| live_version_error(&target, tenant, volume, error))?;
     audit?;
     repository_close.map_err(core_error)?;
     control_close.map_err(core_error)?;
@@ -6482,6 +6517,83 @@ mod tests {
         audit_control.close().await.unwrap();
 
         volume.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_versioning_rejects_a_fenced_live_writer() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([93; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        let record = slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        control
+            .set_versioning_enabled("t", "v", true)
+            .await
+            .unwrap();
+        let dek = control.unwrap_volume_dek(&record).await.unwrap();
+        control.close().await.unwrap();
+
+        let stale = Volume::open(&record, dek.clone(), Arc::clone(&object_store))
+            .await
+            .unwrap();
+        let creds = Credentials::root();
+        let file = stale
+            .create(&creds, ROOT_INO, b"notes.txt", 0o640, true)
+            .await
+            .unwrap();
+        stale
+            .write(&creds, file.ino, 0, b"primary data")
+            .await
+            .unwrap();
+        stale.flush().await.unwrap();
+        let replacement = Volume::open(&record, dek, Arc::clone(&object_store))
+            .await
+            .unwrap();
+        let replacement_file = replacement
+            .lookup(&creds, ROOT_INO, b"notes.txt")
+            .await
+            .unwrap();
+        replacement
+            .write(&creds, replacement_file.ino, 0, b"replacement data")
+            .await
+            .unwrap();
+        replacement.flush().await.unwrap();
+
+        let mut targets = HashMap::new();
+        targets.insert(VolumeId::from_parts("t", "v"), Arc::clone(&stale));
+        let state =
+            available_admin_state(Arc::clone(&object_store), Arc::clone(&kms), targets, None).await;
+        let body = r#"{"path":"/notes.txt","message":"stale commit"}"#;
+        let request = format!(
+            "POST /admin/v1/tenants/t/volumes/v/versioning/commits HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response = admin_exchange(state, request.as_bytes()).await;
+        assert_eq!(response_status(&response), 503, "{response}");
+        assert!(stale.is_dead());
+
+        let control = ControlPlane::open(Arc::clone(&object_store), kms)
+            .await
+            .unwrap();
+        let repository = VersionRepository::open(&control, object_store, "t", "v")
+            .await
+            .unwrap();
+        assert!(repository.history(None, 10).await.unwrap().is_empty());
+        repository.close().await.unwrap();
+        control.close().await.unwrap();
+        replacement.shutdown().await.unwrap();
+        let _ = stale.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

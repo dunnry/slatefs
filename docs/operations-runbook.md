@@ -208,6 +208,11 @@ cannot access another tenant or global admin routes. The
 direct commands without `--live` acquire the volume writer and must not be run
 while `slatefsd` serves that volume.
 
+Live version commits flush and validate the SlateDB writer lease before file
+capture and immediately before publishing history. HTTP `503` means that
+daemon was fenced; discover the current primary and retry there. The failed
+attempt does not advance the version-history head.
+
 Configure and enforce version-history lifecycle offline:
 
 ```sh

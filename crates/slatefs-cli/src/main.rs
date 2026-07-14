@@ -1695,7 +1695,7 @@ async fn run(
             let dek = control.unwrap_volume_dek(&record).await?;
             let live = volume::Volume::open(&record, dek, Arc::clone(&object_store)).await?;
             let commit = repository
-                .commit_paths(live.as_ref(), paths, message.clone())
+                .commit_volume_paths(live.as_ref(), paths, message.clone())
                 .await;
             let live_close = live.shutdown().await;
             let repository_close = repository.close().await;

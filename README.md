@@ -156,6 +156,9 @@ served by `slatefsd`, use `versioning commit --live` or `versioning restore
 --live`; the authenticated admin API executes the operation against the
 daemon's existing writer. Without `--live`, commit and restore remain offline
 operations and must use a stopped or otherwise quiesced volume.
+Live commits verify and flush the volume writer lease before capture and again
+before publishing the Prolly head. A fenced daemon returns `503` without
+creating a commit so the caller can retry the promoted primary.
 
 History lifecycle is explicit. `versioning retention` sets `--keep-last`,
 `--max-age`, and/or a hard `--max-bytes` history quota. `versioning gc`

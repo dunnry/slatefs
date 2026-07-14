@@ -249,6 +249,85 @@ async fn range_reads_and_restore_stream_across_chunks() {
 }
 
 #[tokio::test]
+async fn fenced_live_writer_cannot_publish_a_version_commit() {
+    let object_store: Arc<dyn ObjectStore> = store::resolve_root("memory:///").unwrap();
+    let control = ControlPlane::open(Arc::clone(&object_store), common::test_kms())
+        .await
+        .unwrap();
+    control.create_tenant("t", None).await.unwrap();
+    let record = volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "v",
+        common::create_opts(None, None),
+    )
+    .await
+    .unwrap();
+    control
+        .set_versioning_enabled("t", "v", true)
+        .await
+        .unwrap();
+    let dek = control.unwrap_volume_dek(&record).await.unwrap();
+    let stale = Volume::open(&record, dek.clone(), Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let creds = Credentials::root();
+    let file = stale
+        .create(&creds, ROOT_INO, b"primary.txt", 0o640, true)
+        .await
+        .unwrap();
+    stale
+        .write(&creds, file.ino, 0, b"durable primary data")
+        .await
+        .unwrap();
+    stale.flush().await.unwrap();
+
+    let repository = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap();
+    let replacement = Volume::open(&record, dek, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let replacement_file = replacement
+        .lookup(&creds, ROOT_INO, b"primary.txt")
+        .await
+        .unwrap();
+    replacement
+        .write(&creds, replacement_file.ino, 0, b"replacement primary")
+        .await
+        .unwrap();
+    replacement.flush().await.unwrap();
+    let error = repository
+        .commit_volume_paths(
+            stale.as_ref(),
+            &["/primary.txt".into()],
+            "stale primary".into(),
+        )
+        .await
+        .unwrap_err();
+    assert!(stale.is_dead());
+    assert!(error.to_string().contains("newer DB client"), "{error}");
+    assert!(repository.history(None, 10).await.unwrap().is_empty());
+
+    let committed = repository
+        .commit_volume_paths(
+            replacement.as_ref(),
+            &["/primary.txt".into()],
+            "replacement primary".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(committed.paths, vec!["/primary.txt"]);
+    assert_eq!(repository.history(None, 10).await.unwrap().len(), 1);
+
+    repository.close().await.unwrap();
+    replacement.shutdown().await.unwrap();
+    let _ = stale.shutdown().await;
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn commits_directories_symlinks_renames_and_deletions_atomically() {
     let object_store: Arc<dyn ObjectStore> = store::resolve_root("memory:///").unwrap();
     let control = ControlPlane::open(Arc::clone(&object_store), common::test_kms())

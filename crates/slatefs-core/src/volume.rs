@@ -1371,6 +1371,16 @@ impl Volume {
         })
     }
 
+    /// Force a remote manifest refresh before flushing so callers can prove
+    /// this handle still owns the current writer epoch.
+    pub async fn validate_writer_lease(&self) -> Result<()> {
+        self.db.refresh_manifest().await.map_err(|error| {
+            self.note_storage_error(&error);
+            Error::from(error)
+        })?;
+        self.flush().await
+    }
+
     /// Stop serving and close the underlying Db. Named to avoid colliding
     /// with `Vfs::close(handle)`.
     pub async fn shutdown(&self) -> Result<()> {
