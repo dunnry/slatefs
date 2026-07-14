@@ -496,6 +496,21 @@ async fn concurrent_commits_preserve_a_linear_complete_history() {
     let history = repository.history(None, 10).await.unwrap();
     assert_eq!(history.len(), 2);
     assert_eq!(history[0].parent.as_deref(), Some(history[1].id.as_str()));
+    let (first_page, next_page_token) = repository.history_page(None, 1, None).await.unwrap();
+    assert_eq!(first_page, vec![history[0].clone()]);
+    assert_eq!(next_page_token.as_deref(), Some(history[0].id.as_str()));
+    let (second_page, final_page_token) = repository
+        .history_page(None, 1, next_page_token.as_deref())
+        .await
+        .unwrap();
+    assert_eq!(second_page, vec![history[1].clone()]);
+    assert!(final_page_token.is_none());
+    assert!(
+        repository
+            .history_page(None, 1, Some("missing"))
+            .await
+            .is_err()
+    );
     assert_eq!(
         repository
             .read_file(&history[0].id, "/a.txt")

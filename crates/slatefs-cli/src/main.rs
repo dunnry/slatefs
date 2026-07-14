@@ -350,6 +350,9 @@ enum VersioningCmd {
         path: Option<String>,
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        /// Continue after the last commit ID returned by a previous page.
+        #[arg(long)]
+        page_token: Option<String>,
         #[arg(long)]
         live: bool,
     },
@@ -2046,12 +2049,16 @@ async fn run(
             volume,
             path,
             limit,
+            page_token,
             live,
         }) => {
             if *live {
                 let mut query = vec![("limit", limit.to_string())];
                 if let Some(path) = path {
                     query.push(("path", path.clone()));
+                }
+                if let Some(page_token) = page_token {
+                    query.push(("page_token", page_token.clone()));
                 }
                 let response =
                     live_versioning_json(config, tenant, volume, "GET", "commits", &query, None)
@@ -2062,13 +2069,22 @@ async fn run(
                 for commit in commits {
                     print_version_commit(&commit);
                 }
+                if let Some(next) = response["next_page_token"].as_str() {
+                    println!("next_page_token: {next}");
+                }
                 return Ok(());
             }
             let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
-            let history = repository.history(path.as_deref(), *limit).await;
+            let history = repository
+                .history_page(path.as_deref(), *limit, page_token.as_deref())
+                .await;
             let repository_close = repository.close().await;
-            for commit in history? {
+            let (commits, next_page_token) = history?;
+            for commit in commits {
                 print_version_commit(&commit);
+            }
+            if let Some(next) = next_page_token {
+                println!("next_page_token: {next}");
             }
             repository_close?;
         }

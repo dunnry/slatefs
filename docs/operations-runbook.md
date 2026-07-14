@@ -254,6 +254,16 @@ recent repository lease, including owner UUID, operation, expiry, and whether
 it is expired. Use this before diagnosing a `409` conflict or removing an
 orphaned local lease.
 
+Long histories are newest-first and cursor-paginated. Pass the printed token
+back unchanged to continue after the last commit from the previous page:
+
+```sh
+slatefs -c /etc/slatefs/slatefs.toml versioning log <tenant> <volume> --limit 100 --page-token <commit-id> --live
+```
+
+Path-filtered history uses the same exclusive cursor and returns the next 100
+matching commits rather than merely scanning 100 unfiltered commits.
+
 `versioning purge <tenant> <volume> --yes` is irreversible. SlateFS acquires
 the same deployment-wide per-volume lease used by repository reads, commits,
 verification, and GC, so a concurrent operation returns a conflict instead of

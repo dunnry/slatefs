@@ -2164,9 +2164,13 @@ async fn list_version_commits_response(
     let _guard = version_lock.lock().await;
     let (control, repository) = open_version_repository(state, tenant, volume).await?;
     let result = repository
-        .history(request.query.get("path").map(String::as_str), limit)
+        .history_page(
+            request.query.get("path").map(String::as_str),
+            limit,
+            request.query.get("page_token").map(String::as_str),
+        )
         .await;
-    let commits = finish_version_repository(control, repository, result).await?;
+    let (commits, next_page_token) = finish_version_repository(control, repository, result).await?;
     let commits = commits
         .into_iter()
         .map(|commit| {
@@ -2179,7 +2183,10 @@ async fn list_version_commits_response(
             })
         })
         .collect::<Vec<_>>();
-    Ok(AdminHttpResponse::json(200, json!({ "commits": commits })))
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "commits": commits, "next_page_token": next_page_token }),
+    ))
 }
 
 async fn get_version_content_response(
@@ -6546,6 +6553,7 @@ mod tests {
         );
         let history: Value = serde_json::from_str(response_body(&history_response)).unwrap();
         assert_eq!(history["commits"][0]["id"], commit_id);
+        assert!(history["next_page_token"].is_null());
 
         let content_request = format!(
             "GET /admin/v1/tenants/t/volumes/v/versioning/commits/{commit_id}/content?path=/notes.txt HTTP/1.1\r\nHost: localhost\r\n\r\n"

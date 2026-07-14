@@ -1228,9 +1228,26 @@ impl VersionRepository {
         path: Option<&str>,
         limit: usize,
     ) -> Result<Vec<VersionCommitInfo>> {
+        Ok(self.history_page(path, limit, None).await?.0)
+    }
+
+    /// Return newest-first history after an optional exclusive commit cursor.
+    /// The cursor is the last commit ID returned by the previous page.
+    pub async fn history_page(
+        &self,
+        path: Option<&str>,
+        limit: usize,
+        page_token: Option<&str>,
+    ) -> Result<(Vec<VersionCommitInfo>, Option<String>)> {
         let path = path.map(canonical_path).transpose()?;
-        let mut next = self.store.get_head().await?.map(|head| head.commit_id);
-        let mut history = Vec::new();
+        let mut next = match page_token {
+            Some(page_token) => {
+                let id = parse_commit_id(page_token)?;
+                self.store.get_commit(&id).await?.parent
+            }
+            None => self.store.get_head().await?.map(|head| head.commit_id),
+        };
+        let mut history: Vec<VersionCommitInfo> = Vec::new();
         let limit = limit.clamp(1, 10_000);
         while let Some(id) = next {
             let Some(commit) = self.store.try_get_commit(&id).await? else {
@@ -1244,12 +1261,14 @@ impl VersionRepository {
                     .any(|changed| path_is_within(path, changed) || path_is_within(changed, path))
             }) {
                 history.push(commit.into());
-                if history.len() == limit {
+                if history.len() > limit {
                     break;
                 }
             }
         }
-        Ok(history)
+        let next_page_token = (history.len() > limit).then(|| history[limit - 1].id.clone());
+        history.truncate(limit);
+        Ok((history, next_page_token))
     }
 
     pub async fn read_file(&self, commit: &str, path: &str) -> Result<Bytes> {
