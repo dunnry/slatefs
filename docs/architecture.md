@@ -83,11 +83,14 @@ and blobs have been written. Disabling versioning blocks repository operations
 without deleting its history. Volume deletion removes both the live and
 optional version-store prefixes.
 
-Branch merge is conservative: SlateFS atomically fast-forwards the target when
-its head is an ancestor of the source, reports an already-current target as a
-no-op, and rejects divergent histories. This preserves the single-parent
-commit format while leaving conflict-aware three-way merge as a future format
-evolution.
+SlateFS atomically fast-forwards a target when its head is an ancestor of the
+source and reports an already-current target as a no-op. Divergent branches
+use their nearest common ancestor for a strict Prolly three-way merge. A
+non-conflicting result is published as a two-parent commit; conflicting keys
+return `409` and leave both heads unchanged. First-parent order drives log and
+retention pagination, while verification and ancestry traverse the full DAG.
+An unbounded GC retains the full reachable DAG; bounded retention evaluates
+first-parent history per branch and may prune older secondary ancestry.
 
 Explicit version operations are serialized across processes before a SlateDB
 version writer is opened. SlateFS creates or conditionally replaces the

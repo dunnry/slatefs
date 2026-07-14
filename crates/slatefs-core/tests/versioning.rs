@@ -101,7 +101,7 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         .commit_file(live.as_ref(), "notes.txt", "update notes".to_string())
         .await
         .unwrap();
-    assert_eq!(second.parent.as_deref(), Some(first.id.as_str()));
+    assert_eq!(second.parents, vec![first.id.clone()]);
     let diff = repository
         .diff_commits(&first.id, &second.id)
         .await
@@ -139,7 +139,7 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         .unwrap();
     assert!(branch_replay.replayed());
     assert_eq!(branch_replay.commit().id, branch_commit.id);
-    assert_eq!(branch_commit.parent.as_deref(), Some(first.id.as_str()));
+    assert_eq!(branch_commit.parents, vec![first.id.clone()]);
     assert_eq!(
         repository
             .read_file("main", "/notes.txt")
@@ -179,11 +179,81 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
     let unchanged = repository.merge_branch("main", "release").await.unwrap();
     assert!(!unchanged.fast_forward());
     assert!(unchanged.already_up_to_date());
-    assert!(repository.merge_branch("draft", "main").await.is_err());
+    repository
+        .create_branch("feature", &first.id)
+        .await
+        .unwrap();
+    let feature_file = live
+        .create(&creds, ROOT_INO, b"feature.txt", 0o640, true)
+        .await
+        .unwrap();
+    live.write(&creds, feature_file.ino, 0, b"feature contents")
+        .await
+        .unwrap();
+    let feature_commit = repository
+        .commit_paths_on_branch(
+            live.as_ref(),
+            "feature",
+            &["/feature.txt".into()],
+            "add feature file".into(),
+        )
+        .await
+        .unwrap();
+    let three_way = repository.merge_branch("feature", "main").await.unwrap();
+    assert!(!three_way.fast_forward());
+    assert!(!three_way.already_up_to_date());
+    let merged_history = repository
+        .history_on_branch("main", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(merged_history[0].id, three_way.commit());
+    assert_eq!(
+        merged_history[0].parents,
+        vec![second.id.clone(), feature_commit.id.clone()]
+    );
+    assert_eq!(
+        repository
+            .read_file("main", "/feature.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"feature contents"
+    );
+    assert_eq!(
+        repository
+            .read_file("main", "/notes.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        second_contents
+    );
+    let conflict = repository.merge_branch("draft", "main").await.unwrap_err();
+    assert!(conflict.to_string().contains("merge conflict"));
+    let branches = repository.list_branches().await.unwrap();
+    assert_eq!(
+        branches
+            .iter()
+            .find(|branch| branch.name() == "main")
+            .unwrap()
+            .commit(),
+        three_way.commit()
+    );
+    assert_eq!(
+        branches
+            .iter()
+            .find(|branch| branch.name() == "draft")
+            .unwrap()
+            .commit(),
+        branch_commit.id
+    );
     let verified = repository.verify().await.unwrap();
-    assert_eq!(verified.commits, 3);
+    assert_eq!(verified.commits, 5);
     assert!(verified.nodes > 0);
     assert!(verified.blobs > 0);
+    repository.delete_branch("feature").await.unwrap();
+    let complete_dag_gc = repository.garbage_collect(None, None, true).await.unwrap();
+    assert_eq!(complete_dag_gc.retained_commits, 5);
+    assert_eq!(complete_dag_gc.deleted_commits, 0);
     assert_eq!(
         repository
             .read_file(&first.id, "/notes.txt")
@@ -723,7 +793,7 @@ async fn concurrent_commits_preserve_a_linear_complete_history() {
 
     let history = repository.history(None, 10).await.unwrap();
     assert_eq!(history.len(), 2);
-    assert_eq!(history[0].parent.as_deref(), Some(history[1].id.as_str()));
+    assert_eq!(history[0].parents, vec![history[1].id.clone()]);
     let (first_page, next_page_token) = repository.history_page(None, 1, None).await.unwrap();
     assert_eq!(first_page, vec![history[0].clone()]);
     assert_eq!(next_page_token.as_deref(), Some(history[0].id.as_str()));

@@ -4,13 +4,13 @@
 //! module opens a separate encrypted database only for explicit versioning
 //! operations, so disabled volumes pay no storage or request-path cost.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use prolly::{
     AsyncBlobStore, AsyncProlly, AsyncStore, BatchOp, BlobRef, Cid, Config as ProllyConfig, Diff,
-    Mutation, RootManifest, ValueRef,
+    Mutation, RootManifest, Tree, ValueRef,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -37,8 +37,7 @@ const PRUNED_COMMIT_PREFIX: &[u8] = b"pp/";
 const BRANCH_PREFIX: &[u8] = b"pr/heads/";
 const HEAD_KEY: &[u8] = b"pr/heads/main";
 const TAG_PREFIX: &[u8] = b"pr/tags/";
-const LEGACY_FILE_META_VERSION: u8 = 1;
-const ENTRY_META_VERSION: u8 = 2;
+const ENTRY_META_VERSION: u8 = 1;
 const COMMIT_VERSION: u8 = 1;
 const IDEMPOTENCY_VERSION: u8 = 1;
 const REF_VERSION: u8 = 1;
@@ -437,6 +436,16 @@ enum VersionPublishOutcome {
     Replayed(Box<VersionCommit>),
 }
 
+struct VersionPublishRequest<'a> {
+    branch: &'a str,
+    expected: Option<[u8; 32]>,
+    required_ref: Option<(&'a str, [u8; 32])>,
+    commit: &'a VersionCommit,
+    encoded_commit: Vec<u8>,
+    idempotency: Option<VersionCommitIdempotencyIntent>,
+    max_bytes: Option<u64>,
+}
+
 impl VersionStore {
     fn new(db: Db) -> Self {
         Self {
@@ -504,13 +513,17 @@ impl VersionStore {
 
     async fn publish_commit(
         &self,
-        branch: &str,
-        expected: Option<[u8; 32]>,
-        commit: &VersionCommit,
-        encoded_commit: Vec<u8>,
-        idempotency: Option<VersionCommitIdempotencyIntent>,
-        max_bytes: Option<u64>,
+        request: VersionPublishRequest<'_>,
     ) -> Result<VersionPublishOutcome> {
+        let VersionPublishRequest {
+            branch,
+            expected,
+            required_ref,
+            commit,
+            encoded_commit,
+            idempotency,
+            max_bytes,
+        } = request;
         let _guard = self.ref_lock.lock().await;
         if let Some(intent) = idempotency
             && let Some(existing) = self.resolve_idempotency(intent).await?
@@ -534,6 +547,14 @@ impl VersionStore {
                     .map(|head| hex::encode(head.commit_id))
                     .unwrap_or_else(|| "empty".to_string())
             )));
+        }
+        if let Some((required_branch, required_commit)) = required_ref {
+            let current = self.get_branch(required_branch).await?;
+            if current.as_ref().map(|head| head.commit_id) != Some(required_commit) {
+                return Err(Error::Versioning(format!(
+                    "branch {required_branch} moved while merging"
+                )));
+            }
         }
         if let Some(max_bytes) = max_bytes {
             let mut bytes = 0u64;
@@ -800,17 +821,6 @@ impl AsyncBlobStore for VersionStore {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct LegacyFileVersion {
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    size: u64,
-    atime: Timespec,
-    mtime: Timespec,
-    chunk_count: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum VersionEntryData {
     File { chunk_count: u32 },
     Directory,
@@ -828,26 +838,10 @@ struct VersionEntry {
     data: VersionEntryData,
 }
 
-impl From<LegacyFileVersion> for VersionEntry {
-    fn from(file: LegacyFileVersion) -> Self {
-        Self {
-            mode: file.mode,
-            uid: file.uid,
-            gid: file.gid,
-            size: file.size,
-            atime: file.atime,
-            mtime: file.mtime,
-            data: VersionEntryData::File {
-                chunk_count: file.chunk_count,
-            },
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VersionCommit {
     id: [u8; 32],
-    parent: Option<[u8; 32]>,
+    parents: Vec<[u8; 32]>,
     tree: RootManifest,
     created_at: u64,
     message: String,
@@ -856,7 +850,7 @@ struct VersionCommit {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VersionCommitBody {
-    parent: Option<[u8; 32]>,
+    parents: Vec<[u8; 32]>,
     tree: RootManifest,
     created_at: u64,
     message: String,
@@ -865,13 +859,6 @@ struct VersionCommitBody {
 
 #[derive(Serialize)]
 struct VersionCommitRequestFingerprint<'a> {
-    version: u8,
-    message: &'a str,
-    paths: &'a [String],
-}
-
-#[derive(Serialize)]
-struct VersionCommitRequestFingerprintV2<'a> {
     version: u8,
     branch: &'a str,
     message: &'a str,
@@ -894,7 +881,7 @@ struct VersionTag {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionCommitInfo {
     pub id: String,
-    pub parent: Option<String>,
+    pub parents: Vec<String>,
     pub created_at: u64,
     pub message: String,
     pub paths: Vec<String>,
@@ -1069,7 +1056,7 @@ impl From<VersionCommit> for VersionCommitInfo {
     fn from(commit: VersionCommit) -> Self {
         Self {
             id: hex::encode(commit.id),
-            parent: commit.parent.map(hex::encode),
+            parents: commit.parents.into_iter().map(hex::encode).collect(),
             created_at: commit.created_at,
             message: commit.message,
             paths: commit.paths,
@@ -1291,53 +1278,8 @@ impl VersionRepository {
     /// Verify the reachable commit chain and every referenced Prolly node and
     /// blob. Unreachable objects are intentionally left to garbage collection.
     pub async fn verify(&self) -> Result<VersionVerifyReport> {
-        let head = self.store.get_head().await?;
-        let mut next = head.as_ref().map(|head| head.commit_id);
-        let mut seen = HashSet::new();
-        let mut trees = Vec::new();
-        let mut commits = 0u64;
-        while let Some(id) = next {
-            if !seen.insert(id) {
-                return Err(Error::Versioning(format!(
-                    "commit chain contains a cycle at {}",
-                    hex::encode(id)
-                )));
-            }
-            let Some(commit) = self.store.try_get_commit(&id).await? else {
-                if self.store.is_pruned_commit(&id).await? {
-                    break;
-                }
-                return Err(Error::not_found("version commit", hex::encode(id)));
-            };
-            let body = VersionCommitBody {
-                parent: commit.parent,
-                tree: commit.tree.clone(),
-                created_at: commit.created_at,
-                message: commit.message.clone(),
-                paths: commit.paths.clone(),
-            };
-            let expected: [u8; 32] = Sha256::digest(postcard::to_allocvec(&body)?).into();
-            if expected != commit.id || commit.id != id {
-                return Err(Error::Versioning(format!(
-                    "commit {} does not match its content hash",
-                    hex::encode(id)
-                )));
-            }
-            trees.push(commit.tree.to_tree());
-            next = commit.parent;
-            commits += 1;
-        }
-        if let (Some(head), Some(tree)) = (head.as_ref(), trees.first())
-            && head.tree.to_tree() != *tree
-        {
-            return Err(Error::Versioning(
-                "head tree does not match the head commit".into(),
-            ));
-        }
+        let mut pending = Vec::new();
         for (name, branch) in self.store.list_branches().await? {
-            if name == "main" {
-                continue;
-            }
             let commit = self
                 .store
                 .get_commit(&branch.commit_id)
@@ -1354,65 +1296,47 @@ impl VersionRepository {
                     hex::encode(branch.commit_id)
                 )));
             }
-            let mut next = Some(branch.commit_id);
-            while let Some(id) = next {
-                if !seen.insert(id) {
-                    break;
-                }
-                let Some(commit) = self.store.try_get_commit(&id).await? else {
-                    if self.store.is_pruned_commit(&id).await? {
-                        break;
-                    }
-                    return Err(Error::Versioning(format!(
-                        "version branch {name} references missing commit {}",
-                        hex::encode(id)
-                    )));
-                };
-                let body = VersionCommitBody {
-                    parent: commit.parent,
-                    tree: commit.tree.clone(),
-                    created_at: commit.created_at,
-                    message: commit.message.clone(),
-                    paths: commit.paths.clone(),
-                };
-                let expected: [u8; 32] = Sha256::digest(postcard::to_allocvec(&body)?).into();
-                if expected != commit.id || commit.id != id {
-                    return Err(Error::Versioning(format!(
-                        "branch commit {} does not match its content hash",
-                        hex::encode(id)
-                    )));
-                }
-                trees.push(commit.tree.to_tree());
-                next = commit.parent;
-                commits += 1;
-            }
+            pending.push(branch.commit_id);
         }
         for tag in self.store.list_tags().await? {
-            if !seen.insert(tag.commit_id) {
-                continue;
-            }
-            let commit = self.store.get_commit(&tag.commit_id).await.map_err(|_| {
+            self.store.get_commit(&tag.commit_id).await.map_err(|_| {
                 Error::Versioning(format!(
                     "version tag {} references missing commit {}",
                     tag.name,
                     hex::encode(tag.commit_id)
                 ))
             })?;
+            pending.push(tag.commit_id);
+        }
+        let mut seen = HashSet::new();
+        let mut trees = Vec::new();
+        let mut commits = 0u64;
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(commit) = self.store.try_get_commit(&id).await? else {
+                if self.store.is_pruned_commit(&id).await? {
+                    continue;
+                }
+                return Err(Error::not_found("version commit", hex::encode(id)));
+            };
             let body = VersionCommitBody {
-                parent: commit.parent,
+                parents: commit.parents.clone(),
                 tree: commit.tree.clone(),
                 created_at: commit.created_at,
                 message: commit.message.clone(),
                 paths: commit.paths.clone(),
             };
             let expected: [u8; 32] = Sha256::digest(postcard::to_allocvec(&body)?).into();
-            if expected != commit.id || commit.id != tag.commit_id {
+            if expected != commit.id || commit.id != id {
                 return Err(Error::Versioning(format!(
-                    "tagged commit {} does not match its content hash",
-                    hex::encode(tag.commit_id)
+                    "commit {} does not match its content hash",
+                    hex::encode(id)
                 )));
             }
             trees.push(commit.tree.to_tree());
+            pending.extend(commit.parents.iter().copied());
             commits += 1;
         }
 
@@ -1462,7 +1386,7 @@ impl VersionRepository {
             let Some(commit) = self.store.try_get_commit(&id).await? else {
                 break;
             };
-            next = commit.parent;
+            next = commit.parents.first().copied();
             let position = chain.len();
             let within_count = keep_last.is_none_or(|keep| position < keep as usize);
             let within_age = cutoff.is_none_or(|cutoff| commit.created_at >= cutoff);
@@ -1491,7 +1415,7 @@ impl VersionRepository {
                         hex::encode(id)
                     )));
                 };
-                next = commit.parent;
+                next = commit.parents.first().copied();
                 let within_count = keep_last.is_none_or(|keep| position < keep as usize);
                 let within_age = cutoff.is_none_or(|cutoff| commit.created_at >= cutoff);
                 if (position == 0 || (within_count && within_age))
@@ -1500,6 +1424,22 @@ impl VersionRepository {
                     retained.push(commit);
                 }
                 position += 1;
+            }
+        }
+        if keep_last.is_none() && cutoff.is_none() {
+            let mut pending = retained
+                .iter()
+                .flat_map(|commit| commit.parents.iter().copied())
+                .collect::<Vec<_>>();
+            while let Some(id) = pending.pop() {
+                if !retained_commit_ids.insert(id) {
+                    continue;
+                }
+                let Some(commit) = self.store.try_get_commit(&id).await? else {
+                    continue;
+                };
+                pending.extend(commit.parents.iter().copied());
+                retained.push(commit);
             }
         }
         for tag in self.store.list_tags().await? {
@@ -1820,7 +1760,10 @@ impl VersionRepository {
             )));
         }
         let body = VersionCommitBody {
-            parent: head.as_ref().map(|head| head.commit_id),
+            parents: head
+                .as_ref()
+                .map(|head| vec![head.commit_id])
+                .unwrap_or_default(),
             tree: RootManifest::from_tree(&tree),
             created_at: crate::control::now_unix(),
             message,
@@ -1830,7 +1773,7 @@ impl VersionRepository {
         let id: [u8; 32] = Sha256::digest(&body_bytes).into();
         let commit = VersionCommit {
             id,
-            parent: body.parent,
+            parents: body.parents,
             tree: body.tree,
             created_at: body.created_at,
             message: body.message,
@@ -1842,14 +1785,15 @@ impl VersionRepository {
         }
         match self
             .store
-            .publish_commit(
+            .publish_commit(VersionPublishRequest {
                 branch,
-                head.map(|head| head.commit_id),
-                &commit,
-                encoded,
+                expected: head.map(|head| head.commit_id),
+                required_ref: None,
+                commit: &commit,
+                encoded_commit: encoded,
                 idempotency,
-                self.max_bytes,
-            )
+                max_bytes: self.max_bytes,
+            })
             .await?
         {
             VersionPublishOutcome::Published => Ok(VersionCommitResult {
@@ -2042,8 +1986,9 @@ impl VersionRepository {
         })
     }
 
-    /// Merge `source` into `target` when the target can be fast-forwarded.
-    /// Divergent histories are rejected without changing either branch.
+    /// Merge `source` into `target`. Descendant sources fast-forward the
+    /// target; divergent histories produce a two-parent three-way merge
+    /// commit when their Prolly trees do not conflict.
     pub async fn merge_branch(&self, source: &str, target: &str) -> Result<VersionMergeInfo> {
         validate_version_branch_name(source)?;
         validate_version_branch_name(target)?;
@@ -2076,46 +2021,180 @@ impl VersionRepository {
                 already_up_to_date: true,
             });
         }
-        if !self
+        if self
             .commit_is_ancestor(target_ref.commit_id, source_ref.commit_id)
             .await?
         {
-            return Err(Error::Versioning(format!(
-                "branches {source} and {target} have diverged; a fast-forward merge is not possible"
-            )));
+            let merged = self
+                .store
+                .fast_forward_branch(source, target, source_ref.commit_id, target_ref.commit_id)
+                .await?;
+            return Ok(VersionMergeInfo {
+                source: source.to_string(),
+                target: target.to_string(),
+                commit: hex::encode(merged.commit_id),
+                fast_forward: true,
+                already_up_to_date: false,
+            });
         }
-        let merged = self
-            .store
-            .fast_forward_branch(source, target, source_ref.commit_id, target_ref.commit_id)
+        let base_id = self
+            .merge_base(target_ref.commit_id, source_ref.commit_id)
+            .await?
+            .ok_or_else(|| {
+                Error::Versioning(format!(
+                    "branches {source} and {target} have no common merge base"
+                ))
+            })?;
+        let base = self.store.get_commit(&base_id).await?;
+        let target_commit = self.store.get_commit(&target_ref.commit_id).await?;
+        let source_commit = self.store.get_commit(&source_ref.commit_id).await?;
+        let merged_tree = self
+            .strict_three_way_merge(
+                source,
+                target,
+                &base.tree.to_tree(),
+                &target_commit.tree.to_tree(),
+                &source_commit.tree.to_tree(),
+            )
+            .await?;
+        let changes = self
+            .diff_trees(&target_commit.tree.to_tree(), &merged_tree)
+            .await?;
+        let body = VersionCommitBody {
+            parents: vec![target_ref.commit_id, source_ref.commit_id],
+            tree: RootManifest::from_tree(&merged_tree),
+            created_at: crate::control::now_unix(),
+            message: format!("Merge {source} into {target}"),
+            paths: changes
+                .into_iter()
+                .map(|change| change.path().to_string())
+                .collect(),
+        };
+        let id: [u8; 32] = Sha256::digest(postcard::to_allocvec(&body)?).into();
+        let commit = VersionCommit {
+            id,
+            parents: body.parents,
+            tree: body.tree,
+            created_at: body.created_at,
+            message: body.message,
+            paths: body.paths,
+        };
+        let encoded = encode_versioned(COMMIT_VERSION, &commit)?;
+        self.store
+            .publish_commit(VersionPublishRequest {
+                branch: target,
+                expected: Some(target_ref.commit_id),
+                required_ref: Some((source, source_ref.commit_id)),
+                commit: &commit,
+                encoded_commit: encoded,
+                idempotency: None,
+                max_bytes: self.max_bytes,
+            })
             .await?;
         Ok(VersionMergeInfo {
             source: source.to_string(),
             target: target.to_string(),
-            commit: hex::encode(merged.commit_id),
-            fast_forward: true,
+            commit: hex::encode(commit.id),
+            fast_forward: false,
             already_up_to_date: false,
         })
     }
 
     async fn commit_is_ancestor(&self, ancestor: [u8; 32], descendant: [u8; 32]) -> Result<bool> {
-        let mut next = Some(descendant);
+        let mut pending = vec![descendant];
         let mut seen = HashSet::new();
-        while let Some(id) = next {
+        while let Some(id) = pending.pop() {
             if id == ancestor {
                 return Ok(true);
             }
             if !seen.insert(id) {
-                return Err(Error::Versioning(format!(
-                    "commit chain contains a cycle at {}",
-                    hex::encode(id)
-                )));
+                continue;
             }
             let Some(commit) = self.store.try_get_commit(&id).await? else {
-                return Ok(false);
+                continue;
             };
-            next = commit.parent;
+            pending.extend(commit.parents);
         }
         Ok(false)
+    }
+
+    async fn merge_base(&self, left: [u8; 32], right: [u8; 32]) -> Result<Option<[u8; 32]>> {
+        let left_distances = self.ancestor_distances(left).await?;
+        let right_distances = self.ancestor_distances(right).await?;
+        Ok(left_distances
+            .into_iter()
+            .filter_map(|(id, left_distance)| {
+                right_distances
+                    .get(&id)
+                    .map(|right_distance| (id, left_distance + right_distance))
+            })
+            .min_by(|(left_id, left_distance), (right_id, right_distance)| {
+                left_distance
+                    .cmp(right_distance)
+                    .then_with(|| left_id.cmp(right_id))
+            })
+            .map(|(id, _)| id))
+    }
+
+    async fn ancestor_distances(&self, start: [u8; 32]) -> Result<HashMap<[u8; 32], usize>> {
+        let mut distances = HashMap::new();
+        let mut pending = VecDeque::from([(start, 0usize)]);
+        while let Some((id, distance)) = pending.pop_front() {
+            if distances.contains_key(&id) {
+                continue;
+            }
+            distances.insert(id, distance);
+            let Some(commit) = self.store.try_get_commit(&id).await? else {
+                continue;
+            };
+            pending.extend(
+                commit
+                    .parents
+                    .into_iter()
+                    .map(|parent| (parent, distance + 1)),
+            );
+        }
+        Ok(distances)
+    }
+
+    async fn strict_three_way_merge(
+        &self,
+        source: &str,
+        target: &str,
+        base: &Tree,
+        left: &Tree,
+        right: &Tree,
+    ) -> Result<Tree> {
+        let left_diff = self.prolly.diff(base, left).await.map_err(prolly_error)?;
+        let right_diff = self.prolly.diff(base, right).await.map_err(prolly_error)?;
+        let left_changes = left_diff
+            .into_iter()
+            .map(|diff| (diff.key().to_vec(), diff_result_value(diff)))
+            .collect::<BTreeMap<_, _>>();
+        let mut mutations = Vec::new();
+        for diff in right_diff {
+            let key = diff.key().to_vec();
+            let value = diff_result_value(diff);
+            if let Some(left_value) = left_changes.get(&key) {
+                if left_value != &value {
+                    let path = version_path_from_tree_key(&key)
+                        .map(|(path, _)| path)
+                        .unwrap_or_else(|_| hex::encode(&key));
+                    return Err(Error::Versioning(format!(
+                        "merge conflict between {source} and {target} at {path}"
+                    )));
+                }
+                continue;
+            }
+            mutations.push(match value {
+                Some(val) => Mutation::Upsert { key, val },
+                None => Mutation::Delete { key },
+            });
+        }
+        self.prolly
+            .batch(left, mutations)
+            .await
+            .map_err(prolly_error)
     }
 
     pub async fn history(
@@ -2165,7 +2244,7 @@ impl VersionRepository {
         let mut next = match page_token {
             Some(page_token) => {
                 let id = parse_commit_id(page_token)?;
-                self.store.get_commit(&id).await?.parent
+                self.store.get_commit(&id).await?.parents.first().copied()
             }
             None => {
                 let head = self.store.get_branch(branch).await?;
@@ -2181,7 +2260,7 @@ impl VersionRepository {
             let Some(commit) = self.store.try_get_commit(&id).await? else {
                 break;
             };
-            next = commit.parent;
+            next = commit.parents.first().copied();
             if path.as_ref().is_none_or(|path| {
                 commit
                     .paths
@@ -2205,11 +2284,12 @@ impl VersionRepository {
     pub async fn diff_commits(&self, from: &str, to: &str) -> Result<Vec<VersionPathChange>> {
         let from = self.resolve_commit(from).await?;
         let to = self.resolve_commit(to).await?;
-        let diffs = self
-            .prolly
-            .diff(&from.tree.to_tree(), &to.tree.to_tree())
+        self.diff_trees(&from.tree.to_tree(), &to.tree.to_tree())
             .await
-            .map_err(prolly_error)?;
+    }
+
+    async fn diff_trees(&self, from: &Tree, to: &Tree) -> Result<Vec<VersionPathChange>> {
+        let diffs = self.prolly.diff(from, to).await.map_err(prolly_error)?;
         let mut paths: BTreeMap<String, (Option<VersionPathChangeKind>, bool)> = BTreeMap::new();
         for diff in diffs {
             let (key, raw_change) = match &diff {
@@ -2689,6 +2769,14 @@ fn version_path_from_tree_key(key: &[u8]) -> Result<(String, bool)> {
     Ok((canonical_path(path)?, metadata))
 }
 
+fn diff_result_value(diff: Diff) -> Option<Vec<u8>> {
+    match diff {
+        Diff::Added { val, .. } => Some(val),
+        Diff::Removed { .. } => None,
+        Diff::Changed { new, .. } => Some(new),
+    }
+}
+
 fn path_components(path: &str) -> Vec<&str> {
     path.trim_start_matches('/').split('/').collect()
 }
@@ -2804,22 +2892,13 @@ fn version_commit_idempotency_intent(
             "must not exceed 256 UTF-8 bytes",
         ));
     }
-    let request_fingerprint = if branch == "main" {
-        let request = VersionCommitRequestFingerprint {
-            version: 1,
-            message,
-            paths: canonical_paths,
-        };
-        Sha256::digest(postcard::to_allocvec(&request)?).into()
-    } else {
-        let request = VersionCommitRequestFingerprintV2 {
-            version: 2,
-            branch,
-            message,
-            paths: canonical_paths,
-        };
-        Sha256::digest(postcard::to_allocvec(&request)?).into()
+    let request = VersionCommitRequestFingerprint {
+        version: 1,
+        branch,
+        message,
+        paths: canonical_paths,
     };
+    let request_fingerprint = Sha256::digest(postcard::to_allocvec(&request)?).into();
     Ok(VersionCommitIdempotencyIntent {
         key_hash: Sha256::digest(key.as_bytes()).into(),
         request_fingerprint,
@@ -2833,20 +2912,7 @@ fn encode_versioned<T: Serialize>(version: u8, value: &T) -> Result<Vec<u8>> {
 }
 
 fn decode_version_entry(bytes: &[u8]) -> Result<VersionEntry> {
-    match bytes.first().copied() {
-        Some(LEGACY_FILE_META_VERSION) => decode_versioned::<LegacyFileVersion>(
-            LEGACY_FILE_META_VERSION,
-            bytes,
-            "legacy file version",
-        )
-        .map(VersionEntry::from),
-        Some(ENTRY_META_VERSION) => decode_versioned(ENTRY_META_VERSION, bytes, "version entry"),
-        Some(version) => Err(Error::invalid(
-            "version entry",
-            format!("format version {version}, expected 1 or 2"),
-        )),
-        None => Err(Error::invalid("version entry", "empty record")),
-    }
+    decode_versioned(ENTRY_META_VERSION, bytes, "version entry")
 }
 
 fn decode_versioned<T: for<'de> Deserialize<'de>>(
@@ -2998,28 +3064,5 @@ mod tests {
         assert_ne!(file_meta_key("/a"), file_chunk_key("/a", 0));
         assert_ne!(file_chunk_key("/a", 1), file_chunk_key("/a", 2));
         assert_ne!(file_chunk_key("/a", 0), file_chunk_key("/a/0", 0));
-    }
-
-    #[test]
-    fn legacy_file_metadata_remains_readable() {
-        let legacy = LegacyFileVersion {
-            mode: 0o640,
-            uid: 1,
-            gid: 2,
-            size: 3,
-            atime: Timespec { secs: 4, nanos: 5 },
-            mtime: Timespec { secs: 6, nanos: 7 },
-            chunk_count: 8,
-        };
-        let encoded = encode_versioned(LEGACY_FILE_META_VERSION, &legacy).unwrap();
-        let decoded = decode_version_entry(&encoded).unwrap();
-        assert_eq!(decoded.mode, legacy.mode);
-        assert_eq!(decoded.size, legacy.size);
-        assert_eq!(
-            decoded.data,
-            VersionEntryData::File {
-                chunk_count: legacy.chunk_count
-            }
-        );
     }
 }

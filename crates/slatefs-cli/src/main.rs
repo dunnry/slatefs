@@ -1002,7 +1002,14 @@ fn print_snapshot(snapshot: &volume::SnapshotInfo) {
 
 fn print_version_commit(commit: &VersionCommitInfo) {
     println!("commit {}", commit.id);
-    println!("parent {}", commit.parent.as_deref().unwrap_or("-"));
+    println!(
+        "parents {}",
+        if commit.parents.is_empty() {
+            "-".to_string()
+        } else {
+            commit.parents.join(",")
+        }
+    );
     println!("created {}", commit.created_at);
     println!("paths {}", commit.paths.join(","));
     println!("message {}", commit.message);
@@ -1038,8 +1045,10 @@ fn print_version_merge(merge: &VersionMergeInfo) {
         merge.commit(),
         if merge.fast_forward() {
             "fast-forward"
-        } else {
+        } else if merge.already_up_to_date() {
             "already-up-to-date"
+        } else {
+            "three-way"
         }
     );
 }

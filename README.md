@@ -151,8 +151,9 @@ immutable names for important commits. `versioning branch`, `branches`, and
 where a commit or tag is accepted. `commit --branch <name>` advances an
 existing branch instead of `main`, and `log --branch <name>` follows that
 branch's history.
-`versioning merge <source> <target>` performs an atomic fast-forward and
-rejects divergent histories without changing either branch.
+`versioning merge <source> <target>` fast-forwards when possible or creates an
+atomic two-parent three-way merge commit for non-conflicting divergent trees.
+Conflicts leave both branches unchanged.
 Show and restore stream versioned data in bounded chunks rather than loading a
 complete large file into memory.
 `versioning disable` stops all version operations but retains existing history;
@@ -178,7 +179,7 @@ and `--dry-run` reports first; `versioning stats` reports logical usage.
 Tags and branch heads pin their commit and Prolly tree through both automatic
 and explicit GC until the reference is deleted. `show`, `restore`, and `diff`
 accept a commit ID, tag name, or branch name.
-`versioning verify` checks the reachable commit hash chain and reads every
+`versioning verify` checks the reachable commit DAG and reads every
 referenced Prolly node and content blob.
 `versioning purge --yes` permanently removes the physical history prefix while
 leaving versioning enabled for a fresh next commit. Commit, restore, retention,
@@ -264,12 +265,12 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | List branch heads, including `main`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | Create a branch from `{"name":"...","commit":"commit-or-ref"}`. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}` | Delete a non-main branch without deleting its commit immediately. |
-| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{target}/merge` | Fast-forward a target from `{"source":"..."}`; divergent histories are rejected. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{target}/merge` | Fast-forward or three-way merge a target from `{"source":"..."}`; conflicts return `409`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"...","idempotency_key":"...","branch":"main"}`; retry key and branch are optional and singular `path` remains accepted. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit-or-tag}/content?path=&offset=&length=` | Read a bounded file or symlink range as base64 JSON; defaults to 1 MiB and rejects ranges over 4 MiB. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore` | Atomically restore one file through the live writer from a commit ID or tag in `{"commit":"...","path":"..."}`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/stats` | Logical history bytes, nodes, blobs, and commits. |
-| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/verify` | Verify the reachable commit hash chain, Prolly nodes, and content blobs. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/verify` | Verify the reachable commit DAG, Prolly nodes, and content blobs. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Current history retention and quota policy. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Set `keep_last`, `max_age_secs`, and/or `max_bytes`, or `{"clear":true}`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/gc` | Apply retention, or report with `{"dry_run":true}`. |

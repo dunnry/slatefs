@@ -1500,7 +1500,7 @@ fn core_error(error: slatefs_core::error::Error) -> AdminError {
 }
 
 fn version_merge_error(error: slatefs_core::error::Error) -> AdminError {
-    if matches!(&error, slatefs_core::error::Error::Versioning(message) if message.contains("have diverged"))
+    if matches!(&error, slatefs_core::error::Error::Versioning(message) if message.contains("merge conflict"))
     {
         return AdminError {
             status: 409,
@@ -2029,7 +2029,7 @@ async fn commit_live_version_response(
         json!({
             "commit": {
                 "id": commit.id,
-                "parent": commit.parent,
+                "parents": commit.parents,
                 "created_at": commit.created_at,
                 "message": commit.message,
                 "paths": commit.paths,
@@ -2246,7 +2246,7 @@ async fn list_version_commits_response(
         .map(|commit| {
             json!({
                 "id": commit.id,
-                "parent": commit.parent,
+                "parents": commit.parents,
                 "created_at": commit.created_at,
                 "message": commit.message,
                 "paths": commit.paths,
@@ -6525,9 +6525,9 @@ mod tests {
     const ADMIN_TOKEN: &str = "secret-admin-token";
 
     #[test]
-    fn divergent_version_merge_maps_to_conflict() {
+    fn conflicting_version_merge_maps_to_conflict() {
         let error = version_merge_error(slatefs_core::error::Error::Versioning(
-            "branches source and target have diverged".into(),
+            "merge conflict between source and target at /notes.txt".into(),
         ));
         assert_eq!(error.status, 409);
     }
@@ -7299,7 +7299,7 @@ mod tests {
         let branch_commit: Value =
             serde_json::from_str(response_body(&branch_commit_response)).unwrap();
         assert_eq!(branch_commit["branch"], "release");
-        assert_eq!(branch_commit["commit"]["parent"], commit_id);
+        assert_eq!(branch_commit["commit"]["parents"][0], commit_id);
         assert_ne!(branch_commit["commit"]["id"], commit_id);
         let branch_history_response = admin_exchange(
             Arc::clone(&state),
