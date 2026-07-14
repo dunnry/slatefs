@@ -202,6 +202,12 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         .unwrap();
     assert!(!unchanged.fast_forward());
     assert!(unchanged.already_up_to_date());
+    let reset = repository.reset_branch("release", &first.id).await.unwrap();
+    assert_eq!(reset.previous(), second.id);
+    assert_eq!(reset.commit(), first.id);
+    let reset = repository.reset_branch("release", "main").await.unwrap();
+    assert_eq!(reset.previous(), first.id);
+    assert_eq!(reset.commit(), second.id);
     repository
         .create_branch("feature", &first.id)
         .await

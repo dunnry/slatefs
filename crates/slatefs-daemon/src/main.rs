@@ -1005,6 +1005,12 @@ struct VersionBranchCreateRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct VersionBranchResetRequest {
+    commit: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VersionBranchMergeRequest {
     source: String,
     #[serde(default)]
@@ -2533,6 +2539,58 @@ async fn delete_version_branch_response(
     repository_close.map_err(core_error)?;
     control_close.map_err(core_error)?;
     Ok(AdminHttpResponse::json(200, json!({ "branch": branch })))
+}
+
+async fn reset_version_branch_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+    name: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let body: VersionBranchResetRequest = parse_json_body(request)?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository.reset_branch(name, &body.commit).await;
+    let audit = match &result {
+        Ok(reset) => {
+            append_version_audit(
+                &control,
+                request,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-branch-reset".to_string()),
+                    ),
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(reset.name().to_string()),
+                    ),
+                    (
+                        "previous".to_string(),
+                        AuditDetailValue::String(reset.previous().to_string()),
+                    ),
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(reset.commit().to_string()),
+                    ),
+                ],
+            )
+            .await
+        }
+        Err(_) => Ok(()),
+    };
+    let repository_close = repository.close().await;
+    let control_close = control.close().await;
+    let reset = result.map_err(core_error)?;
+    audit?;
+    repository_close.map_err(core_error)?;
+    control_close.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(200, json!({ "reset": reset })))
 }
 
 async fn merge_version_branch_response(
@@ -4177,6 +4235,21 @@ async fn route_admin_request(
                 name,
             ],
         ) => delete_version_branch_response(state, request, tenant, volume, name).await,
+        (
+            "POST",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "branches",
+                name,
+                "reset",
+            ],
+        ) => reset_version_branch_response(state, request, tenant, volume, name).await,
         (
             "GET",
             [
@@ -7410,6 +7483,32 @@ mod tests {
             branch_history["commits"][0]["id"],
             branch_commit["commit"]["id"]
         );
+        let reset_body = r#"{"commit":"baseline"}"#;
+        let reset_request = format!(
+            "POST /admin/v1/tenants/t/volumes/v/versioning/branches/release/reset HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            reset_body.len(),
+            reset_body
+        );
+        let reset_response = admin_exchange(Arc::clone(&state), reset_request.as_bytes()).await;
+        assert_eq!(response_status(&reset_response), 200, "{reset_response}");
+        let reset: Value = serde_json::from_str(response_body(&reset_response)).unwrap();
+        assert_eq!(reset["reset"]["previous"], branch_commit["commit"]["id"]);
+        assert_eq!(reset["reset"]["commit"], commit_id);
+        let restore_body = format!(
+            r#"{{"commit":"{}"}}"#,
+            branch_commit["commit"]["id"].as_str().unwrap()
+        );
+        let restore_request = format!(
+            "POST /admin/v1/tenants/t/volumes/v/versioning/branches/release/reset HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            restore_body.len(),
+            restore_body
+        );
+        let restore_response = admin_exchange(Arc::clone(&state), restore_request.as_bytes()).await;
+        assert_eq!(
+            response_status(&restore_response),
+            200,
+            "{restore_response}"
+        );
         let tagged_content = admin_exchange(
             Arc::clone(&state),
             b"GET /admin/v1/tenants/t/volumes/v/versioning/commits/baseline/content?path=/notes.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -7646,7 +7745,7 @@ mod tests {
             let expected = if action == AuditAction::VersionCommit {
                 3
             } else if action == AuditAction::Maintain {
-                6
+                8
             } else {
                 1
             };

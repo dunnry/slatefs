@@ -17,9 +17,9 @@ use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{
-    VersionBranchInfo, VersionCommitInfo, VersionMergeConflictStrategy, VersionMergeInfo,
-    VersionMergePreview, VersionPathChangeKind, VersionRepository, VersionTagInfo,
-    force_break_expired_version_maintenance_lease, purge_version_history,
+    VersionBranchInfo, VersionBranchResetInfo, VersionCommitInfo, VersionMergeConflictStrategy,
+    VersionMergeInfo, VersionMergePreview, VersionPathChangeKind, VersionRepository,
+    VersionTagInfo, force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease,
 };
 use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
@@ -434,6 +434,17 @@ enum VersioningCmd {
         tenant: String,
         volume: String,
         name: String,
+        #[arg(long)]
+        live: bool,
+    },
+    /// Move an existing branch to a commit, tag, or branch without rewriting data.
+    ResetBranch {
+        tenant: String,
+        volume: String,
+        name: String,
+        commit: String,
+        #[arg(long)]
+        yes: bool,
         #[arg(long)]
         live: bool,
     },
@@ -1067,6 +1078,15 @@ fn print_version_tag(tag: &VersionTagInfo) {
 
 fn print_version_branch(branch: &VersionBranchInfo) {
     println!("{}\t{}", branch.name(), branch.commit());
+}
+
+fn print_version_branch_reset(reset: &VersionBranchResetInfo) {
+    println!(
+        "{}\t{} -> {}",
+        reset.name(),
+        reset.previous(),
+        reset.commit()
+    );
 }
 
 fn print_version_merge(merge: &VersionMergeInfo) {
@@ -2616,6 +2636,67 @@ async fn run(
             .await?;
             print_version_branch(&branch);
         }
+        Command::Versioning(VersioningCmd::ResetBranch {
+            tenant,
+            volume,
+            name,
+            commit,
+            yes,
+            live,
+        }) => {
+            if !yes {
+                anyhow::bail!(
+                    "resetting version branch {name} requires --yes; this may abandon reachable history"
+                );
+            }
+            if *live {
+                let endpoint = format!("branches/{name}/reset");
+                let response = post_live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    &endpoint,
+                    serde_json::json!({ "commit": commit }),
+                )
+                .await?;
+                let reset: VersionBranchResetInfo =
+                    serde_json::from_value(response["reset"].clone())
+                        .context("parsing reset admin version branch")?;
+                print_version_branch_reset(&reset);
+                return Ok(());
+            }
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let result = repository.reset_branch(name, commit).await;
+            let repository_close = repository.close().await;
+            let reset = result?;
+            repository_close?;
+            append_cli_version_audit(
+                control,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-branch-reset".to_string()),
+                    ),
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(reset.name().to_string()),
+                    ),
+                    (
+                        "previous".to_string(),
+                        AuditDetailValue::String(reset.previous().to_string()),
+                    ),
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(reset.commit().to_string()),
+                    ),
+                ],
+            )
+            .await?;
+            print_version_branch_reset(&reset);
+        }
         Command::Versioning(VersioningCmd::Merge {
             tenant,
             volume,
@@ -4027,6 +4108,29 @@ mod tests {
                 live: true,
                 ..
             }) if name == "release"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "reset-branch",
+            "tenant-a",
+            "docs",
+            "main",
+            "baseline",
+            "--yes",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::ResetBranch {
+                name,
+                commit,
+                yes: true,
+                live: true,
+                ..
+            }) if name == "main" && commit == "baseline"
         ));
 
         let cli = Cli::try_parse_from([

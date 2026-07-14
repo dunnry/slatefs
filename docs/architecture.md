@@ -83,6 +83,11 @@ and blobs have been written. Disabling versioning blocks repository operations
 without deleting its history. Volume deletion removes both the live and
 optional version-store prefixes.
 
+An explicit branch reset may move any existing branch, including `main`, to an
+existing commit, tag, or branch. The update is compare-and-swapped against the
+head observed while preparing it, changes no immutable data, and leaves the
+previous commit recoverable until retention GC makes it unreachable.
+
 SlateFS atomically fast-forwards a target when its head is an ancestor of the
 source and reports an already-current target as a no-op. Divergent branches
 use their nearest common ancestor for a Prolly three-way merge. Conflict

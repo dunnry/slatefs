@@ -150,7 +150,9 @@ immutable names for important commits. `versioning branch`, `branches`, and
 `delete-branch` manage durable branch references; a branch name can be used
 where a commit or tag is accepted. `commit --branch <name>` advances an
 existing branch instead of `main`, and `log --branch <name>` follows that
-branch's history.
+branch's history. `reset-branch <name> <commit-or-ref> --yes` deliberately
+moves any existing branch, including `main`, without rewriting commits or file
+data; the previous head remains recoverable until retention GC reclaims it.
 `versioning merge <source> <target>` fast-forwards when possible or creates an
 atomic two-parent three-way merge commit for divergent trees. The default
 `--conflict-strategy fail` leaves both branches unchanged on a conflict.
@@ -273,6 +275,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | List branch heads, including `main`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | Create a branch from `{"name":"...","commit":"commit-or-ref"}`. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}` | Delete a non-main branch without deleting its commit immediately. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/reset` | Compare-and-swap an existing branch, including `main`, to `{"commit":"commit-or-ref"}`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{target}/merge` | Fast-forward or three-way merge a target from `{"source":"...","conflict_strategy":"fail|ours|theirs"}`; the strategy defaults to `fail`, whose conflicts return `409`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{target}/merge?source=` | Preview ancestry and logical-path conflicts without moving either branch. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"...","idempotency_key":"...","branch":"main"}`; retry key and branch are optional and singular `path` remains accepted. |

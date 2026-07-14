@@ -710,6 +710,32 @@ impl VersionStore {
         Ok(reference)
     }
 
+    async fn reset_branch(
+        &self,
+        name: &str,
+        expected: [u8; 32],
+        reference: &VersionRef,
+    ) -> Result<()> {
+        let _guard = self.ref_lock.lock().await;
+        let key = branch_key(name);
+        let current = self
+            .get_ref(&key)
+            .await?
+            .ok_or_else(|| Error::not_found("version branch", name))?;
+        if current.commit_id != expected {
+            return Err(Error::Versioning(format!(
+                "branch {name} moved while resetting; expected {}, found {}",
+                hex::encode(expected),
+                hex::encode(current.commit_id)
+            )));
+        }
+        self.db
+            .put_bytes(key.into(), encode_versioned(REF_VERSION, reference)?.into())
+            .await?;
+        self.db.flush().await?;
+        Ok(())
+    }
+
     async fn fast_forward_branch(
         &self,
         source: &str,
@@ -902,6 +928,14 @@ pub struct VersionBranchInfo {
     commit: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionBranchResetInfo {
+    name: String,
+    previous: String,
+    commit: String,
+}
+
 /// Policy used when both sides of a branch merge changed the same logical path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1031,6 +1065,20 @@ impl VersionMergeInfo {
 impl VersionBranchInfo {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
+}
+
+impl VersionBranchResetInfo {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn previous(&self) -> &str {
+        &self.previous
     }
 
     pub fn commit(&self) -> &str {
@@ -2076,6 +2124,31 @@ impl VersionRepository {
         let reference = self.store.delete_branch(name).await?;
         Ok(VersionBranchInfo {
             name: name.to_string(),
+            commit: hex::encode(reference.commit_id),
+        })
+    }
+
+    /// Move an existing branch, including `main`, to an existing commit, tag,
+    /// or branch. The ref update is fenced against the head observed while
+    /// preparing the reset and does not rewrite file or commit data.
+    pub async fn reset_branch(&self, name: &str, commit: &str) -> Result<VersionBranchResetInfo> {
+        validate_version_branch_name(name)?;
+        let current = self
+            .store
+            .get_branch(name)
+            .await?
+            .ok_or_else(|| Error::not_found("version branch", name))?;
+        let commit = self.resolve_commit(commit).await?;
+        let reference = VersionRef {
+            commit_id: commit.id,
+            tree: commit.tree,
+        };
+        self.store
+            .reset_branch(name, current.commit_id, &reference)
+            .await?;
+        Ok(VersionBranchResetInfo {
+            name: name.to_string(),
+            previous: hex::encode(current.commit_id),
             commit: hex::encode(reference.commit_id),
         })
     }
