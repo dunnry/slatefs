@@ -123,12 +123,14 @@ the live VFS request path. Its logical key prefixes are:
 | `pc/<sha256-commit-id>` | 1 | `VersionCommit` |
 | `pr/heads/main` | 1 | current `VersionRef` |
 
-File metadata (`m/<canonical-path>`) and chunk references
+Entry metadata (`m/<canonical-path>`) and file chunk references
 (`c/<canonical-path> NUL <u32-be-index>`) live inside the Prolly tree. SlateFS
 prefixes its structured values with `u8 format_version` and postcard-encodes
-the payload. A commit records its parent, root manifest, creation time,
-message, and changed paths. Version repository history is retained when the
-policy is disabled and removed with the volume.
+the payload. Entry metadata version 2 distinguishes regular files,
+directories, and symlinks; version 1 regular-file metadata remains readable.
+A commit records its parent, root manifest, creation time, message, and selected
+paths. Version repository history is retained when the policy is disabled and
+removed with the volume.
 
 Current enum sets:
 

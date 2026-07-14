@@ -79,9 +79,14 @@ have been written. Disabling versioning blocks repository operations without
 deleting its history. Volume deletion removes both the live and optional
 version-store prefixes.
 
-The initial customer slice versions one selected regular file per commit.
-Offline commit and restore open the volume writer directly. For served volumes,
-the CLI's `--live` path calls the authenticated daemon admin API, which uses the
+One commit can select multiple paths. Directories recursively capture regular
+files, subdirectories, and symlinks; selected missing paths delete their old
+tree entries, so a rename is represented by selecting both old and new paths.
+All selected changes produce one Prolly root and one commit/ref publication.
+Restore recreates a selected directory tree entry-by-entry, with regular files
+and symlinks replaced through same-directory temporary names. Offline commit
+and restore open the volume writer directly. For served volumes, the CLI's
+`--live` path calls the authenticated daemon admin API, which uses the
 already-open `Volume` and therefore does not contend for or fence its writer
 lease. Neither mode couples versioning to normal filesystem writes.
 

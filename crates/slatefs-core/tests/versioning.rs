@@ -159,3 +159,128 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
     live.shutdown().await.unwrap();
     control.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn commits_directories_symlinks_renames_and_deletions_atomically() {
+    let object_store: Arc<dyn ObjectStore> = store::resolve_root("memory:///").unwrap();
+    let control = ControlPlane::open(Arc::clone(&object_store), common::test_kms())
+        .await
+        .unwrap();
+    control.create_tenant("t", None).await.unwrap();
+    let record = volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "v",
+        common::create_opts(None, None),
+    )
+    .await
+    .unwrap();
+    control
+        .set_versioning_enabled("t", "v", true)
+        .await
+        .unwrap();
+    let dek = control.unwrap_volume_dek(&record).await.unwrap();
+    let live = Volume::open(&record, dek, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let creds = Credentials::root();
+    let docs = live.mkdir(&creds, ROOT_INO, b"docs", 0o750).await.unwrap();
+    let first_file = live
+        .create(&creds, docs.ino, b"a.txt", 0o640, true)
+        .await
+        .unwrap();
+    live.write(&creds, first_file.ino, 0, b"alpha")
+        .await
+        .unwrap();
+    let second_file = live
+        .create(&creds, docs.ino, b"b.txt", 0o644, true)
+        .await
+        .unwrap();
+    live.write(&creds, second_file.ino, 0, b"bravo")
+        .await
+        .unwrap();
+    live.symlink(&creds, docs.ino, b"latest", b"a.txt")
+        .await
+        .unwrap();
+
+    let repository = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap();
+    let initial = repository
+        .commit_paths(live.as_ref(), &["/docs".into()], "capture docs".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        repository
+            .read_file(&initial.id, "/docs/latest")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"a.txt"
+    );
+
+    live.rename(&creds, docs.ino, b"a.txt", docs.ino, b"renamed.txt")
+        .await
+        .unwrap();
+    live.unlink(&creds, docs.ino, b"b.txt").await.unwrap();
+    let renamed = live.lookup(&creds, docs.ino, b"renamed.txt").await.unwrap();
+    live.write(&creds, renamed.ino, 0, b"updated")
+        .await
+        .unwrap();
+    let changed = repository
+        .commit_paths(
+            live.as_ref(),
+            &[
+                "/docs/a.txt".into(),
+                "/docs/b.txt".into(),
+                "/docs/renamed.txt".into(),
+            ],
+            "rename and delete".into(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        repository
+            .read_file(&changed.id, "/docs/a.txt")
+            .await
+            .is_err()
+    );
+    assert!(
+        repository
+            .read_file(&changed.id, "/docs/b.txt")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        repository
+            .read_file(&changed.id, "/docs/renamed.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"updated"
+    );
+
+    live.unlink(&creds, docs.ino, b"latest").await.unwrap();
+    repository
+        .restore_file(live.as_ref(), &initial.id, "/docs")
+        .await
+        .unwrap();
+    let restored_a = live.lookup(&creds, docs.ino, b"a.txt").await.unwrap();
+    assert_eq!(
+        live.read(&creds, restored_a.ino, 0, 32)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"alpha"
+    );
+    let restored_link = live.lookup(&creds, docs.ino, b"latest").await.unwrap();
+    assert_eq!(
+        live.readlink(&creds, restored_link.ino).await.unwrap(),
+        b"a.txt"
+    );
+
+    repository.close().await.unwrap();
+    live.shutdown().await.unwrap();
+    control.close().await.unwrap();
+}

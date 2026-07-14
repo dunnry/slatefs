@@ -4,6 +4,7 @@
 //! module opens a separate encrypted database only for explicit versioning
 //! operations, so disabled volumes pay no storage or request-path cost.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -30,7 +31,8 @@ const NODE_PREFIX: &[u8] = b"pn/";
 const BLOB_PREFIX: &[u8] = b"pb/";
 const COMMIT_PREFIX: &[u8] = b"pc/";
 const HEAD_KEY: &[u8] = b"pr/heads/main";
-const FILE_META_VERSION: u8 = 1;
+const LEGACY_FILE_META_VERSION: u8 = 1;
+const ENTRY_META_VERSION: u8 = 2;
 const COMMIT_VERSION: u8 = 1;
 const REF_VERSION: u8 = 1;
 
@@ -190,7 +192,7 @@ impl AsyncBlobStore for VersionStore {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct FileVersion {
+struct LegacyFileVersion {
     mode: u32,
     uid: u32,
     gid: u32,
@@ -198,6 +200,40 @@ struct FileVersion {
     atime: Timespec,
     mtime: Timespec,
     chunk_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum VersionEntryData {
+    File { chunk_count: u32 },
+    Directory,
+    Symlink { target: Vec<u8> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct VersionEntry {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    atime: Timespec,
+    mtime: Timespec,
+    data: VersionEntryData,
+}
+
+impl From<LegacyFileVersion> for VersionEntry {
+    fn from(file: LegacyFileVersion) -> Self {
+        Self {
+            mode: file.mode,
+            uid: file.uid,
+            gid: file.gid,
+            size: file.size,
+            atime: file.atime,
+            mtime: file.mtime,
+            data: VersionEntryData::File {
+                chunk_count: file.chunk_count,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,77 +342,52 @@ impl VersionRepository {
         path: &str,
         message: String,
     ) -> Result<VersionCommitInfo> {
-        let canonical = canonical_path(path)?;
-        let attr = resolve_path(live, &canonical).await?;
-        if attr.kind != FileKind::File {
-            return Err(Error::invalid(
-                "versioned path",
-                "the first versioning slice supports regular files only",
-            ));
-        }
+        self.commit_paths(live, &[path.to_string()], message).await
+    }
+
+    /// Commit multiple selected paths as one immutable tree update. Directory
+    /// paths recursively include their descendants. A selected path that no
+    /// longer exists removes its previously versioned subtree.
+    pub async fn commit_paths(
+        &self,
+        live: &dyn Vfs,
+        paths: &[String],
+        message: String,
+    ) -> Result<VersionCommitInfo> {
+        let canonical = canonicalize_path_set(paths)?;
 
         let head = self.store.get_head().await?;
         let base = head
             .as_ref()
             .map(|head| head.tree.to_tree())
             .unwrap_or_else(|| self.prolly.create());
-        let meta_key = file_meta_key(&canonical);
-        let previous: Option<FileVersion> = self
+        let mut changes = BTreeMap::new();
+        let mut range = self
             .prolly
-            .get(&base, &meta_key)
+            .range(&base, &[], None)
             .await
-            .map_err(prolly_error)?
-            .map(|bytes| decode_versioned(FILE_META_VERSION, &bytes, "file version"))
-            .transpose()?;
-
-        let chunk_size = live.chunk_size().min(u32::MAX as u64) as u32;
-        let chunk_count_u64 = attr.size.div_ceil(chunk_size as u64);
-        let chunk_count = u32::try_from(chunk_count_u64)
-            .map_err(|_| Error::invalid("versioned file", "too many chunks"))?;
-        let mut mutations = Vec::with_capacity(chunk_count as usize + 2);
-        for index in 0..chunk_count {
-            let offset = index as u64 * chunk_size as u64;
-            let len = (attr.size - offset).min(chunk_size as u64) as u32;
-            let bytes = live
-                .read_with_atime_policy(
-                    &Credentials::root(),
-                    attr.ino,
-                    offset,
-                    len,
-                    AtimeMode::Noatime,
-                )
-                .await
-                .map_err(fs_error)?;
-            let reference = self
-                .store
-                .put_blob(&bytes)
-                .await
-                .map_err(version_store_error)?;
-            mutations.push(Mutation::Upsert {
-                key: file_chunk_key(&canonical, index),
-                val: ValueRef::Blob(reference).to_bytes(),
-            });
-        }
-        if let Some(previous) = previous {
-            for index in chunk_count..previous.chunk_count {
-                mutations.push(Mutation::Delete {
-                    key: file_chunk_key(&canonical, index),
-                });
+            .map_err(prolly_error)?;
+        while let Some(entry) = range.next().await {
+            let (key, _) = entry.map_err(prolly_error)?;
+            if version_key_matches_any_path(&key, &canonical) {
+                changes.insert(key, None);
             }
         }
-        let metadata = FileVersion {
-            mode: attr.mode,
-            uid: attr.uid,
-            gid: attr.gid,
-            size: attr.size,
-            atime: attr.atime,
-            mtime: attr.mtime,
-            chunk_count,
-        };
-        mutations.push(Mutation::Upsert {
-            key: meta_key,
-            val: encode_versioned(FILE_META_VERSION, &metadata)?,
-        });
+
+        for path in &canonical {
+            let Some(attr) = resolve_path_optional(live, path).await? else {
+                continue;
+            };
+            self.capture_subtree(live, path, attr, &mut changes).await?;
+        }
+
+        let mutations = changes
+            .into_iter()
+            .map(|(key, value)| match value {
+                Some(val) => Mutation::Upsert { key, val },
+                None => Mutation::Delete { key },
+            })
+            .collect();
         let tree = self
             .prolly
             .batch(&base, mutations)
@@ -384,7 +395,8 @@ impl VersionRepository {
             .map_err(prolly_error)?;
         if tree == base {
             return Err(Error::Versioning(format!(
-                "{canonical} has no changes to commit"
+                "{} has no changes to commit",
+                canonical.join(", ")
             )));
         }
 
@@ -393,7 +405,7 @@ impl VersionRepository {
             tree: RootManifest::from_tree(&tree),
             created_at: crate::control::now_unix(),
             message,
-            paths: vec![canonical],
+            paths: canonical,
         };
         let body_bytes = postcard::to_allocvec(&body)?;
         let id: [u8; 32] = Sha256::digest(&body_bytes).into();
@@ -412,6 +424,105 @@ impl VersionRepository {
         Ok(commit.into())
     }
 
+    async fn capture_subtree(
+        &self,
+        live: &dyn Vfs,
+        root_path: &str,
+        root_attr: FileAttr,
+        changes: &mut BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    ) -> Result<()> {
+        let creds = Credentials::root();
+        let mut pending = vec![(root_path.to_string(), root_attr)];
+        while let Some((path, attr)) = pending.pop() {
+            let data = match attr.kind {
+                FileKind::File => {
+                    let chunk_size = live.chunk_size().min(u32::MAX as u64) as u32;
+                    let chunk_count_u64 = attr.size.div_ceil(chunk_size as u64);
+                    let chunk_count = u32::try_from(chunk_count_u64)
+                        .map_err(|_| Error::invalid("versioned file", "too many chunks"))?;
+                    for index in 0..chunk_count {
+                        let offset = index as u64 * chunk_size as u64;
+                        let len = (attr.size - offset).min(chunk_size as u64) as u32;
+                        let bytes = live
+                            .read_with_atime_policy(
+                                &creds,
+                                attr.ino,
+                                offset,
+                                len,
+                                AtimeMode::Noatime,
+                            )
+                            .await
+                            .map_err(fs_error)?;
+                        let reference = self
+                            .store
+                            .put_blob(&bytes)
+                            .await
+                            .map_err(version_store_error)?;
+                        changes.insert(
+                            file_chunk_key(&path, index),
+                            Some(ValueRef::Blob(reference).to_bytes()),
+                        );
+                    }
+                    VersionEntryData::File { chunk_count }
+                }
+                FileKind::Dir => {
+                    let mut cookie = 0;
+                    loop {
+                        let page = live
+                            .readdir(&creds, attr.ino, cookie, 1024)
+                            .await
+                            .map_err(fs_error)?;
+                        if page.entries.is_empty() && !page.eof {
+                            return Err(Error::Versioning(format!(
+                                "directory scan for {path} did not advance"
+                            )));
+                        }
+                        for child in page.entries {
+                            cookie = child.cookie;
+                            let name = std::str::from_utf8(&child.name).map_err(|_| {
+                                Error::invalid(
+                                    "versioned path",
+                                    format!("{path} contains a non-UTF-8 name"),
+                                )
+                            })?;
+                            let child_path = format!("{path}/{name}");
+                            let child_attr =
+                                live.getattr(&creds, child.ino).await.map_err(fs_error)?;
+                            pending.push((child_path, child_attr));
+                        }
+                        if page.eof {
+                            break;
+                        }
+                    }
+                    VersionEntryData::Directory
+                }
+                FileKind::Symlink => VersionEntryData::Symlink {
+                    target: live.readlink(&creds, attr.ino).await.map_err(fs_error)?,
+                },
+                kind => {
+                    return Err(Error::invalid(
+                        "versioned path",
+                        format!("unsupported file kind {kind:?} at {path}"),
+                    ));
+                }
+            };
+            let metadata = VersionEntry {
+                mode: attr.mode,
+                uid: attr.uid,
+                gid: attr.gid,
+                size: attr.size,
+                atime: attr.atime,
+                mtime: attr.mtime,
+                data,
+            };
+            changes.insert(
+                file_meta_key(&path),
+                Some(encode_versioned(ENTRY_META_VERSION, &metadata)?),
+            );
+        }
+        Ok(())
+    }
+
     pub async fn history(
         &self,
         path: Option<&str>,
@@ -424,10 +535,12 @@ impl VersionRepository {
         while let Some(id) = next {
             let commit = self.store.get_commit(&id).await?;
             next = commit.parent;
-            if path
-                .as_ref()
-                .is_none_or(|path| commit.paths.iter().any(|changed| changed == path))
-            {
+            if path.as_ref().is_none_or(|path| {
+                commit
+                    .paths
+                    .iter()
+                    .any(|changed| path_is_within(path, changed) || path_is_within(changed, path))
+            }) {
                 history.push(commit.into());
                 if history.len() == limit {
                     break;
@@ -442,17 +555,27 @@ impl VersionRepository {
         let commit = self.store.get_commit(&id).await?;
         let tree = commit.tree.to_tree();
         let canonical = canonical_path(path)?;
-        let metadata: FileVersion = self
+        let metadata = self
             .prolly
             .get(&tree, &file_meta_key(&canonical))
             .await
             .map_err(prolly_error)?
             .ok_or_else(|| Error::not_found("versioned path", &canonical))
-            .and_then(|bytes| decode_versioned(FILE_META_VERSION, &bytes, "file version"))?;
+            .and_then(|bytes| decode_version_entry(&bytes))?;
+        let chunk_count = match &metadata.data {
+            VersionEntryData::File { chunk_count } => *chunk_count,
+            VersionEntryData::Symlink { target } => return Ok(Bytes::copy_from_slice(target)),
+            VersionEntryData::Directory => {
+                return Err(Error::invalid(
+                    "versioned path",
+                    format!("{canonical} is a directory"),
+                ));
+            }
+        };
         let expected_size = usize::try_from(metadata.size)
             .map_err(|_| Error::Versioning(format!("{canonical} is too large to materialize")))?;
         let mut output = Vec::with_capacity(expected_size);
-        for index in 0..metadata.chunk_count {
+        for index in 0..chunk_count {
             let encoded = self
                 .prolly
                 .get(&tree, &file_chunk_key(&canonical, index))
@@ -491,67 +614,176 @@ impl VersionRepository {
         let commit = self.store.get_commit(&id).await?;
         let tree = commit.tree.to_tree();
         let canonical = canonical_path(path)?;
-        let metadata: FileVersion = self
+        let mut entries = BTreeMap::new();
+        let mut range = self
             .prolly
-            .get(&tree, &file_meta_key(&canonical))
+            .prefix(&tree, b"m/")
             .await
-            .map_err(prolly_error)?
-            .ok_or_else(|| Error::not_found("versioned path", &canonical))
-            .and_then(|bytes| decode_versioned(FILE_META_VERSION, &bytes, "file version"))?;
-        let contents = self
-            .read_file(commit_id_string(&commit.id).as_str(), &canonical)
-            .await?;
-        let (parent, name) = resolve_parent(live, &canonical).await?;
-        let temp_name = format!(".slatefs-restore-{}", uuid::Uuid::new_v4());
-        let creds = Credentials::root();
-        let created = live
-            .create(&creds, parent, temp_name.as_bytes(), metadata.mode, true)
-            .await
-            .map_err(fs_error)?;
-        let result = async {
-            let chunk_size = live.chunk_size().min(u32::MAX as u64) as usize;
-            for (index, chunk) in contents.chunks(chunk_size).enumerate() {
-                live.write(&creds, created.ino, index as u64 * chunk_size as u64, chunk)
-                    .await
-                    .map_err(fs_error)?;
+            .map_err(prolly_error)?;
+        while let Some(entry) = range.next().await {
+            let (key, value) = entry.map_err(prolly_error)?;
+            let path = std::str::from_utf8(key.strip_prefix(b"m/").unwrap_or_default())
+                .map_err(|_| Error::Versioning("version tree contains a non-UTF-8 path".into()))?;
+            if path_is_within(path, &canonical) {
+                entries.insert(path.to_string(), decode_version_entry(&value)?);
             }
-            live.setattr(
-                &creds,
-                created.ino,
-                SetAttrs {
-                    mode: Some(metadata.mode),
-                    uid: Some(metadata.uid),
-                    gid: Some(metadata.gid),
-                    size: Some(metadata.size),
-                    atime: Some(TimeSet::Time(metadata.atime)),
-                    mtime: Some(TimeSet::Time(metadata.mtime)),
-                },
-            )
-            .await
-            .map_err(fs_error)?;
-            live.fsync(&creds, created.ino).await.map_err(fs_error)?;
-            live.rename(&creds, parent, temp_name.as_bytes(), parent, &name)
-                .await
-                .map_err(fs_error)
         }
-        .await;
-        if result.is_err() {
-            let _ = live.unlink(&creds, parent, temp_name.as_bytes()).await;
+        if !entries.contains_key(&canonical) {
+            return Err(Error::not_found("versioned path", canonical));
         }
-        result
+
+        let commit_id = commit_id_string(&commit.id);
+        for (path, metadata) in entries {
+            match &metadata.data {
+                VersionEntryData::Directory => {
+                    restore_directory_entry(live, &path, &metadata).await?;
+                }
+                VersionEntryData::File { .. } => {
+                    let contents = self.read_file(&commit_id, &path).await?;
+                    restore_regular_file(live, &path, &metadata, &contents).await?;
+                }
+                VersionEntryData::Symlink { target } => {
+                    restore_symlink_entry(live, &path, &metadata, target).await?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
-async fn resolve_path(vfs: &dyn Vfs, canonical: &str) -> Result<FileAttr> {
+async fn restore_regular_file(
+    live: &dyn Vfs,
+    canonical: &str,
+    metadata: &VersionEntry,
+    contents: &[u8],
+) -> Result<()> {
+    let (parent, name) = resolve_parent(live, canonical).await?;
+    let temp_name = format!(".slatefs-restore-{}", uuid::Uuid::new_v4());
+    let creds = Credentials::root();
+    let created = live
+        .create(&creds, parent, temp_name.as_bytes(), metadata.mode, true)
+        .await
+        .map_err(fs_error)?;
+    let result = async {
+        let chunk_size = live.chunk_size().min(u32::MAX as u64) as usize;
+        for (index, chunk) in contents.chunks(chunk_size).enumerate() {
+            live.write(&creds, created.ino, index as u64 * chunk_size as u64, chunk)
+                .await
+                .map_err(fs_error)?;
+        }
+        live.setattr(
+            &creds,
+            created.ino,
+            SetAttrs {
+                mode: Some(metadata.mode),
+                uid: Some(metadata.uid),
+                gid: Some(metadata.gid),
+                size: Some(metadata.size),
+                atime: Some(TimeSet::Time(metadata.atime)),
+                mtime: Some(TimeSet::Time(metadata.mtime)),
+            },
+        )
+        .await
+        .map_err(fs_error)?;
+        live.fsync(&creds, created.ino).await.map_err(fs_error)?;
+        live.rename(&creds, parent, temp_name.as_bytes(), parent, &name)
+            .await
+            .map_err(fs_error)
+    }
+    .await;
+    if result.is_err() {
+        let _ = live.unlink(&creds, parent, temp_name.as_bytes()).await;
+    }
+    result
+}
+
+async fn restore_directory_entry(
+    live: &dyn Vfs,
+    canonical: &str,
+    metadata: &VersionEntry,
+) -> Result<()> {
+    let creds = Credentials::root();
+    let attr = match resolve_path_optional(live, canonical).await? {
+        Some(attr) if attr.kind == FileKind::Dir => attr,
+        Some(_) => {
+            return Err(Error::invalid(
+                "restore path",
+                format!("{canonical} exists and is not a directory"),
+            ));
+        }
+        None => {
+            let (parent, name) = resolve_parent(live, canonical).await?;
+            live.mkdir(&creds, parent, &name, metadata.mode)
+                .await
+                .map_err(fs_error)?
+        }
+    };
+    live.setattr(
+        &creds,
+        attr.ino,
+        SetAttrs {
+            mode: Some(metadata.mode),
+            uid: Some(metadata.uid),
+            gid: Some(metadata.gid),
+            atime: Some(TimeSet::Time(metadata.atime)),
+            mtime: Some(TimeSet::Time(metadata.mtime)),
+            ..SetAttrs::default()
+        },
+    )
+    .await
+    .map_err(fs_error)?;
+    Ok(())
+}
+
+async fn restore_symlink_entry(
+    live: &dyn Vfs,
+    canonical: &str,
+    metadata: &VersionEntry,
+    target: &[u8],
+) -> Result<()> {
+    let (parent, name) = resolve_parent(live, canonical).await?;
+    let temp_name = format!(".slatefs-restore-{}", uuid::Uuid::new_v4());
+    let creds = Credentials::root();
+    let created = live
+        .symlink(&creds, parent, temp_name.as_bytes(), target)
+        .await
+        .map_err(fs_error)?;
+    let result = async {
+        live.setattr(
+            &creds,
+            created.ino,
+            SetAttrs {
+                uid: Some(metadata.uid),
+                gid: Some(metadata.gid),
+                atime: Some(TimeSet::Time(metadata.atime)),
+                mtime: Some(TimeSet::Time(metadata.mtime)),
+                ..SetAttrs::default()
+            },
+        )
+        .await
+        .map_err(fs_error)?;
+        live.rename(&creds, parent, temp_name.as_bytes(), parent, &name)
+            .await
+            .map_err(fs_error)
+    }
+    .await;
+    if result.is_err() {
+        let _ = live.unlink(&creds, parent, temp_name.as_bytes()).await;
+    }
+    result
+}
+
+async fn resolve_path_optional(vfs: &dyn Vfs, canonical: &str) -> Result<Option<FileAttr>> {
     let creds = Credentials::root();
     let mut current = vfs.getattr(&creds, ROOT_INO).await.map_err(fs_error)?;
     for component in path_components(canonical) {
-        current = vfs
-            .lookup(&creds, current.ino, component.as_bytes())
-            .await
-            .map_err(fs_error)?;
+        current = match vfs.lookup(&creds, current.ino, component.as_bytes()).await {
+            Ok(attr) => attr,
+            Err(crate::vfs::FsError::NotFound) => return Ok(None),
+            Err(error) => return Err(fs_error(error)),
+        };
     }
-    Ok(current)
+    Ok(Some(current))
 }
 
 async fn resolve_parent(vfs: &dyn Vfs, canonical: &str) -> Result<(u64, Vec<u8>)> {
@@ -598,6 +830,49 @@ fn canonical_path(path: &str) -> Result<String> {
         ));
     }
     Ok(format!("/{}", components.join("/")))
+}
+
+fn canonicalize_path_set(paths: &[String]) -> Result<Vec<String>> {
+    if paths.is_empty() {
+        return Err(Error::invalid(
+            "versioned paths",
+            "provide at least one path",
+        ));
+    }
+    let mut canonical = paths
+        .iter()
+        .map(|path| canonical_path(path))
+        .collect::<Result<Vec<_>>>()?;
+    canonical.sort();
+    canonical.dedup();
+    let mut roots: Vec<String> = Vec::with_capacity(canonical.len());
+    for path in canonical {
+        if roots.iter().any(|root| path_is_within(&path, root)) {
+            continue;
+        }
+        roots.push(path);
+    }
+    Ok(roots)
+}
+
+fn path_is_within(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn version_key_matches_any_path(key: &[u8], paths: &[String]) -> bool {
+    let path = if let Some(path) = key.strip_prefix(b"m/") {
+        path
+    } else if let Some(chunk) = key.strip_prefix(b"c/") {
+        chunk.split(|byte| *byte == 0).next().unwrap_or_default()
+    } else {
+        return false;
+    };
+    paths
+        .iter()
+        .any(|root| std::str::from_utf8(path).is_ok_and(|path| path_is_within(path, root)))
 }
 
 fn path_components(path: &str) -> Vec<&str> {
@@ -653,6 +928,23 @@ fn encode_versioned<T: Serialize>(version: u8, value: &T) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn decode_version_entry(bytes: &[u8]) -> Result<VersionEntry> {
+    match bytes.first().copied() {
+        Some(LEGACY_FILE_META_VERSION) => decode_versioned::<LegacyFileVersion>(
+            LEGACY_FILE_META_VERSION,
+            bytes,
+            "legacy file version",
+        )
+        .map(VersionEntry::from),
+        Some(ENTRY_META_VERSION) => decode_versioned(ENTRY_META_VERSION, bytes, "version entry"),
+        Some(version) => Err(Error::invalid(
+            "version entry",
+            format!("format version {version}, expected 1 or 2"),
+        )),
+        None => Err(Error::invalid("version entry", "empty record")),
+    }
+}
+
 fn decode_versioned<T: for<'de> Deserialize<'de>>(
     expected: u8,
     bytes: &[u8],
@@ -696,5 +988,28 @@ mod tests {
         assert_ne!(file_meta_key("/a"), file_chunk_key("/a", 0));
         assert_ne!(file_chunk_key("/a", 1), file_chunk_key("/a", 2));
         assert_ne!(file_chunk_key("/a", 0), file_chunk_key("/a/0", 0));
+    }
+
+    #[test]
+    fn legacy_file_metadata_remains_readable() {
+        let legacy = LegacyFileVersion {
+            mode: 0o640,
+            uid: 1,
+            gid: 2,
+            size: 3,
+            atime: Timespec { secs: 4, nanos: 5 },
+            mtime: Timespec { secs: 6, nanos: 7 },
+            chunk_count: 8,
+        };
+        let encoded = encode_versioned(LEGACY_FILE_META_VERSION, &legacy).unwrap();
+        let decoded = decode_version_entry(&encoded).unwrap();
+        assert_eq!(decoded.mode, legacy.mode);
+        assert_eq!(decoded.size, legacy.size);
+        assert_eq!(
+            decoded.data,
+            VersionEntryData::File {
+                chunk_count: legacy.chunk_count
+            }
+        );
     }
 }

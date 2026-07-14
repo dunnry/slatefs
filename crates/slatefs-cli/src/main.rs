@@ -304,11 +304,13 @@ enum VersioningCmd {
     Disable { tenant: String, volume: String },
     /// Show whether versioning is enabled. This does not open a version store.
     Status { tenant: String, volume: String },
-    /// Commit the current contents of one regular file (offline volume only).
+    /// Commit selected files, symlinks, or directory trees.
     Commit {
         tenant: String,
         volume: String,
-        path: String,
+        /// One or more files or directories. Missing paths record deletions.
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<String>,
         #[arg(short, long)]
         message: String,
         /// Ask the serving slatefsd admin endpoint to use its active writer.
@@ -1580,7 +1582,7 @@ async fn run(
         Command::Versioning(VersioningCmd::Commit {
             tenant,
             volume: volume_name,
-            path,
+            paths,
             message,
             live,
         }) => {
@@ -1590,7 +1592,7 @@ async fn run(
                     tenant,
                     volume_name,
                     "commits",
-                    serde_json::json!({ "path": path, "message": message }),
+                    serde_json::json!({ "paths": paths, "message": message }),
                 )
                 .await?;
                 println!(
@@ -1608,7 +1610,7 @@ async fn run(
             let dek = control.unwrap_volume_dek(&record).await?;
             let live = volume::Volume::open(&record, dek, Arc::clone(&object_store)).await?;
             let commit = repository
-                .commit_file(live.as_ref(), path, message.clone())
+                .commit_paths(live.as_ref(), paths, message.clone())
                 .await;
             let live_close = live.shutdown().await;
             let repository_close = repository.close().await;

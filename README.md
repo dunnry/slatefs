@@ -146,12 +146,14 @@ versions of selected regular files with `slatefs versioning commit` and its
 tenant, volume, path, and `-m <message>` arguments. `versioning log`,
 `versioning show`, and `versioning restore` inspect and recover those commits.
 `versioning disable` stops all version operations but retains existing history;
-ordinary filesystem I/O continues unchanged. The first implementation operates
-on regular files one at a time. For a volume currently served by `slatefsd`,
-use `versioning commit --live` or `versioning restore --live`; the authenticated
-admin API executes the operation against the daemon's existing writer. Without
-`--live`, commit and restore remain offline operations and must use a stopped or
-otherwise quiesced volume.
+ordinary filesystem I/O continues unchanged. A commit accepts multiple paths
+and recursively captures directories, regular files, and symlinks in one
+Prolly-root update. Selecting a missing path records its deletion; passing both
+old and new paths records a rename as delete-plus-add. For a volume currently
+served by `slatefsd`, use `versioning commit --live` or `versioning restore
+--live`; the authenticated admin API executes the operation against the
+daemon's existing writer. Without `--live`, commit and restore remain offline
+operations and must use a stopped or otherwise quiesced volume.
 
 **Phase 6 started** (snapshots/clones, HA, performance, GA polish):
 `slatefs snapshot create|list|delete` manages SlateDB checkpoints for a volume.
@@ -209,7 +211,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshots` | Checkpoint inventory with `limit`, `page_token`, and optional `name`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshot-retention` | Snapshot retention policy; named snapshots are not exempt. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshot-retention` | Set nullable `keep_last` and/or `max_age_secs`, or `{"clear":true}`. |
-| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Commit one file through the live writer from `{"path":"...","message":"..."}`. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"..."}`; singular `path` remains accepted. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore` | Atomically restore one file through the live writer from `{"commit":"...","path":"..."}`. |
 | `GET` | `/admin/v1/nodes` | Daemon node inventory with `limit` and `page_token`. |
 

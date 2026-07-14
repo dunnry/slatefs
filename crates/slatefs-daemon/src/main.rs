@@ -916,8 +916,23 @@ struct CloneCreateRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VersionCommitRequest {
-    path: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    paths: Vec<String>,
     message: String,
+}
+
+impl VersionCommitRequest {
+    fn into_paths(mut self) -> Result<(Vec<String>, String), AdminError> {
+        if let Some(path) = self.path {
+            self.paths.push(path);
+        }
+        if self.paths.is_empty() {
+            return Err(bad_request("provide path or paths"));
+        }
+        Ok((self.paths, self.message))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1674,6 +1689,7 @@ async fn commit_live_version_response(
     volume: &str,
 ) -> Result<AdminHttpResponse, AdminError> {
     let body: VersionCommitRequest = parse_json_body(request)?;
+    let (paths, message) = body.into_paths()?;
     let target = live_filesystem_target(state, tenant, volume)?;
     let control = state.control_writer().await?;
     let repository =
@@ -1688,7 +1704,7 @@ async fn commit_live_version_response(
         };
 
     let commit = repository
-        .commit_file(target.as_ref(), &body.path, body.message)
+        .commit_paths(target.as_ref(), &paths, message)
         .await;
     let repository_close = repository.close().await;
     let control_close = control.close().await;
