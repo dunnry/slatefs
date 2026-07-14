@@ -880,6 +880,8 @@ const REQUEST_ID_HEADER: &str = "X-Request-Id";
 const ADMIN_API_PREFIX: &str = "/admin/v1";
 const DEFAULT_PAGE_LIMIT: usize = 100;
 const MAX_PAGE_LIMIT: usize = 1_000;
+const DEFAULT_VERSION_CONTENT_BYTES: u64 = 1024 * 1024;
+const MAX_VERSION_CONTENT_BYTES: u64 = 4 * 1024 * 1024;
 const SLATEDB_VERSION: &str = "0.14.1";
 static RUSTLS_PROVIDER: Once = Once::new();
 
@@ -1499,6 +1501,17 @@ fn query_bool(query: &HashMap<String, String>, key: &str, default: bool) -> bool
         .unwrap_or(default)
 }
 
+fn query_u64(query: &HashMap<String, String>, key: &str, default: u64) -> Result<u64, AdminError> {
+    query
+        .get(key)
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|error| bad_request(format!("invalid {key}: {error}")))
+        })
+        .unwrap_or(Ok(default))
+}
+
 fn paginate_by<T, F>(
     items: Vec<T>,
     page_token: Option<&str>,
@@ -2082,11 +2095,21 @@ async fn get_version_content_response(
         .query
         .get("path")
         .ok_or_else(|| bad_request("path query parameter is required"))?;
+    let offset = query_u64(&request.query, "offset", 0)?;
+    let length = query_u64(&request.query, "length", DEFAULT_VERSION_CONTENT_BYTES)?;
+    if length > MAX_VERSION_CONTENT_BYTES {
+        return Err(bad_request(format!(
+            "length must be at most {MAX_VERSION_CONTENT_BYTES} bytes"
+        )));
+    }
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
     let (control, repository) = open_version_repository(state, tenant, volume).await?;
-    let result = repository.read_file(commit, path).await;
-    let content = finish_version_repository(control, repository, result).await?;
+    let result = repository
+        .read_file_range(commit, path, offset, length)
+        .await;
+    let range = finish_version_repository(control, repository, result).await?;
+    let next_offset = (!range.eof).then_some(range.offset + range.data.len() as u64);
     Ok(AdminHttpResponse::json(
         200,
         json!({
@@ -2094,8 +2117,12 @@ async fn get_version_content_response(
                 "commit": commit,
                 "path": path,
                 "encoding": "base64",
-                "size": content.len(),
-                "data": base64::engine::general_purpose::STANDARD.encode(&content),
+                "offset": range.offset,
+                "size": range.data.len(),
+                "total_size": range.total_size,
+                "eof": range.eof,
+                "next_offset": next_offset,
+                "data": base64::engine::general_purpose::STANDARD.encode(&range.data),
             }
         }),
     ))
@@ -6291,6 +6318,23 @@ mod tests {
                 .decode(content["content"]["data"].as_str().unwrap())
                 .unwrap(),
             b"live baseline"
+        );
+
+        let range_request = format!(
+            "GET /admin/v1/tenants/t/volumes/v/versioning/commits/{commit_id}/content?path=/notes.txt&offset=5&length=4 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        let range_response = admin_exchange(Arc::clone(&state), range_request.as_bytes()).await;
+        assert_eq!(response_status(&range_response), 200, "{range_response}");
+        let range: Value = serde_json::from_str(response_body(&range_response)).unwrap();
+        assert_eq!(range["content"]["offset"], 5);
+        assert_eq!(range["content"]["total_size"], 13);
+        assert_eq!(range["content"]["eof"], false);
+        assert_eq!(range["content"]["next_offset"], 9);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(range["content"]["data"].as_str().unwrap())
+                .unwrap(),
+            b"base"
         );
 
         let retention_body = r#"{"keep_last":2,"max_bytes":1048576}"#;

@@ -18,7 +18,7 @@ use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{VersionCommitInfo, VersionRepository, purge_version_history};
 use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
 use slatefs_core::{config, store};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 #[derive(Parser)]
@@ -864,6 +864,30 @@ fn print_version_commit(commit: &VersionCommitInfo) {
     println!("created {}", commit.created_at);
     println!("paths {}", commit.paths.join(","));
     println!("message {}", commit.message);
+}
+
+async fn stream_version_file<W: AsyncWrite + Unpin>(
+    repository: &VersionRepository,
+    commit: &str,
+    path: &str,
+    writer: &mut W,
+) -> anyhow::Result<u64> {
+    const READ_SIZE: u64 = 4 * 1024 * 1024;
+    let mut offset = 0;
+    loop {
+        let range = repository
+            .read_file_range(commit, path, offset, READ_SIZE)
+            .await?;
+        writer.write_all(&range.data).await?;
+        if range.eof {
+            writer.flush().await?;
+            return Ok(range.total_size);
+        }
+        if range.data.is_empty() {
+            anyhow::bail!("versioned file read did not advance at offset {offset}");
+        }
+        offset = range.offset + range.data.len() as u64;
+    }
 }
 
 async fn append_cli_version_audit(
@@ -1713,17 +1737,19 @@ async fn run(
             out,
         }) => {
             let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
-            let contents = repository.read_file(commit, path).await;
+            let streamed = if let Some(out) = out {
+                let mut file = tokio::fs::File::create(out)
+                    .await
+                    .with_context(|| format!("creating {}", out.display()))?;
+                stream_version_file(&repository, commit, path, &mut file).await
+            } else {
+                stream_version_file(&repository, commit, path, &mut tokio::io::stdout()).await
+            };
             let repository_close = repository.close().await;
-            let contents = contents?;
+            let bytes = streamed?;
             repository_close?;
             if let Some(out) = out {
-                tokio::fs::write(out, &contents)
-                    .await
-                    .with_context(|| format!("writing {}", out.display()))?;
-                println!("wrote {} bytes to {}", contents.len(), out.display());
-            } else {
-                tokio::io::stdout().write_all(&contents).await?;
+                println!("wrote {bytes} bytes to {}", out.display());
             }
         }
         Command::Versioning(VersioningCmd::Restore {

@@ -145,6 +145,8 @@ it explicitly with `slatefs versioning enable <tenant> <volume>`, then create
 versions of selected regular files with `slatefs versioning commit` and its
 tenant, volume, path, and `-m <message>` arguments. `versioning log`,
 `versioning show`, and `versioning restore` inspect and recover those commits.
+Show and restore stream versioned data in bounded chunks rather than loading a
+complete large file into memory.
 `versioning disable` stops all version operations but retains existing history;
 ordinary filesystem I/O continues unchanged. A commit accepts multiple paths
 and recursively captures directories, regular files, and symlinks in one
@@ -225,7 +227,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Enable or disable with `{"enabled":true|false}`; disabling retains history. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Commit history with optional `path` and `limit`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"..."}`; singular `path` remains accepted. |
-| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit}/content?path=` | Read file or symlink content as base64 JSON. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit}/content?path=&offset=&length=` | Read a bounded file or symlink range as base64 JSON; defaults to 1 MiB and rejects ranges over 4 MiB. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore` | Atomically restore one file through the live writer from `{"commit":"...","path":"..."}`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/stats` | Logical history bytes, nodes, blobs, and commits. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Current history retention and quota policy. |

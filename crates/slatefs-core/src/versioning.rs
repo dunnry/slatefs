@@ -293,6 +293,14 @@ pub struct VersionGcReport {
     pub dry_run: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionFileRange {
+    pub offset: u64,
+    pub total_size: u64,
+    pub data: Bytes,
+    pub eof: bool,
+}
+
 impl From<VersionCommit> for VersionCommitInfo {
     fn from(commit: VersionCommit) -> Self {
         Self {
@@ -310,6 +318,7 @@ pub struct VersionRepository {
     store: VersionStore,
     prolly: AsyncProlly<VersionStore>,
     max_bytes: Option<u64>,
+    chunk_size: u64,
 }
 
 /// Permanently delete the physical version-repository prefix. The caller must
@@ -374,6 +383,7 @@ impl VersionRepository {
             store,
             prolly,
             max_bytes,
+            chunk_size: u64::from(record.chunk_size),
         })
     }
 
@@ -726,6 +736,18 @@ impl VersionRepository {
     }
 
     pub async fn read_file(&self, commit: &str, path: &str) -> Result<Bytes> {
+        Ok(self.read_file_range(commit, path, 0, u64::MAX).await?.data)
+    }
+
+    /// Read a bounded byte range without materializing the complete versioned
+    /// file. The returned range is clipped to EOF.
+    pub async fn read_file_range(
+        &self,
+        commit: &str,
+        path: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<VersionFileRange> {
         let id = parse_commit_id(commit)?;
         let commit = self.store.get_commit(&id).await?;
         let tree = commit.tree.to_tree();
@@ -739,7 +761,17 @@ impl VersionRepository {
             .and_then(|bytes| decode_version_entry(&bytes))?;
         let chunk_count = match &metadata.data {
             VersionEntryData::File { chunk_count } => *chunk_count,
-            VersionEntryData::Symlink { target } => return Ok(Bytes::copy_from_slice(target)),
+            VersionEntryData::Symlink { target } => {
+                let total_size = target.len() as u64;
+                let start = offset.min(total_size);
+                let end = start.saturating_add(length).min(total_size);
+                return Ok(VersionFileRange {
+                    offset: start,
+                    total_size,
+                    data: Bytes::copy_from_slice(&target[start as usize..end as usize]),
+                    eof: end == total_size,
+                });
+            }
             VersionEntryData::Directory => {
                 return Err(Error::invalid(
                     "versioned path",
@@ -747,10 +779,30 @@ impl VersionRepository {
                 ));
             }
         };
-        let expected_size = usize::try_from(metadata.size)
-            .map_err(|_| Error::Versioning(format!("{canonical} is too large to materialize")))?;
+        let start = offset.min(metadata.size);
+        let end = start.saturating_add(length).min(metadata.size);
+        let expected_size = usize::try_from(end - start).map_err(|_| {
+            Error::Versioning(format!("requested range for {canonical} is too large"))
+        })?;
+        if expected_size == 0 {
+            return Ok(VersionFileRange {
+                offset: start,
+                total_size: metadata.size,
+                data: Bytes::new(),
+                eof: end == metadata.size,
+            });
+        }
+        let first_chunk = start / self.chunk_size;
+        let last_chunk = (end - 1) / self.chunk_size;
+        if last_chunk >= u64::from(chunk_count) {
+            return Err(Error::Versioning(format!(
+                "versioned contents for {canonical} are shorter than its recorded size"
+            )));
+        }
         let mut output = Vec::with_capacity(expected_size);
-        for index in 0..chunk_count {
+        for index in first_chunk..=last_chunk {
+            let index = u32::try_from(index)
+                .map_err(|_| Error::Versioning(format!("too many chunks for {canonical}")))?;
             let encoded = self
                 .prolly
                 .get(&tree, &file_chunk_key(&canonical, index))
@@ -773,15 +825,27 @@ impl VersionRepository {
                 .ok_or_else(|| {
                     Error::Versioning(format!("missing blob for chunk {index} of {canonical}"))
                 })?;
-            output.extend_from_slice(&chunk);
+            let chunk_offset = u64::from(index) * self.chunk_size;
+            let copy_start = start.saturating_sub(chunk_offset) as usize;
+            let copy_end = (end - chunk_offset).min(chunk.len() as u64) as usize;
+            if copy_start > copy_end || copy_end > chunk.len() {
+                return Err(Error::Versioning(format!(
+                    "invalid chunk {index} length for {canonical}"
+                )));
+            }
+            output.extend_from_slice(&chunk[copy_start..copy_end]);
         }
-        if output.len() < expected_size {
+        if output.len() != expected_size {
             return Err(Error::Versioning(format!(
                 "versioned contents for {canonical} are shorter than its recorded size"
             )));
         }
-        output.truncate(expected_size);
-        Ok(Bytes::from(output))
+        Ok(VersionFileRange {
+            offset: start,
+            total_size: metadata.size,
+            data: Bytes::from(output),
+            eof: end == metadata.size,
+        })
     }
 
     pub async fn restore_file(&self, live: &dyn Vfs, commit: &str, path: &str) -> Result<()> {
@@ -814,8 +878,8 @@ impl VersionRepository {
                     restore_directory_entry(live, &path, &metadata).await?;
                 }
                 VersionEntryData::File { .. } => {
-                    let contents = self.read_file(&commit_id, &path).await?;
-                    restore_regular_file(live, &path, &metadata, &contents).await?;
+                    self.restore_regular_file(live, &commit_id, &path, &metadata)
+                        .await?;
                 }
                 VersionEntryData::Symlink { target } => {
                     restore_symlink_entry(live, &path, &metadata, target).await?;
@@ -824,52 +888,62 @@ impl VersionRepository {
         }
         Ok(())
     }
-}
 
-async fn restore_regular_file(
-    live: &dyn Vfs,
-    canonical: &str,
-    metadata: &VersionEntry,
-    contents: &[u8],
-) -> Result<()> {
-    let (parent, name) = resolve_parent(live, canonical).await?;
-    let temp_name = format!(".slatefs-restore-{}", uuid::Uuid::new_v4());
-    let creds = Credentials::root();
-    let created = live
-        .create(&creds, parent, temp_name.as_bytes(), metadata.mode, true)
-        .await
-        .map_err(fs_error)?;
-    let result = async {
-        let chunk_size = live.chunk_size().min(u32::MAX as u64) as usize;
-        for (index, chunk) in contents.chunks(chunk_size).enumerate() {
-            live.write(&creds, created.ino, index as u64 * chunk_size as u64, chunk)
-                .await
-                .map_err(fs_error)?;
-        }
-        live.setattr(
-            &creds,
-            created.ino,
-            SetAttrs {
-                mode: Some(metadata.mode),
-                uid: Some(metadata.uid),
-                gid: Some(metadata.gid),
-                size: Some(metadata.size),
-                atime: Some(TimeSet::Time(metadata.atime)),
-                mtime: Some(TimeSet::Time(metadata.mtime)),
-            },
-        )
-        .await
-        .map_err(fs_error)?;
-        live.fsync(&creds, created.ino).await.map_err(fs_error)?;
-        live.rename(&creds, parent, temp_name.as_bytes(), parent, &name)
+    async fn restore_regular_file(
+        &self,
+        live: &dyn Vfs,
+        commit: &str,
+        canonical: &str,
+        metadata: &VersionEntry,
+    ) -> Result<()> {
+        let (parent, name) = resolve_parent(live, canonical).await?;
+        let temp_name = format!(".slatefs-restore-{}", uuid::Uuid::new_v4());
+        let creds = Credentials::root();
+        let created = live
+            .create(&creds, parent, temp_name.as_bytes(), metadata.mode, true)
             .await
-            .map_err(fs_error)
+            .map_err(fs_error)?;
+        let result = async {
+            let mut offset = 0;
+            while offset < metadata.size {
+                let range = self
+                    .read_file_range(commit, canonical, offset, self.chunk_size)
+                    .await?;
+                if range.data.is_empty() {
+                    return Err(Error::Versioning(format!(
+                        "versioned contents for {canonical} did not advance"
+                    )));
+                }
+                live.write(&creds, created.ino, offset, &range.data)
+                    .await
+                    .map_err(fs_error)?;
+                offset = offset.saturating_add(range.data.len() as u64);
+            }
+            live.setattr(
+                &creds,
+                created.ino,
+                SetAttrs {
+                    mode: Some(metadata.mode),
+                    uid: Some(metadata.uid),
+                    gid: Some(metadata.gid),
+                    size: Some(metadata.size),
+                    atime: Some(TimeSet::Time(metadata.atime)),
+                    mtime: Some(TimeSet::Time(metadata.mtime)),
+                },
+            )
+            .await
+            .map_err(fs_error)?;
+            live.fsync(&creds, created.ino).await.map_err(fs_error)?;
+            live.rename(&creds, parent, temp_name.as_bytes(), parent, &name)
+                .await
+                .map_err(fs_error)
+        }
+        .await;
+        if result.is_err() {
+            let _ = live.unlink(&creds, parent, temp_name.as_bytes()).await;
+        }
+        result
     }
-    .await;
-    if result.is_err() {
-        let _ = live.unlink(&creds, parent, temp_name.as_bytes()).await;
-    }
-    result
 }
 
 async fn restore_directory_entry(

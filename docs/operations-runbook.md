@@ -217,6 +217,10 @@ slatefs -c /etc/slatefs/slatefs.toml versioning gc <tenant> <volume>
 slatefs -c /etc/slatefs/slatefs.toml versioning stats <tenant> <volume>
 ```
 
+`versioning show` and restore stream large files in volume-sized chunks. Admin
+API content reads are paged with `offset` and `length` (1 MiB default, 4 MiB
+maximum) and return `total_size`, `eof`, and `next_offset`.
+
 `versioning purge <tenant> <volume> --yes` is irreversible and must run only
 when no version repository for the volume is open. Disabling alone retains
 history and is not a purge.

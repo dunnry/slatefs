@@ -161,6 +161,94 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
 }
 
 #[tokio::test]
+async fn range_reads_and_restore_stream_across_chunks() {
+    let object_store: Arc<dyn ObjectStore> = store::resolve_root("memory:///").unwrap();
+    let control = ControlPlane::open(Arc::clone(&object_store), common::test_kms())
+        .await
+        .unwrap();
+    control.create_tenant("t", None).await.unwrap();
+    let record = volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "v",
+        common::create_opts(None, None),
+    )
+    .await
+    .unwrap();
+    control
+        .set_versioning_enabled("t", "v", true)
+        .await
+        .unwrap();
+    let dek = control.unwrap_volume_dek(&record).await.unwrap();
+    let live = Volume::open(&record, dek, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let creds = Credentials::root();
+    let file = live
+        .create(&creds, ROOT_INO, b"large.bin", 0o640, true)
+        .await
+        .unwrap();
+    let contents = (0..(common::TEST_CHUNK as usize * 3 + 17))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    live.write(&creds, file.ino, 0, &contents).await.unwrap();
+
+    let repository = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap();
+    let commit = repository
+        .commit_file(live.as_ref(), "/large.bin", "large file".into())
+        .await
+        .unwrap();
+    let offset = common::TEST_CHUNK as u64 - 13;
+    let range = repository
+        .read_file_range(&commit.id, "/large.bin", offset, 64)
+        .await
+        .unwrap();
+    assert_eq!(range.offset, offset);
+    assert_eq!(range.total_size, contents.len() as u64);
+    assert!(!range.eof);
+    assert_eq!(
+        range.data.as_ref(),
+        &contents[offset as usize..offset as usize + 64]
+    );
+
+    let tail = repository
+        .read_file_range(&commit.id, "/large.bin", contents.len() as u64 - 7, 100)
+        .await
+        .unwrap();
+    assert!(tail.eof);
+    assert_eq!(tail.data.as_ref(), &contents[contents.len() - 7..]);
+    let past_eof = repository
+        .read_file_range(&commit.id, "/large.bin", contents.len() as u64 + 10, 100)
+        .await
+        .unwrap();
+    assert!(past_eof.eof);
+    assert!(past_eof.data.is_empty());
+
+    live.write(&creds, file.ino, 0, b"overwritten")
+        .await
+        .unwrap();
+    repository
+        .restore_file(live.as_ref(), &commit.id, "/large.bin")
+        .await
+        .unwrap();
+    let restored = live.lookup(&creds, ROOT_INO, b"large.bin").await.unwrap();
+    assert_eq!(
+        live.read(&creds, restored.ino, 0, contents.len() as u32)
+            .await
+            .unwrap()
+            .as_ref(),
+        contents
+    );
+
+    repository.close().await.unwrap();
+    live.shutdown().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn commits_directories_symlinks_renames_and_deletions_atomically() {
     let object_store: Arc<dyn ObjectStore> = store::resolve_root("memory:///").unwrap();
     let control = ControlPlane::open(Arc::clone(&object_store), common::test_kms())
