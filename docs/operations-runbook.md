@@ -264,8 +264,15 @@ not direct access to the live filesystem writer.
 On CAS-capable cloud stores, a crashed holder's lease is taken over after its
 expiry. The local `file://` store intentionally refuses automatic stale
 takeover because it cannot conditionally update objects. After confirming the
-owning process is gone and no version operation is active, remove
-`version-leases/<tenant>/<volume>` from the local store root, then retry.
+owning process is gone and no version operation is active, use the exact owner
+reported by status:
+
+```sh
+slatefs -c /etc/slatefs/slatefs.toml versioning unlock <tenant> <volume> --owner <owner-uuid> --yes --live
+```
+
+Omit `--live` only for an offline deployment. Unlock rejects active leases,
+owner mismatches, and missing `--yes`; successful unlocks are durably audited.
 
 For a writable restore workspace:
 

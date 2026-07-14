@@ -17,7 +17,8 @@ use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{
-    VersionCommitInfo, VersionRepository, purge_version_history, try_get_version_maintenance_lease,
+    VersionCommitInfo, VersionRepository, force_break_expired_version_maintenance_lease,
+    purge_version_history, try_get_version_maintenance_lease,
 };
 use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
 use slatefs_core::{config, store};
@@ -408,6 +409,18 @@ enum VersioningCmd {
         volume: String,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long)]
+        live: bool,
+    },
+    /// Break an expired repository lease after confirming its owner is gone.
+    Unlock {
+        tenant: String,
+        volume: String,
+        /// Exact owner UUID reported by `versioning status`.
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        yes: bool,
         #[arg(long)]
         live: bool,
     },
@@ -2374,6 +2387,65 @@ async fn run(
                 .await?;
             }
         }
+        Command::Versioning(VersioningCmd::Unlock {
+            tenant,
+            volume,
+            owner,
+            yes,
+            live,
+        }) => {
+            if !yes {
+                anyhow::bail!("versioning unlock requires --yes");
+            }
+            let broken = if *live {
+                let response = live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    "DELETE",
+                    "lease",
+                    &[],
+                    Some(serde_json::json!({
+                        "owner": owner,
+                        "confirm": true,
+                    })),
+                )
+                .await?;
+                response["lease"]["broken"]
+                    .as_bool()
+                    .ok_or_else(|| anyhow::anyhow!("admin response omitted lease.broken"))?
+            } else {
+                let broken = force_break_expired_version_maintenance_lease(
+                    object_store,
+                    tenant,
+                    volume,
+                    owner,
+                )
+                .await?;
+                if broken {
+                    append_cli_version_audit(
+                        control,
+                        AuditAction::Maintain,
+                        tenant,
+                        volume,
+                        [
+                            (
+                                "maintenance".to_string(),
+                                AuditDetailValue::String("version-lease-break".to_string()),
+                            ),
+                            ("owner".to_string(), AuditDetailValue::String(owner.clone())),
+                        ],
+                    )
+                    .await?;
+                }
+                broken
+            };
+            if broken {
+                println!("broke expired version lease for {tenant}/{volume} owned by {owner}");
+            } else {
+                println!("no version lease exists for {tenant}/{volume}");
+            }
+        }
         Command::Versioning(VersioningCmd::Purge {
             tenant,
             volume,
@@ -3159,6 +3231,28 @@ mod tests {
                 live: true,
                 ..
             })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "unlock",
+            "tenant-a",
+            "docs",
+            "--owner",
+            "owner-uuid",
+            "--yes",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::Unlock {
+                owner,
+                yes: true,
+                live: true,
+                ..
+            }) if owner == "owner-uuid"
         ));
     }
 }

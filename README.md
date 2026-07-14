@@ -251,6 +251,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Current history retention and quota policy. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Set `keep_last`, `max_age_secs`, and/or `max_bytes`, or `{"clear":true}`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/gc` | Apply retention, or report with `{"dry_run":true}`. |
+| `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/lease` | Break an expired lease with its exact observed `owner` and `{"confirm":true}`. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/history` | Permanently purge history; requires `{"confirm":true}`. |
 | `GET` | `/admin/v1/nodes` | Daemon node inventory with `limit` and `page_token`. |
 

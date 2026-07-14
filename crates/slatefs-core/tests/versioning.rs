@@ -10,7 +10,8 @@ use slatefs_core::error::Error;
 use slatefs_core::meta::inode::ROOT_INO;
 use slatefs_core::store::{self, ObjectStore};
 use slatefs_core::versioning::{
-    VersionRepository, purge_version_history, try_get_version_maintenance_lease,
+    VersionRepository, force_break_expired_version_maintenance_lease, purge_version_history,
+    try_get_version_maintenance_lease,
 };
 use slatefs_core::vfs::{Credentials, Vfs};
 use slatefs_core::volume::{self, Volume};
@@ -218,6 +219,31 @@ async fn version_repository_lease_coordinates_open_and_purge() {
         .unwrap()
         .unwrap();
     assert!(released.is_expired_at(slatefs_core::control::now_unix()));
+    assert!(
+        force_break_expired_version_maintenance_lease(
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            "wrong-owner",
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        force_break_expired_version_maintenance_lease(
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            released.owner(),
+        )
+        .await
+        .unwrap()
+    );
+    let broken = try_get_version_maintenance_lease(Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(broken.operation(), "operator-break");
     let second = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
         .await
         .unwrap();

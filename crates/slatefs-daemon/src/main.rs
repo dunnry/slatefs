@@ -40,8 +40,8 @@ use slatefs_core::rate::{RateLimiter, RateLimits};
 use slatefs_core::snapshot::SnapshotVolume;
 use slatefs_core::store;
 use slatefs_core::versioning::{
-    VersionMaintenanceLeaseInfo, VersionRepository, purge_version_history,
-    try_get_version_maintenance_lease,
+    VersionMaintenanceLeaseInfo, VersionRepository, force_break_expired_version_maintenance_lease,
+    purge_version_history, try_get_version_maintenance_lease,
 };
 use slatefs_core::vfs::Vfs;
 use slatefs_core::volume::{self, Volume, VolumeCaches};
@@ -1008,6 +1008,13 @@ struct VersionGcRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VersionPurgeRequest {
+    confirm: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionLeaseBreakRequest {
+    owner: String,
     confirm: bool,
 }
 
@@ -2465,6 +2472,67 @@ async fn purge_version_history_response(
     ))
 }
 
+async fn break_version_lease_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let body: VersionLeaseBreakRequest = parse_json_body(request)?;
+    if !body.confirm {
+        return Err(bad_request(
+            "confirm=true is required to break an expired version lease",
+        ));
+    }
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let control = state.control_writer().await?;
+    if let Err(error) = control.get_volume(tenant, volume).await {
+        let _ = control.close().await;
+        return Err(core_error(error));
+    }
+    let broken_result = force_break_expired_version_maintenance_lease(
+        Arc::clone(&state.object_store),
+        tenant,
+        volume,
+        &body.owner,
+    )
+    .await;
+    let broken = match broken_result {
+        Ok(broken) => broken,
+        Err(error) => {
+            let _ = control.close().await;
+            return Err(core_error(error));
+        }
+    };
+    let audit = if broken {
+        append_version_audit(
+            &control,
+            request,
+            AuditAction::Maintain,
+            tenant,
+            volume,
+            [
+                (
+                    "maintenance".to_string(),
+                    AuditDetailValue::String("version-lease-break".to_string()),
+                ),
+                ("owner".to_string(), AuditDetailValue::String(body.owner)),
+            ],
+        )
+        .await
+    } else {
+        Ok(())
+    };
+    let close = control.close().await;
+    audit?;
+    close.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "lease": { "broken": broken } }),
+    ))
+}
+
 fn rate_limits_json(record: &TenantRecord) -> Value {
     json!({
         "ops_per_second": record.rate_limits.ops_per_second,
@@ -3688,6 +3756,19 @@ async fn route_admin_request(
                 "gc",
             ],
         ) => run_version_gc_response(state, request, tenant, volume).await,
+        (
+            "DELETE",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "lease",
+            ],
+        ) => break_version_lease_response(state, request, tenant, volume).await,
         (
             "DELETE",
             [
@@ -6532,12 +6613,23 @@ mod tests {
         let lease: Value = serde_json::from_str(response_body(&lease_response)).unwrap();
         assert_eq!(lease["versioning"]["lease"]["expired"], false);
         assert_eq!(lease["versioning"]["lease"]["operation"], "repository");
-        assert!(
-            !lease["versioning"]["lease"]["owner"]
-                .as_str()
-                .unwrap()
-                .is_empty()
+        let competing_owner = lease["versioning"]["lease"]["owner"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!competing_owner.is_empty());
+        let break_body = serde_json::json!({
+            "owner": competing_owner,
+            "confirm": true,
+        })
+        .to_string();
+        let break_request = format!(
+            "DELETE /admin/v1/tenants/t/volumes/v/versioning/lease HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            break_body.len(),
+            break_body
         );
+        let active_break = admin_exchange(Arc::clone(&state), break_request.as_bytes()).await;
+        assert_eq!(response_status(&active_break), 400, "{active_break}");
         let conflict_response = admin_exchange(
             Arc::clone(&state),
             b"GET /admin/v1/tenants/t/volumes/v/versioning/stats HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -6549,6 +6641,10 @@ mod tests {
             "{conflict_response}"
         );
         competing_repository.close().await.unwrap();
+        let expired_break = admin_exchange(Arc::clone(&state), break_request.as_bytes()).await;
+        assert_eq!(response_status(&expired_break), 200, "{expired_break}");
+        let expired_break: Value = serde_json::from_str(response_body(&expired_break)).unwrap();
+        assert_eq!(expired_break["lease"]["broken"], true);
 
         let stats_response = admin_exchange(
             Arc::clone(&state),
@@ -6631,6 +6727,7 @@ mod tests {
             AuditAction::VersionRestore,
             AuditAction::VersionRetentionSet,
             AuditAction::VersionGc,
+            AuditAction::Maintain,
         ] {
             let (records, _) = audit_control
                 .list_audit(AuditQuery {

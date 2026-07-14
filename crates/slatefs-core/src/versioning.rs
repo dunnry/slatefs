@@ -109,6 +109,76 @@ pub async fn try_get_version_maintenance_lease(
     }
 }
 
+/// Force an expired lease to become available again after the operator has
+/// verified that its exact owner is no longer running. The expected owner
+/// prevents clearing a different observed lease. Returns `false` when no lease
+/// exists.
+pub async fn force_break_expired_version_maintenance_lease(
+    object_store: Arc<dyn ObjectStore>,
+    tenant: &str,
+    volume: &str,
+    expected_owner: &str,
+) -> Result<bool> {
+    store::validate_name("tenant name", tenant)?;
+    store::validate_name("volume name", volume)?;
+    if expected_owner.is_empty() {
+        return Err(Error::invalid("version lease owner", "must not be empty"));
+    }
+    let path = store::version_lease_path(tenant, volume);
+    let current = match object_store.get(&path).await {
+        Ok(current) => current,
+        Err(slatedb::object_store::Error::NotFound { .. }) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let revision = UpdateVersion {
+        e_tag: current.meta.e_tag.clone(),
+        version: current.meta.version.clone(),
+    };
+    let mut record: VersionMaintenanceLeaseInfo = decode_versioned(
+        MAINTENANCE_LEASE_VERSION,
+        &current.bytes().await?,
+        "version maintenance lease",
+    )?;
+    if record.owner != expected_owner {
+        return Err(Error::invalid(
+            "version lease owner",
+            format!("expected {expected_owner}, found {}", record.owner),
+        ));
+    }
+    let now = crate::control::now_unix();
+    if !record.is_expired_at(now) {
+        return Err(Error::invalid(
+            "version maintenance lease",
+            format!("lease is active until {}", record.expires_at),
+        ));
+    }
+    record.operation = "operator-break".to_string();
+    record.expires_at = 0;
+    let payload = encode_versioned(MAINTENANCE_LEASE_VERSION, &record)?;
+    match object_store
+        .put_opts(
+            &path,
+            payload.into(),
+            PutOptions::from(PutMode::Update(revision)),
+        )
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(slatedb::object_store::Error::Precondition { .. }) => Err(Error::already_exists(
+            "version maintenance lease",
+            format!("{tenant}/{volume} changed while breaking the observed lease"),
+        )),
+        Err(slatedb::object_store::Error::NotImplemented { .. }) => {
+            match object_store.delete(&path).await {
+                Ok(()) => Ok(true),
+                Err(slatedb::object_store::Error::NotFound { .. }) => Ok(false),
+                Err(error) => Err(error.into()),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[derive(Clone)]
 struct VersionMaintenanceLease {
     object_store: Arc<dyn ObjectStore>,
@@ -1743,6 +1813,47 @@ mod tests {
         .await
         .unwrap();
         second.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn operator_can_break_exact_expired_local_file_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let object_store: Arc<dyn ObjectStore> =
+            store::resolve_root(&format!("file://{}", directory.path().display())).unwrap();
+        let record = VersionMaintenanceLeaseInfo {
+            tenant: "t".to_string(),
+            volume: "v".to_string(),
+            owner: "crashed-owner".to_string(),
+            operation: "repository".to_string(),
+            acquired_at: 1,
+            expires_at: 2,
+        };
+        object_store
+            .put_opts(
+                &store::version_lease_path("t", "v"),
+                encode_versioned(MAINTENANCE_LEASE_VERSION, &record)
+                    .unwrap()
+                    .into(),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .unwrap();
+        assert!(
+            force_break_expired_version_maintenance_lease(
+                Arc::clone(&object_store),
+                "t",
+                "v",
+                "crashed-owner",
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            try_get_version_maintenance_lease(object_store, "t", "v")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
