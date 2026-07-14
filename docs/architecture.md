@@ -80,9 +80,10 @@ deleting its history. Volume deletion removes both the live and optional
 version-store prefixes.
 
 The initial customer slice versions one selected regular file per commit.
-Commit and restore currently open the volume writer and are therefore offline
-operations; a served-volume admin route can be added later without coupling
-versioning to normal filesystem writes.
+Offline commit and restore open the volume writer directly. For served volumes,
+the CLI's `--live` path calls the authenticated daemon admin API, which uses the
+already-open `Volume` and therefore does not contend for or fence its writer
+lease. Neither mode couples versioning to normal filesystem writes.
 
 ## Request Path
 

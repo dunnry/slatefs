@@ -311,6 +311,9 @@ enum VersioningCmd {
         path: String,
         #[arg(short, long)]
         message: String,
+        /// Ask the serving slatefsd admin endpoint to use its active writer.
+        #[arg(long)]
+        live: bool,
     },
     /// List commits, optionally restricted to a path.
     Log {
@@ -336,6 +339,9 @@ enum VersioningCmd {
         volume: String,
         commit: String,
         path: String,
+        /// Ask the serving slatefsd admin endpoint to use its active writer.
+        #[arg(long)]
+        live: bool,
     },
 }
 
@@ -1105,6 +1111,73 @@ async fn create_live_snapshot_via_admin(
     })
 }
 
+fn admin_bearer_token(config: &Config) -> anyhow::Result<Option<String>> {
+    match (&config.admin.token, &config.admin.token_file) {
+        (Some(token), None) => Ok(Some(token.clone())),
+        (None, Some(path)) => {
+            let token = std::fs::read_to_string(path)
+                .with_context(|| format!("reading admin token file {}", path.display()))?;
+            let token = token.trim().to_string();
+            if token.is_empty() {
+                anyhow::bail!("admin token file {} is empty", path.display());
+            }
+            Ok(Some(token))
+        }
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("admin.token and admin.token_file are mutually exclusive")
+        }
+    }
+}
+
+async fn post_live_versioning_json(
+    config: &Config,
+    tenant: &str,
+    volume: &str,
+    operation: &str,
+    body: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    if config.admin.tls_cert.is_some() {
+        anyhow::bail!(
+            "live versioning through a TLS admin listener is not yet supported by the CLI"
+        );
+    }
+    let listen = config
+        .admin
+        .listen
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--live requires [admin].listen"))?;
+    let body = serde_json::to_string(&body)?;
+    let path = format!("/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/{operation}");
+    let authorization = admin_bearer_token(config)?
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {listen}\r\nContent-Type: application/json\r\n{authorization}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = TcpStream::connect(listen)
+        .await
+        .with_context(|| format!("connecting to slatefsd admin endpoint at {listen}"))?;
+    stream.write_all(request.as_bytes()).await?;
+    stream.shutdown().await?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await?;
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("malformed admin response"))?;
+    let status = head.lines().next().unwrap_or_default();
+    if !status.starts_with("HTTP/1.1 200 ") && !status.starts_with("HTTP/1.1 201 ") {
+        let detail = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|body| body["error"]["message"].as_str().map(str::to_string))
+            .unwrap_or_else(|| body.trim().to_string());
+        anyhow::bail!("admin versioning request failed: {detail}");
+    }
+    serde_json::from_str(body).context("parsing admin versioning response")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -1509,7 +1582,25 @@ async fn run(
             volume: volume_name,
             path,
             message,
+            live,
         }) => {
+            if *live {
+                let response = post_live_versioning_json(
+                    config,
+                    tenant,
+                    volume_name,
+                    "commits",
+                    serde_json::json!({ "path": path, "message": message }),
+                )
+                .await?;
+                println!(
+                    "commit {}",
+                    response["commit"]["id"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("admin response omitted commit id"))?
+                );
+                return Ok(());
+            }
             let repository =
                 VersionRepository::open(control, Arc::clone(&object_store), tenant, volume_name)
                     .await?;
@@ -1566,7 +1657,20 @@ async fn run(
             volume: volume_name,
             commit,
             path,
+            live,
         }) => {
+            if *live {
+                post_live_versioning_json(
+                    config,
+                    tenant,
+                    volume_name,
+                    "restore",
+                    serde_json::json!({ "commit": commit, "path": path }),
+                )
+                .await?;
+                println!("restored {path} from {commit}");
+                return Ok(());
+            }
             let repository =
                 VersionRepository::open(control, Arc::clone(&object_store), tenant, volume_name)
                     .await?;

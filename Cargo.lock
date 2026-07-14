@@ -4132,6 +4132,7 @@ dependencies = [
  "age",
  "anyhow",
  "clap",
+ "serde_json",
  "slatefs-core",
  "tempfile",
  "tokio",

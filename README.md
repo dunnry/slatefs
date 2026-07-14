@@ -147,9 +147,11 @@ tenant, volume, path, and `-m <message>` arguments. `versioning log`,
 `versioning show`, and `versioning restore` inspect and recover those commits.
 `versioning disable` stops all version operations but retains existing history;
 ordinary filesystem I/O continues unchanged. The first implementation operates
-on regular files one at a time. Commit and restore open the live volume writer,
-so the volume must be stopped or otherwise quiesced; do not run those two
-commands against a volume currently served by `slatefsd`.
+on regular files one at a time. For a volume currently served by `slatefsd`,
+use `versioning commit --live` or `versioning restore --live`; the authenticated
+admin API executes the operation against the daemon's existing writer. Without
+`--live`, commit and restore remain offline operations and must use a stopped or
+otherwise quiesced volume.
 
 **Phase 6 started** (snapshots/clones, HA, performance, GA polish):
 `slatefs snapshot create|list|delete` manages SlateDB checkpoints for a volume.
@@ -207,6 +209,8 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshots` | Checkpoint inventory with `limit`, `page_token`, and optional `name`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshot-retention` | Snapshot retention policy; named snapshots are not exempt. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshot-retention` | Set nullable `keep_last` and/or `max_age_secs`, or `{"clear":true}`. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Commit one file through the live writer from `{"path":"...","message":"..."}`. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore` | Atomically restore one file through the live writer from `{"commit":"...","path":"..."}`. |
 | `GET` | `/admin/v1/nodes` | Daemon node inventory with `limit` and `page_token`. |
 
 Every admin response includes `X-Request-Id`; callers may provide it or the

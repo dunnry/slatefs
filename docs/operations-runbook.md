@@ -194,6 +194,18 @@ metric, creates a writable clone from the same checkpoint, mounts the clone,
 verifies clone writes do not affect the live volume, and validates the clone
 with online `slatefs volume scrub`.
 
+For opt-in file history on a currently served filesystem volume, route commit
+and restore through that daemon's configured admin listener:
+
+```sh
+slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path> -m <message> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning restore <tenant> <volume> <commit> <path> --live
+```
+
+The CLI supplies `admin.token` or `admin.token_file` as a bearer token. The
+direct commands without `--live` acquire the volume writer and must not be run
+while `slatefsd` serves that volume.
+
 For a writable restore workspace:
 
 1. Create a clone: `slatefs clone create <tenant> <source-volume> <clone-volume> --snapshot <checkpoint-id>`.

@@ -38,6 +38,7 @@ use slatefs_core::metrics::{AggregatingRecorder, PrometheusSample, render_promet
 use slatefs_core::rate::{RateLimiter, RateLimits};
 use slatefs_core::snapshot::SnapshotVolume;
 use slatefs_core::store;
+use slatefs_core::versioning::VersionRepository;
 use slatefs_core::vfs::Vfs;
 use slatefs_core::volume::{self, Volume, VolumeCaches};
 use slatefs_nbd::{NbdExportOptions, NbdShutdownHandle, NbdTlsConfig};
@@ -912,6 +913,20 @@ struct CloneCreateRequest {
     snapshot_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionCommitRequest {
+    path: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionRestoreRequest {
+    commit: String,
+    path: String,
+}
+
 #[derive(Debug)]
 struct RequiredNullableString(Option<String>);
 
@@ -1636,6 +1651,103 @@ async fn create_live_snapshot_response(
         .await
         .map_err(core_error)?;
     Ok(live_snapshot_response(snapshot, json_body))
+}
+
+fn live_filesystem_target(
+    state: &AdminState,
+    tenant: &str,
+    volume: &str,
+) -> Result<Arc<Volume>, AdminError> {
+    state
+        .targets
+        .lock()
+        .expect("admin targets poisoned")
+        .get(&VolumeId::from_parts(tenant, volume))
+        .cloned()
+        .ok_or_else(|| not_found(format!("no live writable volume {tenant}/{volume}")))
+}
+
+async fn commit_live_version_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let body: VersionCommitRequest = parse_json_body(request)?;
+    let target = live_filesystem_target(state, tenant, volume)?;
+    let control = state.control_writer().await?;
+    let repository =
+        match VersionRepository::open(&control, Arc::clone(&state.object_store), tenant, volume)
+            .await
+        {
+            Ok(repository) => repository,
+            Err(error) => {
+                let _ = control.close().await;
+                return Err(core_error(error));
+            }
+        };
+
+    let commit = repository
+        .commit_file(target.as_ref(), &body.path, body.message)
+        .await;
+    let repository_close = repository.close().await;
+    let control_close = control.close().await;
+    let commit = commit.map_err(core_error)?;
+    repository_close.map_err(core_error)?;
+    control_close.map_err(core_error)?;
+
+    Ok(AdminHttpResponse::json(
+        201,
+        json!({
+            "commit": {
+                "id": commit.id,
+                "parent": commit.parent,
+                "created_at": commit.created_at,
+                "message": commit.message,
+                "paths": commit.paths,
+            }
+        }),
+    ))
+}
+
+async fn restore_live_version_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let body: VersionRestoreRequest = parse_json_body(request)?;
+    let target = live_filesystem_target(state, tenant, volume)?;
+    let control = state.control_writer().await?;
+    let repository =
+        match VersionRepository::open(&control, Arc::clone(&state.object_store), tenant, volume)
+            .await
+        {
+            Ok(repository) => repository,
+            Err(error) => {
+                let _ = control.close().await;
+                return Err(core_error(error));
+            }
+        };
+
+    let restore = repository
+        .restore_file(target.as_ref(), &body.commit, &body.path)
+        .await;
+    let repository_close = repository.close().await;
+    let control_close = control.close().await;
+    restore.map_err(core_error)?;
+    repository_close.map_err(core_error)?;
+    control_close.map_err(core_error)?;
+
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({
+            "restored": {
+                "commit": body.commit,
+                "path": body.path,
+            }
+        }),
+    ))
 }
 
 fn rate_limits_json(record: &TenantRecord) -> Value {
@@ -2690,6 +2802,32 @@ async fn route_admin_request(
             )
             .await
         }
+        (
+            "POST",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "commits",
+            ],
+        ) => commit_live_version_response(state, request, tenant, volume).await,
+        (
+            "POST",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "restore",
+            ],
+        ) => restore_live_version_response(state, request, tenant, volume).await,
         _ if request.path.starts_with(ADMIN_API_PREFIX) => Err(not_found("admin route not found")),
         _ => Ok(AdminHttpResponse::text(404, "not found\n")),
     }
@@ -5336,6 +5474,92 @@ mod tests {
         snapshot.shutdown().await.unwrap();
         volume.shutdown().await.unwrap();
         control.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_versioning_commit_and_restore_use_live_writer() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([91; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        let record = slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        control
+            .set_versioning_enabled("t", "v", true)
+            .await
+            .unwrap();
+        let dek = control.unwrap_volume_dek(&record).await.unwrap();
+        control.close().await.unwrap();
+        let volume = Volume::open(&record, dek, Arc::clone(&object_store))
+            .await
+            .unwrap();
+        let creds = Credentials::root();
+        let file = volume
+            .create(&creds, ROOT_INO, b"notes.txt", 0o644, true)
+            .await
+            .unwrap();
+        volume
+            .write(&creds, file.ino, 0, b"live baseline")
+            .await
+            .unwrap();
+
+        let mut targets = HashMap::new();
+        targets.insert(VolumeId::from_parts("t", "v"), Arc::clone(&volume));
+        let state =
+            available_admin_state(Arc::clone(&object_store), Arc::clone(&kms), targets, None).await;
+        let commit_body = r#"{"path":"/notes.txt","message":"live commit"}"#;
+        let commit_request = format!(
+            "POST /admin/v1/tenants/t/volumes/v/versioning/commits HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            commit_body.len(),
+            commit_body
+        );
+        let commit_response = admin_exchange(Arc::clone(&state), commit_request.as_bytes()).await;
+        assert_eq!(response_status(&commit_response), 201, "{commit_response}");
+        let commit_response: Value = serde_json::from_str(response_body(&commit_response)).unwrap();
+        let commit_id = commit_response["commit"]["id"].as_str().unwrap();
+
+        volume
+            .write(&creds, file.ino, 0, b"changed data!")
+            .await
+            .unwrap();
+        let restore_body = format!(r#"{{"commit":"{commit_id}","path":"/notes.txt"}}"#);
+        let restore_request = format!(
+            "POST /admin/v1/tenants/t/volumes/v/versioning/restore HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            restore_body.len(),
+            restore_body
+        );
+        let restore_response = admin_exchange(state, restore_request.as_bytes()).await;
+        assert_eq!(
+            response_status(&restore_response),
+            200,
+            "{restore_response}"
+        );
+
+        let restored = volume.lookup(&creds, ROOT_INO, b"notes.txt").await.unwrap();
+        assert_eq!(
+            volume
+                .read(&creds, restored.ino, 0, 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"live baseline"
+        );
+        volume
+            .write(&creds, restored.ino, 0, b"still writable")
+            .await
+            .unwrap();
+        assert!(!volume.is_dead());
+
+        volume.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
