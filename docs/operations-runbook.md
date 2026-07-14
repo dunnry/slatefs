@@ -206,6 +206,19 @@ The CLI supplies `admin.token` or `admin.token_file` as a bearer token. The
 direct commands without `--live` acquire the volume writer and must not be run
 while `slatefsd` serves that volume.
 
+Configure and enforce version-history lifecycle offline:
+
+```sh
+slatefs -c /etc/slatefs/slatefs.toml versioning retention <tenant> <volume> --keep-last 100 --max-age 2592000 --max-bytes 10737418240
+slatefs -c /etc/slatefs/slatefs.toml versioning gc <tenant> <volume> --dry-run
+slatefs -c /etc/slatefs/slatefs.toml versioning gc <tenant> <volume>
+slatefs -c /etc/slatefs/slatefs.toml versioning stats <tenant> <volume>
+```
+
+`versioning purge <tenant> <volume> --yes` is irreversible and must run only
+when no version repository for the volume is open. Disabling alone retains
+history and is not a purge.
+
 For a writable restore workspace:
 
 1. Create a clone: `slatefs clone create <tenant> <source-volume> <clone-volume> --snapshot <checkpoint-id>`.

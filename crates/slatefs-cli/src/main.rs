@@ -8,13 +8,14 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use slatefs_core::config::{ClientAddrRule, Config};
 use slatefs_core::control::{
+    AuditAction, AuditActor, AuditDetailValue, AuditOutcome, AuditPlane, AuditRecord, AuditScope,
     ControlPlane, DaemonMetrics, DaemonNodeRecord, DaemonNodeState, ExportRecord, QuotaLimits,
     SnapshotRetentionPolicy, VolumePlacementRecord,
 };
 use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
-use slatefs_core::versioning::{VersionCommitInfo, VersionRepository};
+use slatefs_core::versioning::{VersionCommitInfo, VersionRepository, purge_version_history};
 use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
 use slatefs_core::{config, store};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -335,7 +336,7 @@ enum VersioningCmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Atomically restore a file from a commit (offline volume only).
+    /// Restore a file, symlink, or directory tree from a commit.
     Restore {
         tenant: String,
         volume: String,
@@ -344,6 +345,35 @@ enum VersioningCmd {
         /// Ask the serving slatefsd admin endpoint to use its active writer.
         #[arg(long)]
         live: bool,
+    },
+    /// Show or update history retention and storage quota.
+    Retention {
+        tenant: String,
+        volume: String,
+        #[arg(long)]
+        keep_last: Option<u32>,
+        #[arg(long)]
+        max_age: Option<u64>,
+        #[arg(long)]
+        max_bytes: Option<u64>,
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Show logical version-store usage.
+    Stats { tenant: String, volume: String },
+    /// Remove commits, nodes, and blobs unreachable under the retention policy.
+    Gc {
+        tenant: String,
+        volume: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Permanently delete all version history while leaving versioning enabled.
+    Purge {
+        tenant: String,
+        volume: String,
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -834,6 +864,34 @@ fn print_version_commit(commit: &VersionCommitInfo) {
     println!("created {}", commit.created_at);
     println!("paths {}", commit.paths.join(","));
     println!("message {}", commit.message);
+}
+
+async fn append_cli_version_audit(
+    control: &ControlPlane,
+    action: AuditAction,
+    tenant: &str,
+    volume: &str,
+    details: impl IntoIterator<Item = (String, AuditDetailValue)>,
+) -> anyhow::Result<()> {
+    let mut record = AuditRecord::new(
+        AuditActor {
+            plane: AuditPlane::Cli,
+            principal: None,
+            source_ip: None,
+            client_agent: Some(format!("slatefs/{}", env!("CARGO_PKG_VERSION"))),
+        },
+        action,
+        AuditScope {
+            tenant: Some(tenant.to_string()),
+            volume: Some(volume.to_string()),
+            node: None,
+        },
+        format!("cli-versioning-{}", uuid::Uuid::new_v4()),
+        AuditOutcome::Success,
+    );
+    record.details.extend(details);
+    control.append_audit_record(record).await?;
+    Ok(())
 }
 
 fn print_snapshot_retention(tenant: &str, volume: &str, policy: Option<&SnapshotRetentionPolicy>) {
@@ -1617,6 +1675,17 @@ async fn run(
             let commit = commit?;
             live_close?;
             repository_close?;
+            append_cli_version_audit(
+                control,
+                AuditAction::VersionCommit,
+                tenant,
+                volume_name,
+                [(
+                    "commit".to_string(),
+                    AuditDetailValue::String(commit.id.clone()),
+                )],
+            )
+            .await?;
             print_version_commit(&commit);
         }
         Command::Versioning(VersioningCmd::Log {
@@ -1685,7 +1754,148 @@ async fn run(
             restore?;
             live_close?;
             repository_close?;
+            append_cli_version_audit(
+                control,
+                AuditAction::VersionRestore,
+                tenant,
+                volume_name,
+                [(
+                    "commit".to_string(),
+                    AuditDetailValue::String(commit.clone()),
+                )],
+            )
+            .await?;
             println!("restored {path} from {commit}");
+        }
+        Command::Versioning(VersioningCmd::Retention {
+            tenant,
+            volume,
+            keep_last,
+            max_age,
+            max_bytes,
+            clear,
+        }) => {
+            let mut changed = false;
+            if *clear {
+                if keep_last.is_some() || max_age.is_some() || max_bytes.is_some() {
+                    anyhow::bail!(
+                        "--clear cannot be combined with --keep-last, --max-age, or --max-bytes"
+                    );
+                }
+                control
+                    .clear_versioning_retention_policy(tenant, volume)
+                    .await?;
+                changed = true;
+            } else if keep_last.is_some() || max_age.is_some() || max_bytes.is_some() {
+                control
+                    .set_versioning_retention_policy(
+                        tenant, volume, *keep_last, *max_age, *max_bytes,
+                    )
+                    .await?;
+                changed = true;
+            }
+            let policy = control
+                .try_get_versioning_retention_policy(tenant, volume)
+                .await?;
+            println!("versioning_retention: {tenant}/{volume}");
+            println!(
+                "keep_last: {}",
+                format_limit(
+                    policy
+                        .as_ref()
+                        .and_then(|policy| policy.keep_last.map(u64::from))
+                )
+            );
+            println!(
+                "max_age_secs: {}",
+                format_limit(policy.as_ref().and_then(|policy| policy.max_age_secs))
+            );
+            println!(
+                "max_bytes: {}",
+                format_limit(policy.as_ref().and_then(|policy| policy.max_bytes))
+            );
+            if changed {
+                append_cli_version_audit(
+                    control,
+                    AuditAction::VersionRetentionSet,
+                    tenant,
+                    volume,
+                    std::iter::empty(),
+                )
+                .await?;
+            }
+        }
+        Command::Versioning(VersioningCmd::Stats { tenant, volume }) => {
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let stats = repository.stats().await;
+            let close = repository.close().await;
+            let stats = stats?;
+            close?;
+            println!("bytes: {}", stats.bytes);
+            println!("commits: {}", stats.commits);
+            println!("nodes: {}", stats.nodes);
+            println!("blobs: {}", stats.blobs);
+        }
+        Command::Versioning(VersioningCmd::Gc {
+            tenant,
+            volume,
+            dry_run,
+        }) => {
+            let policy = control
+                .try_get_versioning_retention_policy(tenant, volume)
+                .await?;
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let report = repository
+                .garbage_collect(
+                    policy.as_ref().and_then(|policy| policy.keep_last),
+                    policy.as_ref().and_then(|policy| policy.max_age_secs),
+                    *dry_run,
+                )
+                .await;
+            let close = repository.close().await;
+            let report = report?;
+            close?;
+            println!("retained_commits: {}", report.retained_commits);
+            println!("deleted_commits: {}", report.deleted_commits);
+            println!("deleted_nodes: {}", report.deleted_nodes);
+            println!("deleted_blobs: {}", report.deleted_blobs);
+            println!("reclaimed_bytes: {}", report.reclaimed_bytes);
+            println!("dry_run: {}", report.dry_run);
+            if !report.dry_run {
+                append_cli_version_audit(
+                    control,
+                    AuditAction::VersionGc,
+                    tenant,
+                    volume,
+                    [(
+                        "reclaimed_bytes".to_string(),
+                        AuditDetailValue::U64(report.reclaimed_bytes),
+                    )],
+                )
+                .await?;
+            }
+        }
+        Command::Versioning(VersioningCmd::Purge {
+            tenant,
+            volume,
+            yes,
+        }) => {
+            if !yes {
+                anyhow::bail!("versioning purge requires --yes");
+            }
+            let deleted = purge_version_history(control, object_store, tenant, volume).await?;
+            append_cli_version_audit(
+                control,
+                AuditAction::VersionPurge,
+                tenant,
+                volume,
+                [(
+                    "objects_deleted".to_string(),
+                    AuditDetailValue::U64(deleted as u64),
+                )],
+            )
+            .await?;
+            println!("purged version history for {tenant}/{volume}: {deleted} objects deleted");
         }
         Command::Snapshot(SnapshotCmd::Create {
             tenant,

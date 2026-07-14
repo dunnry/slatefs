@@ -151,6 +151,7 @@ struct ExportMetrics {
     active_snapshots: Arc<Mutex<usize>>,
     reconcile_failures: Arc<AtomicU64>,
     snapshot_retention_deleted: Arc<Mutex<HashMap<VolumeId, u64>>>,
+    version_operations: Arc<Mutex<HashMap<(VolumeId, String), u64>>>,
     tls_reloads: Arc<Mutex<HashMap<String, u64>>>,
     tls_reload_failures: Arc<Mutex<HashMap<String, u64>>>,
     tls_expiry: Arc<Mutex<HashMap<String, i64>>>,
@@ -198,6 +199,16 @@ impl ExportMetrics {
         *deleted
             .entry(VolumeId::from_parts(tenant, volume))
             .or_insert(0) += count;
+    }
+
+    fn version_operation(&self, tenant: &str, volume: &str, operation: &str) {
+        let mut operations = self
+            .version_operations
+            .lock()
+            .expect("version operation metrics poisoned");
+        *operations
+            .entry((VolumeId::from_parts(tenant, volume), operation.to_string()))
+            .or_insert(0) += 1;
     }
 
     fn register_tls_surface(&self, surface: &str, expiry_timestamp_seconds: i64) {
@@ -300,6 +311,22 @@ impl ExportMetrics {
                 [
                     ("tenant", volume_id.tenant.as_str()),
                     ("volume", volume_id.volume.as_str()),
+                ],
+                *value as f64,
+            ));
+        }
+        for ((volume_id, operation), value) in self
+            .version_operations
+            .lock()
+            .expect("version operation metrics poisoned")
+            .iter()
+        {
+            samples.push(PrometheusSample::new(
+                "slatefs_version_operations_total",
+                [
+                    ("tenant", volume_id.tenant.as_str()),
+                    ("volume", volume_id.volume.as_str()),
+                    ("operation", operation.as_str()),
                 ],
                 *value as f64,
             ));
@@ -1706,11 +1733,45 @@ async fn commit_live_version_response(
     let commit = repository
         .commit_paths(target.as_ref(), &paths, message)
         .await;
+    let audit = match &commit {
+        Ok(commit) => {
+            append_version_audit(
+                &control,
+                request,
+                AuditAction::VersionCommit,
+                tenant,
+                volume,
+                [
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(commit.id.clone()),
+                    ),
+                    (
+                        "paths".to_string(),
+                        AuditDetailValue::Array(
+                            commit
+                                .paths
+                                .iter()
+                                .cloned()
+                                .map(AuditDetailValue::String)
+                                .collect(),
+                        ),
+                    ),
+                ],
+            )
+            .await
+        }
+        Err(_) => Ok(()),
+    };
     let repository_close = repository.close().await;
     let control_close = control.close().await;
     let commit = commit.map_err(core_error)?;
+    audit?;
     repository_close.map_err(core_error)?;
     control_close.map_err(core_error)?;
+    state
+        .export_metrics
+        .version_operation(tenant, volume, "commit");
 
     Ok(AdminHttpResponse::json(
         201,
@@ -1749,11 +1810,37 @@ async fn restore_live_version_response(
     let restore = repository
         .restore_file(target.as_ref(), &body.commit, &body.path)
         .await;
+    let audit = if restore.is_ok() {
+        append_version_audit(
+            &control,
+            request,
+            AuditAction::VersionRestore,
+            tenant,
+            volume,
+            [
+                (
+                    "commit".to_string(),
+                    AuditDetailValue::String(body.commit.clone()),
+                ),
+                (
+                    "path".to_string(),
+                    AuditDetailValue::String(body.path.clone()),
+                ),
+            ],
+        )
+        .await
+    } else {
+        Ok(())
+    };
     let repository_close = repository.close().await;
     let control_close = control.close().await;
     restore.map_err(core_error)?;
+    audit?;
     repository_close.map_err(core_error)?;
     control_close.map_err(core_error)?;
+    state
+        .export_metrics
+        .version_operation(tenant, volume, "restore");
 
     Ok(AdminHttpResponse::json(
         200,
@@ -2002,6 +2089,33 @@ fn admin_actor(request: &AdminHttpRequest) -> AuditActor {
         source_ip: request.peer.map(|addr| addr.ip().to_string()),
         client_agent: request.headers.get("user-agent").cloned(),
     }
+}
+
+async fn append_version_audit(
+    control: &ControlPlane,
+    request: &AdminHttpRequest,
+    action: AuditAction,
+    tenant: &str,
+    volume: &str,
+    details: impl IntoIterator<Item = (String, AuditDetailValue)>,
+) -> Result<(), AdminError> {
+    let mut audit = AuditRecord::new(
+        admin_actor(request),
+        action,
+        AuditScope {
+            tenant: Some(tenant.to_string()),
+            volume: Some(volume.to_string()),
+            node: None,
+        },
+        request.request_id.clone(),
+        AuditOutcome::Success,
+    );
+    audit.details.extend(details);
+    control
+        .append_audit_record(audit)
+        .await
+        .map_err(core_error)?;
+    Ok(())
 }
 
 async fn append_export_audit(
@@ -5553,7 +5667,7 @@ mod tests {
             restore_body.len(),
             restore_body
         );
-        let restore_response = admin_exchange(state, restore_request.as_bytes()).await;
+        let restore_response = admin_exchange(Arc::clone(&state), restore_request.as_bytes()).await;
         assert_eq!(
             response_status(&restore_response),
             200,
@@ -5574,6 +5688,31 @@ mod tests {
             .await
             .unwrap();
         assert!(!volume.is_dead());
+        let metrics = render_daemon_metrics_with_exports(&[], &state.export_metrics);
+        assert!(
+            metrics.contains(
+                "slatefs_version_operations_total{tenant=\"t\",volume=\"v\",operation=\"commit\"} 1"
+            ),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains("slatefs_version_operations_total{tenant=\"t\",volume=\"v\",operation=\"restore\"} 1"),
+            "{metrics}"
+        );
+        let audit_control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        for action in [AuditAction::VersionCommit, AuditAction::VersionRestore] {
+            let (records, _) = audit_control
+                .list_audit(AuditQuery {
+                    action: Some(action),
+                    ..AuditQuery::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(records.len(), 1);
+        }
+        audit_control.close().await.unwrap();
 
         volume.shutdown().await.unwrap();
     }

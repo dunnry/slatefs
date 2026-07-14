@@ -4,7 +4,7 @@
 //! module opens a separate encrypted database only for explicit versioning
 //! operations, so disabled volumes pay no storage or request-path cost.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -71,13 +71,18 @@ impl VersionStore {
     }
 
     async fn get_commit(&self, id: &[u8; 32]) -> Result<VersionCommit> {
+        self.try_get_commit(id)
+            .await?
+            .ok_or_else(|| Error::not_found("version commit", hex::encode(id)))
+    }
+
+    async fn try_get_commit(&self, id: &[u8; 32]) -> Result<Option<VersionCommit>> {
         let key = commit_key(id);
-        let bytes = self
-            .get_raw(&key)
+        self.get_raw(&key)
             .await
             .map_err(version_store_error)?
-            .ok_or_else(|| Error::not_found("version commit", hex::encode(id)))?;
-        decode_versioned(COMMIT_VERSION, &bytes, "version commit")
+            .map(|bytes| decode_versioned(COMMIT_VERSION, &bytes, "version commit"))
+            .transpose()
     }
 
     async fn publish_commit(
@@ -270,6 +275,24 @@ pub struct VersionCommitInfo {
     pub paths: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VersionStoreStats {
+    pub bytes: u64,
+    pub nodes: u64,
+    pub blobs: u64,
+    pub commits: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VersionGcReport {
+    pub retained_commits: u64,
+    pub deleted_commits: u64,
+    pub deleted_nodes: u64,
+    pub deleted_blobs: u64,
+    pub reclaimed_bytes: u64,
+    pub dry_run: bool,
+}
+
 impl From<VersionCommit> for VersionCommitInfo {
     fn from(commit: VersionCommit) -> Self {
         Self {
@@ -286,6 +309,19 @@ impl From<VersionCommit> for VersionCommitInfo {
 pub struct VersionRepository {
     store: VersionStore,
     prolly: AsyncProlly<VersionStore>,
+    max_bytes: Option<u64>,
+}
+
+/// Permanently delete the physical version-repository prefix. The caller must
+/// ensure no version repository for this volume is open.
+pub async fn purge_version_history(
+    control: &ControlPlane,
+    object_store: Arc<dyn ObjectStore>,
+    tenant: &str,
+    volume: &str,
+) -> Result<usize> {
+    control.get_volume(tenant, volume).await?;
+    store::delete_prefix(&object_store, &store::version_db_prefix(tenant, volume)).await
 }
 
 impl VersionRepository {
@@ -300,15 +336,20 @@ impl VersionRepository {
                 "versioning is disabled for {tenant}/{volume}"
             )));
         }
+        let max_bytes = control
+            .try_get_versioning_retention_policy(tenant, volume)
+            .await?
+            .and_then(|policy| policy.max_bytes);
         let record = control.get_mountable_volume(tenant, volume).await?;
         let dek = control.unwrap_volume_dek(&record).await?;
-        Self::open_for_record(&record, dek, object_store).await
+        Self::open_for_record(&record, dek, object_store, max_bytes).await
     }
 
     async fn open_for_record(
         record: &VolumeRecord,
         dek: crate::crypto::Secret32,
         object_store: Arc<dyn ObjectStore>,
+        max_bytes: Option<u64>,
     ) -> Result<Self> {
         if !matches!(record.kind, crate::meta::superblock::VolumeKind::Filesystem) {
             return Err(Error::invalid(
@@ -329,11 +370,135 @@ impl VersionRepository {
         .await?;
         let store = VersionStore::new(db);
         let prolly = AsyncProlly::new(store.clone(), ProllyConfig::default());
-        Ok(Self { store, prolly })
+        Ok(Self {
+            store,
+            prolly,
+            max_bytes,
+        })
     }
 
     pub async fn close(&self) -> Result<()> {
         self.store.db.close().await.map_err(Error::from)
+    }
+
+    pub async fn stats(&self) -> Result<VersionStoreStats> {
+        let mut stats = VersionStoreStats::default();
+        let mut iter = self.store.db.scan(..).await?;
+        while let Some(entry) = iter.next().await? {
+            stats.bytes = stats
+                .bytes
+                .saturating_add((entry.key.len() + entry.value.len()) as u64);
+            if entry.key.starts_with(NODE_PREFIX) {
+                stats.nodes += 1;
+            } else if entry.key.starts_with(BLOB_PREFIX) {
+                stats.blobs += 1;
+            } else if entry.key.starts_with(COMMIT_PREFIX) {
+                stats.commits += 1;
+            }
+        }
+        Ok(stats)
+    }
+
+    pub async fn garbage_collect(
+        &self,
+        keep_last: Option<u32>,
+        max_age_secs: Option<u64>,
+        dry_run: bool,
+    ) -> Result<VersionGcReport> {
+        let now = crate::control::now_unix();
+        let cutoff = max_age_secs.map(|age| now.saturating_sub(age));
+        let mut next = self.store.get_head().await?.map(|head| head.commit_id);
+        let mut retained = Vec::new();
+        let mut chain = Vec::new();
+        while let Some(id) = next {
+            let Some(commit) = self.store.try_get_commit(&id).await? else {
+                break;
+            };
+            next = commit.parent;
+            let position = chain.len();
+            let within_count = keep_last.is_none_or(|keep| position < keep as usize);
+            let within_age = cutoff.is_none_or(|cutoff| commit.created_at >= cutoff);
+            if position == 0 || (within_count && within_age) {
+                retained.push(commit.clone());
+            }
+            chain.push(commit);
+        }
+
+        let trees = retained
+            .iter()
+            .map(|commit| commit.tree.to_tree())
+            .collect::<Vec<_>>();
+        let live_nodes = self
+            .prolly
+            .mark_reachable(&trees)
+            .await
+            .map_err(prolly_error)?
+            .live_cids
+            .into_iter()
+            .map(|cid| cid.as_bytes().to_vec())
+            .collect::<HashSet<_>>();
+        let live_blobs = self
+            .prolly
+            .mark_reachable_blobs(&trees)
+            .await
+            .map_err(prolly_error)?
+            .live_blobs
+            .into_iter()
+            .map(|reference| reference.cid.as_bytes().to_vec())
+            .collect::<HashSet<_>>();
+        let retained_ids = retained
+            .iter()
+            .map(|commit| commit.id.to_vec())
+            .collect::<HashSet<_>>();
+
+        let mut report = VersionGcReport {
+            retained_commits: retained.len() as u64,
+            dry_run,
+            ..VersionGcReport::default()
+        };
+        let mut deletions = WriteBatch::new();
+        let mut iter = self.store.db.scan(..).await?;
+        while let Some(entry) = iter.next().await? {
+            let key = entry.key.as_ref();
+            let delete = if let Some(cid) = key.strip_prefix(NODE_PREFIX) {
+                if live_nodes.contains(cid) {
+                    false
+                } else {
+                    report.deleted_nodes += 1;
+                    true
+                }
+            } else if let Some(cid) = key.strip_prefix(BLOB_PREFIX) {
+                if live_blobs.contains(cid) {
+                    false
+                } else {
+                    report.deleted_blobs += 1;
+                    true
+                }
+            } else if let Some(id) = key.strip_prefix(COMMIT_PREFIX) {
+                if retained_ids.contains(id) {
+                    false
+                } else {
+                    report.deleted_commits += 1;
+                    true
+                }
+            } else {
+                false
+            };
+            if delete {
+                report.reclaimed_bytes = report
+                    .reclaimed_bytes
+                    .saturating_add((entry.key.len() + entry.value.len()) as u64);
+                if !dry_run {
+                    deletions.delete(entry.key);
+                }
+            }
+        }
+        if !dry_run && (report.deleted_nodes + report.deleted_blobs + report.deleted_commits > 0) {
+            self.store.db.write(deletions).await?;
+            self.store.db.flush().await?;
+            self.prolly.clear_cache();
+        }
+        Ok(report)
     }
 
     pub async fn commit_file(
@@ -399,7 +564,6 @@ impl VersionRepository {
                 canonical.join(", ")
             )));
         }
-
         let body = VersionCommitBody {
             parent: head.as_ref().map(|head| head.commit_id),
             tree: RootManifest::from_tree(&tree),
@@ -418,6 +582,15 @@ impl VersionRepository {
             paths: body.paths,
         };
         let encoded = encode_versioned(COMMIT_VERSION, &commit)?;
+        if let Some(max_bytes) = self.max_bytes {
+            let stats = self.stats().await?;
+            let projected = stats.bytes.saturating_add(encoded.len() as u64);
+            if projected > max_bytes {
+                return Err(Error::Versioning(format!(
+                    "version history quota exceeded: {projected} bytes projected, {max_bytes} bytes allowed"
+                )));
+            }
+        }
         self.store
             .publish_commit(head.map(|head| head.commit_id), &commit, encoded)
             .await?;
@@ -533,7 +706,9 @@ impl VersionRepository {
         let mut history = Vec::new();
         let limit = limit.clamp(1, 10_000);
         while let Some(id) = next {
-            let commit = self.store.get_commit(&id).await?;
+            let Some(commit) = self.store.try_get_commit(&id).await? else {
+                break;
+            };
             next = commit.parent;
             if path.as_ref().is_none_or(|path| {
                 commit

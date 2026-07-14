@@ -90,6 +90,13 @@ and restore open the volume writer directly. For served volumes, the CLI's
 already-open `Volume` and therefore does not contend for or fence its writer
 lease. Neither mode couples versioning to normal filesystem writes.
 
+An optional control-plane retention record bounds commit count, age, and
+logical history bytes. Maintenance retains the selected commit roots, uses
+Prolly reachability for nodes and content blobs, and deletes unreachable
+objects and expired commit records in one SlateDB batch. The head commit is
+always retained. A physical purge deletes the separate version database prefix
+and is therefore restricted to an offline/no-open-repository operation.
+
 ## Request Path
 
 ```mermaid

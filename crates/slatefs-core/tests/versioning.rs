@@ -8,7 +8,7 @@ use futures::TryStreamExt;
 use slatefs_core::control::ControlPlane;
 use slatefs_core::meta::inode::ROOT_INO;
 use slatefs_core::store::{self, ObjectStore};
-use slatefs_core::versioning::VersionRepository;
+use slatefs_core::versioning::{VersionRepository, purge_version_history};
 use slatefs_core::vfs::{Credentials, Vfs};
 use slatefs_core::volume::{self, Volume};
 
@@ -282,5 +282,122 @@ async fn commits_directories_symlinks_renames_and_deletions_atomically() {
 
     repository.close().await.unwrap();
     live.shutdown().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
+    let object_store: Arc<dyn ObjectStore> = store::resolve_root("memory:///").unwrap();
+    let control = ControlPlane::open(Arc::clone(&object_store), common::test_kms())
+        .await
+        .unwrap();
+    control.create_tenant("t", None).await.unwrap();
+    let record = volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "v",
+        common::create_opts(None, None),
+    )
+    .await
+    .unwrap();
+    control
+        .set_versioning_enabled("t", "v", true)
+        .await
+        .unwrap();
+    control
+        .set_versioning_retention_policy("t", "v", Some(1), None, None)
+        .await
+        .unwrap();
+    let dek = control.unwrap_volume_dek(&record).await.unwrap();
+    let live = Volume::open(&record, dek, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let creds = Credentials::root();
+    let file = live
+        .create(&creds, ROOT_INO, b"history.txt", 0o644, true)
+        .await
+        .unwrap();
+    let repository = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap();
+    let mut commits = Vec::new();
+    for (index, contents) in [b"one".as_slice(), b"two", b"three"]
+        .into_iter()
+        .enumerate()
+    {
+        live.write(&creds, file.ino, 0, contents).await.unwrap();
+        live.setattr(
+            &creds,
+            file.ino,
+            slatefs_core::vfs::SetAttrs {
+                size: Some(contents.len() as u64),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        commits.push(
+            repository
+                .commit_file(live.as_ref(), "/history.txt", format!("version {index}"))
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(repository.stats().await.unwrap().commits, 3);
+    let dry_run = repository
+        .garbage_collect(Some(1), None, true)
+        .await
+        .unwrap();
+    assert_eq!(dry_run.deleted_commits, 2);
+    assert_eq!(repository.history(None, 10).await.unwrap().len(), 3);
+
+    let collected = repository
+        .garbage_collect(Some(1), None, false)
+        .await
+        .unwrap();
+    assert_eq!(collected.retained_commits, 1);
+    assert_eq!(collected.deleted_commits, 2);
+    assert!(collected.reclaimed_bytes > 0);
+    let history = repository.history(None, 10).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].id, commits[2].id);
+    assert!(
+        repository
+            .read_file(&commits[0].id, "/history.txt")
+            .await
+            .is_err()
+    );
+    repository.close().await.unwrap();
+
+    control
+        .set_versioning_retention_policy("t", "v", Some(1), None, Some(1))
+        .await
+        .unwrap();
+    let quota_repository = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap();
+    live.write(&creds, file.ino, 0, b"quota").await.unwrap();
+    assert!(
+        quota_repository
+            .commit_file(live.as_ref(), "/history.txt", "over quota".into())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("quota exceeded")
+    );
+    quota_repository.close().await.unwrap();
+    live.shutdown().await.unwrap();
+
+    let deleted = purge_version_history(&control, Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap();
+    assert!(deleted > 0);
+    let remaining: Vec<_> = object_store
+        .list(Some(&store::version_db_prefix("t", "v")))
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(remaining.is_empty());
     control.close().await.unwrap();
 }

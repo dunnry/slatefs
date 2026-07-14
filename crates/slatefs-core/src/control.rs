@@ -35,6 +35,7 @@ const EXPORT_RECORD_VERSION: u8 = 1;
 const AUDIT_RECORD_VERSION: u8 = 1;
 const SNAPSHOT_RETENTION_RECORD_VERSION: u8 = 1;
 const VERSIONING_POLICY_RECORD_VERSION: u8 = 1;
+const VERSIONING_RETENTION_RECORD_VERSION: u8 = 1;
 const MAX_AUDIT_DETAILS_BYTES: usize = 128 * 1024;
 const MAX_AUDIT_PAGE_LIMIT: usize = 1_000;
 
@@ -116,6 +117,17 @@ pub struct VersioningPolicy {
     pub tenant: String,
     pub volume: String,
     pub enabled: bool,
+    /// Unix seconds.
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersioningRetentionPolicy {
+    pub tenant: String,
+    pub volume: String,
+    pub keep_last: Option<u32>,
+    pub max_age_secs: Option<u64>,
+    pub max_bytes: Option<u64>,
     /// Unix seconds.
     pub updated_at: u64,
 }
@@ -496,6 +508,11 @@ pub enum AuditAction {
     Maintain,
     AuthDenied,
     QuotaRejected,
+    VersionCommit,
+    VersionRestore,
+    VersionGc,
+    VersionPurge,
+    VersionRetentionSet,
 }
 
 impl AuditAction {
@@ -524,6 +541,11 @@ impl AuditAction {
             "Maintain" => Self::Maintain,
             "AuthDenied" => Self::AuthDenied,
             "QuotaRejected" => Self::QuotaRejected,
+            "VersionCommit" => Self::VersionCommit,
+            "VersionRestore" => Self::VersionRestore,
+            "VersionGc" => Self::VersionGc,
+            "VersionPurge" => Self::VersionPurge,
+            "VersionRetentionSet" => Self::VersionRetentionSet,
             _ => return None,
         })
     }
@@ -686,6 +708,10 @@ fn snapshot_retention_key(tenant: &str, volume: &str) -> String {
 
 fn versioning_policy_key(tenant: &str, volume: &str) -> String {
     format!("vr/{tenant}/{volume}")
+}
+
+fn versioning_retention_key(tenant: &str, volume: &str) -> String {
+    format!("vrr/{tenant}/{volume}")
 }
 
 pub fn now_unix() -> u64 {
@@ -1069,6 +1095,8 @@ impl ControlPlane {
         self.put_volume(&record).await?;
         self.clear_snapshot_retention_policy(tenant, volume).await?;
         self.clear_versioning_policy(tenant, volume).await?;
+        self.clear_versioning_retention_policy(tenant, volume)
+            .await?;
         self.delete_volume_placement(tenant, volume).await?;
         let objects_deleted = self.delete_volume_objects(tenant, volume).await?;
         tracing::info!(
@@ -1094,6 +1122,8 @@ impl ControlPlane {
             self.clear_snapshot_retention_policy(name, &volume.name)
                 .await?;
             self.clear_versioning_policy(name, &volume.name).await?;
+            self.clear_versioning_retention_policy(name, &volume.name)
+                .await?;
             self.delete_volume_placement(name, &volume.name).await?;
         }
         tenant.state = TenantState::Deleting;
@@ -1227,6 +1257,79 @@ impl ControlPlane {
         if existing.is_some() {
             self.db
                 .delete(versioning_policy_key(tenant, volume).as_bytes())
+                .await?;
+        }
+        Ok(existing)
+    }
+
+    pub async fn set_versioning_retention_policy(
+        &self,
+        tenant: &str,
+        volume: &str,
+        keep_last: Option<u32>,
+        max_age_secs: Option<u64>,
+        max_bytes: Option<u64>,
+    ) -> Result<VersioningRetentionPolicy> {
+        self.get_volume(tenant, volume).await?;
+        if keep_last == Some(0) {
+            return Err(Error::invalid(
+                "versioning retention",
+                "keep_last must be positive",
+            ));
+        }
+        if max_age_secs == Some(0) {
+            return Err(Error::invalid(
+                "versioning retention",
+                "max_age_secs must be positive",
+            ));
+        }
+        if max_bytes == Some(0) {
+            return Err(Error::invalid(
+                "versioning retention",
+                "max_bytes must be positive",
+            ));
+        }
+        let policy = VersioningRetentionPolicy {
+            tenant: tenant.to_string(),
+            volume: volume.to_string(),
+            keep_last,
+            max_age_secs,
+            max_bytes,
+            updated_at: now_unix(),
+        };
+        self.db
+            .put(
+                versioning_retention_key(tenant, volume).as_bytes(),
+                encode_versioned(VERSIONING_RETENTION_RECORD_VERSION, &policy)?,
+            )
+            .await?;
+        Ok(policy)
+    }
+
+    pub async fn try_get_versioning_retention_policy(
+        &self,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<Option<VersioningRetentionPolicy>> {
+        self.get_volume(tenant, volume).await?;
+        self.db
+            .get(versioning_retention_key(tenant, volume).as_bytes())
+            .await?
+            .map(|bytes| decode_versioned(VERSIONING_RETENTION_RECORD_VERSION, &bytes))
+            .transpose()
+    }
+
+    pub async fn clear_versioning_retention_policy(
+        &self,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<Option<VersioningRetentionPolicy>> {
+        let existing = self
+            .try_get_versioning_retention_policy(tenant, volume)
+            .await?;
+        if existing.is_some() {
+            self.db
+                .delete(versioning_retention_key(tenant, volume).as_bytes())
                 .await?;
         }
         Ok(existing)

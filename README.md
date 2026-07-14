@@ -155,6 +155,15 @@ served by `slatefsd`, use `versioning commit --live` or `versioning restore
 daemon's existing writer. Without `--live`, commit and restore remain offline
 operations and must use a stopped or otherwise quiesced volume.
 
+History lifecycle is explicit. `versioning retention` sets `--keep-last`,
+`--max-age`, and/or a hard `--max-bytes` history quota. `versioning gc`
+removes commits outside that policy plus unreachable Prolly nodes and content
+blobs (`--dry-run` reports first); `versioning stats` reports logical usage.
+`versioning purge --yes` permanently removes the physical history prefix while
+leaving versioning enabled for a fresh next commit. Commit, restore, retention,
+GC, and purge actions emit durable audit records, and live daemon operations
+increment `slatefs_version_operations_total{tenant,volume,operation}`.
+
 **Phase 6 started** (snapshots/clones, HA, performance, GA polish):
 `slatefs snapshot create|list|delete` manages SlateDB checkpoints for a volume.
 The CLI create path opens the volume as the writer so SlateDB can flush before
@@ -185,7 +194,8 @@ in the control plane; volume data blocks are not rewritten. Optional
 `[metrics].listen = "ip:port"` exposes Prometheus text at `/metrics`, including
 SlateDB cache/flush samples per writable volume, `slatefs_volume_dead`,
 `slatefs_exports_active{protocol,source}`, and
-`slatefs_export_reconcile_failures_total`.
+`slatefs_export_reconcile_failures_total`, plus live version commit/restore
+counters.
 `[admin].listen = "127.0.0.1:port"` exposes the daemon admin listener. It
 keeps the legacy live-writer snapshot route and serves admin API v1:
 
