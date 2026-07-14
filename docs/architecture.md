@@ -95,6 +95,8 @@ One commit can select multiple paths. Directories recursively capture regular
 files, subdirectories, and symlinks; selected missing paths delete their old
 tree entries, so a rename is represented by selecting both old and new paths.
 All selected changes produce one Prolly root and one commit/ref publication.
+Commit comparison uses Prolly structural diff and folds internal metadata and
+chunk-key changes into one added, modified, or deleted result per path.
 Restore recreates a selected directory tree entry-by-entry, with regular files
 and symlinks replaced through same-directory temporary names. Offline commit
 and restore open the volume writer directly. For served volumes, the CLI's

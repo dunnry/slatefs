@@ -10,8 +10,8 @@ use slatefs_core::error::Error;
 use slatefs_core::meta::inode::ROOT_INO;
 use slatefs_core::store::{self, ObjectStore};
 use slatefs_core::versioning::{
-    VersionRepository, force_break_expired_version_maintenance_lease, purge_version_history,
-    try_get_version_maintenance_lease,
+    VersionPathChangeKind, VersionRepository, force_break_expired_version_maintenance_lease,
+    purge_version_history, try_get_version_maintenance_lease,
 };
 use slatefs_core::vfs::{Credentials, Vfs};
 use slatefs_core::volume::{self, Volume};
@@ -102,6 +102,13 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         .await
         .unwrap();
     assert_eq!(second.parent.as_deref(), Some(first.id.as_str()));
+    let diff = repository
+        .diff_commits(&first.id, &second.id)
+        .await
+        .unwrap();
+    assert_eq!(diff.len(), 1);
+    assert_eq!(diff[0].path(), "/notes.txt");
+    assert_eq!(diff[0].change(), VersionPathChangeKind::Modified);
 
     let history = repository.history(Some("/notes.txt"), 10).await.unwrap();
     assert_eq!(history.len(), 2);
@@ -792,6 +799,28 @@ async fn commits_directories_symlinks_renames_and_deletions_atomically() {
             .as_ref(),
         b"updated"
     );
+    let diff = repository
+        .diff_commits(&initial.id, &changed.id)
+        .await
+        .unwrap();
+    assert_eq!(diff.len(), 3);
+    assert_eq!(diff[0].path(), "/docs/a.txt");
+    assert_eq!(diff[0].change(), VersionPathChangeKind::Deleted);
+    assert_eq!(diff[1].path(), "/docs/b.txt");
+    assert_eq!(diff[1].change(), VersionPathChangeKind::Deleted);
+    assert_eq!(diff[2].path(), "/docs/renamed.txt");
+    assert_eq!(diff[2].change(), VersionPathChangeKind::Added);
+    let (first_page, token) = repository
+        .diff_commits_page(&initial.id, &changed.id, 2, None)
+        .await
+        .unwrap();
+    assert_eq!(first_page, diff[..2]);
+    let (second_page, final_token) = repository
+        .diff_commits_page(&initial.id, &changed.id, 2, token.as_deref())
+        .await
+        .unwrap();
+    assert_eq!(second_page, diff[2..]);
+    assert!(final_token.is_none());
 
     live.unlink(&creds, docs.ino, b"latest").await.unwrap();
     repository

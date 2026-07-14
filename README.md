@@ -144,7 +144,8 @@ every volume and is never part of the normal NFS/9P read or write path. Enable
 it explicitly with `slatefs versioning enable <tenant> <volume>`, then create
 versions of selected regular files with `slatefs versioning commit` and its
 tenant, volume, path, and `-m <message>` arguments. `versioning log`,
-`versioning show`, and `versioning restore` inspect and recover those commits.
+`versioning diff`, `versioning show`, and `versioning restore` inspect, compare,
+and recover those commits.
 Show and restore stream versioned data in bounded chunks rather than loading a
 complete large file into memory.
 `versioning disable` stops all version operations but retains existing history;
@@ -246,6 +247,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Opt-in state, retention policy, and current or last repository lease. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Enable or disable with `{"enabled":true|false}`; disabling retains history. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Commit history with optional `path`, `limit`, and exclusive `page_token`; returns `next_page_token`. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/diff` | Added, modified, and deleted paths between required `from` and `to` commits; supports `limit` and exclusive path `page_token`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"...","idempotency_key":"..."}`; the retry key is optional and singular `path` remains accepted. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit}/content?path=&offset=&length=` | Read a bounded file or symlink range as base64 JSON; defaults to 1 MiB and rejects ranges over 4 MiB. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore` | Atomically restore one file through the live writer from `{"commit":"...","path":"..."}`. |

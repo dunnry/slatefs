@@ -2204,6 +2204,48 @@ async fn list_version_commits_response(
     ))
 }
 
+async fn diff_version_commits_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let from = request
+        .query
+        .get("from")
+        .ok_or_else(|| bad_request("missing from commit"))?;
+    let to = request
+        .query
+        .get("to")
+        .ok_or_else(|| bad_request("missing to commit"))?;
+    let limit = page_limit(&request.query)?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository
+        .diff_commits_page(
+            from,
+            to,
+            limit,
+            request.query.get("page_token").map(String::as_str),
+        )
+        .await;
+    let (changes, next_page_token) = finish_version_repository(control, repository, result).await?;
+    let changes = changes
+        .into_iter()
+        .map(|change| {
+            json!({
+                "path": change.path(),
+                "change": change.change(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "changes": changes, "next_page_token": next_page_token }),
+    ))
+}
+
 async fn get_version_content_response(
     state: &AdminState,
     request: &AdminHttpRequest,
@@ -3672,6 +3714,19 @@ async fn route_admin_request(
                 "commits",
             ],
         ) => list_version_commits_response(state, request, tenant, volume).await,
+        (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "diff",
+            ],
+        ) => diff_version_commits_response(state, request, tenant, volume).await,
         (
             "POST",
             [
@@ -6732,6 +6787,14 @@ mod tests {
         );
         let conflict = admin_exchange(Arc::clone(&state), conflict_request.as_bytes()).await;
         assert_eq!(response_status(&conflict), 409, "{conflict}");
+        let diff_request = format!(
+            "GET /admin/v1/tenants/t/volumes/v/versioning/diff?from={commit_id}&to={commit_id}&limit=1 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        let diff_response = admin_exchange(Arc::clone(&state), diff_request.as_bytes()).await;
+        assert_eq!(response_status(&diff_response), 200, "{diff_response}");
+        let diff: Value = serde_json::from_str(response_body(&diff_response)).unwrap();
+        assert_eq!(diff["changes"], serde_json::json!([]));
+        assert!(diff["next_page_token"].is_null());
 
         let history_response = admin_exchange(
             Arc::clone(&state),

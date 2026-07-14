@@ -201,6 +201,7 @@ and restore through that daemon's configured admin listener:
 slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path>... -m <message> --idempotency-key <retry-key> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning restore <tenant> <volume> <commit> <path> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning log <tenant> <volume> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning diff <tenant> <volume> <from-commit> <to-commit> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning show <tenant> <volume> <commit> <path> --out restored.bin --live
 slatefs -c /etc/slatefs/slatefs.toml versioning retention <tenant> <volume> --keep-last 100 --live
 slatefs -c /etc/slatefs/slatefs.toml versioning gc <tenant> <volume> --dry-run --live

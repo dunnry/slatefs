@@ -17,8 +17,9 @@ use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{
-    VersionCommitInfo, VersionRepository, force_break_expired_version_maintenance_lease,
-    purge_version_history, try_get_version_maintenance_lease,
+    VersionCommitInfo, VersionPathChangeKind, VersionRepository,
+    force_break_expired_version_maintenance_lease, purge_version_history,
+    try_get_version_maintenance_lease,
 };
 use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
 use slatefs_core::{config, store};
@@ -354,6 +355,20 @@ enum VersioningCmd {
         #[arg(long, default_value_t = 100)]
         limit: usize,
         /// Continue after the last commit ID returned by a previous page.
+        #[arg(long)]
+        page_token: Option<String>,
+        #[arg(long)]
+        live: bool,
+    },
+    /// Compare two commits and list changed paths.
+    Diff {
+        tenant: String,
+        volume: String,
+        from: String,
+        to: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Continue after the last path returned by a previous page.
         #[arg(long)]
         page_token: Option<String>,
         #[arg(long)]
@@ -928,6 +943,15 @@ fn print_version_commit(commit: &VersionCommitInfo) {
     println!("created {}", commit.created_at);
     println!("paths {}", commit.paths.join(","));
     println!("message {}", commit.message);
+}
+
+fn version_change_label(change: VersionPathChangeKind) -> &'static str {
+    match change {
+        VersionPathChangeKind::Added => "added",
+        VersionPathChangeKind::Modified => "modified",
+        VersionPathChangeKind::Deleted => "deleted",
+        _ => "unknown",
+    }
 }
 
 async fn stream_version_file<W: AsyncWrite + Unpin>(
@@ -2109,6 +2133,60 @@ async fn run(
             let (commits, next_page_token) = history?;
             for commit in commits {
                 print_version_commit(&commit);
+            }
+            if let Some(next) = next_page_token {
+                println!("next_page_token: {next}");
+            }
+            repository_close?;
+        }
+        Command::Versioning(VersioningCmd::Diff {
+            tenant,
+            volume,
+            from,
+            to,
+            limit,
+            page_token,
+            live,
+        }) => {
+            if *live {
+                let mut query = vec![
+                    ("from", from.clone()),
+                    ("to", to.clone()),
+                    ("limit", limit.to_string()),
+                ];
+                if let Some(page_token) = page_token {
+                    query.push(("page_token", page_token.clone()));
+                }
+                let response =
+                    live_versioning_json(config, tenant, volume, "GET", "diff", &query, None)
+                        .await?;
+                let changes = response["changes"]
+                    .as_array()
+                    .ok_or_else(|| anyhow::anyhow!("admin response omitted changes"))?;
+                for change in changes {
+                    println!(
+                        "{}\t{}",
+                        change["change"].as_str().unwrap_or("unknown"),
+                        change["path"].as_str().unwrap_or("-")
+                    );
+                }
+                if let Some(next) = response["next_page_token"].as_str() {
+                    println!("next_page_token: {next}");
+                }
+                return Ok(());
+            }
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let diff = repository
+                .diff_commits_page(from, to, *limit, page_token.as_deref())
+                .await;
+            let repository_close = repository.close().await;
+            let (changes, next_page_token) = diff?;
+            for change in changes {
+                println!(
+                    "{}\t{}",
+                    version_change_label(change.change()),
+                    change.path()
+                );
             }
             if let Some(next) = next_page_token {
                 println!("next_page_token: {next}");
@@ -3319,6 +3397,30 @@ mod tests {
                 live: true,
                 ..
             }) if key == "retry-1"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "diff",
+            "tenant-a",
+            "docs",
+            "from-id",
+            "to-id",
+            "--limit",
+            "25",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::Diff {
+                from,
+                to,
+                limit: 25,
+                live: true,
+                ..
+            }) if from == "from-id" && to == "to-id"
         ));
     }
 }

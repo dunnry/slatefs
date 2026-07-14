@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use prolly::{
-    AsyncBlobStore, AsyncProlly, AsyncStore, BatchOp, BlobRef, Cid, Config as ProllyConfig,
+    AsyncBlobStore, AsyncProlly, AsyncStore, BatchOp, BlobRef, Cid, Config as ProllyConfig, Diff,
     Mutation, RootManifest, ValueRef,
 };
 use serde::{Deserialize, Serialize};
@@ -795,6 +795,32 @@ pub struct VersionFileRange {
     pub eof: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum VersionPathChangeKind {
+    Added,
+    Modified,
+    Deleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionPathChange {
+    path: String,
+    change: VersionPathChangeKind,
+}
+
+impl VersionPathChange {
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn change(&self) -> VersionPathChangeKind {
+        self.change
+    }
+}
+
 impl From<VersionCommit> for VersionCommitInfo {
     fn from(commit: VersionCommit) -> Self {
         Self {
@@ -1529,6 +1555,62 @@ impl VersionRepository {
         Ok((history, next_page_token))
     }
 
+    /// Compare two immutable commits and return one logical change per path.
+    /// File chunk changes are folded into their owning file, so callers never
+    /// see internal Prolly metadata or chunk keys.
+    pub async fn diff_commits(&self, from: &str, to: &str) -> Result<Vec<VersionPathChange>> {
+        let from = self.store.get_commit(&parse_commit_id(from)?).await?;
+        let to = self.store.get_commit(&parse_commit_id(to)?).await?;
+        let diffs = self
+            .prolly
+            .diff(&from.tree.to_tree(), &to.tree.to_tree())
+            .await
+            .map_err(prolly_error)?;
+        let mut paths: BTreeMap<String, (Option<VersionPathChangeKind>, bool)> = BTreeMap::new();
+        for diff in diffs {
+            let (key, raw_change) = match &diff {
+                Diff::Added { key, .. } => (key.as_slice(), VersionPathChangeKind::Added),
+                Diff::Removed { key, .. } => (key.as_slice(), VersionPathChangeKind::Deleted),
+                Diff::Changed { key, .. } => (key.as_slice(), VersionPathChangeKind::Modified),
+            };
+            let (path, metadata) = version_path_from_tree_key(key)?;
+            let entry = paths.entry(path).or_insert((None, false));
+            if metadata {
+                entry.0 = Some(raw_change);
+            } else {
+                entry.1 = true;
+            }
+        }
+        Ok(paths
+            .into_iter()
+            .filter_map(|(path, (metadata_change, content_changed))| {
+                metadata_change
+                    .or(content_changed.then_some(VersionPathChangeKind::Modified))
+                    .map(|change| VersionPathChange { path, change })
+            })
+            .collect())
+    }
+
+    /// Return a lexicographically ordered page from [`Self::diff_commits`].
+    /// The page token is the last path returned by the previous page.
+    pub async fn diff_commits_page(
+        &self,
+        from: &str,
+        to: &str,
+        limit: usize,
+        page_token: Option<&str>,
+    ) -> Result<(Vec<VersionPathChange>, Option<String>)> {
+        let page_token = page_token.map(canonical_path).transpose()?;
+        let limit = limit.clamp(1, 10_000);
+        let mut changes = self.diff_commits(from, to).await?;
+        if let Some(page_token) = page_token {
+            changes.retain(|change| change.path > page_token);
+        }
+        let next_page_token = (changes.len() > limit).then(|| changes[limit - 1].path.clone());
+        changes.truncate(limit);
+        Ok((changes, next_page_token))
+    }
+
     pub async fn read_file(&self, commit: &str, path: &str) -> Result<Bytes> {
         Ok(self.read_file_range(commit, path, 0, u64::MAX).await?.data)
     }
@@ -1916,6 +1998,25 @@ fn version_key_matches_any_path(key: &[u8], paths: &[String]) -> bool {
     paths
         .iter()
         .any(|root| std::str::from_utf8(path).is_ok_and(|path| path_is_within(path, root)))
+}
+
+fn version_path_from_tree_key(key: &[u8]) -> Result<(String, bool)> {
+    let (path, metadata) = if let Some(path) = key.strip_prefix(b"m/") {
+        (path, true)
+    } else if let Some(chunk) = key.strip_prefix(b"c/") {
+        (
+            chunk.split(|byte| *byte == 0).next().unwrap_or_default(),
+            false,
+        )
+    } else {
+        return Err(Error::Versioning(format!(
+            "version tree contains unknown key prefix {}",
+            hex::encode(key)
+        )));
+    };
+    let path = std::str::from_utf8(path)
+        .map_err(|_| Error::Versioning("version tree contains a non-UTF-8 path".into()))?;
+    Ok((canonical_path(path)?, metadata))
 }
 
 fn path_components(path: &str) -> Vec<&str> {
