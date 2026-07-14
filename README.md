@@ -146,7 +146,10 @@ versions of selected regular files with `slatefs versioning commit` and its
 tenant, volume, path, and `-m <message>` arguments. `versioning log`,
 `versioning diff`, `versioning show`, and `versioning restore` inspect, compare,
 and recover those commits. `versioning tag`, `tags`, and `untag` manage
-immutable names for important commits.
+immutable names for important commits. `versioning branch`, `branches`, and
+`delete-branch` manage durable branch references; a branch name can be used
+where a commit or tag is accepted. Commits continue to advance `main` unless a
+branch is only being used as a named retention root.
 Show and restore stream versioned data in bounded chunks rather than loading a
 complete large file into memory.
 `versioning disable` stops all version operations but retains existing history;
@@ -169,9 +172,9 @@ served by `slatefsd`, the daemon applies count and age retention on its normal
 export-control poll; disabled, unserved, policyless, and never-committed
 volumes are untouched. `versioning gc` runs the same collection explicitly
 and `--dry-run` reports first; `versioning stats` reports logical usage.
-Tags pin their commit and Prolly tree through both automatic and explicit GC
-until the tag is deleted. `show`, `restore`, and `diff` accept either a commit
-ID or a tag name.
+Tags and branch heads pin their commit and Prolly tree through both automatic
+and explicit GC until the reference is deleted. `show`, `restore`, and `diff`
+accept a commit ID, tag name, or branch name.
 `versioning verify` checks the reachable commit hash chain and reads every
 referenced Prolly node and content blob.
 `versioning purge --yes` permanently removes the physical history prefix while
@@ -255,6 +258,9 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/tags` | List immutable commit tags. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/tags` | Create a retention-pinning tag from `{"name":"...","commit":"..."}`. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/tags/{name}` | Delete a tag without deleting its commit immediately. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | List branch heads, including `main`. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | Create a branch from `{"name":"...","commit":"commit-or-ref"}`. |
+| `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}` | Delete a non-main branch without deleting its commit immediately. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"...","idempotency_key":"..."}`; the retry key is optional and singular `path` remains accepted. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit-or-tag}/content?path=&offset=&length=` | Read a bounded file or symlink range as base64 JSON; defaults to 1 MiB and rejects ranges over 4 MiB. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore` | Atomically restore one file through the live writer from a commit ID or tag in `{"commit":"...","path":"..."}`. |

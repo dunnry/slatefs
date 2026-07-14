@@ -205,6 +205,9 @@ slatefs -c /etc/slatefs/slatefs.toml versioning diff <tenant> <volume> <from-com
 slatefs -c /etc/slatefs/slatefs.toml versioning tag <tenant> <volume> <name> <commit> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning tags <tenant> <volume> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning untag <tenant> <volume> <name> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning branch <tenant> <volume> <name> <commit-or-ref> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning branches <tenant> <volume> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning delete-branch <tenant> <volume> <name> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning show <tenant> <volume> <commit> <path> --out restored.bin --live
 slatefs -c /etc/slatefs/slatefs.toml versioning retention <tenant> <volume> --keep-last 100 --live
 slatefs -c /etc/slatefs/slatefs.toml versioning gc <tenant> <volume> --dry-run --live

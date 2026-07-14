@@ -912,11 +912,36 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
         .unwrap();
     assert_eq!(tag.name(), "milestone-1");
     assert_eq!(tag.commit(), commits[0].id);
+    let branch = repository
+        .create_branch("release", "milestone-1")
+        .await
+        .unwrap();
+    assert_eq!(branch.name(), "release");
+    assert_eq!(branch.commit(), commits[0].id);
     assert!(matches!(
         repository.create_tag("milestone-1", &commits[1].id).await,
         Err(Error::AlreadyExists { .. })
     ));
+    assert!(matches!(
+        repository.create_tag("release", &commits[1].id).await,
+        Err(Error::AlreadyExists { .. })
+    ));
+    assert!(matches!(
+        repository
+            .create_branch("milestone-1", &commits[1].id)
+            .await,
+        Err(Error::AlreadyExists { .. })
+    ));
+    assert!(matches!(
+        repository.create_branch("main", &commits[1].id).await,
+        Err(Error::Invalid { .. })
+    ));
     assert_eq!(repository.list_tags().await.unwrap(), vec![tag.clone()]);
+    let branches = repository.list_branches().await.unwrap();
+    assert_eq!(branches.len(), 2);
+    assert_eq!(branches[0].name(), "main");
+    assert_eq!(branches[0].commit(), commits[2].id);
+    assert_eq!(branches[1], branch);
     assert!(matches!(
         repository.create_tag(&"a".repeat(64), &commits[0].id).await,
         Err(Error::Invalid { .. })
@@ -947,6 +972,14 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
             .as_ref(),
         b"one"
     );
+    assert_eq!(
+        repository
+            .read_file("release", "/history.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"one"
+    );
     let tagged_diff = repository
         .diff_commits("milestone-1", &commits[2].id)
         .await
@@ -955,6 +988,18 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
     assert_eq!(tagged_diff[0].change(), VersionPathChangeKind::Modified);
     assert_eq!(repository.delete_tag("milestone-1").await.unwrap(), tag);
     assert!(repository.list_tags().await.unwrap().is_empty());
+    let still_branch_pinned = repository
+        .garbage_collect(Some(1), None, false)
+        .await
+        .unwrap();
+    assert_eq!(still_branch_pinned.retained_commits, 2);
+    assert_eq!(still_branch_pinned.deleted_commits, 0);
+    assert_eq!(repository.delete_branch("release").await.unwrap(), branch);
+    assert_eq!(repository.list_branches().await.unwrap().len(), 1);
+    assert!(matches!(
+        repository.delete_branch("main").await,
+        Err(Error::Invalid { .. })
+    ));
     let unpinned = repository
         .garbage_collect(Some(1), None, false)
         .await

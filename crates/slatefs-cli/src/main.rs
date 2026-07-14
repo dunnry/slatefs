@@ -17,7 +17,7 @@ use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{
-    VersionCommitInfo, VersionPathChangeKind, VersionRepository, VersionTagInfo,
+    VersionBranchInfo, VersionCommitInfo, VersionPathChangeKind, VersionRepository, VersionTagInfo,
     force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease,
 };
@@ -392,6 +392,30 @@ enum VersioningCmd {
     },
     /// Delete a commit tag so normal retention can reclaim it.
     Untag {
+        tenant: String,
+        volume: String,
+        name: String,
+        #[arg(long)]
+        live: bool,
+    },
+    /// Create a movable branch reference at an existing commit, tag, or branch.
+    Branch {
+        tenant: String,
+        volume: String,
+        name: String,
+        commit: String,
+        #[arg(long)]
+        live: bool,
+    },
+    /// List version branches, including the default main branch.
+    Branches {
+        tenant: String,
+        volume: String,
+        #[arg(long)]
+        live: bool,
+    },
+    /// Delete a non-main version branch.
+    DeleteBranch {
         tenant: String,
         volume: String,
         name: String,
@@ -985,6 +1009,10 @@ fn print_version_tag(tag: &VersionTagInfo) {
         tag.commit(),
         tag.created_at()
     );
+}
+
+fn print_version_branch(branch: &VersionBranchInfo) {
+    println!("{}\t{}", branch.name(), branch.commit());
 }
 
 async fn stream_version_file<W: AsyncWrite + Unpin>(
@@ -2342,6 +2370,124 @@ async fn run(
             .await?;
             print_version_tag(&tag);
         }
+        Command::Versioning(VersioningCmd::Branch {
+            tenant,
+            volume,
+            name,
+            commit,
+            live,
+        }) => {
+            if *live {
+                let response = post_live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    "branches",
+                    serde_json::json!({ "name": name, "commit": commit }),
+                )
+                .await?;
+                let branch: VersionBranchInfo = serde_json::from_value(response["branch"].clone())
+                    .context("parsing admin version branch")?;
+                print_version_branch(&branch);
+                return Ok(());
+            }
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let result = repository.create_branch(name, commit).await;
+            let repository_close = repository.close().await;
+            let branch = result?;
+            repository_close?;
+            append_cli_version_audit(
+                control,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-branch-create".to_string()),
+                    ),
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(branch.name().to_string()),
+                    ),
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(branch.commit().to_string()),
+                    ),
+                ],
+            )
+            .await?;
+            print_version_branch(&branch);
+        }
+        Command::Versioning(VersioningCmd::Branches {
+            tenant,
+            volume,
+            live,
+        }) => {
+            if *live {
+                let response =
+                    live_versioning_json(config, tenant, volume, "GET", "branches", &[], None)
+                        .await?;
+                let branches: Vec<VersionBranchInfo> =
+                    serde_json::from_value(response["branches"].clone())
+                        .context("parsing admin version branches")?;
+                for branch in branches {
+                    print_version_branch(&branch);
+                }
+                return Ok(());
+            }
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let result = repository.list_branches().await;
+            let repository_close = repository.close().await;
+            for branch in result? {
+                print_version_branch(&branch);
+            }
+            repository_close?;
+        }
+        Command::Versioning(VersioningCmd::DeleteBranch {
+            tenant,
+            volume,
+            name,
+            live,
+        }) => {
+            if *live {
+                let endpoint = format!("branches/{name}");
+                let response =
+                    live_versioning_json(config, tenant, volume, "DELETE", &endpoint, &[], None)
+                        .await?;
+                let branch: VersionBranchInfo = serde_json::from_value(response["branch"].clone())
+                    .context("parsing deleted admin version branch")?;
+                print_version_branch(&branch);
+                return Ok(());
+            }
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let result = repository.delete_branch(name).await;
+            let repository_close = repository.close().await;
+            let branch = result?;
+            repository_close?;
+            append_cli_version_audit(
+                control,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-branch-delete".to_string()),
+                    ),
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(branch.name().to_string()),
+                    ),
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(branch.commit().to_string()),
+                    ),
+                ],
+            )
+            .await?;
+            print_version_branch(&branch);
+        }
         Command::Versioning(VersioningCmd::Show {
             tenant,
             volume,
@@ -3591,6 +3737,46 @@ mod tests {
                 live: true,
                 ..
             }) if name == "baseline" && commit == "commit-id"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "branch",
+            "tenant-a",
+            "docs",
+            "release",
+            "baseline",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::Branch {
+                name,
+                commit,
+                live: true,
+                ..
+            }) if name == "release" && commit == "baseline"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "delete-branch",
+            "tenant-a",
+            "docs",
+            "release",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::DeleteBranch {
+                name,
+                live: true,
+                ..
+            }) if name == "release"
         ));
     }
 }

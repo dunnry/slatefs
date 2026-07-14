@@ -125,7 +125,7 @@ the live VFS request path. Its logical key prefixes are:
 | `pb/<content-id>` | Prolly | content-addressed file chunk blob |
 | `pc/<sha256-commit-id>` | 1 | `VersionCommit` |
 | `pi/<sha256-idempotency-key>` | 1 | commit ID and canonical request fingerprint |
-| `pr/heads/main` | 1 | current `VersionRef` |
+| `pr/heads/<name>` | 1 | mutable branch `VersionRef`; `main` is the default commit head |
 | `pr/tags/<name>` | 1 | immutable named commit reference and creation time |
 
 Entry metadata (`m/<canonical-path>`) and file chunk references

@@ -34,6 +34,7 @@ const BLOB_PREFIX: &[u8] = b"pb/";
 const COMMIT_PREFIX: &[u8] = b"pc/";
 const IDEMPOTENCY_PREFIX: &[u8] = b"pi/";
 const PRUNED_COMMIT_PREFIX: &[u8] = b"pp/";
+const BRANCH_PREFIX: &[u8] = b"pr/heads/";
 const HEAD_KEY: &[u8] = b"pr/heads/main";
 const TAG_PREFIX: &[u8] = b"pr/tags/";
 const LEGACY_FILE_META_VERSION: u8 = 1;
@@ -449,11 +450,34 @@ impl VersionStore {
     }
 
     async fn get_head(&self) -> Result<Option<VersionRef>> {
-        self.get_raw(HEAD_KEY)
+        self.get_ref(HEAD_KEY).await
+    }
+
+    async fn get_ref(&self, key: &[u8]) -> Result<Option<VersionRef>> {
+        self.get_raw(key)
             .await
             .map_err(version_store_error)?
             .map(|bytes| decode_versioned(REF_VERSION, &bytes, "version ref"))
             .transpose()
+    }
+
+    async fn get_branch(&self, name: &str) -> Result<Option<VersionRef>> {
+        self.get_ref(&branch_key(name)).await
+    }
+
+    async fn list_branches(&self) -> Result<Vec<(String, VersionRef)>> {
+        let mut iter = self.db.scan_prefix(BRANCH_PREFIX, ..).await?;
+        let mut branches = Vec::new();
+        while let Some(entry) = iter.next().await? {
+            let name =
+                std::str::from_utf8(entry.key.strip_prefix(BRANCH_PREFIX).unwrap_or_default())
+                    .map_err(|_| Error::Versioning("version branch name is not UTF-8".into()))?
+                    .to_string();
+            let reference = decode_versioned(REF_VERSION, &entry.value, "version ref")?;
+            branches.push((name, reference));
+        }
+        branches.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(branches)
     }
 
     async fn get_commit(&self, id: &[u8; 32]) -> Result<VersionCommit> {
@@ -584,13 +608,14 @@ impl VersionStore {
         Ok(tags)
     }
 
-    async fn get_tag(&self, name: &str) -> Result<VersionTag> {
-        self.get_raw(&tag_key(name))
+    async fn try_get_tag(&self, name: &str) -> Result<Option<VersionTag>> {
+        let tag = self
+            .get_raw(&tag_key(name))
             .await
             .map_err(version_store_error)?
             .map(|bytes| decode_versioned(TAG_VERSION, &bytes, "version tag"))
-            .transpose()?
-            .ok_or_else(|| Error::not_found("version tag", name))
+            .transpose()?;
+        Ok(tag)
     }
 
     async fn create_tag(&self, tag: &VersionTag) -> Result<()> {
@@ -603,6 +628,9 @@ impl VersionStore {
             .is_some()
         {
             return Err(Error::already_exists("version tag", &tag.name));
+        }
+        if self.get_branch(&tag.name).await?.is_some() {
+            return Err(Error::already_exists("version branch", &tag.name));
         }
         self.db
             .put_bytes(key.into(), encode_versioned(TAG_VERSION, tag)?.into())
@@ -624,6 +652,34 @@ impl VersionStore {
         self.db.delete(key).await?;
         self.db.flush().await?;
         Ok(tag)
+    }
+
+    async fn create_branch(&self, name: &str, reference: &VersionRef) -> Result<()> {
+        let _guard = self.ref_lock.lock().await;
+        let key = branch_key(name);
+        if self.get_ref(&key).await?.is_some() {
+            return Err(Error::already_exists("version branch", name));
+        }
+        if self.try_get_tag(name).await?.is_some() {
+            return Err(Error::already_exists("version tag", name));
+        }
+        self.db
+            .put_bytes(key.into(), encode_versioned(REF_VERSION, reference)?.into())
+            .await?;
+        self.db.flush().await?;
+        Ok(())
+    }
+
+    async fn delete_branch(&self, name: &str) -> Result<VersionRef> {
+        let _guard = self.ref_lock.lock().await;
+        let key = branch_key(name);
+        let reference = self
+            .get_ref(&key)
+            .await?
+            .ok_or_else(|| Error::not_found("version branch", name))?;
+        self.db.delete(key).await?;
+        self.db.flush().await?;
+        Ok(reference)
     }
 }
 
@@ -804,6 +860,23 @@ pub struct VersionTagInfo {
     name: String,
     commit: String,
     created_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionBranchInfo {
+    name: String,
+    commit: String,
+}
+
+impl VersionBranchInfo {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
 }
 
 impl VersionTagInfo {
@@ -1176,6 +1249,53 @@ impl VersionRepository {
             next = commit.parent;
             commits += 1;
         }
+        if let (Some(head), Some(tree)) = (head.as_ref(), trees.first())
+            && head.tree.to_tree() != *tree
+        {
+            return Err(Error::Versioning(
+                "head tree does not match the head commit".into(),
+            ));
+        }
+        for (name, branch) in self.store.list_branches().await? {
+            if name == "main" {
+                continue;
+            }
+            let commit = self
+                .store
+                .get_commit(&branch.commit_id)
+                .await
+                .map_err(|_| {
+                    Error::Versioning(format!(
+                        "version branch {name} references missing commit {}",
+                        hex::encode(branch.commit_id)
+                    ))
+                })?;
+            if branch.tree.to_tree() != commit.tree.to_tree() {
+                return Err(Error::Versioning(format!(
+                    "version branch {name} tree does not match commit {}",
+                    hex::encode(branch.commit_id)
+                )));
+            }
+            if !seen.insert(branch.commit_id) {
+                continue;
+            }
+            let body = VersionCommitBody {
+                parent: commit.parent,
+                tree: commit.tree.clone(),
+                created_at: commit.created_at,
+                message: commit.message.clone(),
+                paths: commit.paths.clone(),
+            };
+            let expected: [u8; 32] = Sha256::digest(postcard::to_allocvec(&body)?).into();
+            if expected != commit.id || commit.id != branch.commit_id {
+                return Err(Error::Versioning(format!(
+                    "branch commit {} does not match its content hash",
+                    hex::encode(branch.commit_id)
+                )));
+            }
+            trees.push(commit.tree.to_tree());
+            commits += 1;
+        }
         for tag in self.store.list_tags().await? {
             if !seen.insert(tag.commit_id) {
                 continue;
@@ -1203,13 +1323,6 @@ impl VersionRepository {
             }
             trees.push(commit.tree.to_tree());
             commits += 1;
-        }
-        if let (Some(head), Some(tree)) = (head, trees.first())
-            && head.tree.to_tree() != *tree
-        {
-            return Err(Error::Versioning(
-                "head tree does not match the head commit".into(),
-            ));
         }
 
         let nodes = self
@@ -1271,6 +1384,29 @@ impl VersionRepository {
             .iter()
             .map(|commit| commit.id)
             .collect::<HashSet<_>>();
+        for (name, branch) in self.store.list_branches().await? {
+            if name == "main" || !retained_commit_ids.insert(branch.commit_id) {
+                continue;
+            }
+            let commit = if let Some(commit) = chain
+                .iter()
+                .find(|commit| commit.id == branch.commit_id)
+                .cloned()
+            {
+                commit
+            } else {
+                self.store
+                    .try_get_commit(&branch.commit_id)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::Versioning(format!(
+                            "version branch {name} references missing commit {}",
+                            hex::encode(branch.commit_id)
+                        ))
+                    })?
+            };
+            retained.push(commit);
+        }
         for tag in self.store.list_tags().await? {
             if retained_commit_ids.insert(tag.commit_id) {
                 let commit = if let Some(commit) = chain
@@ -1685,6 +1821,56 @@ impl VersionRepository {
         Ok(self.store.delete_tag(name).await?.into())
     }
 
+    /// Create a named branch at an existing commit or named reference. The
+    /// branch head pins that commit and tree through retention GC.
+    pub async fn create_branch(&self, name: &str, commit: &str) -> Result<VersionBranchInfo> {
+        validate_version_branch_name(name)?;
+        if name == "main" {
+            return Err(Error::invalid(
+                "version branch",
+                "main already exists as the default branch",
+            ));
+        }
+        let commit = self.resolve_commit(commit).await?;
+        let reference = VersionRef {
+            commit_id: commit.id,
+            tree: commit.tree,
+        };
+        self.store.create_branch(name, &reference).await?;
+        Ok(VersionBranchInfo {
+            name: name.to_string(),
+            commit: hex::encode(reference.commit_id),
+        })
+    }
+
+    pub async fn list_branches(&self) -> Result<Vec<VersionBranchInfo>> {
+        Ok(self
+            .store
+            .list_branches()
+            .await?
+            .into_iter()
+            .map(|(name, reference)| VersionBranchInfo {
+                name,
+                commit: hex::encode(reference.commit_id),
+            })
+            .collect())
+    }
+
+    pub async fn delete_branch(&self, name: &str) -> Result<VersionBranchInfo> {
+        validate_version_branch_name(name)?;
+        if name == "main" {
+            return Err(Error::invalid(
+                "version branch",
+                "the default main branch cannot be deleted",
+            ));
+        }
+        let reference = self.store.delete_branch(name).await?;
+        Ok(VersionBranchInfo {
+            name: name.to_string(),
+            commit: hex::encode(reference.commit_id),
+        })
+    }
+
     pub async fn history(
         &self,
         path: Option<&str>,
@@ -2001,15 +2187,28 @@ impl VersionRepository {
         if let Ok(id) = parse_commit_id(reference) {
             return self.store.get_commit(&id).await;
         }
-        validate_version_tag_name(reference)?;
-        let tag = self.store.get_tag(reference).await?;
-        self.store.get_commit(&tag.commit_id).await.map_err(|_| {
-            Error::Versioning(format!(
-                "version tag {} references missing commit {}",
-                tag.name,
-                hex::encode(tag.commit_id)
-            ))
-        })
+        validate_version_named_ref("version reference", reference)?;
+        if let Some(tag) = self.store.try_get_tag(reference).await? {
+            return self.store.get_commit(&tag.commit_id).await.map_err(|_| {
+                Error::Versioning(format!(
+                    "version tag {} references missing commit {}",
+                    tag.name,
+                    hex::encode(tag.commit_id)
+                ))
+            });
+        }
+        if let Some(branch) = self.store.get_branch(reference).await? {
+            return self.store.get_commit(&branch.commit_id).await.map_err(|_| {
+                Error::Versioning(format!(
+                    "version branch {reference} references missing commit {}",
+                    hex::encode(branch.commit_id)
+                ))
+            });
+        }
+        Err(Error::not_found(
+            "version commit, tag, or branch",
+            reference,
+        ))
     }
 }
 
@@ -2249,6 +2448,10 @@ fn tag_key(name: &str) -> Vec<u8> {
     prefixed_key(TAG_PREFIX, name.as_bytes())
 }
 
+fn branch_key(name: &str) -> Vec<u8> {
+    prefixed_key(BRANCH_PREFIX, name.as_bytes())
+}
+
 fn idempotency_key(key_hash: &[u8; 32]) -> Vec<u8> {
     prefixed_key(IDEMPOTENCY_PREFIX, key_hash)
 }
@@ -2274,9 +2477,17 @@ fn commit_id_string(id: &[u8; 32]) -> String {
 }
 
 fn validate_version_tag_name(name: &str) -> Result<()> {
+    validate_version_named_ref("version tag", name)
+}
+
+fn validate_version_branch_name(name: &str) -> Result<()> {
+    validate_version_named_ref("version branch", name)
+}
+
+fn validate_version_named_ref(what: &'static str, name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 128 {
         return Err(Error::invalid(
-            "version tag",
+            what,
             "must contain 1 to 128 ASCII characters",
         ));
     }
@@ -2288,7 +2499,7 @@ fn validate_version_tag_name(name: &str) -> Result<()> {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
         return Err(Error::invalid(
-            "version tag",
+            what,
             "use only ASCII letters, digits, '.', '_', or '-' and do not use a SHA-256-shaped name",
         ));
     }

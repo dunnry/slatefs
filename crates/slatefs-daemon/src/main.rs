@@ -990,6 +990,13 @@ struct VersionTagCreateRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct VersionBranchCreateRequest {
+    name: String,
+    commit: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VersionPolicyPatchRequest {
     enabled: bool,
 }
@@ -2358,6 +2365,116 @@ async fn delete_version_tag_response(
     repository_close.map_err(core_error)?;
     control_close.map_err(core_error)?;
     Ok(AdminHttpResponse::json(200, json!({ "tag": tag })))
+}
+
+async fn list_version_branches_response(
+    state: &AdminState,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository.list_branches().await;
+    let branches = finish_version_repository(control, repository, result).await?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "branches": branches }),
+    ))
+}
+
+async fn create_version_branch_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let body: VersionBranchCreateRequest = parse_json_body(request)?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository.create_branch(&body.name, &body.commit).await;
+    let audit = match &result {
+        Ok(branch) => {
+            append_version_audit(
+                &control,
+                request,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-branch-create".to_string()),
+                    ),
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(branch.name().to_string()),
+                    ),
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(branch.commit().to_string()),
+                    ),
+                ],
+            )
+            .await
+        }
+        Err(_) => Ok(()),
+    };
+    let repository_close = repository.close().await;
+    let control_close = control.close().await;
+    let branch = result.map_err(core_error)?;
+    audit?;
+    repository_close.map_err(core_error)?;
+    control_close.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(201, json!({ "branch": branch })))
+}
+
+async fn delete_version_branch_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+    name: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository.delete_branch(name).await;
+    let audit = match &result {
+        Ok(branch) => {
+            append_version_audit(
+                &control,
+                request,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-branch-delete".to_string()),
+                    ),
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(branch.name().to_string()),
+                    ),
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(branch.commit().to_string()),
+                    ),
+                ],
+            )
+            .await
+        }
+        Err(_) => Ok(()),
+    };
+    let repository_close = repository.close().await;
+    let control_close = control.close().await;
+    let branch = result.map_err(core_error)?;
+    audit?;
+    repository_close.map_err(core_error)?;
+    control_close.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(200, json!({ "branch": branch })))
 }
 
 async fn get_version_content_response(
@@ -3881,6 +3998,46 @@ async fn route_admin_request(
                 name,
             ],
         ) => delete_version_tag_response(state, request, tenant, volume, name).await,
+        (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "branches",
+            ],
+        ) => list_version_branches_response(state, tenant, volume).await,
+        (
+            "POST",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "branches",
+            ],
+        ) => create_version_branch_response(state, request, tenant, volume).await,
+        (
+            "DELETE",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "branches",
+                name,
+            ],
+        ) => delete_version_branch_response(state, request, tenant, volume, name).await,
         (
             "POST",
             [
@@ -6968,18 +7125,57 @@ mod tests {
         assert_eq!(response_status(&tags_response), 200, "{tags_response}");
         let tags: Value = serde_json::from_str(response_body(&tags_response)).unwrap();
         assert_eq!(tags["tags"].as_array().unwrap().len(), 1);
+        let branch_body = r#"{"name":"release","commit":"baseline"}"#;
+        let branch_request = format!(
+            "POST /admin/v1/tenants/t/volumes/v/versioning/branches HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            branch_body.len(),
+            branch_body
+        );
+        let branch_response = admin_exchange(Arc::clone(&state), branch_request.as_bytes()).await;
+        assert_eq!(response_status(&branch_response), 201, "{branch_response}");
+        let branch: Value = serde_json::from_str(response_body(&branch_response)).unwrap();
+        assert_eq!(branch["branch"]["name"], "release");
+        assert_eq!(branch["branch"]["commit"], commit_id);
+        let branches_response = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning/branches HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            response_status(&branches_response),
+            200,
+            "{branches_response}"
+        );
+        let branches: Value = serde_json::from_str(response_body(&branches_response)).unwrap();
+        assert_eq!(branches["branches"].as_array().unwrap().len(), 2);
         let tagged_content = admin_exchange(
             Arc::clone(&state),
             b"GET /admin/v1/tenants/t/volumes/v/versioning/commits/baseline/content?path=/notes.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
         .await;
         assert_eq!(response_status(&tagged_content), 200, "{tagged_content}");
+        let branch_content = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning/commits/release/content?path=/notes.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&branch_content), 200, "{branch_content}");
         let untag_response = admin_exchange(
             Arc::clone(&state),
             b"DELETE /admin/v1/tenants/t/volumes/v/versioning/tags/baseline HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
         .await;
         assert_eq!(response_status(&untag_response), 200, "{untag_response}");
+        let delete_branch_response = admin_exchange(
+            Arc::clone(&state),
+            b"DELETE /admin/v1/tenants/t/volumes/v/versioning/branches/release HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            response_status(&delete_branch_response),
+            200,
+            "{delete_branch_response}"
+        );
 
         let history_response = admin_exchange(
             Arc::clone(&state),
@@ -7187,7 +7383,7 @@ mod tests {
             let expected = if action == AuditAction::VersionCommit {
                 2
             } else if action == AuditAction::Maintain {
-                3
+                5
             } else {
                 1
             };

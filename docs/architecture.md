@@ -74,11 +74,14 @@ block transformer. Normal VFS, NFS, and 9P operations do not open or update it.
 
 Each commit applies file metadata and content-chunk references to an immutable
 Prolly tree. Chunks are content-addressed blobs, commit IDs are SHA-256 hashes,
-and `heads/main` points to the current commit. Publishing the commit and branch
-reference is one SlateDB batch after the new immutable tree nodes and blobs
-have been written. Disabling versioning blocks repository operations without
-deleting its history. Volume deletion removes both the live and optional
-version-store prefixes.
+and `heads/main` points to the current commit. Additional named branch
+references can point to any existing commit, tag, or branch and can be used by
+read, restore, and diff operations. Commits currently advance `main`;
+branch-targeted publication is a separate operation. Publishing a commit and
+the main reference is one SlateDB batch after the new immutable tree nodes and
+blobs have been written. Disabling versioning blocks repository operations
+without deleting its history. Volume deletion removes both the live and
+optional version-store prefixes.
 
 Explicit version operations are serialized across processes before a SlateDB
 version writer is opened. SlateFS creates or conditionally replaces the
@@ -112,8 +115,9 @@ always retained. The daemon enforces count and age policies only for enabled
 filesystem volumes whose writable backend it currently serves. It opens only
 an existing history under the repository lease, preserving lazy creation and
 avoiding work on disabled, unserved, or policyless volumes. Immutable named
-tags add their referenced commit and tree to the GC reachability roots. A physical purge
-deletes the separate version database prefix under the same lease.
+tags and named branch heads add their referenced commit and tree to the GC
+reachability roots. A physical purge deletes the separate version database
+prefix under the same lease.
 
 ## Request Path
 
