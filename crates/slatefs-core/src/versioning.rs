@@ -31,6 +31,7 @@ use crate::volume::Volume;
 const NODE_PREFIX: &[u8] = b"pn/";
 const BLOB_PREFIX: &[u8] = b"pb/";
 const COMMIT_PREFIX: &[u8] = b"pc/";
+const PRUNED_COMMIT_PREFIX: &[u8] = b"pp/";
 const HEAD_KEY: &[u8] = b"pr/heads/main";
 const LEGACY_FILE_META_VERSION: u8 = 1;
 const ENTRY_META_VERSION: u8 = 2;
@@ -84,6 +85,13 @@ impl VersionStore {
             .map_err(version_store_error)?
             .map(|bytes| decode_versioned(COMMIT_VERSION, &bytes, "version commit"))
             .transpose()
+    }
+
+    async fn is_pruned_commit(&self, id: &[u8; 32]) -> Result<bool> {
+        self.get_raw(&pruned_commit_key(id))
+            .await
+            .map(|value| value.is_some())
+            .map_err(version_store_error)
     }
 
     async fn publish_commit(
@@ -294,6 +302,15 @@ pub struct VersionGcReport {
     pub dry_run: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionVerifyReport {
+    pub commits: u64,
+    pub nodes: u64,
+    pub node_bytes: u64,
+    pub blobs: u64,
+    pub blob_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionFileRange {
     pub offset: u64,
@@ -410,6 +427,84 @@ impl VersionRepository {
         Ok(stats)
     }
 
+    /// Verify the reachable commit chain and every referenced Prolly node and
+    /// blob. Unreachable objects are intentionally left to garbage collection.
+    pub async fn verify(&self) -> Result<VersionVerifyReport> {
+        let head = self.store.get_head().await?;
+        let mut next = head.as_ref().map(|head| head.commit_id);
+        let mut seen = HashSet::new();
+        let mut trees = Vec::new();
+        let mut commits = 0u64;
+        while let Some(id) = next {
+            if !seen.insert(id) {
+                return Err(Error::Versioning(format!(
+                    "commit chain contains a cycle at {}",
+                    hex::encode(id)
+                )));
+            }
+            let Some(commit) = self.store.try_get_commit(&id).await? else {
+                if self.store.is_pruned_commit(&id).await? {
+                    break;
+                }
+                return Err(Error::not_found("version commit", hex::encode(id)));
+            };
+            let body = VersionCommitBody {
+                parent: commit.parent,
+                tree: commit.tree.clone(),
+                created_at: commit.created_at,
+                message: commit.message.clone(),
+                paths: commit.paths.clone(),
+            };
+            let expected: [u8; 32] = Sha256::digest(postcard::to_allocvec(&body)?).into();
+            if expected != commit.id || commit.id != id {
+                return Err(Error::Versioning(format!(
+                    "commit {} does not match its content hash",
+                    hex::encode(id)
+                )));
+            }
+            trees.push(commit.tree.to_tree());
+            next = commit.parent;
+            commits += 1;
+        }
+        if let (Some(head), Some(tree)) = (head, trees.first())
+            && head.tree.to_tree() != *tree
+        {
+            return Err(Error::Versioning(
+                "head tree does not match the head commit".into(),
+            ));
+        }
+
+        let nodes = self
+            .prolly
+            .mark_reachable(&trees)
+            .await
+            .map_err(prolly_error)?;
+        let blobs = self
+            .prolly
+            .mark_reachable_blobs(&trees)
+            .await
+            .map_err(prolly_error)?;
+        for reference in &blobs.live_blobs {
+            self.store
+                .get_blob(reference)
+                .await
+                .map_err(version_store_error)?
+                .ok_or_else(|| {
+                    Error::Versioning(format!(
+                        "missing reachable blob {}",
+                        hex::encode(reference.cid.as_bytes())
+                    ))
+                })?;
+        }
+        Ok(VersionVerifyReport {
+            commits,
+            nodes: nodes.live_nodes as u64,
+            node_bytes: nodes.live_bytes as u64,
+            blobs: blobs.live_blob_count as u64,
+            blob_bytes: blobs.live_blob_bytes,
+        })
+    }
+
     pub async fn garbage_collect(
         &self,
         keep_last: Option<u32>,
@@ -490,6 +585,9 @@ impl VersionRepository {
                     false
                 } else {
                     report.deleted_commits += 1;
+                    if !dry_run {
+                        deletions.put(pruned_commit_key_bytes(id), Vec::<u8>::new());
+                    }
                     true
                 }
             } else {
@@ -1184,6 +1282,14 @@ fn blob_key(cid: &Cid) -> Vec<u8> {
 
 fn commit_key(id: &[u8; 32]) -> Vec<u8> {
     prefixed_key(COMMIT_PREFIX, id)
+}
+
+fn pruned_commit_key(id: &[u8; 32]) -> Vec<u8> {
+    prefixed_key(PRUNED_COMMIT_PREFIX, id)
+}
+
+fn pruned_commit_key_bytes(id: &[u8]) -> Vec<u8> {
+    prefixed_key(PRUNED_COMMIT_PREFIX, id)
 }
 
 fn parse_commit_id(value: &str) -> Result<[u8; 32]> {

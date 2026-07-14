@@ -88,6 +88,10 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
     assert_eq!(history.len(), 2);
     assert_eq!(history[0].id, second.id);
     assert_eq!(history[1].id, first.id);
+    let verified = repository.verify().await.unwrap();
+    assert_eq!(verified.commits, 2);
+    assert!(verified.nodes > 0);
+    assert!(verified.blobs > 0);
     assert_eq!(
         repository
             .read_file(&first.id, "/notes.txt")
@@ -630,6 +634,7 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
     let history = repository.history(None, 10).await.unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].id, commits[2].id);
+    assert_eq!(repository.verify().await.unwrap().commits, 1);
     assert!(
         repository
             .read_file(&commits[0].id, "/history.txt")

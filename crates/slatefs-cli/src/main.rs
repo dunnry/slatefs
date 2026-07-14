@@ -388,6 +388,13 @@ enum VersioningCmd {
         #[arg(long)]
         live: bool,
     },
+    /// Verify the reachable commit chain, Prolly nodes, and content blobs.
+    Verify {
+        tenant: String,
+        volume: String,
+        #[arg(long)]
+        live: bool,
+    },
     /// Remove commits, nodes, and blobs unreachable under the retention policy.
     Gc {
         tenant: String,
@@ -2151,6 +2158,34 @@ async fn run(
             println!("commits: {}", stats.commits);
             println!("nodes: {}", stats.nodes);
             println!("blobs: {}", stats.blobs);
+        }
+        Command::Versioning(VersioningCmd::Verify {
+            tenant,
+            volume,
+            live,
+        }) => {
+            if *live {
+                let response =
+                    live_versioning_json(config, tenant, volume, "GET", "verify", &[], None)
+                        .await?;
+                let report = &response["verify"];
+                println!("commits: {}", report["commits"]);
+                println!("nodes: {}", report["nodes"]);
+                println!("node_bytes: {}", report["node_bytes"]);
+                println!("blobs: {}", report["blobs"]);
+                println!("blob_bytes: {}", report["blob_bytes"]);
+                return Ok(());
+            }
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let report = repository.verify().await;
+            let close = repository.close().await;
+            let report = report?;
+            close?;
+            println!("commits: {}", report.commits);
+            println!("nodes: {}", report.nodes);
+            println!("node_bytes: {}", report.node_bytes);
+            println!("blobs: {}", report.blobs);
+            println!("blob_bytes: {}", report.blob_bytes);
         }
         Command::Versioning(VersioningCmd::Gc {
             tenant,

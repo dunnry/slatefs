@@ -205,6 +205,7 @@ slatefs -c /etc/slatefs/slatefs.toml versioning show <tenant> <volume> <commit> 
 slatefs -c /etc/slatefs/slatefs.toml versioning retention <tenant> <volume> --keep-last 100 --live
 slatefs -c /etc/slatefs/slatefs.toml versioning gc <tenant> <volume> --dry-run --live
 slatefs -c /etc/slatefs/slatefs.toml versioning stats <tenant> <volume> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning verify <tenant> <volume> --live
 ```
 
 The CLI supplies the matching `[admin.tenant_tokens]` credential when present,
@@ -225,6 +226,7 @@ slatefs -c /etc/slatefs/slatefs.toml versioning retention <tenant> <volume> --ke
 slatefs -c /etc/slatefs/slatefs.toml versioning gc <tenant> <volume> --dry-run
 slatefs -c /etc/slatefs/slatefs.toml versioning gc <tenant> <volume>
 slatefs -c /etc/slatefs/slatefs.toml versioning stats <tenant> <volume>
+slatefs -c /etc/slatefs/slatefs.toml versioning verify <tenant> <volume>
 ```
 
 `versioning show` and restore stream large files in volume-sized chunks. Admin

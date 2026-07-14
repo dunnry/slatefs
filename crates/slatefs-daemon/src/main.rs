@@ -2186,6 +2186,30 @@ async fn get_version_stats_response(
     ))
 }
 
+async fn verify_version_history_response(
+    state: &AdminState,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository.verify().await;
+    let report = finish_version_repository(control, repository, result).await?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({
+            "verify": {
+                "commits": report.commits,
+                "nodes": report.nodes,
+                "node_bytes": report.node_bytes,
+                "blobs": report.blobs,
+                "blob_bytes": report.blob_bytes,
+            }
+        }),
+    ))
+}
+
 async fn get_version_retention_response(
     state: &AdminState,
     tenant: &str,
@@ -3556,6 +3580,19 @@ async fn route_admin_request(
                 "stats",
             ],
         ) => get_version_stats_response(state, tenant, volume).await,
+        (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "verify",
+            ],
+        ) => verify_version_history_response(state, tenant, volume).await,
         (
             "GET",
             [
@@ -6394,6 +6431,17 @@ mod tests {
         assert_eq!(response_status(&stats_response), 200, "{stats_response}");
         let stats: Value = serde_json::from_str(response_body(&stats_response)).unwrap();
         assert_eq!(stats["stats"]["commits"], 1);
+
+        let verify_response = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning/verify HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&verify_response), 200, "{verify_response}");
+        let verify: Value = serde_json::from_str(response_body(&verify_response)).unwrap();
+        assert_eq!(verify["verify"]["commits"], 1);
+        assert!(verify["verify"]["nodes"].as_u64().unwrap() > 0);
+        assert!(verify["verify"]["blobs"].as_u64().unwrap() > 0);
 
         let gc_body = r#"{"dry_run":true}"#;
         let gc_request = format!(

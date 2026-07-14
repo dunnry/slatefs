@@ -165,6 +165,8 @@ History lifecycle is explicit. `versioning retention` sets `--keep-last`,
 `--max-age`, and/or a hard `--max-bytes` history quota. `versioning gc`
 removes commits outside that policy plus unreachable Prolly nodes and content
 blobs (`--dry-run` reports first); `versioning stats` reports logical usage.
+`versioning verify` checks the reachable commit hash chain and reads every
+referenced Prolly node and content blob.
 `versioning purge --yes` permanently removes the physical history prefix while
 leaving versioning enabled for a fresh next commit. Commit, restore, retention,
 GC, and purge actions emit durable audit records, and live daemon operations
@@ -234,6 +236,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit}/content?path=&offset=&length=` | Read a bounded file or symlink range as base64 JSON; defaults to 1 MiB and rejects ranges over 4 MiB. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore` | Atomically restore one file through the live writer from `{"commit":"...","path":"..."}`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/stats` | Logical history bytes, nodes, blobs, and commits. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/verify` | Verify the reachable commit hash chain, Prolly nodes, and content blobs. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Current history retention and quota policy. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Set `keep_last`, `max_age_secs`, and/or `max_bytes`, or `{"clear":true}`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/gc` | Apply retention, or report with `{"dry_run":true}`. |
