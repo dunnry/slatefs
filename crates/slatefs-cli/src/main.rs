@@ -17,8 +17,8 @@ use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{
-    VersionBranchInfo, VersionCommitInfo, VersionMergeInfo, VersionMergePreview,
-    VersionPathChangeKind, VersionRepository, VersionTagInfo,
+    VersionBranchInfo, VersionCommitInfo, VersionMergeConflictStrategy, VersionMergeInfo,
+    VersionMergePreview, VersionPathChangeKind, VersionRepository, VersionTagInfo,
     force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease,
 };
@@ -429,12 +429,15 @@ enum VersioningCmd {
         #[arg(long)]
         live: bool,
     },
-    /// Fast-forward a target branch to a source branch.
+    /// Merge a source branch into a target branch.
     Merge {
         tenant: String,
         volume: String,
         source: String,
         target: String,
+        /// Resolve conflicts by failing, keeping target paths, or keeping source paths.
+        #[arg(long, default_value = "fail", value_parser = parse_version_merge_conflict_strategy)]
+        conflict_strategy: VersionMergeConflictStrategy,
         #[arg(long)]
         live: bool,
     },
@@ -910,6 +913,17 @@ fn parse_atime_mode(s: &str) -> Result<config::AtimeMode, String> {
     }
 }
 
+fn parse_version_merge_conflict_strategy(s: &str) -> Result<VersionMergeConflictStrategy, String> {
+    match s {
+        "fail" => Ok(VersionMergeConflictStrategy::Fail),
+        "ours" => Ok(VersionMergeConflictStrategy::Ours),
+        "theirs" => Ok(VersionMergeConflictStrategy::Theirs),
+        _ => Err(format!(
+            "unknown merge conflict strategy {s:?} (fail|ours|theirs)"
+        )),
+    }
+}
+
 fn parse_client_addr_rule(s: &str) -> Result<ClientAddrRule, String> {
     s.parse()
 }
@@ -1049,7 +1063,7 @@ fn print_version_branch(branch: &VersionBranchInfo) {
 
 fn print_version_merge(merge: &VersionMergeInfo) {
     println!(
-        "{} -> {}\t{}\t{}",
+        "{} -> {}\t{}\t{}\tstrategy={}",
         merge.source(),
         merge.target(),
         merge.commit(),
@@ -1059,7 +1073,8 @@ fn print_version_merge(merge: &VersionMergeInfo) {
             "already-up-to-date"
         } else {
             "three-way"
-        }
+        },
+        merge.strategy().as_str(),
     );
 }
 
@@ -2569,6 +2584,7 @@ async fn run(
             volume,
             source,
             target,
+            conflict_strategy,
             live,
         }) => {
             if *live {
@@ -2578,7 +2594,10 @@ async fn run(
                     tenant,
                     volume,
                     &endpoint,
-                    serde_json::json!({ "source": source }),
+                    serde_json::json!({
+                        "source": source,
+                        "conflict_strategy": conflict_strategy,
+                    }),
                 )
                 .await?;
                 let merge: VersionMergeInfo = serde_json::from_value(response["merge"].clone())
@@ -2587,7 +2606,9 @@ async fn run(
                 return Ok(());
             }
             let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
-            let result = repository.merge_branch(source, target).await;
+            let result = repository
+                .merge_branch(source, target, *conflict_strategy)
+                .await;
             let repository_close = repository.close().await;
             let merge = result?;
             repository_close?;
@@ -2612,6 +2633,10 @@ async fn run(
                     (
                         "commit".to_string(),
                         AuditDetailValue::String(merge.commit().to_string()),
+                    ),
+                    (
+                        "conflict_strategy".to_string(),
+                        AuditDetailValue::String(merge.strategy().as_str().to_string()),
                     ),
                     (
                         "fast_forward".to_string(),
@@ -3956,6 +3981,8 @@ mod tests {
             "docs",
             "draft",
             "main",
+            "--conflict-strategy",
+            "theirs",
             "--live",
         ])
         .unwrap();
@@ -3964,6 +3991,7 @@ mod tests {
             Command::Versioning(VersioningCmd::Merge {
                 source,
                 target,
+                conflict_strategy: VersionMergeConflictStrategy::Theirs,
                 live: true,
                 ..
             }) if source == "draft" && target == "main"

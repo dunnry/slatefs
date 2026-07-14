@@ -10,8 +10,9 @@ use slatefs_core::error::Error;
 use slatefs_core::meta::inode::ROOT_INO;
 use slatefs_core::store::{self, ObjectStore};
 use slatefs_core::versioning::{
-    VersionPathChangeKind, VersionRepository, force_break_expired_version_maintenance_lease,
-    purge_version_history, try_get_version_maintenance_lease,
+    VersionMergeConflictStrategy, VersionPathChangeKind, VersionRepository,
+    force_break_expired_version_maintenance_lease, purge_version_history,
+    try_get_version_maintenance_lease,
 };
 use slatefs_core::vfs::{Credentials, Vfs};
 use slatefs_core::volume::{self, Volume};
@@ -115,11 +116,18 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
     live.write(&creds, file.ino, 0, branch_contents)
         .await
         .unwrap();
+    let draft_file = live
+        .create(&creds, ROOT_INO, b"draft.txt", 0o640, true)
+        .await
+        .unwrap();
+    live.write(&creds, draft_file.ino, 0, b"draft contents")
+        .await
+        .unwrap();
     let branch_result = repository
         .commit_paths_on_branch_idempotent(
             live.as_ref(),
             "draft",
-            &["/notes.txt".into()],
+            &["/notes.txt".into(), "/draft.txt".into()],
             "draft update".into(),
             "draft-retry",
         )
@@ -131,7 +139,7 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         .commit_paths_on_branch_idempotent(
             live.as_ref(),
             "draft",
-            &["/notes.txt".into()],
+            &["/notes.txt".into(), "/draft.txt".into()],
             "draft update".into(),
             "draft-retry",
         )
@@ -181,11 +189,17 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
     assert_eq!(fast_forward_preview.ahead(), 1);
     assert_eq!(fast_forward_preview.behind(), 0);
     assert_eq!(fast_forward_preview.merge_base(), first.id);
-    let merged = repository.merge_branch("main", "release").await.unwrap();
+    let merged = repository
+        .merge_branch("main", "release", VersionMergeConflictStrategy::Fail)
+        .await
+        .unwrap();
     assert!(merged.fast_forward());
     assert!(!merged.already_up_to_date());
     assert_eq!(merged.commit(), second.id);
-    let unchanged = repository.merge_branch("main", "release").await.unwrap();
+    let unchanged = repository
+        .merge_branch("main", "release", VersionMergeConflictStrategy::Fail)
+        .await
+        .unwrap();
     assert!(!unchanged.fast_forward());
     assert!(unchanged.already_up_to_date());
     repository
@@ -218,7 +232,10 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
     assert_eq!(three_way_preview.ahead(), 1);
     assert_eq!(three_way_preview.behind(), 1);
     assert_eq!(three_way_preview.merge_base(), first.id);
-    let three_way = repository.merge_branch("feature", "main").await.unwrap();
+    let three_way = repository
+        .merge_branch("feature", "main", VersionMergeConflictStrategy::Fail)
+        .await
+        .unwrap();
     assert!(!three_way.fast_forward());
     assert!(!three_way.already_up_to_date());
     let merged_history = repository
@@ -252,7 +269,10 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         .unwrap();
     assert!(!conflict_preview.can_merge());
     assert_eq!(conflict_preview.conflicts(), &["/notes.txt".to_string()]);
-    let conflict = repository.merge_branch("draft", "main").await.unwrap_err();
+    let conflict = repository
+        .merge_branch("draft", "main", VersionMergeConflictStrategy::Fail)
+        .await
+        .unwrap_err();
     assert!(conflict.to_string().contains("merge conflict"));
     let branches = repository.list_branches().await.unwrap();
     assert_eq!(
@@ -271,13 +291,79 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
             .commit(),
         branch_commit.id
     );
+    repository
+        .create_branch("theirs-target", three_way.commit())
+        .await
+        .unwrap();
+    let ours = repository
+        .merge_branch("draft", "main", VersionMergeConflictStrategy::Ours)
+        .await
+        .unwrap();
+    assert_eq!(ours.strategy(), VersionMergeConflictStrategy::Ours);
+    assert_eq!(
+        repository
+            .read_file("main", "/notes.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        second_contents
+    );
+    assert_eq!(
+        repository
+            .read_file("main", "/draft.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"draft contents"
+    );
+    assert_eq!(
+        repository
+            .read_file("main", "/feature.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"feature contents"
+    );
+    let theirs = repository
+        .merge_branch(
+            "draft",
+            "theirs-target",
+            VersionMergeConflictStrategy::Theirs,
+        )
+        .await
+        .unwrap();
+    assert_eq!(theirs.strategy(), VersionMergeConflictStrategy::Theirs);
+    assert_eq!(
+        repository
+            .read_file("theirs-target", "/notes.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        branch_contents
+    );
+    assert_eq!(
+        repository
+            .read_file("theirs-target", "/draft.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"draft contents"
+    );
+    assert_eq!(
+        repository
+            .read_file("theirs-target", "/feature.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"feature contents"
+    );
     let verified = repository.verify().await.unwrap();
-    assert_eq!(verified.commits, 5);
+    assert_eq!(verified.commits, 7);
     assert!(verified.nodes > 0);
     assert!(verified.blobs > 0);
     repository.delete_branch("feature").await.unwrap();
     let complete_dag_gc = repository.garbage_collect(None, None, true).await.unwrap();
-    assert_eq!(complete_dag_gc.retained_commits, 5);
+    assert_eq!(complete_dag_gc.retained_commits, 7);
     assert_eq!(complete_dag_gc.deleted_commits, 0);
     assert_eq!(
         repository

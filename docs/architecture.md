@@ -85,12 +85,14 @@ optional version-store prefixes.
 
 SlateFS atomically fast-forwards a target when its head is an ancestor of the
 source and reports an already-current target as a no-op. Divergent branches
-use their nearest common ancestor for a strict Prolly three-way merge. A
-non-conflicting result is published as a two-parent commit; conflicting keys
-return `409` and leave both heads unchanged. First-parent order drives log and
-retention pagination, while verification and ancestry traverse the full DAG.
-Merge preview runs the same strict diff planner without applying its mutations
-and folds metadata/chunk conflicts into logical file paths.
+use their nearest common ancestor for a Prolly three-way merge. Conflict
+resolution is explicit and path-level: `fail` returns `409` without moving a
+head, `ours` keeps the target's complete path, and `theirs` keeps the source's
+complete path. Non-conflicting changes from both sides are retained, and a
+successful divergent result is published as a two-parent commit. First-parent
+order drives log and retention pagination, while verification and ancestry
+traverse the full DAG. Merge preview runs the same diff planner without
+applying mutations and folds metadata/chunk conflicts into logical file paths.
 An unbounded GC retains the full reachable DAG; bounded retention evaluates
 first-parent history per branch and may prune older secondary ancestry.
 

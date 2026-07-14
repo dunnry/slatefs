@@ -211,6 +211,7 @@ slatefs -c /etc/slatefs/slatefs.toml versioning delete-branch <tenant> <volume> 
 slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path>... -m <message> --branch <name> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning log <tenant> <volume> --branch <name> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning merge <tenant> <volume> <source> <target> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning merge <tenant> <volume> <source> <target> --conflict-strategy ours --live
 slatefs -c /etc/slatefs/slatefs.toml versioning merge-preview <tenant> <volume> <source> <target> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning show <tenant> <volume> <commit> <path> --out restored.bin --live
 slatefs -c /etc/slatefs/slatefs.toml versioning retention <tenant> <volume> --keep-last 100 --live
@@ -218,6 +219,12 @@ slatefs -c /etc/slatefs/slatefs.toml versioning gc <tenant> <volume> --dry-run -
 slatefs -c /etc/slatefs/slatefs.toml versioning stats <tenant> <volume> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning verify <tenant> <volume> --live
 ```
+
+Merge conflicts fail without moving either branch by default. After reviewing
+`merge-preview`, use `--conflict-strategy ours` to keep each conflicting path
+from the target or `--conflict-strategy theirs` to keep it from the source.
+Resolution is applied to the complete logical path, while non-conflicting
+changes from both branches are still merged.
 
 The CLI supplies the matching `[admin.tenant_tokens]` credential when present,
 otherwise `admin.token` or `admin.token_file`, as a bearer token. Tenant tokens

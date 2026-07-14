@@ -40,8 +40,9 @@ use slatefs_core::rate::{RateLimiter, RateLimits};
 use slatefs_core::snapshot::SnapshotVolume;
 use slatefs_core::store;
 use slatefs_core::versioning::{
-    VersionMaintenanceLeaseInfo, VersionRepository, force_break_expired_version_maintenance_lease,
-    purge_version_history, try_get_version_maintenance_lease,
+    VersionMaintenanceLeaseInfo, VersionMergeConflictStrategy, VersionRepository,
+    force_break_expired_version_maintenance_lease, purge_version_history,
+    try_get_version_maintenance_lease,
 };
 use slatefs_core::vfs::Vfs;
 use slatefs_core::volume::{self, Volume, VolumeCaches};
@@ -1006,6 +1007,8 @@ struct VersionBranchCreateRequest {
 #[serde(deny_unknown_fields)]
 struct VersionBranchMergeRequest {
     source: String,
+    #[serde(default)]
+    conflict_strategy: VersionMergeConflictStrategy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2529,7 +2532,9 @@ async fn merge_version_branch_response(
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
     let (control, repository) = open_version_repository(state, tenant, volume).await?;
-    let result = repository.merge_branch(&body.source, target).await;
+    let result = repository
+        .merge_branch(&body.source, target, body.conflict_strategy)
+        .await;
     let audit = match &result {
         Ok(merge) => {
             append_version_audit(
@@ -2554,6 +2559,10 @@ async fn merge_version_branch_response(
                     (
                         "commit".to_string(),
                         AuditDetailValue::String(merge.commit().to_string()),
+                    ),
+                    (
+                        "conflict_strategy".to_string(),
+                        AuditDetailValue::String(merge.strategy().as_str().to_string()),
                     ),
                     (
                         "fast_forward".to_string(),
@@ -7323,6 +7332,7 @@ mod tests {
         assert_eq!(response_status(&merge_response), 200, "{merge_response}");
         let merge: Value = serde_json::from_str(response_body(&merge_response)).unwrap();
         assert_eq!(merge["merge"]["already_up_to_date"], true);
+        assert_eq!(merge["merge"]["strategy"], "fail");
         volume
             .write(&creds, file.ino, 0, b"branch update")
             .await

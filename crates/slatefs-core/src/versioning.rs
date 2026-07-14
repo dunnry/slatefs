@@ -902,12 +902,36 @@ pub struct VersionBranchInfo {
     commit: String,
 }
 
+/// Policy used when both sides of a branch merge changed the same logical path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VersionMergeConflictStrategy {
+    /// Reject the merge without moving either branch.
+    #[default]
+    Fail,
+    /// Keep the target branch's complete value for each conflicting path.
+    Ours,
+    /// Keep the source branch's complete value for each conflicting path.
+    Theirs,
+}
+
+impl VersionMergeConflictStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fail => "fail",
+            Self::Ours => "ours",
+            Self::Theirs => "theirs",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct VersionMergeInfo {
     source: String,
     target: String,
     commit: String,
+    strategy: VersionMergeConflictStrategy,
     fast_forward: bool,
     already_up_to_date: bool,
 }
@@ -989,6 +1013,10 @@ impl VersionMergeInfo {
 
     pub fn commit(&self) -> &str {
         &self.commit
+    }
+
+    pub fn strategy(&self) -> VersionMergeConflictStrategy {
+        self.strategy
     }
 
     pub fn fast_forward(&self) -> bool {
@@ -2127,9 +2155,15 @@ impl VersionRepository {
     }
 
     /// Merge `source` into `target`. Descendant sources fast-forward the
-    /// target; divergent histories produce a two-parent three-way merge
-    /// commit when their Prolly trees do not conflict.
-    pub async fn merge_branch(&self, source: &str, target: &str) -> Result<VersionMergeInfo> {
+    /// target; divergent histories produce a two-parent three-way merge.
+    /// Conflict resolution applies to complete logical paths, with `ours`
+    /// referring to the target and `theirs` referring to the source.
+    pub async fn merge_branch(
+        &self,
+        source: &str,
+        target: &str,
+        strategy: VersionMergeConflictStrategy,
+    ) -> Result<VersionMergeInfo> {
         validate_version_branch_name(source)?;
         validate_version_branch_name(target)?;
         if source == target {
@@ -2157,6 +2191,7 @@ impl VersionRepository {
                 source: source.to_string(),
                 target: target.to_string(),
                 commit: hex::encode(target_ref.commit_id),
+                strategy,
                 fast_forward: false,
                 already_up_to_date: true,
             });
@@ -2173,6 +2208,7 @@ impl VersionRepository {
                 source: source.to_string(),
                 target: target.to_string(),
                 commit: hex::encode(merged.commit_id),
+                strategy,
                 fast_forward: true,
                 already_up_to_date: false,
             });
@@ -2189,12 +2225,13 @@ impl VersionRepository {
         let target_commit = self.store.get_commit(&target_ref.commit_id).await?;
         let source_commit = self.store.get_commit(&source_ref.commit_id).await?;
         let merged_tree = self
-            .strict_three_way_merge(
+            .resolve_three_way_merge(
                 source,
                 target,
                 &base.tree.to_tree(),
                 &target_commit.tree.to_tree(),
                 &source_commit.tree.to_tree(),
+                strategy,
             )
             .await?;
         let changes = self
@@ -2204,7 +2241,7 @@ impl VersionRepository {
             parents: vec![target_ref.commit_id, source_ref.commit_id],
             tree: RootManifest::from_tree(&merged_tree),
             created_at: crate::control::now_unix(),
-            message: format!("Merge {source} into {target}"),
+            message: format!("Merge {source} into {target} ({})", strategy.as_str()),
             paths: changes
                 .into_iter()
                 .map(|change| change.path().to_string())
@@ -2235,6 +2272,7 @@ impl VersionRepository {
             source: source.to_string(),
             target: target.to_string(),
             commit: hex::encode(commit.id),
+            strategy,
             fast_forward: false,
             already_up_to_date: false,
         })
@@ -2297,22 +2335,39 @@ impl VersionRepository {
         Ok(distances)
     }
 
-    async fn strict_three_way_merge(
+    async fn resolve_three_way_merge(
         &self,
         source: &str,
         target: &str,
         base: &Tree,
         left: &Tree,
         right: &Tree,
+        strategy: VersionMergeConflictStrategy,
     ) -> Result<Tree> {
         let plan = self.three_way_merge_plan(base, left, right).await?;
-        if let Some(path) = plan.conflicts.first() {
+        if strategy == VersionMergeConflictStrategy::Fail
+            && let Some(path) = plan.conflicts.first()
+        {
             return Err(Error::Versioning(format!(
                 "merge conflict between {source} and {target} at {path}"
             )));
         }
+        let mut mutations = plan.mutations;
+        if strategy == VersionMergeConflictStrategy::Theirs && !plan.conflicts.is_empty() {
+            let conflicts = plan.conflicts.into_iter().collect::<BTreeSet<_>>();
+            let source_diff = self.prolly.diff(left, right).await.map_err(prolly_error)?;
+            for diff in source_diff {
+                let key = diff.key().to_vec();
+                let path = version_path_from_tree_key(&key)
+                    .map(|(path, _)| path)
+                    .unwrap_or_else(|_| hex::encode(&key));
+                if conflicts.contains(&path) {
+                    mutations.push(mutation_from_diff(diff));
+                }
+            }
+        }
         self.prolly
-            .batch(left, plan.mutations)
+            .batch(left, mutations)
             .await
             .map_err(prolly_error)
     }
@@ -2329,25 +2384,32 @@ impl VersionRepository {
             .into_iter()
             .map(|diff| (diff.key().to_vec(), diff_result_value(diff)))
             .collect::<BTreeMap<_, _>>();
-        let mut mutations = Vec::new();
+        let right_changes = right_diff
+            .into_iter()
+            .map(|diff| {
+                let key = diff.key().to_vec();
+                let path = version_path_from_tree_key(&key)
+                    .map(|(path, _)| path)
+                    .unwrap_or_else(|_| hex::encode(&key));
+                (key, diff_result_value(diff), path)
+            })
+            .collect::<Vec<_>>();
         let mut conflicts = BTreeSet::new();
-        for diff in right_diff {
-            let key = diff.key().to_vec();
-            let value = diff_result_value(diff);
-            if let Some(left_value) = left_changes.get(&key) {
-                if left_value != &value {
-                    let path = version_path_from_tree_key(&key)
-                        .map(|(path, _)| path)
-                        .unwrap_or_else(|_| hex::encode(&key));
-                    conflicts.insert(path);
-                }
-                continue;
+        for (key, value, path) in &right_changes {
+            if let Some(left_value) = left_changes.get(key)
+                && left_value != value
+            {
+                conflicts.insert(path.clone());
             }
-            mutations.push(match value {
+        }
+        let mutations = right_changes
+            .into_iter()
+            .filter(|(key, _, path)| !left_changes.contains_key(key) && !conflicts.contains(path))
+            .map(|(key, value, _)| match value {
                 Some(val) => Mutation::Upsert { key, val },
                 None => Mutation::Delete { key },
-            });
-        }
+            })
+            .collect();
         Ok(ThreeWayMergePlan {
             mutations,
             conflicts: conflicts.into_iter().collect(),
@@ -2931,6 +2993,14 @@ fn diff_result_value(diff: Diff) -> Option<Vec<u8>> {
         Diff::Added { val, .. } => Some(val),
         Diff::Removed { .. } => None,
         Diff::Changed { new, .. } => Some(new),
+    }
+}
+
+fn mutation_from_diff(diff: Diff) -> Mutation {
+    let key = diff.key().to_vec();
+    match diff_result_value(diff) {
+        Some(val) => Mutation::Upsert { key, val },
+        None => Mutation::Delete { key },
     }
 }
 
