@@ -145,7 +145,8 @@ it explicitly with `slatefs versioning enable <tenant> <volume>`, then create
 versions of selected regular files with `slatefs versioning commit` and its
 tenant, volume, path, and `-m <message>` arguments. `versioning log`,
 `versioning diff`, `versioning show`, and `versioning restore` inspect, compare,
-and recover those commits.
+and recover those commits. `versioning tag`, `tags`, and `untag` manage
+immutable names for important commits.
 Show and restore stream versioned data in bounded chunks rather than loading a
 complete large file into memory.
 `versioning disable` stops all version operations but retains existing history;
@@ -168,6 +169,8 @@ served by `slatefsd`, the daemon applies count and age retention on its normal
 export-control poll; disabled, unserved, policyless, and never-committed
 volumes are untouched. `versioning gc` runs the same collection explicitly
 and `--dry-run` reports first; `versioning stats` reports logical usage.
+Tags pin their commit and Prolly tree through both automatic and explicit GC
+until the tag is deleted.
 `versioning verify` checks the reachable commit hash chain and reads every
 referenced Prolly node and content blob.
 `versioning purge --yes` permanently removes the physical history prefix while
@@ -248,6 +251,9 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Enable or disable with `{"enabled":true|false}`; disabling retains history. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Commit history with optional `path`, `limit`, and exclusive `page_token`; returns `next_page_token`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/diff` | Added, modified, and deleted paths between required `from` and `to` commits; supports `limit` and exclusive path `page_token`. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/tags` | List immutable commit tags. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/tags` | Create a retention-pinning tag from `{"name":"...","commit":"..."}`. |
+| `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/tags/{name}` | Delete a tag without deleting its commit immediately. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"...","idempotency_key":"..."}`; the retry key is optional and singular `path` remains accepted. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit}/content?path=&offset=&length=` | Read a bounded file or symlink range as base64 JSON; defaults to 1 MiB and rejects ranges over 4 MiB. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore` | Atomically restore one file through the live writer from `{"commit":"...","path":"..."}`. |

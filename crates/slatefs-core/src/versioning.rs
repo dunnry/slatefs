@@ -35,11 +35,13 @@ const COMMIT_PREFIX: &[u8] = b"pc/";
 const IDEMPOTENCY_PREFIX: &[u8] = b"pi/";
 const PRUNED_COMMIT_PREFIX: &[u8] = b"pp/";
 const HEAD_KEY: &[u8] = b"pr/heads/main";
+const TAG_PREFIX: &[u8] = b"pr/tags/";
 const LEGACY_FILE_META_VERSION: u8 = 1;
 const ENTRY_META_VERSION: u8 = 2;
 const COMMIT_VERSION: u8 = 1;
 const IDEMPOTENCY_VERSION: u8 = 1;
 const REF_VERSION: u8 = 1;
+const TAG_VERSION: u8 = 1;
 const MAINTENANCE_LEASE_VERSION: u8 = 1;
 const MAINTENANCE_LEASE_TTL_SECS: u64 = 120;
 const MAINTENANCE_LEASE_RENEW_SECS: u64 = 30;
@@ -571,6 +573,49 @@ impl VersionStore {
             })?;
         Ok(Some(commit))
     }
+
+    async fn list_tags(&self) -> Result<Vec<VersionTag>> {
+        let mut iter = self.db.scan_prefix(TAG_PREFIX, ..).await?;
+        let mut tags = Vec::new();
+        while let Some(entry) = iter.next().await? {
+            tags.push(decode_versioned(TAG_VERSION, &entry.value, "version tag")?);
+        }
+        tags.sort_by(|left: &VersionTag, right| left.name.cmp(&right.name));
+        Ok(tags)
+    }
+
+    async fn create_tag(&self, tag: &VersionTag) -> Result<()> {
+        let _guard = self.ref_lock.lock().await;
+        let key = tag_key(&tag.name);
+        if self
+            .get_raw(&key)
+            .await
+            .map_err(version_store_error)?
+            .is_some()
+        {
+            return Err(Error::already_exists("version tag", &tag.name));
+        }
+        self.db
+            .put_bytes(key.into(), encode_versioned(TAG_VERSION, tag)?.into())
+            .await?;
+        self.db.flush().await?;
+        Ok(())
+    }
+
+    async fn delete_tag(&self, name: &str) -> Result<VersionTag> {
+        let _guard = self.ref_lock.lock().await;
+        let key = tag_key(name);
+        let tag = self
+            .get_raw(&key)
+            .await
+            .map_err(version_store_error)?
+            .map(|bytes| decode_versioned(TAG_VERSION, &bytes, "version tag"))
+            .transpose()?
+            .ok_or_else(|| Error::not_found("version tag", name))?;
+        self.db.delete(key).await?;
+        self.db.flush().await?;
+        Ok(tag)
+    }
 }
 
 impl AsyncStore for VersionStore {
@@ -728,6 +773,13 @@ struct VersionRef {
     tree: RootManifest,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VersionTag {
+    name: String,
+    commit_id: [u8; 32],
+    created_at: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionCommitInfo {
     pub id: String,
@@ -735,6 +787,38 @@ pub struct VersionCommitInfo {
     pub created_at: u64,
     pub message: String,
     pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionTagInfo {
+    name: String,
+    commit: String,
+    created_at: u64,
+}
+
+impl VersionTagInfo {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
+
+    pub fn created_at(&self) -> u64 {
+        self.created_at
+    }
+}
+
+impl From<VersionTag> for VersionTagInfo {
+    fn from(tag: VersionTag) -> Self {
+        Self {
+            name: tag.name,
+            commit: hex::encode(tag.commit_id),
+            created_at: tag.created_at,
+        }
+    }
 }
 
 /// The result of an idempotent version commit. A replay returns the original
@@ -1083,6 +1167,34 @@ impl VersionRepository {
             next = commit.parent;
             commits += 1;
         }
+        for tag in self.store.list_tags().await? {
+            if !seen.insert(tag.commit_id) {
+                continue;
+            }
+            let commit = self.store.get_commit(&tag.commit_id).await.map_err(|_| {
+                Error::Versioning(format!(
+                    "version tag {} references missing commit {}",
+                    tag.name,
+                    hex::encode(tag.commit_id)
+                ))
+            })?;
+            let body = VersionCommitBody {
+                parent: commit.parent,
+                tree: commit.tree.clone(),
+                created_at: commit.created_at,
+                message: commit.message.clone(),
+                paths: commit.paths.clone(),
+            };
+            let expected: [u8; 32] = Sha256::digest(postcard::to_allocvec(&body)?).into();
+            if expected != commit.id || commit.id != tag.commit_id {
+                return Err(Error::Versioning(format!(
+                    "tagged commit {} does not match its content hash",
+                    hex::encode(tag.commit_id)
+                )));
+            }
+            trees.push(commit.tree.to_tree());
+            commits += 1;
+        }
         if let (Some(head), Some(tree)) = (head, trees.first())
             && head.tree.to_tree() != *tree
         {
@@ -1145,6 +1257,33 @@ impl VersionRepository {
                 retained.push(commit.clone());
             }
             chain.push(commit);
+        }
+        let mut retained_commit_ids = retained
+            .iter()
+            .map(|commit| commit.id)
+            .collect::<HashSet<_>>();
+        for tag in self.store.list_tags().await? {
+            if retained_commit_ids.insert(tag.commit_id) {
+                let commit = if let Some(commit) = chain
+                    .iter()
+                    .find(|commit| commit.id == tag.commit_id)
+                    .cloned()
+                {
+                    commit
+                } else {
+                    self.store
+                        .try_get_commit(&tag.commit_id)
+                        .await?
+                        .ok_or_else(|| {
+                            Error::Versioning(format!(
+                                "version tag {} references missing commit {}",
+                                tag.name,
+                                hex::encode(tag.commit_id)
+                            ))
+                        })?
+                };
+                retained.push(commit);
+            }
         }
 
         let trees = retained
@@ -1505,6 +1644,36 @@ impl VersionRepository {
             );
         }
         Ok(())
+    }
+
+    /// Create an immutable name for an existing commit. Tags pin their commit
+    /// and tree through retention garbage collection until explicitly deleted.
+    pub async fn create_tag(&self, name: &str, commit: &str) -> Result<VersionTagInfo> {
+        validate_version_tag_name(name)?;
+        let commit_id = parse_commit_id(commit)?;
+        self.store.get_commit(&commit_id).await?;
+        let tag = VersionTag {
+            name: name.to_string(),
+            commit_id,
+            created_at: crate::control::now_unix(),
+        };
+        self.store.create_tag(&tag).await?;
+        Ok(tag.into())
+    }
+
+    pub async fn list_tags(&self) -> Result<Vec<VersionTagInfo>> {
+        Ok(self
+            .store
+            .list_tags()
+            .await?
+            .into_iter()
+            .map(VersionTagInfo::from)
+            .collect())
+    }
+
+    pub async fn delete_tag(&self, name: &str) -> Result<VersionTagInfo> {
+        validate_version_tag_name(name)?;
+        Ok(self.store.delete_tag(name).await?.into())
     }
 
     pub async fn history(
@@ -2054,6 +2223,10 @@ fn commit_key(id: &[u8; 32]) -> Vec<u8> {
     prefixed_key(COMMIT_PREFIX, id)
 }
 
+fn tag_key(name: &str) -> Vec<u8> {
+    prefixed_key(TAG_PREFIX, name.as_bytes())
+}
+
 fn idempotency_key(key_hash: &[u8; 32]) -> Vec<u8> {
     prefixed_key(IDEMPOTENCY_PREFIX, key_hash)
 }
@@ -2076,6 +2249,27 @@ fn parse_commit_id(value: &str) -> Result<[u8; 32]> {
 
 fn commit_id_string(id: &[u8; 32]) -> String {
     hex::encode(id)
+}
+
+fn validate_version_tag_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 128 {
+        return Err(Error::invalid(
+            "version tag",
+            "must contain 1 to 128 ASCII characters",
+        ));
+    }
+    if name == "."
+        || name == ".."
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(Error::invalid(
+            "version tag",
+            "use only ASCII letters, digits, '.', '_', or '-'",
+        ));
+    }
+    Ok(())
 }
 
 fn version_commit_idempotency_intent(

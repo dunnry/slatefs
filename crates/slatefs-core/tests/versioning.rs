@@ -906,24 +906,51 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
         );
     }
     assert_eq!(repository.stats().await.unwrap().commits, 3);
+    let tag = repository
+        .create_tag("milestone-1", &commits[0].id)
+        .await
+        .unwrap();
+    assert_eq!(tag.name(), "milestone-1");
+    assert_eq!(tag.commit(), commits[0].id);
+    assert!(matches!(
+        repository.create_tag("milestone-1", &commits[1].id).await,
+        Err(Error::AlreadyExists { .. })
+    ));
+    assert_eq!(repository.list_tags().await.unwrap(), vec![tag.clone()]);
     let dry_run = repository
         .garbage_collect(Some(1), None, true)
         .await
         .unwrap();
-    assert_eq!(dry_run.deleted_commits, 2);
+    assert_eq!(dry_run.deleted_commits, 1);
     assert_eq!(repository.history(None, 10).await.unwrap().len(), 3);
 
     let collected = repository
         .garbage_collect(Some(1), None, false)
         .await
         .unwrap();
-    assert_eq!(collected.retained_commits, 1);
-    assert_eq!(collected.deleted_commits, 2);
+    assert_eq!(collected.retained_commits, 2);
+    assert_eq!(collected.deleted_commits, 1);
     assert!(collected.reclaimed_bytes > 0);
     let history = repository.history(None, 10).await.unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].id, commits[2].id);
-    assert_eq!(repository.verify().await.unwrap().commits, 1);
+    assert_eq!(repository.verify().await.unwrap().commits, 2);
+    assert_eq!(
+        repository
+            .read_file(&commits[0].id, "/history.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"one"
+    );
+    assert_eq!(repository.delete_tag("milestone-1").await.unwrap(), tag);
+    assert!(repository.list_tags().await.unwrap().is_empty());
+    let unpinned = repository
+        .garbage_collect(Some(1), None, false)
+        .await
+        .unwrap();
+    assert_eq!(unpinned.retained_commits, 1);
+    assert_eq!(unpinned.deleted_commits, 1);
     assert!(
         repository
             .read_file(&commits[0].id, "/history.txt")

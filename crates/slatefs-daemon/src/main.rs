@@ -983,6 +983,13 @@ struct VersionRestoreRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct VersionTagCreateRequest {
+    name: String,
+    commit: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VersionPolicyPatchRequest {
     enabled: bool,
 }
@@ -2244,6 +2251,113 @@ async fn diff_version_commits_response(
         200,
         json!({ "changes": changes, "next_page_token": next_page_token }),
     ))
+}
+
+async fn list_version_tags_response(
+    state: &AdminState,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository.list_tags().await;
+    let tags = finish_version_repository(control, repository, result).await?;
+    Ok(AdminHttpResponse::json(200, json!({ "tags": tags })))
+}
+
+async fn create_version_tag_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let body: VersionTagCreateRequest = parse_json_body(request)?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository.create_tag(&body.name, &body.commit).await;
+    let audit = match &result {
+        Ok(tag) => {
+            append_version_audit(
+                &control,
+                request,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-tag-create".to_string()),
+                    ),
+                    (
+                        "tag".to_string(),
+                        AuditDetailValue::String(tag.name().to_string()),
+                    ),
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(tag.commit().to_string()),
+                    ),
+                ],
+            )
+            .await
+        }
+        Err(_) => Ok(()),
+    };
+    let repository_close = repository.close().await;
+    let control_close = control.close().await;
+    let tag = result.map_err(core_error)?;
+    audit?;
+    repository_close.map_err(core_error)?;
+    control_close.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(201, json!({ "tag": tag })))
+}
+
+async fn delete_version_tag_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+    name: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository.delete_tag(name).await;
+    let audit = match &result {
+        Ok(tag) => {
+            append_version_audit(
+                &control,
+                request,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-tag-delete".to_string()),
+                    ),
+                    (
+                        "tag".to_string(),
+                        AuditDetailValue::String(tag.name().to_string()),
+                    ),
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(tag.commit().to_string()),
+                    ),
+                ],
+            )
+            .await
+        }
+        Err(_) => Ok(()),
+    };
+    let repository_close = repository.close().await;
+    let control_close = control.close().await;
+    let tag = result.map_err(core_error)?;
+    audit?;
+    repository_close.map_err(core_error)?;
+    control_close.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(200, json!({ "tag": tag })))
 }
 
 async fn get_version_content_response(
@@ -3727,6 +3841,46 @@ async fn route_admin_request(
                 "diff",
             ],
         ) => diff_version_commits_response(state, request, tenant, volume).await,
+        (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "tags",
+            ],
+        ) => list_version_tags_response(state, tenant, volume).await,
+        (
+            "POST",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "tags",
+            ],
+        ) => create_version_tag_response(state, request, tenant, volume).await,
+        (
+            "DELETE",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "tags",
+                name,
+            ],
+        ) => delete_version_tag_response(state, request, tenant, volume, name).await,
         (
             "POST",
             [
@@ -6795,6 +6949,31 @@ mod tests {
         let diff: Value = serde_json::from_str(response_body(&diff_response)).unwrap();
         assert_eq!(diff["changes"], serde_json::json!([]));
         assert!(diff["next_page_token"].is_null());
+        let tag_body = format!(r#"{{"name":"baseline","commit":"{commit_id}"}}"#);
+        let tag_request = format!(
+            "POST /admin/v1/tenants/t/volumes/v/versioning/tags HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            tag_body.len(),
+            tag_body
+        );
+        let tag_response = admin_exchange(Arc::clone(&state), tag_request.as_bytes()).await;
+        assert_eq!(response_status(&tag_response), 201, "{tag_response}");
+        let tag: Value = serde_json::from_str(response_body(&tag_response)).unwrap();
+        assert_eq!(tag["tag"]["name"], "baseline");
+        assert_eq!(tag["tag"]["commit"], commit_id);
+        let tags_response = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning/tags HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&tags_response), 200, "{tags_response}");
+        let tags: Value = serde_json::from_str(response_body(&tags_response)).unwrap();
+        assert_eq!(tags["tags"].as_array().unwrap().len(), 1);
+        let untag_response = admin_exchange(
+            Arc::clone(&state),
+            b"DELETE /admin/v1/tenants/t/volumes/v/versioning/tags/baseline HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&untag_response), 200, "{untag_response}");
 
         let history_response = admin_exchange(
             Arc::clone(&state),
@@ -6999,7 +7178,13 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            let expected = usize::from(action == AuditAction::VersionCommit) + 1;
+            let expected = if action == AuditAction::VersionCommit {
+                2
+            } else if action == AuditAction::Maintain {
+                3
+            } else {
+                1
+            };
             assert_eq!(records.len(), expected);
         }
         audit_control.close().await.unwrap();

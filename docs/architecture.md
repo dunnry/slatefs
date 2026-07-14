@@ -111,7 +111,8 @@ objects and expired commit records in one SlateDB batch. The head commit is
 always retained. The daemon enforces count and age policies only for enabled
 filesystem volumes whose writable backend it currently serves. It opens only
 an existing history under the repository lease, preserving lazy creation and
-avoiding work on disabled, unserved, or policyless volumes. A physical purge
+avoiding work on disabled, unserved, or policyless volumes. Immutable named
+tags add their referenced commit and tree to the GC reachability roots. A physical purge
 deletes the separate version database prefix under the same lease.
 
 ## Request Path

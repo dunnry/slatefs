@@ -126,6 +126,7 @@ the live VFS request path. Its logical key prefixes are:
 | `pc/<sha256-commit-id>` | 1 | `VersionCommit` |
 | `pi/<sha256-idempotency-key>` | 1 | commit ID and canonical request fingerprint |
 | `pr/heads/main` | 1 | current `VersionRef` |
+| `pr/tags/<name>` | 1 | immutable named commit reference and creation time |
 
 Entry metadata (`m/<canonical-path>`) and file chunk references
 (`c/<canonical-path> NUL <u32-be-index>`) live inside the Prolly tree. SlateFS
@@ -135,7 +136,9 @@ directories, and symlinks; version 1 regular-file metadata remains readable.
 A commit records its parent, root manifest, creation time, message, and selected
 paths. An idempotency record is written atomically with its commit and head;
 garbage collection removes it when that commit is pruned. Version repository
-history is retained when the policy is disabled and removed with the volume.
+tags keep their referenced commit and tree reachable through garbage
+collection. Version repository history is retained when the policy is disabled
+and removed with the volume.
 
 `version-leases/<tenant>/<volume>` is a version-1 postcard record containing
 `tenant`, `volume`, an ephemeral owner UUID, operation name, acquisition time,

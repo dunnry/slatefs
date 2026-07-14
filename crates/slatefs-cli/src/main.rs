@@ -17,7 +17,7 @@ use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{
-    VersionCommitInfo, VersionPathChangeKind, VersionRepository,
+    VersionCommitInfo, VersionPathChangeKind, VersionRepository, VersionTagInfo,
     force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease,
 };
@@ -371,6 +371,30 @@ enum VersioningCmd {
         /// Continue after the last path returned by a previous page.
         #[arg(long)]
         page_token: Option<String>,
+        #[arg(long)]
+        live: bool,
+    },
+    /// Create an immutable tag that pins a commit through retention GC.
+    Tag {
+        tenant: String,
+        volume: String,
+        name: String,
+        commit: String,
+        #[arg(long)]
+        live: bool,
+    },
+    /// List immutable commit tags.
+    Tags {
+        tenant: String,
+        volume: String,
+        #[arg(long)]
+        live: bool,
+    },
+    /// Delete a commit tag so normal retention can reclaim it.
+    Untag {
+        tenant: String,
+        volume: String,
+        name: String,
         #[arg(long)]
         live: bool,
     },
@@ -952,6 +976,15 @@ fn version_change_label(change: VersionPathChangeKind) -> &'static str {
         VersionPathChangeKind::Deleted => "deleted",
         _ => "unknown",
     }
+}
+
+fn print_version_tag(tag: &VersionTagInfo) {
+    println!(
+        "{}\t{}\tcreated={}",
+        tag.name(),
+        tag.commit(),
+        tag.created_at()
+    );
 }
 
 async fn stream_version_file<W: AsyncWrite + Unpin>(
@@ -2193,6 +2226,122 @@ async fn run(
             }
             repository_close?;
         }
+        Command::Versioning(VersioningCmd::Tag {
+            tenant,
+            volume,
+            name,
+            commit,
+            live,
+        }) => {
+            if *live {
+                let response = post_live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    "tags",
+                    serde_json::json!({ "name": name, "commit": commit }),
+                )
+                .await?;
+                let tag: VersionTagInfo = serde_json::from_value(response["tag"].clone())
+                    .context("parsing admin version tag")?;
+                print_version_tag(&tag);
+                return Ok(());
+            }
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let result = repository.create_tag(name, commit).await;
+            let repository_close = repository.close().await;
+            let tag = result?;
+            repository_close?;
+            append_cli_version_audit(
+                control,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-tag-create".to_string()),
+                    ),
+                    (
+                        "tag".to_string(),
+                        AuditDetailValue::String(tag.name().to_string()),
+                    ),
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(tag.commit().to_string()),
+                    ),
+                ],
+            )
+            .await?;
+            print_version_tag(&tag);
+        }
+        Command::Versioning(VersioningCmd::Tags {
+            tenant,
+            volume,
+            live,
+        }) => {
+            if *live {
+                let response =
+                    live_versioning_json(config, tenant, volume, "GET", "tags", &[], None).await?;
+                let tags: Vec<VersionTagInfo> = serde_json::from_value(response["tags"].clone())
+                    .context("parsing admin version tags")?;
+                for tag in tags {
+                    print_version_tag(&tag);
+                }
+                return Ok(());
+            }
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let result = repository.list_tags().await;
+            let repository_close = repository.close().await;
+            for tag in result? {
+                print_version_tag(&tag);
+            }
+            repository_close?;
+        }
+        Command::Versioning(VersioningCmd::Untag {
+            tenant,
+            volume,
+            name,
+            live,
+        }) => {
+            if *live {
+                let endpoint = format!("tags/{name}");
+                let response =
+                    live_versioning_json(config, tenant, volume, "DELETE", &endpoint, &[], None)
+                        .await?;
+                let tag: VersionTagInfo = serde_json::from_value(response["tag"].clone())
+                    .context("parsing deleted admin version tag")?;
+                print_version_tag(&tag);
+                return Ok(());
+            }
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let result = repository.delete_tag(name).await;
+            let repository_close = repository.close().await;
+            let tag = result?;
+            repository_close?;
+            append_cli_version_audit(
+                control,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-tag-delete".to_string()),
+                    ),
+                    (
+                        "tag".to_string(),
+                        AuditDetailValue::String(tag.name().to_string()),
+                    ),
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(tag.commit().to_string()),
+                    ),
+                ],
+            )
+            .await?;
+            print_version_tag(&tag);
+        }
         Command::Versioning(VersioningCmd::Show {
             tenant,
             volume,
@@ -3421,6 +3570,27 @@ mod tests {
                 live: true,
                 ..
             }) if from == "from-id" && to == "to-id"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "tag",
+            "tenant-a",
+            "docs",
+            "baseline",
+            "commit-id",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::Tag {
+                name,
+                commit,
+                live: true,
+                ..
+            }) if name == "baseline" && commit == "commit-id"
         ));
     }
 }
