@@ -1499,6 +1499,17 @@ fn core_error(error: slatefs_core::error::Error) -> AdminError {
     }
 }
 
+fn version_merge_error(error: slatefs_core::error::Error) -> AdminError {
+    if matches!(&error, slatefs_core::error::Error::Versioning(message) if message.contains("have diverged"))
+    {
+        return AdminError {
+            status: 409,
+            message: error.to_string(),
+        };
+    }
+    core_error(error)
+}
+
 fn bad_request(message: impl Into<String>) -> AdminError {
     AdminError {
         status: 400,
@@ -2556,7 +2567,7 @@ async fn merge_version_branch_response(
     };
     let repository_close = repository.close().await;
     let control_close = control.close().await;
-    let merge = result.map_err(core_error)?;
+    let merge = result.map_err(version_merge_error)?;
     audit?;
     repository_close.map_err(core_error)?;
     control_close.map_err(core_error)?;
@@ -6512,6 +6523,14 @@ mod tests {
 
     type TestResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
     const ADMIN_TOKEN: &str = "secret-admin-token";
+
+    #[test]
+    fn divergent_version_merge_maps_to_conflict() {
+        let error = version_merge_error(slatefs_core::error::Error::Versioning(
+            "branches source and target have diverged".into(),
+        ));
+        assert_eq!(error.status, 409);
+    }
 
     fn create_opts() -> slatefs_core::volume::CreateVolumeOptions {
         slatefs_core::volume::CreateVolumeOptions {
