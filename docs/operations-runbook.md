@@ -253,7 +253,8 @@ slatefs -c /etc/slatefs/slatefs.toml versioning verify <tenant> <volume>
 
 `versioning show` and restore stream large files in volume-sized chunks. Admin
 API content reads are paged with `offset` and `length` (1 MiB default, 4 MiB
-maximum) and return `total_size`, `eof`, and `next_offset`.
+maximum) and return `total_size`, `eof`, and `next_offset`. Show, restore, and
+diff accept either a commit ID or an immutable tag name.
 
 `versioning status <tenant> <volume> [--live]` also reports the current or most
 recent repository lease, including owner UUID, operation, expiry, and whether

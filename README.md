@@ -170,7 +170,8 @@ export-control poll; disabled, unserved, policyless, and never-committed
 volumes are untouched. `versioning gc` runs the same collection explicitly
 and `--dry-run` reports first; `versioning stats` reports logical usage.
 Tags pin their commit and Prolly tree through both automatic and explicit GC
-until the tag is deleted.
+until the tag is deleted. `show`, `restore`, and `diff` accept either a commit
+ID or a tag name.
 `versioning verify` checks the reachable commit hash chain and reads every
 referenced Prolly node and content blob.
 `versioning purge --yes` permanently removes the physical history prefix while
@@ -250,13 +251,13 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Opt-in state, retention policy, and current or last repository lease. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Enable or disable with `{"enabled":true|false}`; disabling retains history. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Commit history with optional `path`, `limit`, and exclusive `page_token`; returns `next_page_token`. |
-| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/diff` | Added, modified, and deleted paths between required `from` and `to` commits; supports `limit` and exclusive path `page_token`. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/diff` | Added, modified, and deleted paths between required `from` and `to` commit IDs or tags; supports `limit` and exclusive path `page_token`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/tags` | List immutable commit tags. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/tags` | Create a retention-pinning tag from `{"name":"...","commit":"..."}`. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/tags/{name}` | Delete a tag without deleting its commit immediately. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"...","idempotency_key":"..."}`; the retry key is optional and singular `path` remains accepted. |
-| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit}/content?path=&offset=&length=` | Read a bounded file or symlink range as base64 JSON; defaults to 1 MiB and rejects ranges over 4 MiB. |
-| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore` | Atomically restore one file through the live writer from `{"commit":"...","path":"..."}`. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit-or-tag}/content?path=&offset=&length=` | Read a bounded file or symlink range as base64 JSON; defaults to 1 MiB and rejects ranges over 4 MiB. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore` | Atomically restore one file through the live writer from a commit ID or tag in `{"commit":"...","path":"..."}`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/stats` | Logical history bytes, nodes, blobs, and commits. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/verify` | Verify the reachable commit hash chain, Prolly nodes, and content blobs. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Current history retention and quota policy. |

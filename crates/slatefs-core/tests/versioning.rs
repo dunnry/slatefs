@@ -917,6 +917,10 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
         Err(Error::AlreadyExists { .. })
     ));
     assert_eq!(repository.list_tags().await.unwrap(), vec![tag.clone()]);
+    assert!(matches!(
+        repository.create_tag(&"a".repeat(64), &commits[0].id).await,
+        Err(Error::Invalid { .. })
+    ));
     let dry_run = repository
         .garbage_collect(Some(1), None, true)
         .await
@@ -937,12 +941,18 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
     assert_eq!(repository.verify().await.unwrap().commits, 2);
     assert_eq!(
         repository
-            .read_file(&commits[0].id, "/history.txt")
+            .read_file("milestone-1", "/history.txt")
             .await
             .unwrap()
             .as_ref(),
         b"one"
     );
+    let tagged_diff = repository
+        .diff_commits("milestone-1", &commits[2].id)
+        .await
+        .unwrap();
+    assert_eq!(tagged_diff.len(), 1);
+    assert_eq!(tagged_diff[0].change(), VersionPathChangeKind::Modified);
     assert_eq!(repository.delete_tag("milestone-1").await.unwrap(), tag);
     assert!(repository.list_tags().await.unwrap().is_empty());
     let unpinned = repository

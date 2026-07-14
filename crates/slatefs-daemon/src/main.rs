@@ -6968,6 +6968,12 @@ mod tests {
         assert_eq!(response_status(&tags_response), 200, "{tags_response}");
         let tags: Value = serde_json::from_str(response_body(&tags_response)).unwrap();
         assert_eq!(tags["tags"].as_array().unwrap().len(), 1);
+        let tagged_content = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning/commits/baseline/content?path=/notes.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&tagged_content), 200, "{tagged_content}");
         let untag_response = admin_exchange(
             Arc::clone(&state),
             b"DELETE /admin/v1/tenants/t/volumes/v/versioning/tags/baseline HTTP/1.1\r\nHost: localhost\r\n\r\n",

@@ -584,6 +584,15 @@ impl VersionStore {
         Ok(tags)
     }
 
+    async fn get_tag(&self, name: &str) -> Result<VersionTag> {
+        self.get_raw(&tag_key(name))
+            .await
+            .map_err(version_store_error)?
+            .map(|bytes| decode_versioned(TAG_VERSION, &bytes, "version tag"))
+            .transpose()?
+            .ok_or_else(|| Error::not_found("version tag", name))
+    }
+
     async fn create_tag(&self, tag: &VersionTag) -> Result<()> {
         let _guard = self.ref_lock.lock().await;
         let key = tag_key(&tag.name);
@@ -1728,8 +1737,8 @@ impl VersionRepository {
     /// File chunk changes are folded into their owning file, so callers never
     /// see internal Prolly metadata or chunk keys.
     pub async fn diff_commits(&self, from: &str, to: &str) -> Result<Vec<VersionPathChange>> {
-        let from = self.store.get_commit(&parse_commit_id(from)?).await?;
-        let to = self.store.get_commit(&parse_commit_id(to)?).await?;
+        let from = self.resolve_commit(from).await?;
+        let to = self.resolve_commit(to).await?;
         let diffs = self
             .prolly
             .diff(&from.tree.to_tree(), &to.tree.to_tree())
@@ -1793,8 +1802,7 @@ impl VersionRepository {
         offset: u64,
         length: u64,
     ) -> Result<VersionFileRange> {
-        let id = parse_commit_id(commit)?;
-        let commit = self.store.get_commit(&id).await?;
+        let commit = self.resolve_commit(commit).await?;
         let tree = commit.tree.to_tree();
         let canonical = canonical_path(path)?;
         let metadata = self
@@ -1894,8 +1902,7 @@ impl VersionRepository {
     }
 
     pub async fn restore_file(&self, live: &dyn Vfs, commit: &str, path: &str) -> Result<()> {
-        let id = parse_commit_id(commit)?;
-        let commit = self.store.get_commit(&id).await?;
+        let commit = self.resolve_commit(commit).await?;
         let tree = commit.tree.to_tree();
         let canonical = canonical_path(path)?;
         let mut entries = BTreeMap::new();
@@ -1988,6 +1995,21 @@ impl VersionRepository {
             let _ = live.unlink(&creds, parent, temp_name.as_bytes()).await;
         }
         result
+    }
+
+    async fn resolve_commit(&self, reference: &str) -> Result<VersionCommit> {
+        if let Ok(id) = parse_commit_id(reference) {
+            return self.store.get_commit(&id).await;
+        }
+        validate_version_tag_name(reference)?;
+        let tag = self.store.get_tag(reference).await?;
+        self.store.get_commit(&tag.commit_id).await.map_err(|_| {
+            Error::Versioning(format!(
+                "version tag {} references missing commit {}",
+                tag.name,
+                hex::encode(tag.commit_id)
+            ))
+        })
     }
 }
 
@@ -2260,13 +2282,14 @@ fn validate_version_tag_name(name: &str) -> Result<()> {
     }
     if name == "."
         || name == ".."
+        || (name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()))
         || !name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
         return Err(Error::invalid(
             "version tag",
-            "use only ASCII letters, digits, '.', '_', or '-'",
+            "use only ASCII letters, digits, '.', '_', or '-' and do not use a SHA-256-shaped name",
         ));
     }
     Ok(())
