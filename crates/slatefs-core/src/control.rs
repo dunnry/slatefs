@@ -513,6 +513,8 @@ pub enum AuditAction {
     VersionGc,
     VersionPurge,
     VersionRetentionSet,
+    VersionEnable,
+    VersionDisable,
 }
 
 impl AuditAction {
@@ -546,6 +548,8 @@ impl AuditAction {
             "VersionGc" => Self::VersionGc,
             "VersionPurge" => Self::VersionPurge,
             "VersionRetentionSet" => Self::VersionRetentionSet,
+            "VersionEnable" => Self::VersionEnable,
+            "VersionDisable" => Self::VersionDisable,
             _ => return None,
         })
     }

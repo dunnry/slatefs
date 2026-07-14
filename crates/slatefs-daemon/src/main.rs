@@ -5,7 +5,7 @@
 //! control DB while the daemon runs) → open volumes → one listener per export
 //! (DD-10).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, Once, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
+use base64::Engine as _;
 use clap::Parser;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -30,7 +31,7 @@ use slatefs_core::config::{
 use slatefs_core::control::{
     AuditAction, AuditActor, AuditDetailValue, AuditOutcome, AuditPlane, AuditQuery, AuditRecord,
     AuditScope, ControlPlane, ControlReader, ExportRecord, QuotaLimits, SnapshotRetentionPolicy,
-    TenantRecord, VolumePlacementRecord, VolumeRecord,
+    TenantRecord, VersioningRetentionPolicy, VolumePlacementRecord, VolumeRecord,
 };
 use slatefs_core::crypto::kms;
 use slatefs_core::meta::superblock::VolumeKind;
@@ -38,13 +39,14 @@ use slatefs_core::metrics::{AggregatingRecorder, PrometheusSample, render_promet
 use slatefs_core::rate::{RateLimiter, RateLimits};
 use slatefs_core::snapshot::SnapshotVolume;
 use slatefs_core::store;
-use slatefs_core::versioning::VersionRepository;
+use slatefs_core::versioning::{VersionRepository, purge_version_history};
 use slatefs_core::vfs::Vfs;
 use slatefs_core::volume::{self, Volume, VolumeCaches};
 use slatefs_nbd::{NbdExportOptions, NbdShutdownHandle, NbdTlsConfig};
 use slatefs_nfs::{NFSTcp, NfsExportOptions, QuotaRejectionAudit, SquashPolicy};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
@@ -898,6 +900,8 @@ struct AdminState {
     export_metrics: ExportMetrics,
     started_at: Instant,
     auth_token: Option<String>,
+    tenant_tokens: BTreeMap<String, String>,
+    version_locks: Arc<Mutex<HashMap<VolumeId, Arc<AsyncMutex<()>>>>>,
     allow_cert_auth: bool,
     node_id: Option<String>,
 }
@@ -967,6 +971,38 @@ impl VersionCommitRequest {
 struct VersionRestoreRequest {
     commit: String,
     path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionPolicyPatchRequest {
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionRetentionPatchRequest {
+    #[serde(default)]
+    keep_last: Option<u32>,
+    #[serde(default)]
+    max_age_secs: Option<u64>,
+    #[serde(default)]
+    max_bytes: Option<u64>,
+    #[serde(default)]
+    clear: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionGcRequest {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionPurgeRequest {
+    confirm: bool,
 }
 
 #[derive(Debug)]
@@ -1234,6 +1270,16 @@ impl AdminState {
             .map_err(core_error)
     }
 
+    fn version_lock(&self, tenant: &str, volume: &str) -> Arc<AsyncMutex<()>> {
+        let id = VolumeId::from_parts(tenant, volume);
+        let mut locks = self.version_locks.lock().expect("version locks poisoned");
+        Arc::clone(
+            locks
+                .entry(id)
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        )
+    }
+
     fn serving_export_count(&self) -> usize {
         self.export_metrics.active_total()
     }
@@ -1355,6 +1401,7 @@ fn status_line(status: u16) -> &'static str {
         201 => "201 Created",
         400 => "400 Bad Request",
         401 => "401 Unauthorized",
+        403 => "403 Forbidden",
         404 => "404 Not Found",
         405 => "405 Method Not Allowed",
         409 => "409 Conflict",
@@ -1368,6 +1415,7 @@ fn admin_error_code(status: u16) -> &'static str {
     match status {
         400 => "bad_request",
         401 => "unauthorized",
+        403 => "forbidden",
         404 => "not_found",
         405 => "method_not_allowed",
         409 => "conflict",
@@ -1543,7 +1591,7 @@ fn authenticate_admin_request(
     state: &AdminState,
     request: &AdminHttpRequest,
 ) -> Result<Option<String>, AdminError> {
-    if let Some(expected) = state.auth_token.as_deref() {
+    if state.auth_token.is_some() || !state.tenant_tokens.is_empty() {
         let Some(presented) = bearer_token_from_headers(&request.headers) else {
             if state.allow_cert_auth
                 && let Some(principal) = cert_auth_principal(request)
@@ -1555,8 +1603,20 @@ fn authenticate_admin_request(
                 message: "missing bearer token".to_string(),
             });
         };
-        if token_matches(expected, presented) {
-            return Ok(admin_principal_from_headers(&request.headers));
+        if state
+            .auth_token
+            .as_deref()
+            .is_some_and(|expected| token_matches(expected, presented))
+        {
+            return Ok(admin_principal_from_headers(&request.headers)
+                .or_else(|| Some("admin-token".to_string())));
+        }
+        if let Some((tenant, _)) = state
+            .tenant_tokens
+            .iter()
+            .find(|(_, expected)| token_matches(expected, presented))
+        {
+            return Ok(Some(format!("tenant:{tenant}")));
         }
         if state.allow_cert_auth
             && let Some(principal) = cert_auth_principal(request)
@@ -1579,6 +1639,19 @@ fn authenticate_admin_request(
     }
 
     Ok(None)
+}
+
+fn authorize_tenant_scope(principal: Option<&str>, route: &[&str]) -> Result<(), AdminError> {
+    let Some(tenant) = principal.and_then(|principal| principal.strip_prefix("tenant:")) else {
+        return Ok(());
+    };
+    if matches!(route, ["admin", "v1", "tenants", route_tenant, ..] if *route_tenant == tenant) {
+        return Ok(());
+    }
+    Err(AdminError {
+        status: 403,
+        message: format!("tenant credential is restricted to {tenant}"),
+    })
 }
 
 async fn read_admin_request<R>(
@@ -1709,6 +1782,34 @@ fn live_filesystem_target(
         .ok_or_else(|| not_found(format!("no live writable volume {tenant}/{volume}")))
 }
 
+async fn open_version_repository(
+    state: &AdminState,
+    tenant: &str,
+    volume: &str,
+) -> Result<(ControlPlane, VersionRepository), AdminError> {
+    let control = state.control_writer().await?;
+    match VersionRepository::open(&control, Arc::clone(&state.object_store), tenant, volume).await {
+        Ok(repository) => Ok((control, repository)),
+        Err(error) => {
+            let _ = control.close().await;
+            Err(core_error(error))
+        }
+    }
+}
+
+async fn finish_version_repository<T>(
+    control: ControlPlane,
+    repository: VersionRepository,
+    result: slatefs_core::error::Result<T>,
+) -> Result<T, AdminError> {
+    let repository_close = repository.close().await;
+    let control_close = control.close().await;
+    let value = result.map_err(core_error)?;
+    repository_close.map_err(core_error)?;
+    control_close.map_err(core_error)?;
+    Ok(value)
+}
+
 async fn commit_live_version_response(
     state: &AdminState,
     request: &AdminHttpRequest,
@@ -1718,6 +1819,8 @@ async fn commit_live_version_response(
     let body: VersionCommitRequest = parse_json_body(request)?;
     let (paths, message) = body.into_paths()?;
     let target = live_filesystem_target(state, tenant, volume)?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
     let control = state.control_writer().await?;
     let repository =
         match VersionRepository::open(&control, Arc::clone(&state.object_store), tenant, volume)
@@ -1795,6 +1898,8 @@ async fn restore_live_version_response(
 ) -> Result<AdminHttpResponse, AdminError> {
     let body: VersionRestoreRequest = parse_json_body(request)?;
     let target = live_filesystem_target(state, tenant, volume)?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
     let control = state.control_writer().await?;
     let repository =
         match VersionRepository::open(&control, Arc::clone(&state.object_store), tenant, volume)
@@ -1850,6 +1955,371 @@ async fn restore_live_version_response(
                 "path": body.path,
             }
         }),
+    ))
+}
+
+fn version_retention_json(policy: Option<&VersioningRetentionPolicy>) -> Value {
+    policy
+        .map(|policy| {
+            json!({
+                "tenant": policy.tenant,
+                "volume": policy.volume,
+                "keep_last": policy.keep_last,
+                "max_age_secs": policy.max_age_secs,
+                "max_bytes": policy.max_bytes,
+                "updated_at": policy.updated_at,
+            })
+        })
+        .unwrap_or(Value::Null)
+}
+
+async fn get_versioning_response(
+    state: &AdminState,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let control = state.control_writer().await?;
+    let policy = control
+        .try_get_versioning_policy(tenant, volume)
+        .await
+        .map_err(core_error)?;
+    let retention = control
+        .try_get_versioning_retention_policy(tenant, volume)
+        .await
+        .map_err(core_error)?;
+    control.close().await.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({
+            "versioning": {
+                "enabled": policy.as_ref().is_some_and(|policy| policy.enabled),
+                "updated_at": policy.as_ref().map(|policy| policy.updated_at),
+                "retention": version_retention_json(retention.as_ref()),
+            }
+        }),
+    ))
+}
+
+async fn patch_versioning_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let body: VersionPolicyPatchRequest = parse_json_body(request)?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let control = state.control_writer().await?;
+    let policy = control
+        .set_versioning_enabled(tenant, volume, body.enabled)
+        .await
+        .map_err(core_error)?;
+    append_version_audit(
+        &control,
+        request,
+        if policy.enabled {
+            AuditAction::VersionEnable
+        } else {
+            AuditAction::VersionDisable
+        },
+        tenant,
+        volume,
+        [(
+            "enabled".to_string(),
+            AuditDetailValue::Bool(policy.enabled),
+        )],
+    )
+    .await?;
+    control.close().await.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({
+            "versioning": {
+                "enabled": policy.enabled,
+                "updated_at": policy.updated_at,
+            }
+        }),
+    ))
+}
+
+async fn list_version_commits_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let limit = page_limit(&request.query)?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository
+        .history(request.query.get("path").map(String::as_str), limit)
+        .await;
+    let commits = finish_version_repository(control, repository, result).await?;
+    let commits = commits
+        .into_iter()
+        .map(|commit| {
+            json!({
+                "id": commit.id,
+                "parent": commit.parent,
+                "created_at": commit.created_at,
+                "message": commit.message,
+                "paths": commit.paths,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(AdminHttpResponse::json(200, json!({ "commits": commits })))
+}
+
+async fn get_version_content_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+    commit: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let path = request
+        .query
+        .get("path")
+        .ok_or_else(|| bad_request("path query parameter is required"))?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository.read_file(commit, path).await;
+    let content = finish_version_repository(control, repository, result).await?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({
+            "content": {
+                "commit": commit,
+                "path": path,
+                "encoding": "base64",
+                "size": content.len(),
+                "data": base64::engine::general_purpose::STANDARD.encode(&content),
+            }
+        }),
+    ))
+}
+
+async fn get_version_stats_response(
+    state: &AdminState,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository.stats().await;
+    let stats = finish_version_repository(control, repository, result).await?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({
+            "stats": {
+                "bytes": stats.bytes,
+                "nodes": stats.nodes,
+                "blobs": stats.blobs,
+                "commits": stats.commits,
+            }
+        }),
+    ))
+}
+
+async fn get_version_retention_response(
+    state: &AdminState,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let control = state.control_writer().await?;
+    let policy = control
+        .try_get_versioning_retention_policy(tenant, volume)
+        .await
+        .map_err(core_error)?;
+    control.close().await.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "retention": version_retention_json(policy.as_ref()) }),
+    ))
+}
+
+async fn patch_version_retention_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let body: VersionRetentionPatchRequest = parse_json_body(request)?;
+    let has_limits =
+        body.keep_last.is_some() || body.max_age_secs.is_some() || body.max_bytes.is_some();
+    if body.clear && has_limits {
+        return Err(bad_request(
+            "clear cannot be combined with retention limits",
+        ));
+    }
+    if !body.clear && !has_limits {
+        return Err(bad_request(
+            "provide keep_last, max_age_secs, max_bytes, or clear=true",
+        ));
+    }
+
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let control = state.control_writer().await?;
+    let policy = if body.clear {
+        control
+            .clear_versioning_retention_policy(tenant, volume)
+            .await
+            .map_err(core_error)?;
+        None
+    } else {
+        let current = control
+            .try_get_versioning_retention_policy(tenant, volume)
+            .await
+            .map_err(core_error)?;
+        Some(
+            control
+                .set_versioning_retention_policy(
+                    tenant,
+                    volume,
+                    body.keep_last
+                        .or_else(|| current.as_ref().and_then(|policy| policy.keep_last)),
+                    body.max_age_secs
+                        .or_else(|| current.as_ref().and_then(|policy| policy.max_age_secs)),
+                    body.max_bytes
+                        .or_else(|| current.as_ref().and_then(|policy| policy.max_bytes)),
+                )
+                .await
+                .map_err(core_error)?,
+        )
+    };
+    append_version_audit(
+        &control,
+        request,
+        AuditAction::VersionRetentionSet,
+        tenant,
+        volume,
+        [("clear".to_string(), AuditDetailValue::Bool(body.clear))],
+    )
+    .await?;
+    control.close().await.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "retention": version_retention_json(policy.as_ref()) }),
+    ))
+}
+
+async fn run_version_gc_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let body: VersionGcRequest = parse_json_body(request)?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let control = state.control_writer().await?;
+    let retention = control
+        .try_get_versioning_retention_policy(tenant, volume)
+        .await
+        .map_err(core_error)?;
+    let repository =
+        match VersionRepository::open(&control, Arc::clone(&state.object_store), tenant, volume)
+            .await
+        {
+            Ok(repository) => repository,
+            Err(error) => {
+                let _ = control.close().await;
+                return Err(core_error(error));
+            }
+        };
+    let report_result = repository
+        .garbage_collect(
+            retention.as_ref().and_then(|policy| policy.keep_last),
+            retention.as_ref().and_then(|policy| policy.max_age_secs),
+            body.dry_run,
+        )
+        .await;
+    let report = match report_result {
+        Ok(report) => report,
+        Err(error) => {
+            return finish_version_repository(control, repository, Err(error)).await;
+        }
+    };
+    let audit = append_version_audit(
+        &control,
+        request,
+        AuditAction::VersionGc,
+        tenant,
+        volume,
+        [
+            ("dry_run".to_string(), AuditDetailValue::Bool(body.dry_run)),
+            (
+                "reclaimed_bytes".to_string(),
+                AuditDetailValue::U64(report.reclaimed_bytes),
+            ),
+        ],
+    )
+    .await;
+    let repository_close = repository.close().await;
+    let control_close = control.close().await;
+    audit?;
+    repository_close.map_err(core_error)?;
+    control_close.map_err(core_error)?;
+    if !body.dry_run {
+        state.export_metrics.version_operation(tenant, volume, "gc");
+    }
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({
+            "gc": {
+                "retained_commits": report.retained_commits,
+                "deleted_commits": report.deleted_commits,
+                "deleted_nodes": report.deleted_nodes,
+                "deleted_blobs": report.deleted_blobs,
+                "reclaimed_bytes": report.reclaimed_bytes,
+                "dry_run": report.dry_run,
+            }
+        }),
+    ))
+}
+
+async fn purge_version_history_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let body: VersionPurgeRequest = parse_json_body(request)?;
+    if !body.confirm {
+        return Err(bad_request(
+            "confirm=true is required to purge version history",
+        ));
+    }
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let control = state.control_writer().await?;
+    let deleted_objects =
+        purge_version_history(&control, Arc::clone(&state.object_store), tenant, volume)
+            .await
+            .map_err(core_error)?;
+    append_version_audit(
+        &control,
+        request,
+        AuditAction::VersionPurge,
+        tenant,
+        volume,
+        [(
+            "deleted_objects".to_string(),
+            AuditDetailValue::U64(deleted_objects as u64),
+        )],
+    )
+    .await?;
+    control.close().await.map_err(core_error)?;
+    state
+        .export_metrics
+        .version_operation(tenant, volume, "purge");
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "purged": { "deleted_objects": deleted_objects } }),
     ))
 }
 
@@ -2838,6 +3308,7 @@ async fn route_admin_request(
 
     let segments = route_segments(&request.path)?;
     let parts = segments.iter().map(String::as_str).collect::<Vec<_>>();
+    authorize_tenant_scope(request.authenticated_principal.as_deref(), &parts)?;
     match (request.method.as_str(), parts.as_slice()) {
         ("GET", ["admin", "v1", "audit"]) => audit_response(state, request).await,
         ("GET", ["admin", "v1", "exports"]) => list_exports_response(state, request).await,
@@ -2933,6 +3404,43 @@ async fn route_admin_request(
             .await
         }
         (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+            ],
+        ) => get_versioning_response(state, tenant, volume).await,
+        (
+            "PATCH",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+            ],
+        ) => patch_versioning_response(state, request, tenant, volume).await,
+        (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "commits",
+            ],
+        ) => list_version_commits_response(state, request, tenant, volume).await,
+        (
             "POST",
             [
                 "admin",
@@ -2946,6 +3454,21 @@ async fn route_admin_request(
             ],
         ) => commit_live_version_response(state, request, tenant, volume).await,
         (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "commits",
+                commit,
+                "content",
+            ],
+        ) => get_version_content_response(state, request, tenant, volume, commit).await,
+        (
             "POST",
             [
                 "admin",
@@ -2958,6 +3481,71 @@ async fn route_admin_request(
                 "restore",
             ],
         ) => restore_live_version_response(state, request, tenant, volume).await,
+        (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "stats",
+            ],
+        ) => get_version_stats_response(state, tenant, volume).await,
+        (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "retention",
+            ],
+        ) => get_version_retention_response(state, tenant, volume).await,
+        (
+            "PATCH",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "retention",
+            ],
+        ) => patch_version_retention_response(state, request, tenant, volume).await,
+        (
+            "POST",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "gc",
+            ],
+        ) => run_version_gc_response(state, request, tenant, volume).await,
+        (
+            "DELETE",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "history",
+            ],
+        ) => purge_version_history_response(state, request, tenant, volume).await,
         _ if request.path.starts_with(ADMIN_API_PREFIX) => Err(not_found("admin route not found")),
         _ => Ok(AdminHttpResponse::text(404, "not found\n")),
     }
@@ -4781,6 +5369,15 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("resolving object store {}", config.object_store.url))?;
     let kms = kms::from_config(&config.kms)?;
     let admin_token = load_admin_token(&config.admin)?;
+    if let Some(admin_token) = &admin_token
+        && config
+            .admin
+            .tenant_tokens
+            .values()
+            .any(|tenant_token| tenant_token == admin_token)
+    {
+        anyhow::bail!("admin token must differ from every admin.tenant_tokens value");
+    }
     let export_metrics = ExportMetrics::default();
     let admin_tls_loaded = load_admin_tls_config(&config.admin)?;
     let admin_tls = admin_tls_loaded.map(|loaded| {
@@ -4812,12 +5409,13 @@ async fn main() -> anyhow::Result<()> {
     let admin_tls_target = admin_tls.as_ref().map(|(_, target)| Arc::clone(target));
     let admin_cert_auth_allowed = config.admin.allow_cert_auth;
     if config.admin.listen.is_some() {
-        if admin_token.is_none() && !admin_cert_auth_allowed {
+        let has_bearer_auth = admin_token.is_some() || !config.admin.tenant_tokens.is_empty();
+        if !has_bearer_auth && !admin_cert_auth_allowed {
             tracing::warn!(
                 "slatefs admin API is unauthenticated; set admin.token/admin.token_file or enable mTLS cert auth on untrusted networks"
             );
         }
-        if admin_token.is_some() && admin_tls.is_none() {
+        if has_bearer_auth && admin_tls.is_none() {
             tracing::warn!(
                 "slatefs admin bearer tokens are accepted over cleartext HTTP; set admin.tls_cert and admin.tls_key on untrusted networks"
             );
@@ -4940,6 +5538,8 @@ async fn main() -> anyhow::Result<()> {
             export_metrics: export_metrics.clone(),
             started_at: Instant::now(),
             auth_token: admin_token,
+            tenant_tokens: config.admin.tenant_tokens.clone(),
+            version_locks: Arc::new(Mutex::new(HashMap::new())),
             allow_cert_auth: admin_cert_auth_allowed,
             node_id: None,
         });
@@ -5090,6 +5690,8 @@ mod tests {
             export_metrics: ExportMetrics::default(),
             started_at: Instant::now(),
             auth_token,
+            tenant_tokens: BTreeMap::new(),
+            version_locks: Arc::new(Mutex::new(HashMap::new())),
             allow_cert_auth: false,
             node_id: None,
         })
@@ -5110,6 +5712,8 @@ mod tests {
             export_metrics: ExportMetrics::default(),
             started_at: Instant::now(),
             auth_token,
+            tenant_tokens: BTreeMap::new(),
+            version_locks: Arc::new(Mutex::new(HashMap::new())),
             allow_cert_auth: false,
             node_id: None,
         })
@@ -5290,6 +5894,7 @@ mod tests {
             listen: None,
             token: None,
             token_file: None,
+            tenant_tokens: Default::default(),
             tls_cert: Some(certs.server_cert.clone()),
             tls_key: Some(certs.server_key.clone()),
             tls_client_ca: client_ca.then(|| certs.ca.clone()),
@@ -5657,6 +6262,71 @@ mod tests {
         let commit_response: Value = serde_json::from_str(response_body(&commit_response)).unwrap();
         let commit_id = commit_response["commit"]["id"].as_str().unwrap();
 
+        let history_response = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning/commits?path=/notes.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            response_status(&history_response),
+            200,
+            "{history_response}"
+        );
+        let history: Value = serde_json::from_str(response_body(&history_response)).unwrap();
+        assert_eq!(history["commits"][0]["id"], commit_id);
+
+        let content_request = format!(
+            "GET /admin/v1/tenants/t/volumes/v/versioning/commits/{commit_id}/content?path=/notes.txt HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        let content_response = admin_exchange(Arc::clone(&state), content_request.as_bytes()).await;
+        assert_eq!(
+            response_status(&content_response),
+            200,
+            "{content_response}"
+        );
+        let content: Value = serde_json::from_str(response_body(&content_response)).unwrap();
+        assert_eq!(content["content"]["encoding"], "base64");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(content["content"]["data"].as_str().unwrap())
+                .unwrap(),
+            b"live baseline"
+        );
+
+        let retention_body = r#"{"keep_last":2,"max_bytes":1048576}"#;
+        let retention_request = format!(
+            "PATCH /admin/v1/tenants/t/volumes/v/versioning/retention HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            retention_body.len(),
+            retention_body
+        );
+        let retention_response =
+            admin_exchange(Arc::clone(&state), retention_request.as_bytes()).await;
+        assert_eq!(
+            response_status(&retention_response),
+            200,
+            "{retention_response}"
+        );
+
+        let stats_response = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning/stats HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&stats_response), 200, "{stats_response}");
+        let stats: Value = serde_json::from_str(response_body(&stats_response)).unwrap();
+        assert_eq!(stats["stats"]["commits"], 1);
+
+        let gc_body = r#"{"dry_run":true}"#;
+        let gc_request = format!(
+            "POST /admin/v1/tenants/t/volumes/v/versioning/gc HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            gc_body.len(),
+            gc_body
+        );
+        let gc_response = admin_exchange(Arc::clone(&state), gc_request.as_bytes()).await;
+        assert_eq!(response_status(&gc_response), 200, "{gc_response}");
+        let gc: Value = serde_json::from_str(response_body(&gc_response)).unwrap();
+        assert_eq!(gc["gc"]["dry_run"], true);
+
         volume
             .write(&creds, file.ino, 0, b"changed data!")
             .await
@@ -5702,7 +6372,60 @@ mod tests {
         let audit_control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
             .await
             .unwrap();
-        for action in [AuditAction::VersionCommit, AuditAction::VersionRestore] {
+        for action in [
+            AuditAction::VersionCommit,
+            AuditAction::VersionRestore,
+            AuditAction::VersionRetentionSet,
+            AuditAction::VersionGc,
+        ] {
+            let (records, _) = audit_control
+                .list_audit(AuditQuery {
+                    action: Some(action),
+                    ..AuditQuery::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(records.len(), 1);
+        }
+        audit_control.close().await.unwrap();
+
+        let policy_response = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&policy_response), 200, "{policy_response}");
+        let policy: Value = serde_json::from_str(response_body(&policy_response)).unwrap();
+        assert_eq!(policy["versioning"]["enabled"], true);
+
+        let disable_body = r#"{"enabled":false}"#;
+        let disable_request = format!(
+            "PATCH /admin/v1/tenants/t/volumes/v/versioning HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            disable_body.len(),
+            disable_body
+        );
+        let disable_response = admin_exchange(Arc::clone(&state), disable_request.as_bytes()).await;
+        assert_eq!(
+            response_status(&disable_response),
+            200,
+            "{disable_response}"
+        );
+
+        let purge_body = r#"{"confirm":true}"#;
+        let purge_request = format!(
+            "DELETE /admin/v1/tenants/t/volumes/v/versioning/history HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            purge_body.len(),
+            purge_body
+        );
+        let purge_response = admin_exchange(Arc::clone(&state), purge_request.as_bytes()).await;
+        assert_eq!(response_status(&purge_response), 200, "{purge_response}");
+        let purge: Value = serde_json::from_str(response_body(&purge_response)).unwrap();
+        assert!(purge["purged"]["deleted_objects"].as_u64().unwrap() > 0);
+
+        let audit_control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        for action in [AuditAction::VersionDisable, AuditAction::VersionPurge] {
             let (records, _) = audit_control
                 .list_audit(AuditQuery {
                     action: Some(action),
@@ -5942,6 +6665,73 @@ mod tests {
         let body: Value = serde_json::from_str(response_body(&response)).unwrap();
         assert_eq!(body["error"]["code"], "unauthorized");
         assert_eq!(body["error"]["request_id"], "auth-req");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tenant_bearer_token_is_restricted_to_its_admin_v1_scope() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([92; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("tenant-a", None).await.unwrap();
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "tenant-a",
+            "docs",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        control.close().await.unwrap();
+
+        let state =
+            available_admin_state(object_store, kms, HashMap::new(), Some(ADMIN_TOKEN.into()))
+                .await;
+        let mut state = (*state).clone();
+        state
+            .tenant_tokens
+            .insert("tenant-a".to_string(), "tenant-secret".to_string());
+        let state = Arc::new(state);
+
+        let own = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/tenant-a/volumes/docs/versioning HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer tenant-secret\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&own), 200, "{own}");
+
+        let other = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/tenant-b/volumes/docs/versioning HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer tenant-secret\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&other), 403, "{other}");
+
+        let global = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/nodes HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer tenant-secret\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&global), 403, "{global}");
+
+        let invalid = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/tenant-a/volumes/docs/versioning HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer wrong\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&invalid), 401, "{invalid}");
+
+        let admin = admin_exchange(
+            state,
+            format!(
+                "GET /admin/v1/nodes HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {ADMIN_TOKEN}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert_eq!(response_status(&admin), 200, "{admin}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6203,6 +6993,8 @@ mod tests {
             export_metrics: metrics.clone(),
             started_at: Instant::now(),
             auth_token: None,
+            tenant_tokens: BTreeMap::new(),
+            version_locks: Arc::new(Mutex::new(HashMap::new())),
             allow_cert_auth: false,
             node_id: None,
         });
@@ -6581,6 +7373,8 @@ mod tests {
             export_metrics: ExportMetrics::default(),
             started_at: Instant::now(),
             auth_token: None,
+            tenant_tokens: BTreeMap::new(),
+            version_locks: Arc::new(Mutex::new(HashMap::new())),
             allow_cert_auth: false,
             node_id: None,
         });
@@ -7330,6 +8124,8 @@ mod tests {
             export_metrics: ExportMetrics::default(),
             started_at: Instant::now(),
             auth_token: None,
+            tenant_tokens: BTreeMap::new(),
+            version_locks: Arc::new(Mutex::new(HashMap::new())),
             allow_cert_auth: false,
             node_id: None,
         });
@@ -7488,6 +8284,8 @@ mod tests {
             export_metrics: ExportMetrics::default(),
             started_at: Instant::now(),
             auth_token: None,
+            tenant_tokens: BTreeMap::new(),
+            version_locks: Arc::new(Mutex::new(HashMap::new())),
             allow_cert_auth: false,
             node_id: None,
         });

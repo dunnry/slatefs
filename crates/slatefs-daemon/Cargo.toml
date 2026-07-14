@@ -19,6 +19,7 @@ slatefs-nbd.workspace = true
 slatedb.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+base64.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

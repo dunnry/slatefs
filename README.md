@@ -221,15 +221,26 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshots` | Checkpoint inventory with `limit`, `page_token`, and optional `name`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshot-retention` | Snapshot retention policy; named snapshots are not exempt. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshot-retention` | Set nullable `keep_last` and/or `max_age_secs`, or `{"clear":true}`. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Opt-in state and retention policy. |
+| `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Enable or disable with `{"enabled":true|false}`; disabling retains history. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Commit history with optional `path` and `limit`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"..."}`; singular `path` remains accepted. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit}/content?path=` | Read file or symlink content as base64 JSON. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore` | Atomically restore one file through the live writer from `{"commit":"...","path":"..."}`. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/stats` | Logical history bytes, nodes, blobs, and commits. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Current history retention and quota policy. |
+| `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Set `keep_last`, `max_age_secs`, and/or `max_bytes`, or `{"clear":true}`. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/gc` | Apply retention, or report with `{"dry_run":true}`. |
+| `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/history` | Permanently purge history; requires `{"confirm":true}`. |
 | `GET` | `/admin/v1/nodes` | Daemon node inventory with `limit` and `page_token`. |
 
 Every admin response includes `X-Request-Id`; callers may provide it or the
 daemon generates a UUID. v1 errors use `{"error":{"code","message","request_id"}}`.
 Unauthenticated loopback remains the default. To bind the admin listener
 outside loopback, configure `[admin].token = "..."`, `token_file = "..."`, or
-mTLS cert auth. `/admin/v1` routes require the configured app-level
+mTLS cert auth. Per-customer bearer tokens may be configured in
+`[admin.tenant_tokens]`; each token is authorized only for its matching
+`/admin/v1/tenants/{tenant}/...` subtree. `/admin/v1` routes require the configured app-level
 authentication; `/livez` and `/readyz` remain unauthenticated but are still
 served over HTTPS/mTLS when admin TLS is enabled.
 
@@ -253,6 +264,7 @@ reloads emit `slatefs_tls_reloads_total{surface=...}` and
 | Mode | Admin config | Admin route authentication | Audit principal |
 | --- | --- | --- | --- |
 | Token-only | `token` or `token_file` | Bearer token over HTTP; startup warns about cleartext token transport. | `X-Admin-Principal` after token validation, otherwise no principal. |
+| Tenant token | `[admin.tenant_tokens]` entry | Bearer token is restricted to the matching tenant subtree. | `tenant:<tenant>`. |
 | TLS + token | Token plus `tls_cert` and `tls_key` | Bearer token over HTTPS. | Same as token-only. |
 | mTLS + token | TLS + token plus `tls_client_ca` | Verified client certificate and bearer token are both required. | Same as token-only. |
 | mTLS cert auth | mTLS plus `allow_cert_auth = true` | A verified client certificate is sufficient; bearer token is still accepted when configured. | `cert:<SAN-or-CN>` for cert-authenticated requests. |
@@ -267,6 +279,9 @@ tls_cert = "/etc/slatefs/admin.pem"
 tls_key = "/etc/slatefs/admin.key"
 tls_client_ca = "/etc/slatefs/admin-ca.pem"
 allow_cert_auth = false
+
+[admin.tenant_tokens]
+customer-a = "replace-with-customer-token"
 ```
 
 For a local lab CA and leaf certificates:

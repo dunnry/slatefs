@@ -1,6 +1,7 @@
 //! TOML configuration (`/etc/slatefs/slatefs.toml`). Secrets never live here:
 //! the KMS section points at key *files* or cloud KMS key ids (plan §13).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
@@ -180,6 +181,9 @@ pub struct AdminConfig {
     pub token: Option<String>,
     /// Optional file containing the static bearer token for `/admin/v1` routes.
     pub token_file: Option<std::path::PathBuf>,
+    /// Optional tenant-scoped bearer tokens. A matching token may access only
+    /// `/admin/v1/tenants/<tenant>/...` for its configured tenant.
+    pub tenant_tokens: BTreeMap<String, String>,
     /// Optional PEM certificate chain served by the admin listener.
     pub tls_cert: Option<std::path::PathBuf>,
     /// Optional PEM private key for `tls_cert`.
@@ -581,6 +585,25 @@ impl Config {
         {
             return Err(Error::Config("admin.token must not be empty".into()));
         }
+        let mut tenant_tokens = BTreeSet::new();
+        for (tenant, token) in &self.admin.tenant_tokens {
+            crate::store::validate_name("admin tenant token name", tenant)?;
+            if token.is_empty() {
+                return Err(Error::Config(format!(
+                    "admin.tenant_tokens.{tenant} must not be empty"
+                )));
+            }
+            if !tenant_tokens.insert(token) {
+                return Err(Error::Config(
+                    "admin.tenant_tokens values must be unique".into(),
+                ));
+            }
+            if self.admin.token.as_ref() == Some(token) {
+                return Err(Error::Config(format!(
+                    "admin.tenant_tokens.{tenant} must differ from admin.token"
+                )));
+            }
+        }
         let has_admin_tls_cert = self.admin.tls_cert.is_some();
         let has_admin_tls_key = self.admin.tls_key.is_some();
         let has_admin_tls_client_ca = self.admin.tls_client_ca.is_some();
@@ -608,7 +631,9 @@ impl Config {
             let addr: SocketAddr = listen.parse().map_err(|e| {
                 Error::Config(format!("admin.listen must be an ip:port listener: {e}"))
             })?;
-            let has_token = self.admin.token.is_some() || self.admin.token_file.is_some();
+            let has_token = self.admin.token.is_some()
+                || self.admin.token_file.is_some()
+                || !self.admin.tenant_tokens.is_empty();
             let has_cert_auth = has_admin_tls_cert
                 && has_admin_tls_key
                 && has_admin_tls_client_ca
@@ -881,6 +906,69 @@ mod tests {
         "#;
         let config = Config::parse(raw).unwrap();
         assert_eq!(config.admin.token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn admin_tenant_tokens_parse_and_secure_non_loopback_listener() {
+        let raw = r#"
+            [object_store]
+            url = "memory:///"
+
+            [kms]
+            provider = "static"
+            key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+            [admin]
+            listen = "0.0.0.0:12081"
+
+            [admin.tenant_tokens]
+            tenant-a = "tenant-secret"
+        "#;
+        let config = Config::parse(raw).unwrap();
+        assert_eq!(
+            config
+                .admin
+                .tenant_tokens
+                .get("tenant-a")
+                .map(String::as_str),
+            Some("tenant-secret")
+        );
+    }
+
+    #[test]
+    fn admin_tenant_tokens_reject_empty_tokens() {
+        let raw = r#"
+            [object_store]
+            url = "memory:///"
+
+            [kms]
+            provider = "static"
+            key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+            [admin]
+            listen = "127.0.0.1:12081"
+
+            [admin.tenant_tokens]
+            tenant-a = ""
+        "#;
+        assert!(Config::parse(raw).is_err());
+    }
+
+    #[test]
+    fn admin_tenant_tokens_must_be_unique() {
+        let raw = r#"
+            [object_store]
+            url = "memory:///"
+
+            [kms]
+            provider = "static"
+            key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+            [admin.tenant_tokens]
+            tenant-a = "shared-secret"
+            tenant-b = "shared-secret"
+        "#;
+        assert!(Config::parse(raw).is_err());
     }
 
     #[test]

@@ -1171,7 +1171,10 @@ async fn create_live_snapshot_via_admin(
     })
 }
 
-fn admin_bearer_token(config: &Config) -> anyhow::Result<Option<String>> {
+fn admin_bearer_token(config: &Config, tenant: &str) -> anyhow::Result<Option<String>> {
+    if let Some(token) = config.admin.tenant_tokens.get(tenant) {
+        return Ok(Some(token.clone()));
+    }
     match (&config.admin.token, &config.admin.token_file) {
         (Some(token), None) => Ok(Some(token.clone())),
         (None, Some(path)) => {
@@ -1209,7 +1212,7 @@ async fn post_live_versioning_json(
         .ok_or_else(|| anyhow::anyhow!("--live requires [admin].listen"))?;
     let body = serde_json::to_string(&body)?;
     let path = format!("/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/{operation}");
-    let authorization = admin_bearer_token(config)?
+    let authorization = admin_bearer_token(config, tenant)?
         .map(|token| format!("Authorization: Bearer {token}\r\n"))
         .unwrap_or_default();
     let request = format!(

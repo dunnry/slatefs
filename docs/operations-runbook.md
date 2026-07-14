@@ -202,7 +202,9 @@ slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path>.
 slatefs -c /etc/slatefs/slatefs.toml versioning restore <tenant> <volume> <commit> <path> --live
 ```
 
-The CLI supplies `admin.token` or `admin.token_file` as a bearer token. The
+The CLI supplies the matching `[admin.tenant_tokens]` credential when present,
+otherwise `admin.token` or `admin.token_file`, as a bearer token. Tenant tokens
+cannot access another tenant or global admin routes. The
 direct commands without `--live` acquire the volume writer and must not be run
 while `slatefsd` serves that volume.
 
