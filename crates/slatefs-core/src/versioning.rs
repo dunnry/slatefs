@@ -4,7 +4,7 @@
 //! module opens a separate encrypted database only for explicit versioning
 //! operations, so disabled volumes pay no storage or request-path cost.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -910,6 +910,72 @@ pub struct VersionMergeInfo {
     commit: String,
     fast_forward: bool,
     already_up_to_date: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionMergePreview {
+    source: String,
+    target: String,
+    source_head: String,
+    target_head: String,
+    merge_base: String,
+    ahead: u64,
+    behind: u64,
+    fast_forward: bool,
+    already_up_to_date: bool,
+    conflicts: Vec<String>,
+}
+
+impl VersionMergePreview {
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    pub fn source_head(&self) -> &str {
+        &self.source_head
+    }
+
+    pub fn target_head(&self) -> &str {
+        &self.target_head
+    }
+
+    pub fn merge_base(&self) -> &str {
+        &self.merge_base
+    }
+
+    pub fn ahead(&self) -> u64 {
+        self.ahead
+    }
+
+    pub fn behind(&self) -> u64 {
+        self.behind
+    }
+
+    pub fn fast_forward(&self) -> bool {
+        self.fast_forward
+    }
+
+    pub fn already_up_to_date(&self) -> bool {
+        self.already_up_to_date
+    }
+
+    pub fn conflicts(&self) -> &[String] {
+        &self.conflicts
+    }
+
+    pub fn can_merge(&self) -> bool {
+        self.conflicts.is_empty()
+    }
+}
+
+struct ThreeWayMergePlan {
+    mutations: Vec<Mutation>,
+    conflicts: Vec<String>,
 }
 
 impl VersionMergeInfo {
@@ -1986,6 +2052,80 @@ impl VersionRepository {
         })
     }
 
+    /// Preview how `source` would merge into `target` without publishing a
+    /// commit or moving either branch.
+    pub async fn preview_branch_merge(
+        &self,
+        source: &str,
+        target: &str,
+    ) -> Result<VersionMergePreview> {
+        validate_version_branch_name(source)?;
+        validate_version_branch_name(target)?;
+        if source == target {
+            return Err(Error::invalid(
+                "version branch merge",
+                "source and target must differ",
+            ));
+        }
+        let source_ref = self
+            .store
+            .get_branch(source)
+            .await?
+            .ok_or_else(|| Error::not_found("version branch", source))?;
+        let target_ref = self
+            .store
+            .get_branch(target)
+            .await?
+            .ok_or_else(|| Error::not_found("version branch", target))?;
+        let source_ancestors = self.ancestor_distances(source_ref.commit_id).await?;
+        let target_ancestors = self.ancestor_distances(target_ref.commit_id).await?;
+        let ahead = source_ancestors
+            .keys()
+            .filter(|id| !target_ancestors.contains_key(*id))
+            .count() as u64;
+        let behind = target_ancestors
+            .keys()
+            .filter(|id| !source_ancestors.contains_key(*id))
+            .count() as u64;
+        let merge_base = self
+            .merge_base(target_ref.commit_id, source_ref.commit_id)
+            .await?
+            .ok_or_else(|| {
+                Error::Versioning(format!(
+                    "branches {source} and {target} have no common merge base"
+                ))
+            })?;
+        let already_up_to_date = target_ancestors.contains_key(&source_ref.commit_id);
+        let fast_forward =
+            !already_up_to_date && source_ancestors.contains_key(&target_ref.commit_id);
+        let conflicts = if already_up_to_date || fast_forward {
+            Vec::new()
+        } else {
+            let base = self.store.get_commit(&merge_base).await?;
+            let target_commit = self.store.get_commit(&target_ref.commit_id).await?;
+            let source_commit = self.store.get_commit(&source_ref.commit_id).await?;
+            self.three_way_merge_plan(
+                &base.tree.to_tree(),
+                &target_commit.tree.to_tree(),
+                &source_commit.tree.to_tree(),
+            )
+            .await?
+            .conflicts
+        };
+        Ok(VersionMergePreview {
+            source: source.to_string(),
+            target: target.to_string(),
+            source_head: hex::encode(source_ref.commit_id),
+            target_head: hex::encode(target_ref.commit_id),
+            merge_base: hex::encode(merge_base),
+            ahead,
+            behind,
+            fast_forward,
+            already_up_to_date,
+            conflicts,
+        })
+    }
+
     /// Merge `source` into `target`. Descendant sources fast-forward the
     /// target; divergent histories produce a two-parent three-way merge
     /// commit when their Prolly trees do not conflict.
@@ -2165,6 +2305,24 @@ impl VersionRepository {
         left: &Tree,
         right: &Tree,
     ) -> Result<Tree> {
+        let plan = self.three_way_merge_plan(base, left, right).await?;
+        if let Some(path) = plan.conflicts.first() {
+            return Err(Error::Versioning(format!(
+                "merge conflict between {source} and {target} at {path}"
+            )));
+        }
+        self.prolly
+            .batch(left, plan.mutations)
+            .await
+            .map_err(prolly_error)
+    }
+
+    async fn three_way_merge_plan(
+        &self,
+        base: &Tree,
+        left: &Tree,
+        right: &Tree,
+    ) -> Result<ThreeWayMergePlan> {
         let left_diff = self.prolly.diff(base, left).await.map_err(prolly_error)?;
         let right_diff = self.prolly.diff(base, right).await.map_err(prolly_error)?;
         let left_changes = left_diff
@@ -2172,6 +2330,7 @@ impl VersionRepository {
             .map(|diff| (diff.key().to_vec(), diff_result_value(diff)))
             .collect::<BTreeMap<_, _>>();
         let mut mutations = Vec::new();
+        let mut conflicts = BTreeSet::new();
         for diff in right_diff {
             let key = diff.key().to_vec();
             let value = diff_result_value(diff);
@@ -2180,9 +2339,7 @@ impl VersionRepository {
                     let path = version_path_from_tree_key(&key)
                         .map(|(path, _)| path)
                         .unwrap_or_else(|_| hex::encode(&key));
-                    return Err(Error::Versioning(format!(
-                        "merge conflict between {source} and {target} at {path}"
-                    )));
+                    conflicts.insert(path);
                 }
                 continue;
             }
@@ -2191,10 +2348,10 @@ impl VersionRepository {
                 None => Mutation::Delete { key },
             });
         }
-        self.prolly
-            .batch(left, mutations)
-            .await
-            .map_err(prolly_error)
+        Ok(ThreeWayMergePlan {
+            mutations,
+            conflicts: conflicts.into_iter().collect(),
+        })
     }
 
     pub async fn history(

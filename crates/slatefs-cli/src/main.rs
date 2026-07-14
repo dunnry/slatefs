@@ -17,9 +17,10 @@ use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{
-    VersionBranchInfo, VersionCommitInfo, VersionMergeInfo, VersionPathChangeKind,
-    VersionRepository, VersionTagInfo, force_break_expired_version_maintenance_lease,
-    purge_version_history, try_get_version_maintenance_lease,
+    VersionBranchInfo, VersionCommitInfo, VersionMergeInfo, VersionMergePreview,
+    VersionPathChangeKind, VersionRepository, VersionTagInfo,
+    force_break_expired_version_maintenance_lease, purge_version_history,
+    try_get_version_maintenance_lease,
 };
 use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
 use slatefs_core::{config, store};
@@ -430,6 +431,15 @@ enum VersioningCmd {
     },
     /// Fast-forward a target branch to a source branch.
     Merge {
+        tenant: String,
+        volume: String,
+        source: String,
+        target: String,
+        #[arg(long)]
+        live: bool,
+    },
+    /// Preview a branch merge without moving either branch.
+    MergePreview {
         tenant: String,
         volume: String,
         source: String,
@@ -1051,6 +1061,20 @@ fn print_version_merge(merge: &VersionMergeInfo) {
             "three-way"
         }
     );
+}
+
+fn print_version_merge_preview(preview: &VersionMergePreview) {
+    println!("source {}\t{}", preview.source(), preview.source_head());
+    println!("target {}\t{}", preview.target(), preview.target_head());
+    println!("merge_base {}", preview.merge_base());
+    println!("ahead {}", preview.ahead());
+    println!("behind {}", preview.behind());
+    println!("fast_forward {}", preview.fast_forward());
+    println!("already_up_to_date {}", preview.already_up_to_date());
+    println!("can_merge {}", preview.can_merge());
+    for conflict in preview.conflicts() {
+        println!("conflict {conflict}");
+    }
 }
 
 async fn stream_version_file<W: AsyncWrite + Unpin>(
@@ -2598,6 +2622,38 @@ async fn run(
             .await?;
             print_version_merge(&merge);
         }
+        Command::Versioning(VersioningCmd::MergePreview {
+            tenant,
+            volume,
+            source,
+            target,
+            live,
+        }) => {
+            if *live {
+                let endpoint = format!("branches/{target}/merge");
+                let response = live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    "GET",
+                    &endpoint,
+                    &[("source", source.clone())],
+                    None,
+                )
+                .await?;
+                let preview: VersionMergePreview =
+                    serde_json::from_value(response["preview"].clone())
+                        .context("parsing admin version merge preview")?;
+                print_version_merge_preview(&preview);
+                return Ok(());
+            }
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let result = repository.preview_branch_merge(source, target).await;
+            let repository_close = repository.close().await;
+            let preview = result?;
+            repository_close?;
+            print_version_merge_preview(&preview);
+        }
         Command::Versioning(VersioningCmd::Show {
             tenant,
             volume,
@@ -3906,6 +3962,27 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Versioning(VersioningCmd::Merge {
+                source,
+                target,
+                live: true,
+                ..
+            }) if source == "draft" && target == "main"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "merge-preview",
+            "tenant-a",
+            "docs",
+            "draft",
+            "main",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::MergePreview {
                 source,
                 target,
                 live: true,

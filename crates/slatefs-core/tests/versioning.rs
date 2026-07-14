@@ -172,6 +172,15 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         .create_branch("release", &first.id)
         .await
         .unwrap();
+    let fast_forward_preview = repository
+        .preview_branch_merge("main", "release")
+        .await
+        .unwrap();
+    assert!(fast_forward_preview.fast_forward());
+    assert!(!fast_forward_preview.already_up_to_date());
+    assert_eq!(fast_forward_preview.ahead(), 1);
+    assert_eq!(fast_forward_preview.behind(), 0);
+    assert_eq!(fast_forward_preview.merge_base(), first.id);
     let merged = repository.merge_branch("main", "release").await.unwrap();
     assert!(merged.fast_forward());
     assert!(!merged.already_up_to_date());
@@ -199,6 +208,16 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         )
         .await
         .unwrap();
+    let three_way_preview = repository
+        .preview_branch_merge("feature", "main")
+        .await
+        .unwrap();
+    assert!(!three_way_preview.fast_forward());
+    assert!(!three_way_preview.already_up_to_date());
+    assert!(three_way_preview.can_merge());
+    assert_eq!(three_way_preview.ahead(), 1);
+    assert_eq!(three_way_preview.behind(), 1);
+    assert_eq!(three_way_preview.merge_base(), first.id);
     let three_way = repository.merge_branch("feature", "main").await.unwrap();
     assert!(!three_way.fast_forward());
     assert!(!three_way.already_up_to_date());
@@ -227,6 +246,12 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
             .as_ref(),
         second_contents
     );
+    let conflict_preview = repository
+        .preview_branch_merge("draft", "main")
+        .await
+        .unwrap();
+    assert!(!conflict_preview.can_merge());
+    assert_eq!(conflict_preview.conflicts(), &["/notes.txt".to_string()]);
     let conflict = repository.merge_branch("draft", "main").await.unwrap_err();
     assert!(conflict.to_string().contains("merge conflict"));
     let branches = repository.list_branches().await.unwrap();

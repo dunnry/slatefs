@@ -2574,6 +2574,25 @@ async fn merge_version_branch_response(
     Ok(AdminHttpResponse::json(200, json!({ "merge": merge })))
 }
 
+async fn preview_version_branch_merge_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+    target: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let source = request
+        .query
+        .get("source")
+        .ok_or_else(|| bad_request("source query parameter is required"))?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository.preview_branch_merge(source, target).await;
+    let preview = finish_version_repository(control, repository, result).await?;
+    Ok(AdminHttpResponse::json(200, json!({ "preview": preview })))
+}
+
 async fn get_version_content_response(
     state: &AdminState,
     request: &AdminHttpRequest,
@@ -4135,6 +4154,21 @@ async fn route_admin_request(
                 name,
             ],
         ) => delete_version_branch_response(state, request, tenant, volume, name).await,
+        (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "branches",
+                target,
+                "merge",
+            ],
+        ) => preview_version_branch_merge_response(state, request, tenant, volume, target).await,
         (
             "POST",
             [
@@ -7268,6 +7302,17 @@ mod tests {
         );
         let branches: Value = serde_json::from_str(response_body(&branches_response)).unwrap();
         assert_eq!(branches["branches"].as_array().unwrap().len(), 2);
+        let merge_preview = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning/branches/release/merge?source=main HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&merge_preview), 200, "{merge_preview}");
+        let merge_preview: Value = serde_json::from_str(response_body(&merge_preview)).unwrap();
+        assert_eq!(merge_preview["preview"]["already_up_to_date"], true);
+        assert_eq!(merge_preview["preview"]["ahead"], 0);
+        assert_eq!(merge_preview["preview"]["behind"], 0);
+        assert_eq!(merge_preview["preview"]["conflicts"], json!([]));
         let merge_body = r#"{"source":"main"}"#;
         let merge_request = format!(
             "POST /admin/v1/tenants/t/volumes/v/versioning/branches/release/merge HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
