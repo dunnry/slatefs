@@ -14,6 +14,7 @@ use slatefs_core::control::{
 use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
+use slatefs_core::versioning::{VersionCommitInfo, VersionRepository};
 use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
 use slatefs_core::{config, store};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -53,6 +54,9 @@ enum Command {
     Quota(QuotaCmd),
     #[command(subcommand)]
     Snapshot(SnapshotCmd),
+    /// Opt-in, per-volume file version control backed by Prolly trees.
+    #[command(subcommand)]
+    Versioning(VersioningCmd),
     #[command(subcommand)]
     Clone(CloneCmd),
     #[command(subcommand)]
@@ -289,6 +293,49 @@ enum SnapshotRetentionCmd {
         /// Clear the retention policy.
         #[arg(long)]
         clear: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum VersioningCmd {
+    /// Enable explicit file versioning for a filesystem volume.
+    Enable { tenant: String, volume: String },
+    /// Disable versioning without deleting existing history.
+    Disable { tenant: String, volume: String },
+    /// Show whether versioning is enabled. This does not open a version store.
+    Status { tenant: String, volume: String },
+    /// Commit the current contents of one regular file (offline volume only).
+    Commit {
+        tenant: String,
+        volume: String,
+        path: String,
+        #[arg(short, long)]
+        message: String,
+    },
+    /// List commits, optionally restricted to a path.
+    Log {
+        tenant: String,
+        volume: String,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Read a file from a commit, writing it to stdout unless --out is given.
+    Show {
+        tenant: String,
+        volume: String,
+        commit: String,
+        path: String,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Atomically restore a file from a commit (offline volume only).
+    Restore {
+        tenant: String,
+        volume: String,
+        commit: String,
+        path: String,
     },
 }
 
@@ -771,6 +818,14 @@ fn print_snapshot(snapshot: &volume::SnapshotInfo) {
         snapshot.expire_time.as_deref().unwrap_or("-"),
         snapshot.name.as_deref().unwrap_or("-")
     );
+}
+
+fn print_version_commit(commit: &VersionCommitInfo) {
+    println!("commit {}", commit.id);
+    println!("parent {}", commit.parent.as_deref().unwrap_or("-"));
+    println!("created {}", commit.created_at);
+    println!("paths {}", commit.paths.join(","));
+    println!("message {}", commit.message);
 }
 
 fn print_snapshot_retention(tenant: &str, volume: &str, policy: Option<&SnapshotRetentionPolicy>) {
@@ -1418,6 +1473,113 @@ async fn run(
             println!(
                 "note: slatefsd reloads served-volume quota limits on the export-control poll interval"
             );
+        }
+        Command::Versioning(VersioningCmd::Enable { tenant, volume }) => {
+            let policy = control.set_versioning_enabled(tenant, volume, true).await?;
+            println!(
+                "versioning enabled for {}/{} (history is created only by explicit commits)",
+                policy.tenant, policy.volume
+            );
+        }
+        Command::Versioning(VersioningCmd::Disable { tenant, volume }) => {
+            let policy = control
+                .set_versioning_enabled(tenant, volume, false)
+                .await?;
+            println!(
+                "versioning disabled for {}/{} (existing history retained)",
+                policy.tenant, policy.volume
+            );
+        }
+        Command::Versioning(VersioningCmd::Status { tenant, volume }) => {
+            let policy = control.try_get_versioning_policy(tenant, volume).await?;
+            println!(
+                "versioning:  {}",
+                if policy.as_ref().is_some_and(|policy| policy.enabled) {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            if let Some(policy) = policy {
+                println!("updated_at:  {}", policy.updated_at);
+            }
+        }
+        Command::Versioning(VersioningCmd::Commit {
+            tenant,
+            volume: volume_name,
+            path,
+            message,
+        }) => {
+            let repository =
+                VersionRepository::open(control, Arc::clone(&object_store), tenant, volume_name)
+                    .await?;
+            let record = control.get_mountable_volume(tenant, volume_name).await?;
+            let dek = control.unwrap_volume_dek(&record).await?;
+            let live = volume::Volume::open(&record, dek, Arc::clone(&object_store)).await?;
+            let commit = repository
+                .commit_file(live.as_ref(), path, message.clone())
+                .await;
+            let live_close = live.shutdown().await;
+            let repository_close = repository.close().await;
+            let commit = commit?;
+            live_close?;
+            repository_close?;
+            print_version_commit(&commit);
+        }
+        Command::Versioning(VersioningCmd::Log {
+            tenant,
+            volume,
+            path,
+            limit,
+        }) => {
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let history = repository.history(path.as_deref(), *limit).await;
+            let repository_close = repository.close().await;
+            for commit in history? {
+                print_version_commit(&commit);
+            }
+            repository_close?;
+        }
+        Command::Versioning(VersioningCmd::Show {
+            tenant,
+            volume,
+            commit,
+            path,
+            out,
+        }) => {
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let contents = repository.read_file(commit, path).await;
+            let repository_close = repository.close().await;
+            let contents = contents?;
+            repository_close?;
+            if let Some(out) = out {
+                tokio::fs::write(out, &contents)
+                    .await
+                    .with_context(|| format!("writing {}", out.display()))?;
+                println!("wrote {} bytes to {}", contents.len(), out.display());
+            } else {
+                tokio::io::stdout().write_all(&contents).await?;
+            }
+        }
+        Command::Versioning(VersioningCmd::Restore {
+            tenant,
+            volume: volume_name,
+            commit,
+            path,
+        }) => {
+            let repository =
+                VersionRepository::open(control, Arc::clone(&object_store), tenant, volume_name)
+                    .await?;
+            let record = control.get_mountable_volume(tenant, volume_name).await?;
+            let dek = control.unwrap_volume_dek(&record).await?;
+            let live = volume::Volume::open(&record, dek, Arc::clone(&object_store)).await?;
+            let restore = repository.restore_file(live.as_ref(), commit, path).await;
+            let live_close = live.shutdown().await;
+            let repository_close = repository.close().await;
+            restore?;
+            live_close?;
+            repository_close?;
+            println!("restored {path} from {commit}");
         }
         Command::Snapshot(SnapshotCmd::Create {
             tenant,

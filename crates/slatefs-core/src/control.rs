@@ -34,6 +34,7 @@ const VOLUME_PLACEMENT_RECORD_VERSION: u8 = 1;
 const EXPORT_RECORD_VERSION: u8 = 1;
 const AUDIT_RECORD_VERSION: u8 = 1;
 const SNAPSHOT_RETENTION_RECORD_VERSION: u8 = 1;
+const VERSIONING_POLICY_RECORD_VERSION: u8 = 1;
 const MAX_AUDIT_DETAILS_BYTES: usize = 128 * 1024;
 const MAX_AUDIT_PAGE_LIMIT: usize = 1_000;
 
@@ -103,6 +104,18 @@ pub struct SnapshotRetentionPolicy {
     pub volume: String,
     pub keep_last: Option<u32>,
     pub max_age_secs: Option<u64>,
+    /// Unix seconds.
+    pub updated_at: u64,
+}
+
+/// Per-volume opt-in state for Prolly-backed file versioning. A missing record
+/// is intentionally equivalent to disabled so existing volumes keep their
+/// current behavior without migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersioningPolicy {
+    pub tenant: String,
+    pub volume: String,
+    pub enabled: bool,
     /// Unix seconds.
     pub updated_at: u64,
 }
@@ -671,6 +684,10 @@ fn snapshot_retention_key(tenant: &str, volume: &str) -> String {
     format!("sr/{tenant}/{volume}")
 }
 
+fn versioning_policy_key(tenant: &str, volume: &str) -> String {
+    format!("vr/{tenant}/{volume}")
+}
+
 pub fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1051,6 +1068,7 @@ impl ControlPlane {
         record.wrapped_dek.clear();
         self.put_volume(&record).await?;
         self.clear_snapshot_retention_policy(tenant, volume).await?;
+        self.clear_versioning_policy(tenant, volume).await?;
         self.delete_volume_placement(tenant, volume).await?;
         let objects_deleted = self.delete_volume_objects(tenant, volume).await?;
         tracing::info!(
@@ -1075,6 +1093,7 @@ impl ControlPlane {
             self.put_volume(&volume).await?;
             self.clear_snapshot_retention_policy(name, &volume.name)
                 .await?;
+            self.clear_versioning_policy(name, &volume.name).await?;
             self.delete_volume_placement(name, &volume.name).await?;
         }
         tenant.state = TenantState::Deleting;
@@ -1098,8 +1117,11 @@ impl ControlPlane {
     }
 
     async fn delete_volume_objects(&self, tenant: &str, volume: &str) -> Result<usize> {
-        let prefix = store::volume_db_prefix(tenant, volume);
-        store::delete_prefix(&self.object_store, &prefix).await
+        let volume_prefix = store::volume_db_prefix(tenant, volume);
+        let version_prefix = store::version_db_prefix(tenant, volume);
+        let volume_objects = store::delete_prefix(&self.object_store, &volume_prefix).await?;
+        let version_objects = store::delete_prefix(&self.object_store, &version_prefix).await?;
+        Ok(volume_objects + version_objects)
     }
 
     pub async fn set_tenant_rate_limits(
@@ -1143,6 +1165,71 @@ impl ControlPlane {
         record.quota = quota;
         self.put_volume(&record).await?;
         Ok(record)
+    }
+
+    // ---- opt-in file versioning ----
+
+    pub async fn set_versioning_enabled(
+        &self,
+        tenant: &str,
+        volume: &str,
+        enabled: bool,
+    ) -> Result<VersioningPolicy> {
+        let record = self.get_mountable_volume(tenant, volume).await?;
+        if !matches!(record.kind, VolumeKind::Filesystem) {
+            return Err(Error::invalid(
+                "versioning volume",
+                "file versioning is available only for filesystem volumes",
+            ));
+        }
+        let policy = VersioningPolicy {
+            tenant: tenant.to_string(),
+            volume: volume.to_string(),
+            enabled,
+            updated_at: now_unix(),
+        };
+        self.db
+            .put(
+                versioning_policy_key(tenant, volume).as_bytes(),
+                encode_versioned(VERSIONING_POLICY_RECORD_VERSION, &policy)?,
+            )
+            .await?;
+        Ok(policy)
+    }
+
+    pub async fn try_get_versioning_policy(
+        &self,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<Option<VersioningPolicy>> {
+        self.get_volume(tenant, volume).await?;
+        let key = versioning_policy_key(tenant, volume);
+        self.db
+            .get(key.as_bytes())
+            .await?
+            .map(|bytes| decode_versioning_policy(&bytes))
+            .transpose()
+    }
+
+    pub async fn versioning_enabled(&self, tenant: &str, volume: &str) -> Result<bool> {
+        Ok(self
+            .try_get_versioning_policy(tenant, volume)
+            .await?
+            .is_some_and(|policy| policy.enabled))
+    }
+
+    pub async fn clear_versioning_policy(
+        &self,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<Option<VersioningPolicy>> {
+        let existing = self.try_get_versioning_policy(tenant, volume).await?;
+        if existing.is_some() {
+            self.db
+                .delete(versioning_policy_key(tenant, volume).as_bytes())
+                .await?;
+        }
+        Ok(existing)
     }
 
     // ---- per-volume snapshot retention ----
@@ -2468,6 +2555,10 @@ fn decode_export_record(bytes: &[u8]) -> Result<ExportRecord> {
 
 fn decode_snapshot_retention_policy(bytes: &[u8]) -> Result<SnapshotRetentionPolicy> {
     decode_versioned(SNAPSHOT_RETENTION_RECORD_VERSION, bytes)
+}
+
+fn decode_versioning_policy(bytes: &[u8]) -> Result<VersioningPolicy> {
+    decode_versioned(VERSIONING_POLICY_RECORD_VERSION, bytes)
 }
 
 fn decode_audit_record(bytes: &[u8]) -> Result<AuditRecord> {

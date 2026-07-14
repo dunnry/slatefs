@@ -139,6 +139,18 @@ read-only and never persist atime updates regardless of policy.
 deleting, drop wrapped keys from the current control-plane state, and delete
 the affected volume object-store prefixes.
 
+**Opt-in file versioning:** Prolly-backed history is disabled by default for
+every volume and is never part of the normal NFS/9P read or write path. Enable
+it explicitly with `slatefs versioning enable <tenant> <volume>`, then create
+versions of selected regular files with `slatefs versioning commit` and its
+tenant, volume, path, and `-m <message>` arguments. `versioning log`,
+`versioning show`, and `versioning restore` inspect and recover those commits.
+`versioning disable` stops all version operations but retains existing history;
+ordinary filesystem I/O continues unchanged. The first implementation operates
+on regular files one at a time. Commit and restore open the live volume writer,
+so the volume must be stopped or otherwise quiesced; do not run those two
+commands against a volume currently served by `slatefsd`.
+
 **Phase 6 started** (snapshots/clones, HA, performance, GA polish):
 `slatefs snapshot create|list|delete` manages SlateDB checkpoints for a volume.
 The CLI create path opens the volume as the writer so SlateDB can flush before

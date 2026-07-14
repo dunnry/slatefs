@@ -34,6 +34,9 @@ pub enum Error {
 
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("versioning: {0}")]
+    Versioning(String),
 }
 
 pub(crate) fn is_fenced_slatedb_error(error: &slatedb::Error) -> bool {

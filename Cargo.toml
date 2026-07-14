@@ -51,6 +51,7 @@ x509-parser = "0.18"
 # crates/nfs3-server/README.md.
 nfs3_server = { path = "crates/nfs3-server", features = ["memfs"] }
 slatedb-common = "0.14.1"
+prolly = { package = "prolly-map", version = "0.2.1", features = ["async-store"] }
 
 # 9P2000.L frontend (plan §9.3 spike outcome: rs9p revived 2025, BSD-3-Clause)
 rs9p = { path = "crates/rs9p" }

@@ -209,6 +209,14 @@ pub fn volume_db_prefix(tenant: &str, volume: &str) -> ObjPath {
     ObjPath::from(volume_db_path(tenant, volume))
 }
 
+pub fn version_db_path(tenant: &str, volume: &str) -> String {
+    format!("versions/{tenant}/{volume}")
+}
+
+pub fn version_db_prefix(tenant: &str, volume: &str) -> ObjPath {
+    ObjPath::from(version_db_path(tenant, volume))
+}
+
 /// Temporary SlateDB 0.13 reader shim for shallow clones.
 ///
 /// `Db::builder` installs a `PathResolver` with `external_ssts` from the

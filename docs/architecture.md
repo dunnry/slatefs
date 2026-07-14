@@ -15,6 +15,7 @@ flowchart LR
     nfsfe --> daemon["slatefsd"]
     p9fe --> daemon
     cli["slatefs CLI"] --> control["Control plane DB"]
+    cli --> versions["Optional Prolly version DB"]
     daemon --> control
     daemon --> vfs["VFS core"]
     vfs --> volume["Volume"]
@@ -23,13 +24,14 @@ flowchart LR
     db --> ram["Per-volume RAM block cache"]
     db --> disk["Per-volume disk part cache"]
     db --> store
+    versions --> store
 ```
 
 ## Component Map
 
 | Component | Code | Responsibility |
 |---|---|---|
-| CLI | `crates/slatefs-cli` | Tenant, volume, quota, snapshot, clone, key-rotation, scrub, and fsck operations. |
+| CLI | `crates/slatefs-cli` | Tenant, volume, quota, snapshot, clone, opt-in file versioning, key-rotation, scrub, and fsck operations. |
 | Daemon | `crates/slatefs-daemon` | Loads config, resolves exports, opens volumes, starts NFS/9P listeners, metrics, and loopback admin endpoint. |
 | VFS core | `crates/slatefs-core/src/vfs.rs`, `vfs_impl.rs` | Protocol-independent filesystem semantics and errno mapping. |
 | Volume layer | `crates/slatefs-core/src/volume.rs` | One SlateDB writer per volume, mkfs/open, cache wiring, fencing, snapshots, clones. |
@@ -50,6 +52,7 @@ SlateFS keeps:
 | `control.dek` | SlateFS | Wrapped control-plane DEK. |
 | `control` | SlateDB | Encrypted control-plane database. |
 | `volumes/<tenant>/<volume>` | SlateDB | One encrypted database per volume. |
+| `versions/<tenant>/<volume>` | SlateDB + Prolly | Optional encrypted file-version repository, opened only for explicit versioning operations. |
 
 Each volume is an independent SlateDB database. This is the core isolation
 decision: the volume DEK, SlateDB writer lease, cache namespace, quota counters,
@@ -59,6 +62,27 @@ SlateDB owns the physical SST/WAL/manifest layout below each database path.
 SlateFS owns the logical records inside the control and volume keyspaces. The
 current record contract is documented in
 [on-disk-format.md](on-disk-format.md).
+
+## Optional File Versioning
+
+File versioning is a sidecar, not a filesystem storage requirement. A missing
+control-plane policy means disabled. Enabling a filesystem volume records only
+that policy; the separate `versions/<tenant>/<volume>` database is created
+lazily by the first explicit version operation and reuses the volume DEK and
+block transformer. Normal VFS, NFS, and 9P operations do not open or update it.
+
+Each commit applies file metadata and content-chunk references to an immutable
+Prolly tree. Chunks are content-addressed blobs, commit IDs are SHA-256 hashes,
+and `heads/main` points to the current commit. Publishing the commit and branch
+reference is one SlateDB batch after the new immutable tree nodes and blobs
+have been written. Disabling versioning blocks repository operations without
+deleting its history. Volume deletion removes both the live and optional
+version-store prefixes.
+
+The initial customer slice versions one selected regular file per commit.
+Commit and restore currently open the volume writer and are therefore offline
+operations; a served-volume admin route can be added later without coupling
+versioning to normal filesystem writes.
 
 ## Request Path
 

@@ -135,7 +135,8 @@ impl VolumeHealth {
             Error::NotFound { .. }
             | Error::AlreadyExists { .. }
             | Error::Invalid { .. }
-            | Error::Config(_) => {}
+            | Error::Config(_)
+            | Error::Versioning(_) => {}
         }
     }
 

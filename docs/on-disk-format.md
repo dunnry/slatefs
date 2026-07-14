@@ -46,12 +46,14 @@ All paths are relative to the configured object-store root.
 | `control.dek` | SlateFS raw object | `CONTROL_KEYFILE_VERSION=1` envelope containing `ControlKeyFile` |
 | `control` | SlateDB | encrypted control-plane database |
 | `volumes/<tenant>/<volume>` | SlateDB | one encrypted database per volume |
+| `versions/<tenant>/<volume>` | SlateDB + Prolly | optional encrypted per-volume file-version repository |
 
 The control-plane DB at `control` is encrypted with `SlateBlockTransformer`.
 Its DEK is wrapped directly by the configured master KMS and stored in
 `control.dek`.
 
-Each volume DB is encrypted with its own volume DEK. SlateDB compresses blocks
+Each volume DB and its optional version DB are encrypted with the same volume
+DEK. SlateDB compresses blocks
 first, then the SlateFS block transformer AEAD-seals the compressed bytes, and
 SlateDB checksums the transformed bytes.
 
@@ -94,6 +96,7 @@ Control DB keys are UTF-8 byte strings.
 |---|---:|---|
 | `t/<tenant>` | 1 | `TenantRecord` |
 | `v/<tenant>/<volume>` | 1 | `VolumeRecord` |
+| `vr/<tenant>/<volume>` | 1 | optional `VersioningPolicy`; absence means disabled |
 | `k/fhmac` | internal | server file-handle HMAC key |
 
 `control.dek` is not inside the control DB. It is a raw object containing a
@@ -106,6 +109,26 @@ Current record payloads:
 - `CloneParent { tenant, volume }`
 - `QuotaLimits { bytes, inodes }`
 - `QuotaLimit { soft, hard, grace_until }`
+- `VersioningPolicy { tenant, volume, enabled, updated_at }`
+
+## Optional Version Repository Records
+
+The `versions/<tenant>/<volume>` database is created lazily and is not read by
+the live VFS request path. Its logical key prefixes are:
+
+| Prefix/key | Version | Value |
+|---|---:|---|
+| `pn/<prolly-node-key>` | Prolly | immutable Prolly node bytes |
+| `pb/<content-id>` | Prolly | content-addressed file chunk blob |
+| `pc/<sha256-commit-id>` | 1 | `VersionCommit` |
+| `pr/heads/main` | 1 | current `VersionRef` |
+
+File metadata (`m/<canonical-path>`) and chunk references
+(`c/<canonical-path> NUL <u32-be-index>`) live inside the Prolly tree. SlateFS
+prefixes its structured values with `u8 format_version` and postcard-encodes
+the payload. A commit records its parent, root manifest, creation time,
+message, and changed paths. Version repository history is retained when the
+policy is disabled and removed with the volume.
 
 Current enum sets:
 
