@@ -198,7 +198,7 @@ For opt-in file history on a currently served filesystem volume, route commit
 and restore through that daemon's configured admin listener:
 
 ```sh
-slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path>... -m <message> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path>... -m <message> --idempotency-key <retry-key> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning restore <tenant> <volume> <commit> <path> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning log <tenant> <volume> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning show <tenant> <volume> <commit> <path> --out restored.bin --live

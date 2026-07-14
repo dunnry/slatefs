@@ -124,6 +124,7 @@ the live VFS request path. Its logical key prefixes are:
 | `pn/<prolly-node-key>` | Prolly | immutable Prolly node bytes |
 | `pb/<content-id>` | Prolly | content-addressed file chunk blob |
 | `pc/<sha256-commit-id>` | 1 | `VersionCommit` |
+| `pi/<sha256-idempotency-key>` | 1 | commit ID and canonical request fingerprint |
 | `pr/heads/main` | 1 | current `VersionRef` |
 
 Entry metadata (`m/<canonical-path>`) and file chunk references
@@ -132,8 +133,9 @@ prefixes its structured values with `u8 format_version` and postcard-encodes
 the payload. Entry metadata version 2 distinguishes regular files,
 directories, and symlinks; version 1 regular-file metadata remains readable.
 A commit records its parent, root manifest, creation time, message, and selected
-paths. Version repository history is retained when the policy is disabled and
-removed with the volume.
+paths. An idempotency record is written atomically with its commit and head;
+garbage collection removes it when that commit is pruned. Version repository
+history is retained when the policy is disabled and removed with the volume.
 
 `version-leases/<tenant>/<volume>` is a version-1 postcard record containing
 `tenant`, `volume`, an ephemeral owner UUID, operation name, acquisition time,

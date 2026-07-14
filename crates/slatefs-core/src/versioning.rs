@@ -32,11 +32,13 @@ use crate::volume::Volume;
 const NODE_PREFIX: &[u8] = b"pn/";
 const BLOB_PREFIX: &[u8] = b"pb/";
 const COMMIT_PREFIX: &[u8] = b"pc/";
+const IDEMPOTENCY_PREFIX: &[u8] = b"pi/";
 const PRUNED_COMMIT_PREFIX: &[u8] = b"pp/";
 const HEAD_KEY: &[u8] = b"pr/heads/main";
 const LEGACY_FILE_META_VERSION: u8 = 1;
 const ENTRY_META_VERSION: u8 = 2;
 const COMMIT_VERSION: u8 = 1;
+const IDEMPOTENCY_VERSION: u8 = 1;
 const REF_VERSION: u8 = 1;
 const MAINTENANCE_LEASE_VERSION: u8 = 1;
 const MAINTENANCE_LEASE_TTL_SECS: u64 = 120;
@@ -415,6 +417,23 @@ struct VersionStore {
     ref_lock: Arc<Mutex<()>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VersionCommitIdempotencyRecord {
+    commit_id: [u8; 32],
+    request_fingerprint: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VersionCommitIdempotencyIntent {
+    key_hash: [u8; 32],
+    request_fingerprint: [u8; 32],
+}
+
+enum VersionPublishOutcome {
+    Published,
+    Replayed(Box<VersionCommit>),
+}
+
 impl VersionStore {
     fn new(db: Db) -> Self {
         Self {
@@ -462,8 +481,15 @@ impl VersionStore {
         expected: Option<[u8; 32]>,
         commit: &VersionCommit,
         encoded_commit: Vec<u8>,
-    ) -> Result<()> {
+        idempotency: Option<VersionCommitIdempotencyIntent>,
+        max_bytes: Option<u64>,
+    ) -> Result<VersionPublishOutcome> {
         let _guard = self.ref_lock.lock().await;
+        if let Some(intent) = idempotency
+            && let Some(existing) = self.resolve_idempotency(intent).await?
+        {
+            return Ok(VersionPublishOutcome::Replayed(Box::new(existing)));
+        }
         let current = self.get_head().await?;
         if current.as_ref().map(|head| head.commit_id) != expected {
             return Err(Error::Versioning(format!(
@@ -476,6 +502,19 @@ impl VersionStore {
                     .unwrap_or_else(|| "empty".to_string())
             )));
         }
+        if let Some(max_bytes) = max_bytes {
+            let mut bytes = 0u64;
+            let mut iter = self.db.scan(..).await?;
+            while let Some(entry) = iter.next().await? {
+                bytes = bytes.saturating_add((entry.key.len() + entry.value.len()) as u64);
+            }
+            let projected = bytes.saturating_add(encoded_commit.len() as u64);
+            if projected > max_bytes {
+                return Err(Error::Versioning(format!(
+                    "version history quota exceeded: {projected} bytes projected, {max_bytes} bytes allowed"
+                )));
+            }
+        }
 
         let head = VersionRef {
             commit_id: commit.id,
@@ -484,9 +523,53 @@ impl VersionStore {
         let mut batch = WriteBatch::new();
         batch.put(commit_key(&commit.id), encoded_commit);
         batch.put(HEAD_KEY, encode_versioned(REF_VERSION, &head)?);
+        if let Some(intent) = idempotency {
+            let record = VersionCommitIdempotencyRecord {
+                commit_id: commit.id,
+                request_fingerprint: intent.request_fingerprint,
+            };
+            batch.put(
+                idempotency_key(&intent.key_hash),
+                encode_versioned(IDEMPOTENCY_VERSION, &record)?,
+            );
+        }
         self.db.write(batch).await?;
         self.db.flush().await?;
-        Ok(())
+        Ok(VersionPublishOutcome::Published)
+    }
+
+    async fn resolve_idempotency(
+        &self,
+        intent: VersionCommitIdempotencyIntent,
+    ) -> Result<Option<VersionCommit>> {
+        let Some(bytes) = self
+            .get_raw(&idempotency_key(&intent.key_hash))
+            .await
+            .map_err(version_store_error)?
+        else {
+            return Ok(None);
+        };
+        let record: VersionCommitIdempotencyRecord = decode_versioned(
+            IDEMPOTENCY_VERSION,
+            &bytes,
+            "version commit idempotency record",
+        )?;
+        if record.request_fingerprint != intent.request_fingerprint {
+            return Err(Error::already_exists(
+                "version commit idempotency key",
+                hex::encode(intent.key_hash),
+            ));
+        }
+        let commit = self
+            .try_get_commit(&record.commit_id)
+            .await?
+            .ok_or_else(|| {
+                Error::Versioning(format!(
+                    "idempotency record references missing commit {}",
+                    hex::encode(record.commit_id)
+                ))
+            })?;
+        Ok(Some(commit))
     }
 }
 
@@ -632,6 +715,13 @@ struct VersionCommitBody {
     paths: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct VersionCommitRequestFingerprint<'a> {
+    version: u8,
+    message: &'a str,
+    paths: &'a [String],
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VersionRef {
     commit_id: [u8; 32],
@@ -645,6 +735,29 @@ pub struct VersionCommitInfo {
     pub created_at: u64,
     pub message: String,
     pub paths: Vec<String>,
+}
+
+/// The result of an idempotent version commit. A replay returns the original
+/// commit without capturing or publishing the live paths again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct VersionCommitResult {
+    commit: VersionCommitInfo,
+    replayed: bool,
+}
+
+impl VersionCommitResult {
+    pub fn commit(&self) -> &VersionCommitInfo {
+        &self.commit
+    }
+
+    pub fn replayed(&self) -> bool {
+        self.replayed
+    }
+
+    pub fn into_commit(self) -> VersionCommitInfo {
+        self.commit
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -982,6 +1095,13 @@ impl VersionRepository {
                     }
                     true
                 }
+            } else if key.starts_with(IDEMPOTENCY_PREFIX) {
+                let record: VersionCommitIdempotencyRecord = decode_versioned(
+                    IDEMPOTENCY_VERSION,
+                    &entry.value,
+                    "version commit idempotency record",
+                )?;
+                !retained_ids.contains(record.commit_id.as_slice())
             } else {
                 false
             };
@@ -1020,7 +1140,24 @@ impl VersionRepository {
         paths: &[String],
         message: String,
     ) -> Result<VersionCommitInfo> {
-        self.commit_paths_inner(live, None, paths, message).await
+        Ok(self
+            .commit_paths_inner(live, None, paths, message, None)
+            .await?
+            .into_commit())
+    }
+
+    /// Commit selected paths with a caller-supplied retry key. Reusing the key
+    /// with the same canonical paths and message returns the original commit;
+    /// reusing it for a different request is rejected.
+    pub async fn commit_paths_idempotent(
+        &self,
+        live: &dyn Vfs,
+        paths: &[String],
+        message: String,
+        idempotency_key: &str,
+    ) -> Result<VersionCommitResult> {
+        self.commit_paths_inner(live, None, paths, message, Some(idempotency_key))
+            .await
     }
 
     /// Commit from a live SlateFS volume while validating its writer lease
@@ -1032,7 +1169,23 @@ impl VersionRepository {
         message: String,
     ) -> Result<VersionCommitInfo> {
         live.validate_writer_lease().await?;
-        self.commit_paths_inner(live, Some(live), paths, message)
+        Ok(self
+            .commit_paths_inner(live, Some(live), paths, message, None)
+            .await?
+            .into_commit())
+    }
+
+    /// Commit through a live writer with a caller-supplied retry key. The key,
+    /// commit, and branch head are published atomically in the version store.
+    pub async fn commit_volume_paths_idempotent(
+        &self,
+        live: &Volume,
+        paths: &[String],
+        message: String,
+        idempotency_key: &str,
+    ) -> Result<VersionCommitResult> {
+        live.validate_writer_lease().await?;
+        self.commit_paths_inner(live, Some(live), paths, message, Some(idempotency_key))
             .await
     }
 
@@ -1042,8 +1195,20 @@ impl VersionRepository {
         writer_guard: Option<&Volume>,
         paths: &[String],
         message: String,
-    ) -> Result<VersionCommitInfo> {
+        idempotency_key: Option<&str>,
+    ) -> Result<VersionCommitResult> {
         let canonical = canonicalize_path_set(paths)?;
+        let idempotency = idempotency_key
+            .map(|key| version_commit_idempotency_intent(key, &canonical, &message))
+            .transpose()?;
+        if let Some(intent) = idempotency
+            && let Some(commit) = self.store.resolve_idempotency(intent).await?
+        {
+            return Ok(VersionCommitResult {
+                commit: commit.into(),
+                replayed: true,
+            });
+        }
 
         let head = self.store.get_head().await?;
         let base = head
@@ -1106,22 +1271,29 @@ impl VersionRepository {
             paths: body.paths,
         };
         let encoded = encode_versioned(COMMIT_VERSION, &commit)?;
-        if let Some(max_bytes) = self.max_bytes {
-            let stats = self.stats().await?;
-            let projected = stats.bytes.saturating_add(encoded.len() as u64);
-            if projected > max_bytes {
-                return Err(Error::Versioning(format!(
-                    "version history quota exceeded: {projected} bytes projected, {max_bytes} bytes allowed"
-                )));
-            }
-        }
         if let Some(writer_guard) = writer_guard {
             writer_guard.validate_writer_lease().await?;
         }
-        self.store
-            .publish_commit(head.map(|head| head.commit_id), &commit, encoded)
-            .await?;
-        Ok(commit.into())
+        match self
+            .store
+            .publish_commit(
+                head.map(|head| head.commit_id),
+                &commit,
+                encoded,
+                idempotency,
+                self.max_bytes,
+            )
+            .await?
+        {
+            VersionPublishOutcome::Published => Ok(VersionCommitResult {
+                commit: commit.into(),
+                replayed: false,
+            }),
+            VersionPublishOutcome::Replayed(commit) => Ok(VersionCommitResult {
+                commit: (*commit).into(),
+                replayed: true,
+            }),
+        }
     }
 
     async fn capture_subtree(
@@ -1695,6 +1867,10 @@ fn commit_key(id: &[u8; 32]) -> Vec<u8> {
     prefixed_key(COMMIT_PREFIX, id)
 }
 
+fn idempotency_key(key_hash: &[u8; 32]) -> Vec<u8> {
+    prefixed_key(IDEMPOTENCY_PREFIX, key_hash)
+}
+
 fn pruned_commit_key(id: &[u8; 32]) -> Vec<u8> {
     prefixed_key(PRUNED_COMMIT_PREFIX, id)
 }
@@ -1713,6 +1889,35 @@ fn parse_commit_id(value: &str) -> Result<[u8; 32]> {
 
 fn commit_id_string(id: &[u8; 32]) -> String {
     hex::encode(id)
+}
+
+fn version_commit_idempotency_intent(
+    key: &str,
+    canonical_paths: &[String],
+    message: &str,
+) -> Result<VersionCommitIdempotencyIntent> {
+    if key.is_empty() {
+        return Err(Error::invalid(
+            "version commit idempotency key",
+            "must not be empty",
+        ));
+    }
+    if key.len() > 256 {
+        return Err(Error::invalid(
+            "version commit idempotency key",
+            "must not exceed 256 UTF-8 bytes",
+        ));
+    }
+    let request = VersionCommitRequestFingerprint {
+        version: 1,
+        message,
+        paths: canonical_paths,
+    };
+    let request_fingerprint = Sha256::digest(postcard::to_allocvec(&request)?).into();
+    Ok(VersionCommitIdempotencyIntent {
+        key_hash: Sha256::digest(key.as_bytes()).into(),
+        request_fingerprint,
+    })
 }
 
 fn encode_versioned<T: Serialize>(version: u8, value: &T) -> Result<Vec<u8>> {

@@ -338,6 +338,9 @@ enum VersioningCmd {
         paths: Vec<String>,
         #[arg(short, long)]
         message: String,
+        /// Retry key; reuse only for the same canonical paths and message.
+        #[arg(long)]
+        idempotency_key: Option<String>,
         /// Ask the serving slatefsd admin endpoint to use its active writer.
         #[arg(long)]
         live: bool,
@@ -1998,6 +2001,7 @@ async fn run(
             volume: volume_name,
             paths,
             message,
+            idempotency_key,
             live,
         }) => {
             if *live {
@@ -2006,7 +2010,11 @@ async fn run(
                     tenant,
                     volume_name,
                     "commits",
-                    serde_json::json!({ "paths": paths, "message": message }),
+                    serde_json::json!({
+                        "paths": paths,
+                        "message": message,
+                        "idempotency_key": idempotency_key,
+                    }),
                 )
                 .await?;
                 println!(
@@ -2015,6 +2023,9 @@ async fn run(
                         .as_str()
                         .ok_or_else(|| anyhow::anyhow!("admin response omitted commit id"))?
                 );
+                if response["replayed"].as_bool().unwrap_or(false) {
+                    println!("replayed true");
+                }
                 return Ok(());
             }
             let repository =
@@ -2023,12 +2034,22 @@ async fn run(
             let record = control.get_mountable_volume(tenant, volume_name).await?;
             let dek = control.unwrap_volume_dek(&record).await?;
             let live = volume::Volume::open(&record, dek, Arc::clone(&object_store)).await?;
-            let commit = repository
-                .commit_volume_paths(live.as_ref(), paths, message.clone())
-                .await;
+            let commit = match idempotency_key.as_deref() {
+                Some(key) => repository
+                    .commit_volume_paths_idempotent(live.as_ref(), paths, message.clone(), key)
+                    .await
+                    .map(|result| {
+                        let replayed = result.replayed();
+                        (result.into_commit(), replayed)
+                    }),
+                None => repository
+                    .commit_volume_paths(live.as_ref(), paths, message.clone())
+                    .await
+                    .map(|commit| (commit, false)),
+            };
             let live_close = live.shutdown().await;
             let repository_close = repository.close().await;
-            let commit = commit?;
+            let (commit, replayed) = commit?;
             live_close?;
             repository_close?;
             append_cli_version_audit(
@@ -2036,13 +2057,19 @@ async fn run(
                 AuditAction::VersionCommit,
                 tenant,
                 volume_name,
-                [(
-                    "commit".to_string(),
-                    AuditDetailValue::String(commit.id.clone()),
-                )],
+                [
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(commit.id.clone()),
+                    ),
+                    ("replayed".to_string(), AuditDetailValue::Bool(replayed)),
+                ],
             )
             .await?;
             print_version_commit(&commit);
+            if replayed {
+                println!("replayed true");
+            }
         }
         Command::Versioning(VersioningCmd::Log {
             tenant,
@@ -3269,6 +3296,29 @@ mod tests {
                 live: true,
                 ..
             }) if owner == "owner-uuid"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "commit",
+            "tenant-a",
+            "docs",
+            "/notes.txt",
+            "--message",
+            "save notes",
+            "--idempotency-key",
+            "retry-1",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::Commit {
+                idempotency_key: Some(key),
+                live: true,
+                ..
+            }) if key == "retry-1"
         ));
     }
 }

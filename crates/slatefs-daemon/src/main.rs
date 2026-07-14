@@ -958,17 +958,19 @@ struct VersionCommitRequest {
     #[serde(default)]
     paths: Vec<String>,
     message: String,
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 impl VersionCommitRequest {
-    fn into_paths(mut self) -> Result<(Vec<String>, String), AdminError> {
+    fn into_paths(mut self) -> Result<(Vec<String>, String, Option<String>), AdminError> {
         if let Some(path) = self.path {
             self.paths.push(path);
         }
         if self.paths.is_empty() {
             return Err(bad_request("provide path or paths"));
         }
-        Ok((self.paths, self.message))
+        Ok((self.paths, self.message, self.idempotency_key))
     }
 }
 
@@ -1899,7 +1901,7 @@ async fn commit_live_version_response(
     volume: &str,
 ) -> Result<AdminHttpResponse, AdminError> {
     let body: VersionCommitRequest = parse_json_body(request)?;
-    let (paths, message) = body.into_paths()?;
+    let (paths, message, idempotency_key) = body.into_paths()?;
     let target = live_filesystem_target(state, tenant, volume)?;
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
@@ -1919,11 +1921,21 @@ async fn commit_live_version_response(
             }
         };
 
-    let commit = repository
-        .commit_volume_paths(target.as_ref(), &paths, message)
-        .await;
+    let commit = match idempotency_key.as_deref() {
+        Some(key) => repository
+            .commit_volume_paths_idempotent(target.as_ref(), &paths, message, key)
+            .await
+            .map(|result| {
+                let replayed = result.replayed();
+                (result.into_commit(), replayed)
+            }),
+        None => repository
+            .commit_volume_paths(target.as_ref(), &paths, message)
+            .await
+            .map(|commit| (commit, false)),
+    };
     let audit = match &commit {
-        Ok(commit) => {
+        Ok((commit, replayed)) => {
             append_version_audit(
                 &control,
                 request,
@@ -1946,6 +1958,7 @@ async fn commit_live_version_response(
                                 .collect(),
                         ),
                     ),
+                    ("replayed".to_string(), AuditDetailValue::Bool(*replayed)),
                 ],
             )
             .await
@@ -1954,7 +1967,8 @@ async fn commit_live_version_response(
     };
     let repository_close = repository.close().await;
     let control_close = control.close().await;
-    let commit = commit.map_err(|error| live_version_error(&target, tenant, volume, error))?;
+    let (commit, replayed) =
+        commit.map_err(|error| live_version_error(&target, tenant, volume, error))?;
     audit?;
     repository_close.map_err(core_error)?;
     control_close.map_err(core_error)?;
@@ -1971,7 +1985,8 @@ async fn commit_live_version_response(
                 "created_at": commit.created_at,
                 "message": commit.message,
                 "paths": commit.paths,
-            }
+            },
+            "replayed": replayed,
         }),
     ))
 }
@@ -6530,7 +6545,8 @@ mod tests {
         targets.insert(VolumeId::from_parts("t", "v"), Arc::clone(&volume));
         let state =
             available_admin_state(Arc::clone(&object_store), Arc::clone(&kms), targets, None).await;
-        let commit_body = r#"{"path":"/notes.txt","message":"live commit"}"#;
+        let commit_body =
+            r#"{"path":"/notes.txt","message":"live commit","idempotency_key":"retry-live-1"}"#;
         let commit_request = format!(
             "POST /admin/v1/tenants/t/volumes/v/versioning/commits HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             commit_body.len(),
@@ -6540,6 +6556,21 @@ mod tests {
         assert_eq!(response_status(&commit_response), 201, "{commit_response}");
         let commit_response: Value = serde_json::from_str(response_body(&commit_response)).unwrap();
         let commit_id = commit_response["commit"]["id"].as_str().unwrap();
+        assert_eq!(commit_response["replayed"], false);
+        let replay_response = admin_exchange(Arc::clone(&state), commit_request.as_bytes()).await;
+        assert_eq!(response_status(&replay_response), 201, "{replay_response}");
+        let replay: Value = serde_json::from_str(response_body(&replay_response)).unwrap();
+        assert_eq!(replay["commit"]["id"], commit_id);
+        assert_eq!(replay["replayed"], true);
+        let conflict_body =
+            r#"{"path":"/notes.txt","message":"other request","idempotency_key":"retry-live-1"}"#;
+        let conflict_request = format!(
+            "POST /admin/v1/tenants/t/volumes/v/versioning/commits HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            conflict_body.len(),
+            conflict_body
+        );
+        let conflict = admin_exchange(Arc::clone(&state), conflict_request.as_bytes()).await;
+        assert_eq!(response_status(&conflict), 409, "{conflict}");
 
         let history_response = admin_exchange(
             Arc::clone(&state),
@@ -6719,7 +6750,7 @@ mod tests {
         let metrics = render_daemon_metrics_with_exports(&[], &state.export_metrics);
         assert!(
             metrics.contains(
-                "slatefs_version_operations_total{tenant=\"t\",volume=\"v\",operation=\"commit\"} 1"
+                "slatefs_version_operations_total{tenant=\"t\",volume=\"v\",operation=\"commit\"} 2"
             ),
             "{metrics}"
         );
@@ -6744,7 +6775,8 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert_eq!(records.len(), 1);
+            let expected = usize::from(action == AuditAction::VersionCommit) + 1;
+            assert_eq!(records.len(), expected);
         }
         audit_control.close().await.unwrap();
 

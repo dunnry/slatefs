@@ -243,7 +243,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Opt-in state, retention policy, and current or last repository lease. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Enable or disable with `{"enabled":true|false}`; disabling retains history. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Commit history with optional `path`, `limit`, and exclusive `page_token`; returns `next_page_token`. |
-| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"..."}`; singular `path` remains accepted. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"...","idempotency_key":"..."}`; the retry key is optional and singular `path` remains accepted. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit}/content?path=&offset=&length=` | Read a bounded file or symlink range as base64 JSON; defaults to 1 MiB and rejects ranges over 4 MiB. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore` | Atomically restore one file through the live writer from `{"commit":"...","path":"..."}`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/stats` | Logical history bytes, nodes, blobs, and commits. |
@@ -257,6 +257,11 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 
 Every admin response includes `X-Request-Id`; callers may provide it or the
 daemon generates a UUID. v1 errors use `{"error":{"code","message","request_id"}}`.
+Version commit callers can separately provide an `idempotency_key` of up to
+256 UTF-8 bytes. Repeating the same key with the same canonical paths and
+message returns the original commit with `"replayed":true`; using it for a
+different request returns HTTP 409. Retry records are retained and collected
+with their commits.
 Unauthenticated loopback remains the default. To bind the admin listener
 outside loopback, configure `[admin].token = "..."`, `token_file = "..."`, or
 mTLS cert auth. Per-customer bearer tokens may be configured in

@@ -169,6 +169,146 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
 }
 
 #[tokio::test]
+async fn idempotent_commit_retries_return_the_original_commit() {
+    let object_store: Arc<dyn ObjectStore> = store::resolve_root("memory:///").unwrap();
+    let control = ControlPlane::open(Arc::clone(&object_store), common::test_kms())
+        .await
+        .unwrap();
+    control.create_tenant("t", None).await.unwrap();
+    let record = volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "v",
+        common::create_opts(None, None),
+    )
+    .await
+    .unwrap();
+    control
+        .set_versioning_enabled("t", "v", true)
+        .await
+        .unwrap();
+    let dek = control.unwrap_volume_dek(&record).await.unwrap();
+    let live = Volume::open(&record, dek, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let creds = Credentials::root();
+    let file = live
+        .create(&creds, ROOT_INO, b"notes.txt", 0o640, true)
+        .await
+        .unwrap();
+    live.write(&creds, file.ino, 0, b"first contents")
+        .await
+        .unwrap();
+
+    let repository = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap();
+    let first = repository
+        .commit_volume_paths_idempotent(
+            live.as_ref(),
+            &["notes.txt".into(), "/notes.txt".into()],
+            "save notes".into(),
+            "retry-1",
+        )
+        .await
+        .unwrap();
+    assert!(!first.replayed());
+    let first_id = first.commit().id.clone();
+
+    live.write(&creds, file.ino, 0, b"changed after response loss")
+        .await
+        .unwrap();
+    let replay = repository
+        .commit_volume_paths_idempotent(
+            live.as_ref(),
+            &["/notes.txt".into()],
+            "save notes".into(),
+            "retry-1",
+        )
+        .await
+        .unwrap();
+    assert!(replay.replayed());
+    assert_eq!(replay.commit().id, first_id);
+    assert_eq!(repository.history(None, 10).await.unwrap().len(), 1);
+    assert_eq!(
+        repository
+            .read_file(&first_id, "/notes.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"first contents"
+    );
+
+    let conflict = repository
+        .commit_volume_paths_idempotent(
+            live.as_ref(),
+            &["/notes.txt".into()],
+            "different request".into(),
+            "retry-1",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(conflict, Error::AlreadyExists { .. }));
+    let invalid = repository
+        .commit_volume_paths_idempotent(
+            live.as_ref(),
+            &["/notes.txt".into()],
+            "save notes".into(),
+            "",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(invalid, Error::Invalid { .. }));
+
+    let repository = Arc::new(repository);
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let repository = Arc::clone(&repository);
+        let live = Arc::clone(&live);
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            repository
+                .commit_volume_paths_idempotent(
+                    live.as_ref(),
+                    &["/notes.txt".into()],
+                    "save changed notes".into(),
+                    "retry-concurrent",
+                )
+                .await
+                .unwrap()
+        }));
+    }
+    barrier.wait().await;
+    let left = tasks.remove(0).await.unwrap();
+    let right = tasks.remove(0).await.unwrap();
+    assert_eq!(left.commit().id, right.commit().id);
+    assert_ne!(left.replayed(), right.replayed());
+    assert_eq!(repository.history(None, 10).await.unwrap().len(), 2);
+    let gc = repository
+        .garbage_collect(Some(1), None, false)
+        .await
+        .unwrap();
+    assert_eq!(gc.deleted_commits, 1);
+    let pruned_retry = repository
+        .commit_volume_paths_idempotent(
+            live.as_ref(),
+            &["/notes.txt".into()],
+            "save notes".into(),
+            "retry-1",
+        )
+        .await
+        .unwrap_err();
+    assert!(pruned_retry.to_string().contains("no changes"));
+
+    repository.close().await.unwrap();
+    live.shutdown().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn version_repository_lease_coordinates_open_and_purge() {
     let object_store: Arc<dyn ObjectStore> = store::resolve_root("memory:///").unwrap();
     let control = ControlPlane::open(Arc::clone(&object_store), common::test_kms())
