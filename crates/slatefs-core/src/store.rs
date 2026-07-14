@@ -217,6 +217,13 @@ pub fn version_db_prefix(tenant: &str, volume: &str) -> ObjPath {
     ObjPath::from(version_db_path(tenant, volume))
 }
 
+/// Object-store lease used to serialize version-repository access across
+/// daemon processes. It deliberately lives outside the repository prefix so a
+/// history purge cannot delete its own coordination record.
+pub fn version_lease_path(tenant: &str, volume: &str) -> ObjPath {
+    ObjPath::from(format!("version-leases/{tenant}/{volume}"))
+}
+
 /// Temporary SlateDB 0.13 reader shim for shallow clones.
 ///
 /// `Db::builder` installs a `PathResolver` with `external_ssts` from the

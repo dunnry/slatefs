@@ -1152,9 +1152,21 @@ impl ControlPlane {
 
     async fn delete_volume_objects(&self, tenant: &str, volume: &str) -> Result<usize> {
         let volume_prefix = store::volume_db_prefix(tenant, volume);
-        let version_prefix = store::version_db_prefix(tenant, volume);
+        let version_objects = crate::versioning::delete_version_history_objects(
+            Arc::clone(&self.object_store),
+            tenant,
+            volume,
+        )
+        .await?;
         let volume_objects = store::delete_prefix(&self.object_store, &volume_prefix).await?;
-        let version_objects = store::delete_prefix(&self.object_store, &version_prefix).await?;
+        match self
+            .object_store
+            .delete(&store::version_lease_path(tenant, volume))
+            .await
+        {
+            Ok(()) | Err(slatedb::object_store::Error::NotFound { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
         Ok(volume_objects + version_objects)
     }
 

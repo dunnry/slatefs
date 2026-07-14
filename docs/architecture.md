@@ -53,6 +53,7 @@ SlateFS keeps:
 | `control` | SlateDB | Encrypted control-plane database. |
 | `volumes/<tenant>/<volume>` | SlateDB | One encrypted database per volume. |
 | `versions/<tenant>/<volume>` | SlateDB + Prolly | Optional encrypted file-version repository, opened only for explicit versioning operations. |
+| `version-leases/<tenant>/<volume>` | SlateFS | Conditional-write coordination record for explicit version operations. |
 
 Each volume is an independent SlateDB database. This is the core isolation
 decision: the volume DEK, SlateDB writer lease, cache namespace, quota counters,
@@ -78,6 +79,17 @@ reference is one SlateDB batch after the new immutable tree nodes and blobs
 have been written. Disabling versioning blocks repository operations without
 deleting its history. Volume deletion removes both the live and optional
 version-store prefixes.
+
+Explicit version operations are serialized across processes before a SlateDB
+version writer is opened. SlateFS creates or conditionally replaces the
+per-volume `version-leases` record, renews it during the operation, and expires
+it on close. The object contains only coordination metadata (owner UUID,
+operation, and timestamps), never file content or key material. Conditional
+revision updates prevent an expired owner from releasing a successor's lease.
+Purge uses the same lease, so it cannot race repository reads, commits, or GC.
+Backends without conditional update (notably local `file://`) release leases
+normally but require confirmed-safe operator cleanup after a process crash;
+they never perform an unsafe automatic takeover.
 
 One commit can select multiple paths. Directories recursively capture regular
 files, subdirectories, and symlinks; selected missing paths delete their old

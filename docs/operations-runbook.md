@@ -249,9 +249,18 @@ slatefs -c /etc/slatefs/slatefs.toml versioning verify <tenant> <volume>
 API content reads are paged with `offset` and `length` (1 MiB default, 4 MiB
 maximum) and return `total_size`, `eof`, and `next_offset`.
 
-`versioning purge <tenant> <volume> --yes` is irreversible and must run only
-when no version repository for the volume is open. Disabling alone retains
-history and is not a purge.
+`versioning purge <tenant> <volume> --yes` is irreversible. SlateFS acquires
+the same deployment-wide per-volume lease used by repository reads, commits,
+verification, and GC, so a concurrent operation returns a conflict instead of
+racing the deletion. Disabling alone retains history and is not a purge. For a
+served volume, continue to use `--live`; the lease coordinates version history,
+not direct access to the live filesystem writer.
+
+On CAS-capable cloud stores, a crashed holder's lease is taken over after its
+expiry. The local `file://` store intentionally refuses automatic stale
+takeover because it cannot conditionally update objects. After confirming the
+owning process is gone and no version operation is active, remove
+`version-leases/<tenant>/<volume>` from the local store root, then retry.
 
 For a writable restore workspace:
 

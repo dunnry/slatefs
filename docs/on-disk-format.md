@@ -47,6 +47,7 @@ All paths are relative to the configured object-store root.
 | `control` | SlateDB | encrypted control-plane database |
 | `volumes/<tenant>/<volume>` | SlateDB | one encrypted database per volume |
 | `versions/<tenant>/<volume>` | SlateDB + Prolly | optional encrypted per-volume file-version repository |
+| `version-leases/<tenant>/<volume>` | SlateFS raw object | version-operation lease metadata; no secrets or file data |
 
 The control-plane DB at `control` is encrypted with `SlateBlockTransformer`.
 Its DEK is wrapped directly by the configured master KMS and stored in
@@ -133,6 +134,14 @@ directories, and symlinks; version 1 regular-file metadata remains readable.
 A commit records its parent, root manifest, creation time, message, and selected
 paths. Version repository history is retained when the policy is disabled and
 removed with the volume.
+
+`version-leases/<tenant>/<volume>` is a version-1 postcard record containing
+`tenant`, `volume`, an ephemeral owner UUID, operation name, acquisition time,
+and expiry time. It is created and renewed with object-store conditional
+writes. The record lives outside the version database prefix so purge cannot
+delete its own lock; an expired record is replaced with compare-and-swap, and
+a stale owner cannot overwrite or release its successor. Stores without
+conditional update do not automatically take over an expired record.
 
 Current enum sets:
 

@@ -172,6 +172,17 @@ leaving versioning enabled for a fresh next commit. Commit, restore, retention,
 GC, and purge actions emit durable audit records, and live daemon operations
 increment `slatefs_version_operations_total{tenant,volume,operation}`.
 
+Every explicit repository operation and purge acquires a per-volume lease with
+an atomic object-store conditional write. The lease is renewed while work is
+active and permits stale-owner takeover after expiry on CAS-capable stores,
+coordinating CLI and multiple daemon processes without opening a competing
+SlateDB writer. A
+contender receives HTTP `409` (or an `already exists` CLI error) and should
+retry after the current operation finishes. The local `file://` backend lacks
+conditional update; normal release is still automatic, but a lease orphaned by
+a crashed process must be removed by an operator after confirming no owner is
+active.
+
 **Phase 6 started** (snapshots/clones, HA, performance, GA polish):
 `slatefs snapshot create|list|delete` manages SlateDB checkpoints for a volume.
 The CLI create path opens the volume as the writer so SlateDB can flush before

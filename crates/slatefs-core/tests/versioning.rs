@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use futures::TryStreamExt;
 use slatefs_core::control::ControlPlane;
+use slatefs_core::error::Error;
 use slatefs_core::meta::inode::ROOT_INO;
 use slatefs_core::store::{self, ObjectStore};
 use slatefs_core::versioning::{VersionRepository, purge_version_history};
@@ -161,6 +162,52 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
     );
 
     live.shutdown().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn version_repository_lease_coordinates_open_and_purge() {
+    let object_store: Arc<dyn ObjectStore> = store::resolve_root("memory:///").unwrap();
+    let control = ControlPlane::open(Arc::clone(&object_store), common::test_kms())
+        .await
+        .unwrap();
+    control.create_tenant("t", None).await.unwrap();
+    volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "v",
+        common::create_opts(None, None),
+    )
+    .await
+    .unwrap();
+    control
+        .set_versioning_enabled("t", "v", true)
+        .await
+        .unwrap();
+
+    let first = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap();
+    let second = match VersionRepository::open(&control, Arc::clone(&object_store), "t", "v").await
+    {
+        Ok(_) => panic!("second repository unexpectedly acquired the lease"),
+        Err(error) => error,
+    };
+    assert!(matches!(second, Error::AlreadyExists { .. }));
+    let purge = purge_version_history(&control, Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap_err();
+    assert!(matches!(purge, Error::AlreadyExists { .. }));
+
+    first.close().await.unwrap();
+    let second = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap();
+    second.close().await.unwrap();
+    purge_version_history(&control, Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap();
     control.close().await.unwrap();
 }
 

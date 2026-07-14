@@ -6491,6 +6491,26 @@ mod tests {
             "{retention_response}"
         );
 
+        let competing_control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        let competing_repository =
+            VersionRepository::open(&competing_control, Arc::clone(&object_store), "t", "v")
+                .await
+                .unwrap();
+        competing_control.close().await.unwrap();
+        let conflict_response = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning/stats HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            response_status(&conflict_response),
+            409,
+            "{conflict_response}"
+        );
+        competing_repository.close().await.unwrap();
+
         let stats_response = admin_exchange(
             Arc::clone(&state),
             b"GET /admin/v1/tenants/t/volumes/v/versioning/stats HTTP/1.1\r\nHost: localhost\r\n\r\n",

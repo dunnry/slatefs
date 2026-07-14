@@ -15,9 +15,10 @@ use prolly::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use slatedb::bytes::Bytes as SlateBytes;
-use slatedb::object_store::ObjectStore;
+use slatedb::object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
 use slatedb::{Db, Settings, WriteBatch};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
+use tokio::task::JoinHandle;
 
 use crate::config::AtimeMode;
 use crate::control::{ControlPlane, VolumeRecord};
@@ -37,6 +38,241 @@ const LEGACY_FILE_META_VERSION: u8 = 1;
 const ENTRY_META_VERSION: u8 = 2;
 const COMMIT_VERSION: u8 = 1;
 const REF_VERSION: u8 = 1;
+const MAINTENANCE_LEASE_VERSION: u8 = 1;
+const MAINTENANCE_LEASE_TTL_SECS: u64 = 120;
+const MAINTENANCE_LEASE_RENEW_SECS: u64 = 30;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct VersionMaintenanceLeaseRecord {
+    tenant: String,
+    volume: String,
+    owner: String,
+    operation: String,
+    acquired_at: u64,
+    expires_at: u64,
+}
+
+#[derive(Clone)]
+struct VersionMaintenanceLease {
+    object_store: Arc<dyn ObjectStore>,
+    path: slatedb::object_store::path::Path,
+    state: Arc<Mutex<VersionMaintenanceLeaseState>>,
+}
+
+struct VersionMaintenanceLeaseState {
+    record: VersionMaintenanceLeaseRecord,
+    revision: UpdateVersion,
+    conditional_updates: bool,
+}
+
+impl VersionMaintenanceLease {
+    async fn acquire(
+        object_store: Arc<dyn ObjectStore>,
+        tenant: &str,
+        volume: &str,
+        owner: String,
+        operation: &str,
+    ) -> Result<Self> {
+        let path = store::version_lease_path(tenant, volume);
+        let now = crate::control::now_unix();
+        let record = VersionMaintenanceLeaseRecord {
+            tenant: tenant.to_string(),
+            volume: volume.to_string(),
+            owner,
+            operation: operation.to_string(),
+            acquired_at: now,
+            expires_at: now.saturating_add(MAINTENANCE_LEASE_TTL_SECS),
+        };
+        let payload = encode_versioned(MAINTENANCE_LEASE_VERSION, &record)?;
+        let result = match object_store
+            .put_opts(
+                &path,
+                payload.clone().into(),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
+                let current = object_store.get(&path).await?;
+                let revision = UpdateVersion {
+                    e_tag: current.meta.e_tag.clone(),
+                    version: current.meta.version.clone(),
+                };
+                let current_record: VersionMaintenanceLeaseRecord = decode_versioned(
+                    MAINTENANCE_LEASE_VERSION,
+                    &current.bytes().await?,
+                    "version maintenance lease",
+                )?;
+                if current_record.expires_at > now {
+                    return Err(Error::already_exists(
+                        "version maintenance lease",
+                        format!(
+                            "{tenant}/{volume} held by {} for {} until {}",
+                            current_record.owner,
+                            current_record.operation,
+                            current_record.expires_at
+                        ),
+                    ));
+                }
+                object_store
+                    .put_opts(
+                        &path,
+                        payload.into(),
+                        PutOptions::from(PutMode::Update(revision)),
+                    )
+                    .await
+                    .map_err(|error| match error {
+                        slatedb::object_store::Error::Precondition { .. } => Error::already_exists(
+                            "version maintenance lease",
+                            format!("{tenant}/{volume} changed during stale-lease takeover"),
+                        ),
+                        slatedb::object_store::Error::NotImplemented { .. } => {
+                            Error::already_exists(
+                                "version maintenance lease",
+                                format!(
+                                    "{tenant}/{volume} is expired, but this object store does not support safe automatic takeover"
+                                ),
+                            )
+                        }
+                        other => other.into(),
+                    })?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Self {
+            object_store,
+            path,
+            state: Arc::new(Mutex::new(VersionMaintenanceLeaseState {
+                record,
+                revision: result.into(),
+                conditional_updates: true,
+            })),
+        })
+    }
+
+    async fn renew(&self) -> Result<()> {
+        let mut state = self.state.lock().await;
+        state.record.expires_at =
+            crate::control::now_unix().saturating_add(MAINTENANCE_LEASE_TTL_SECS);
+        let payload = encode_versioned(MAINTENANCE_LEASE_VERSION, &state.record)?;
+        if !state.conditional_updates {
+            return Ok(());
+        }
+        let result = match self
+            .object_store
+            .put_opts(
+                &self.path,
+                payload.into(),
+                PutOptions::from(PutMode::Update(state.revision.clone())),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(slatedb::object_store::Error::NotImplemented { .. }) => {
+                state.conditional_updates = false;
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(match error {
+                    slatedb::object_store::Error::Precondition { .. } => {
+                        Error::Versioning("version maintenance lease was lost".to_string())
+                    }
+                    other => other.into(),
+                });
+            }
+        };
+        state.revision = result.into();
+        Ok(())
+    }
+
+    async fn release(&self) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if !state.conditional_updates {
+            return self
+                .object_store
+                .delete(&self.path)
+                .await
+                .map_err(Error::from);
+        }
+        state.record.expires_at = 0;
+        let payload = encode_versioned(MAINTENANCE_LEASE_VERSION, &state.record)?;
+        match self
+            .object_store
+            .put_opts(
+                &self.path,
+                payload.into(),
+                PutOptions::from(PutMode::Update(state.revision.clone())),
+            )
+            .await
+        {
+            Ok(result) => {
+                state.revision = result.into();
+                Ok(())
+            }
+            Err(slatedb::object_store::Error::Precondition { .. }) => Ok(()),
+            Err(slatedb::object_store::Error::NotImplemented { .. }) => {
+                state.conditional_updates = false;
+                self.object_store
+                    .delete(&self.path)
+                    .await
+                    .map_err(Error::from)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+struct VersionMaintenanceGuard {
+    stop: watch::Sender<bool>,
+    task: Mutex<Option<JoinHandle<Result<()>>>>,
+}
+
+impl VersionMaintenanceGuard {
+    async fn acquire(
+        object_store: Arc<dyn ObjectStore>,
+        tenant: &str,
+        volume: &str,
+        operation: &str,
+    ) -> Result<Self> {
+        let owner = uuid::Uuid::new_v4().to_string();
+        let lease =
+            VersionMaintenanceLease::acquire(object_store, tenant, volume, owner, operation)
+                .await?;
+        let (stop, mut stopped) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = stopped.changed() => {
+                        if changed.is_err() || *stopped.borrow() {
+                            break;
+                        }
+                    }
+                    () = tokio::time::sleep(std::time::Duration::from_secs(MAINTENANCE_LEASE_RENEW_SECS)) => {
+                        if let Err(error) = lease.renew().await {
+                            tracing::warn!(%error, "version maintenance lease renewal failed; retrying");
+                        }
+                    }
+                }
+            }
+            lease.release().await
+        });
+        Ok(Self {
+            stop,
+            task: Mutex::new(Some(task)),
+        })
+    }
+
+    async fn close(&self) -> Result<()> {
+        let _ = self.stop.send(true);
+        if let Some(task) = self.task.lock().await.take() {
+            task.await.map_err(|error| {
+                Error::Versioning(format!("lease heartbeat task failed: {error}"))
+            })??;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum VersionStoreError {
@@ -337,10 +573,11 @@ pub struct VersionRepository {
     prolly: AsyncProlly<VersionStore>,
     max_bytes: Option<u64>,
     chunk_size: u64,
+    maintenance: VersionMaintenanceGuard,
 }
 
-/// Permanently delete the physical version-repository prefix. The caller must
-/// ensure no version repository for this volume is open.
+/// Permanently delete the physical version-repository prefix. The same lease
+/// used by repository opens makes this conflict safely with active work.
 pub async fn purge_version_history(
     control: &ControlPlane,
     object_store: Arc<dyn ObjectStore>,
@@ -348,7 +585,23 @@ pub async fn purge_version_history(
     volume: &str,
 ) -> Result<usize> {
     control.get_volume(tenant, volume).await?;
-    store::delete_prefix(&object_store, &store::version_db_prefix(tenant, volume)).await
+    delete_version_history_objects(object_store, tenant, volume).await
+}
+
+pub(crate) async fn delete_version_history_objects(
+    object_store: Arc<dyn ObjectStore>,
+    tenant: &str,
+    volume: &str,
+) -> Result<usize> {
+    let maintenance =
+        VersionMaintenanceGuard::acquire(Arc::clone(&object_store), tenant, volume, "purge")
+            .await?;
+    let result =
+        store::delete_prefix(&object_store, &store::version_db_prefix(tenant, volume)).await;
+    let close = maintenance.close().await;
+    let deleted = result?;
+    close?;
+    Ok(deleted)
 }
 
 impl VersionRepository {
@@ -369,7 +622,14 @@ impl VersionRepository {
             .and_then(|policy| policy.max_bytes);
         let record = control.get_mountable_volume(tenant, volume).await?;
         let dek = control.unwrap_volume_dek(&record).await?;
-        Self::open_for_record(&record, dek, object_store, max_bytes).await
+        let maintenance = VersionMaintenanceGuard::acquire(
+            Arc::clone(&object_store),
+            tenant,
+            volume,
+            "repository",
+        )
+        .await?;
+        Self::open_for_record(&record, dek, object_store, max_bytes, maintenance).await
     }
 
     async fn open_for_record(
@@ -377,6 +637,7 @@ impl VersionRepository {
         dek: crate::crypto::Secret32,
         object_store: Arc<dyn ObjectStore>,
         max_bytes: Option<u64>,
+        maintenance: VersionMaintenanceGuard,
     ) -> Result<Self> {
         if !matches!(record.kind, crate::meta::superblock::VolumeKind::Filesystem) {
             return Err(Error::invalid(
@@ -402,11 +663,15 @@ impl VersionRepository {
             prolly,
             max_bytes,
             chunk_size: u64::from(record.chunk_size),
+            maintenance,
         })
     }
 
     pub async fn close(&self) -> Result<()> {
-        self.store.db.close().await.map_err(Error::from)
+        let db_close = self.store.db.close().await.map_err(Error::from);
+        let lease_close = self.maintenance.close().await;
+        db_close?;
+        lease_close
     }
 
     pub async fn stats(&self) -> Result<VersionStoreStats> {
@@ -1357,6 +1622,71 @@ fn fs_error(error: crate::vfs::FsError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stale_lease_owner_cannot_release_successor() {
+        let object_store: Arc<dyn ObjectStore> = store::resolve_root("memory:///").unwrap();
+        let first = VersionMaintenanceLease::acquire(
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            "first".to_string(),
+            "gc",
+        )
+        .await
+        .unwrap();
+        first.release().await.unwrap();
+        let successor = VersionMaintenanceLease::acquire(
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            "successor".to_string(),
+            "purge",
+        )
+        .await
+        .unwrap();
+
+        // This uses the first owner's stale object-store revision. Its
+        // conditional update must not expire the successor's active lease.
+        first.release().await.unwrap();
+        let contender = VersionMaintenanceLease::acquire(
+            object_store,
+            "t",
+            "v",
+            "contender".to_string(),
+            "verify",
+        )
+        .await;
+        assert!(matches!(contender, Err(Error::AlreadyExists { .. })));
+        successor.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_file_lease_releases_without_conditional_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let object_store: Arc<dyn ObjectStore> =
+            store::resolve_root(&format!("file://{}", directory.path().display())).unwrap();
+        let first = VersionMaintenanceLease::acquire(
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            "first".to_string(),
+            "commit",
+        )
+        .await
+        .unwrap();
+        first.release().await.unwrap();
+        let second = VersionMaintenanceLease::acquire(
+            object_store,
+            "t",
+            "v",
+            "second".to_string(),
+            "verify",
+        )
+        .await
+        .unwrap();
+        second.release().await.unwrap();
+    }
 
     #[test]
     fn canonical_paths_reject_ambiguous_components() {
