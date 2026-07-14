@@ -504,6 +504,7 @@ impl VersionStore {
 
     async fn publish_commit(
         &self,
+        branch: &str,
         expected: Option<[u8; 32]>,
         commit: &VersionCommit,
         encoded_commit: Vec<u8>,
@@ -516,10 +517,16 @@ impl VersionStore {
         {
             return Ok(VersionPublishOutcome::Replayed(Box::new(existing)));
         }
-        let current = self.get_head().await?;
+        let ref_key = branch_key(branch);
+        let current = self.get_ref(&ref_key).await?;
         if current.as_ref().map(|head| head.commit_id) != expected {
+            let subject = if branch == "main" {
+                "branch".to_string()
+            } else {
+                format!("branch {branch}")
+            };
             return Err(Error::Versioning(format!(
-                "branch moved while committing; expected {}, found {}",
+                "{subject} moved while committing; expected {}, found {}",
                 expected
                     .map(hex::encode)
                     .unwrap_or_else(|| "empty".to_string()),
@@ -548,7 +555,7 @@ impl VersionStore {
         };
         let mut batch = WriteBatch::new();
         batch.put(commit_key(&commit.id), encoded_commit);
-        batch.put(HEAD_KEY, encode_versioned(REF_VERSION, &head)?);
+        batch.put(ref_key, encode_versioned(REF_VERSION, &head)?);
         if let Some(intent) = idempotency {
             let record = VersionCommitIdempotencyRecord {
                 commit_id: commit.id,
@@ -828,6 +835,14 @@ struct VersionCommitBody {
 #[derive(Serialize)]
 struct VersionCommitRequestFingerprint<'a> {
     version: u8,
+    message: &'a str,
+    paths: &'a [String],
+}
+
+#[derive(Serialize)]
+struct VersionCommitRequestFingerprintV2<'a> {
+    version: u8,
+    branch: &'a str,
     message: &'a str,
     paths: &'a [String],
 }
@@ -1276,25 +1291,38 @@ impl VersionRepository {
                     hex::encode(branch.commit_id)
                 )));
             }
-            if !seen.insert(branch.commit_id) {
-                continue;
+            let mut next = Some(branch.commit_id);
+            while let Some(id) = next {
+                if !seen.insert(id) {
+                    break;
+                }
+                let Some(commit) = self.store.try_get_commit(&id).await? else {
+                    if self.store.is_pruned_commit(&id).await? {
+                        break;
+                    }
+                    return Err(Error::Versioning(format!(
+                        "version branch {name} references missing commit {}",
+                        hex::encode(id)
+                    )));
+                };
+                let body = VersionCommitBody {
+                    parent: commit.parent,
+                    tree: commit.tree.clone(),
+                    created_at: commit.created_at,
+                    message: commit.message.clone(),
+                    paths: commit.paths.clone(),
+                };
+                let expected: [u8; 32] = Sha256::digest(postcard::to_allocvec(&body)?).into();
+                if expected != commit.id || commit.id != id {
+                    return Err(Error::Versioning(format!(
+                        "branch commit {} does not match its content hash",
+                        hex::encode(id)
+                    )));
+                }
+                trees.push(commit.tree.to_tree());
+                next = commit.parent;
+                commits += 1;
             }
-            let body = VersionCommitBody {
-                parent: commit.parent,
-                tree: commit.tree.clone(),
-                created_at: commit.created_at,
-                message: commit.message.clone(),
-                paths: commit.paths.clone(),
-            };
-            let expected: [u8; 32] = Sha256::digest(postcard::to_allocvec(&body)?).into();
-            if expected != commit.id || commit.id != branch.commit_id {
-                return Err(Error::Versioning(format!(
-                    "branch commit {} does not match its content hash",
-                    hex::encode(branch.commit_id)
-                )));
-            }
-            trees.push(commit.tree.to_tree());
-            commits += 1;
         }
         for tag in self.store.list_tags().await? {
             if !seen.insert(tag.commit_id) {
@@ -1385,27 +1413,31 @@ impl VersionRepository {
             .map(|commit| commit.id)
             .collect::<HashSet<_>>();
         for (name, branch) in self.store.list_branches().await? {
-            if name == "main" || !retained_commit_ids.insert(branch.commit_id) {
+            if name == "main" {
                 continue;
             }
-            let commit = if let Some(commit) = chain
-                .iter()
-                .find(|commit| commit.id == branch.commit_id)
-                .cloned()
-            {
-                commit
-            } else {
-                self.store
-                    .try_get_commit(&branch.commit_id)
-                    .await?
-                    .ok_or_else(|| {
-                        Error::Versioning(format!(
-                            "version branch {name} references missing commit {}",
-                            hex::encode(branch.commit_id)
-                        ))
-                    })?
-            };
-            retained.push(commit);
+            let mut next = Some(branch.commit_id);
+            let mut position = 0usize;
+            while let Some(id) = next {
+                let Some(commit) = self.store.try_get_commit(&id).await? else {
+                    if position > 0 && self.store.is_pruned_commit(&id).await? {
+                        break;
+                    }
+                    return Err(Error::Versioning(format!(
+                        "version branch {name} references missing commit {}",
+                        hex::encode(id)
+                    )));
+                };
+                next = commit.parent;
+                let within_count = keep_last.is_none_or(|keep| position < keep as usize);
+                let within_age = cutoff.is_none_or(|cutoff| commit.created_at >= cutoff);
+                if (position == 0 || (within_count && within_age))
+                    && retained_commit_ids.insert(commit.id)
+                {
+                    retained.push(commit);
+                }
+                position += 1;
+            }
         }
         for tag in self.store.list_tags().await? {
             if retained_commit_ids.insert(tag.commit_id) {
@@ -1537,7 +1569,21 @@ impl VersionRepository {
         message: String,
     ) -> Result<VersionCommitInfo> {
         Ok(self
-            .commit_paths_inner(live, None, paths, message, None)
+            .commit_paths_inner(live, None, "main", paths, message, None)
+            .await?
+            .into_commit())
+    }
+
+    /// Commit selected paths to an existing named branch.
+    pub async fn commit_paths_on_branch(
+        &self,
+        live: &dyn Vfs,
+        branch: &str,
+        paths: &[String],
+        message: String,
+    ) -> Result<VersionCommitInfo> {
+        Ok(self
+            .commit_paths_inner(live, None, branch, paths, message, None)
             .await?
             .into_commit())
     }
@@ -1552,7 +1598,20 @@ impl VersionRepository {
         message: String,
         idempotency_key: &str,
     ) -> Result<VersionCommitResult> {
-        self.commit_paths_inner(live, None, paths, message, Some(idempotency_key))
+        self.commit_paths_inner(live, None, "main", paths, message, Some(idempotency_key))
+            .await
+    }
+
+    /// Commit selected paths to an existing named branch with a retry key.
+    pub async fn commit_paths_on_branch_idempotent(
+        &self,
+        live: &dyn Vfs,
+        branch: &str,
+        paths: &[String],
+        message: String,
+        idempotency_key: &str,
+    ) -> Result<VersionCommitResult> {
+        self.commit_paths_inner(live, None, branch, paths, message, Some(idempotency_key))
             .await
     }
 
@@ -1566,7 +1625,22 @@ impl VersionRepository {
     ) -> Result<VersionCommitInfo> {
         live.validate_writer_lease().await?;
         Ok(self
-            .commit_paths_inner(live, Some(live), paths, message, None)
+            .commit_paths_inner(live, Some(live), "main", paths, message, None)
+            .await?
+            .into_commit())
+    }
+
+    /// Commit selected paths through a live writer to an existing branch.
+    pub async fn commit_volume_paths_on_branch(
+        &self,
+        live: &Volume,
+        branch: &str,
+        paths: &[String],
+        message: String,
+    ) -> Result<VersionCommitInfo> {
+        live.validate_writer_lease().await?;
+        Ok(self
+            .commit_paths_inner(live, Some(live), branch, paths, message, None)
             .await?
             .into_commit())
     }
@@ -1581,22 +1655,56 @@ impl VersionRepository {
         idempotency_key: &str,
     ) -> Result<VersionCommitResult> {
         live.validate_writer_lease().await?;
-        self.commit_paths_inner(live, Some(live), paths, message, Some(idempotency_key))
-            .await
+        self.commit_paths_inner(
+            live,
+            Some(live),
+            "main",
+            paths,
+            message,
+            Some(idempotency_key),
+        )
+        .await
+    }
+
+    /// Commit through a live writer to an existing branch with a retry key.
+    pub async fn commit_volume_paths_on_branch_idempotent(
+        &self,
+        live: &Volume,
+        branch: &str,
+        paths: &[String],
+        message: String,
+        idempotency_key: &str,
+    ) -> Result<VersionCommitResult> {
+        live.validate_writer_lease().await?;
+        self.commit_paths_inner(
+            live,
+            Some(live),
+            branch,
+            paths,
+            message,
+            Some(idempotency_key),
+        )
+        .await
     }
 
     async fn commit_paths_inner(
         &self,
         live: &dyn Vfs,
         writer_guard: Option<&Volume>,
+        branch: &str,
         paths: &[String],
         message: String,
         idempotency_key: Option<&str>,
     ) -> Result<VersionCommitResult> {
+        validate_version_branch_name(branch)?;
         let canonical = canonicalize_path_set(paths)?;
         let idempotency = idempotency_key
-            .map(|key| version_commit_idempotency_intent(key, &canonical, &message))
+            .map(|key| version_commit_idempotency_intent(key, branch, &canonical, &message))
             .transpose()?;
+        let head = self.store.get_branch(branch).await?;
+        if branch != "main" && head.is_none() {
+            return Err(Error::not_found("version branch", branch));
+        }
         if let Some(intent) = idempotency
             && let Some(commit) = self.store.resolve_idempotency(intent).await?
         {
@@ -1606,7 +1714,6 @@ impl VersionRepository {
             });
         }
 
-        let head = self.store.get_head().await?;
         let base = head
             .as_ref()
             .map(|head| head.tree.to_tree())
@@ -1673,6 +1780,7 @@ impl VersionRepository {
         match self
             .store
             .publish_commit(
+                branch,
                 head.map(|head| head.commit_id),
                 &commit,
                 encoded,
@@ -1879,6 +1987,19 @@ impl VersionRepository {
         Ok(self.history_page(path, limit, None).await?.0)
     }
 
+    /// Return newest-first history for a named branch.
+    pub async fn history_on_branch(
+        &self,
+        branch: &str,
+        path: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<VersionCommitInfo>> {
+        Ok(self
+            .history_page_on_branch(branch, path, limit, None)
+            .await?
+            .0)
+    }
+
     /// Return newest-first history after an optional exclusive commit cursor.
     /// The cursor is the last commit ID returned by the previous page.
     pub async fn history_page(
@@ -1887,13 +2008,33 @@ impl VersionRepository {
         limit: usize,
         page_token: Option<&str>,
     ) -> Result<(Vec<VersionCommitInfo>, Option<String>)> {
+        self.history_page_on_branch("main", path, limit, page_token)
+            .await
+    }
+
+    /// Return newest-first history for a named branch after an optional
+    /// exclusive commit cursor.
+    pub async fn history_page_on_branch(
+        &self,
+        branch: &str,
+        path: Option<&str>,
+        limit: usize,
+        page_token: Option<&str>,
+    ) -> Result<(Vec<VersionCommitInfo>, Option<String>)> {
+        validate_version_branch_name(branch)?;
         let path = path.map(canonical_path).transpose()?;
         let mut next = match page_token {
             Some(page_token) => {
                 let id = parse_commit_id(page_token)?;
                 self.store.get_commit(&id).await?.parent
             }
-            None => self.store.get_head().await?.map(|head| head.commit_id),
+            None => {
+                let head = self.store.get_branch(branch).await?;
+                if branch != "main" && head.is_none() {
+                    return Err(Error::not_found("version branch", branch));
+                }
+                head.map(|head| head.commit_id)
+            }
         };
         let mut history: Vec<VersionCommitInfo> = Vec::new();
         let limit = limit.clamp(1, 10_000);
@@ -2508,6 +2649,7 @@ fn validate_version_named_ref(what: &'static str, name: &str) -> Result<()> {
 
 fn version_commit_idempotency_intent(
     key: &str,
+    branch: &str,
     canonical_paths: &[String],
     message: &str,
 ) -> Result<VersionCommitIdempotencyIntent> {
@@ -2523,12 +2665,22 @@ fn version_commit_idempotency_intent(
             "must not exceed 256 UTF-8 bytes",
         ));
     }
-    let request = VersionCommitRequestFingerprint {
-        version: 1,
-        message,
-        paths: canonical_paths,
+    let request_fingerprint = if branch == "main" {
+        let request = VersionCommitRequestFingerprint {
+            version: 1,
+            message,
+            paths: canonical_paths,
+        };
+        Sha256::digest(postcard::to_allocvec(&request)?).into()
+    } else {
+        let request = VersionCommitRequestFingerprintV2 {
+            version: 2,
+            branch,
+            message,
+            paths: canonical_paths,
+        };
+        Sha256::digest(postcard::to_allocvec(&request)?).into()
     };
-    let request_fingerprint = Sha256::digest(postcard::to_allocvec(&request)?).into();
     Ok(VersionCommitIdempotencyIntent {
         key_hash: Sha256::digest(key.as_bytes()).into(),
         request_fingerprint,

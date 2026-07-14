@@ -76,10 +76,10 @@ Each commit applies file metadata and content-chunk references to an immutable
 Prolly tree. Chunks are content-addressed blobs, commit IDs are SHA-256 hashes,
 and `heads/main` points to the current commit. Additional named branch
 references can point to any existing commit, tag, or branch and can be used by
-read, restore, and diff operations. Commits currently advance `main`;
-branch-targeted publication is a separate operation. Publishing a commit and
-the main reference is one SlateDB batch after the new immutable tree nodes and
-blobs have been written. Disabling versioning blocks repository operations
+read, restore, diff, and history operations. Commits advance `main` by default
+or an existing named branch when selected explicitly. Publishing a commit and
+its branch reference is one SlateDB batch after the new immutable tree nodes
+and blobs have been written. Disabling versioning blocks repository operations
 without deleting its history. Volume deletion removes both the live and
 optional version-store prefixes.
 
@@ -110,8 +110,9 @@ lease. Neither mode couples versioning to normal filesystem writes.
 An optional control-plane retention record bounds commit count, age, and
 logical history bytes. Maintenance retains the selected commit roots, uses
 Prolly reachability for nodes and content blobs, and deletes unreachable
-objects and expired commit records in one SlateDB batch. The head commit is
-always retained. The daemon enforces count and age policies only for enabled
+objects and expired commit records in one SlateDB batch. Each branch head is
+always retained, and count/age selection is evaluated along every branch.
+The daemon enforces count and age policies only for enabled
 filesystem volumes whose writable backend it currently serves. It opens only
 an existing history under the repository lease, preserving lazy creation and
 avoiding work on disabled, unserved, or policyless volumes. Immutable named

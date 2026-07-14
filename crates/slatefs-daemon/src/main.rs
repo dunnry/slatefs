@@ -960,17 +960,24 @@ struct VersionCommitRequest {
     message: String,
     #[serde(default)]
     idempotency_key: Option<String>,
+    #[serde(default)]
+    branch: Option<String>,
 }
 
 impl VersionCommitRequest {
-    fn into_paths(mut self) -> Result<(Vec<String>, String, Option<String>), AdminError> {
+    fn into_paths(mut self) -> Result<(Vec<String>, String, Option<String>, String), AdminError> {
         if let Some(path) = self.path {
             self.paths.push(path);
         }
         if self.paths.is_empty() {
             return Err(bad_request("provide path or paths"));
         }
-        Ok((self.paths, self.message, self.idempotency_key))
+        Ok((
+            self.paths,
+            self.message,
+            self.idempotency_key,
+            self.branch.unwrap_or_else(|| "main".to_string()),
+        ))
     }
 }
 
@@ -1915,7 +1922,7 @@ async fn commit_live_version_response(
     volume: &str,
 ) -> Result<AdminHttpResponse, AdminError> {
     let body: VersionCommitRequest = parse_json_body(request)?;
-    let (paths, message, idempotency_key) = body.into_paths()?;
+    let (paths, message, idempotency_key, branch) = body.into_paths()?;
     let target = live_filesystem_target(state, tenant, volume)?;
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
@@ -1937,14 +1944,20 @@ async fn commit_live_version_response(
 
     let commit = match idempotency_key.as_deref() {
         Some(key) => repository
-            .commit_volume_paths_idempotent(target.as_ref(), &paths, message, key)
+            .commit_volume_paths_on_branch_idempotent(
+                target.as_ref(),
+                &branch,
+                &paths,
+                message,
+                key,
+            )
             .await
             .map(|result| {
                 let replayed = result.replayed();
                 (result.into_commit(), replayed)
             }),
         None => repository
-            .commit_volume_paths(target.as_ref(), &paths, message)
+            .commit_volume_paths_on_branch(target.as_ref(), &branch, &paths, message)
             .await
             .map(|commit| (commit, false)),
     };
@@ -1973,6 +1986,10 @@ async fn commit_live_version_response(
                         ),
                     ),
                     ("replayed".to_string(), AuditDetailValue::Bool(*replayed)),
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(branch.clone()),
+                    ),
                 ],
             )
             .await
@@ -2001,6 +2018,7 @@ async fn commit_live_version_response(
                 "paths": commit.paths,
             },
             "replayed": replayed,
+            "branch": branch,
         }),
     ))
 }
@@ -2189,11 +2207,17 @@ async fn list_version_commits_response(
     volume: &str,
 ) -> Result<AdminHttpResponse, AdminError> {
     let limit = page_limit(&request.query)?;
+    let branch = request
+        .query
+        .get("branch")
+        .map(String::as_str)
+        .unwrap_or("main");
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
     let (control, repository) = open_version_repository(state, tenant, volume).await?;
     let result = repository
-        .history_page(
+        .history_page_on_branch(
+            branch,
             request.query.get("path").map(String::as_str),
             limit,
             request.query.get("page_token").map(String::as_str),
@@ -7148,6 +7172,46 @@ mod tests {
         );
         let branches: Value = serde_json::from_str(response_body(&branches_response)).unwrap();
         assert_eq!(branches["branches"].as_array().unwrap().len(), 2);
+        volume
+            .write(&creds, file.ino, 0, b"branch update")
+            .await
+            .unwrap();
+        let branch_commit_body =
+            r#"{"path":"/notes.txt","message":"release update","branch":"release"}"#;
+        let branch_commit_request = format!(
+            "POST /admin/v1/tenants/t/volumes/v/versioning/commits HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            branch_commit_body.len(),
+            branch_commit_body
+        );
+        let branch_commit_response =
+            admin_exchange(Arc::clone(&state), branch_commit_request.as_bytes()).await;
+        assert_eq!(
+            response_status(&branch_commit_response),
+            201,
+            "{branch_commit_response}"
+        );
+        let branch_commit: Value =
+            serde_json::from_str(response_body(&branch_commit_response)).unwrap();
+        assert_eq!(branch_commit["branch"], "release");
+        assert_eq!(branch_commit["commit"]["parent"], commit_id);
+        assert_ne!(branch_commit["commit"]["id"], commit_id);
+        let branch_history_response = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning/commits?branch=release HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            response_status(&branch_history_response),
+            200,
+            "{branch_history_response}"
+        );
+        let branch_history: Value =
+            serde_json::from_str(response_body(&branch_history_response)).unwrap();
+        assert_eq!(branch_history["commits"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            branch_history["commits"][0]["id"],
+            branch_commit["commit"]["id"]
+        );
         let tagged_content = admin_exchange(
             Arc::clone(&state),
             b"GET /admin/v1/tenants/t/volumes/v/versioning/commits/baseline/content?path=/notes.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -7166,17 +7230,6 @@ mod tests {
         )
         .await;
         assert_eq!(response_status(&untag_response), 200, "{untag_response}");
-        let delete_branch_response = admin_exchange(
-            Arc::clone(&state),
-            b"DELETE /admin/v1/tenants/t/volumes/v/versioning/branches/release HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        )
-        .await;
-        assert_eq!(
-            response_status(&delete_branch_response),
-            200,
-            "{delete_branch_response}"
-        );
-
         let history_response = admin_exchange(
             Arc::clone(&state),
             b"GET /admin/v1/tenants/t/volumes/v/versioning/commits?path=/notes.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -7297,7 +7350,7 @@ mod tests {
         .await;
         assert_eq!(response_status(&stats_response), 200, "{stats_response}");
         let stats: Value = serde_json::from_str(response_body(&stats_response)).unwrap();
-        assert_eq!(stats["stats"]["commits"], 1);
+        assert_eq!(stats["stats"]["commits"], 2);
 
         let verify_response = admin_exchange(
             Arc::clone(&state),
@@ -7306,7 +7359,7 @@ mod tests {
         .await;
         assert_eq!(response_status(&verify_response), 200, "{verify_response}");
         let verify: Value = serde_json::from_str(response_body(&verify_response)).unwrap();
-        assert_eq!(verify["verify"]["commits"], 1);
+        assert_eq!(verify["verify"]["commits"], 2);
         assert!(verify["verify"]["nodes"].as_u64().unwrap() > 0);
         assert!(verify["verify"]["blobs"].as_u64().unwrap() > 0);
 
@@ -7320,6 +7373,18 @@ mod tests {
         assert_eq!(response_status(&gc_response), 200, "{gc_response}");
         let gc: Value = serde_json::from_str(response_body(&gc_response)).unwrap();
         assert_eq!(gc["gc"]["dry_run"], true);
+        assert_eq!(gc["gc"]["retained_commits"], 2);
+        assert_eq!(gc["gc"]["deleted_commits"], 0);
+        let delete_branch_response = admin_exchange(
+            Arc::clone(&state),
+            b"DELETE /admin/v1/tenants/t/volumes/v/versioning/branches/release HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            response_status(&delete_branch_response),
+            200,
+            "{delete_branch_response}"
+        );
 
         volume
             .write(&creds, file.ino, 0, b"changed data!")
@@ -7355,7 +7420,7 @@ mod tests {
         let metrics = render_daemon_metrics_with_exports(&[], &state.export_metrics);
         assert!(
             metrics.contains(
-                "slatefs_version_operations_total{tenant=\"t\",volume=\"v\",operation=\"commit\"} 2"
+                "slatefs_version_operations_total{tenant=\"t\",volume=\"v\",operation=\"commit\"} 3"
             ),
             "{metrics}"
         );
@@ -7381,7 +7446,7 @@ mod tests {
                 .await
                 .unwrap();
             let expected = if action == AuditAction::VersionCommit {
-                2
+                3
             } else if action == AuditAction::Maintain {
                 5
             } else {

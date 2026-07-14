@@ -110,12 +110,66 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
     assert_eq!(diff[0].path(), "/notes.txt");
     assert_eq!(diff[0].change(), VersionPathChangeKind::Modified);
 
+    repository.create_branch("draft", &first.id).await.unwrap();
+    let branch_contents = b"branch version\n";
+    live.write(&creds, file.ino, 0, branch_contents)
+        .await
+        .unwrap();
+    let branch_result = repository
+        .commit_paths_on_branch_idempotent(
+            live.as_ref(),
+            "draft",
+            &["/notes.txt".into()],
+            "draft update".into(),
+            "draft-retry",
+        )
+        .await
+        .unwrap();
+    assert!(!branch_result.replayed());
+    let branch_commit = branch_result.commit().clone();
+    let branch_replay = repository
+        .commit_paths_on_branch_idempotent(
+            live.as_ref(),
+            "draft",
+            &["/notes.txt".into()],
+            "draft update".into(),
+            "draft-retry",
+        )
+        .await
+        .unwrap();
+    assert!(branch_replay.replayed());
+    assert_eq!(branch_replay.commit().id, branch_commit.id);
+    assert_eq!(branch_commit.parent.as_deref(), Some(first.id.as_str()));
+    assert_eq!(
+        repository
+            .read_file("main", "/notes.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        second_contents
+    );
+    assert_eq!(
+        repository
+            .read_file("draft", "/notes.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        branch_contents
+    );
+
     let history = repository.history(Some("/notes.txt"), 10).await.unwrap();
     assert_eq!(history.len(), 2);
     assert_eq!(history[0].id, second.id);
     assert_eq!(history[1].id, first.id);
+    let branch_history = repository
+        .history_on_branch("draft", Some("/notes.txt"), 10)
+        .await
+        .unwrap();
+    assert_eq!(branch_history.len(), 2);
+    assert_eq!(branch_history[0].id, branch_commit.id);
+    assert_eq!(branch_history[1].id, first.id);
     let verified = repository.verify().await.unwrap();
-    assert_eq!(verified.commits, 2);
+    assert_eq!(verified.commits, 3);
     assert!(verified.nodes > 0);
     assert!(verified.blobs > 0);
     assert_eq!(

@@ -342,6 +342,9 @@ enum VersioningCmd {
         /// Retry key; reuse only for the same canonical paths and message.
         #[arg(long)]
         idempotency_key: Option<String>,
+        /// Branch to advance.
+        #[arg(long, default_value = "main")]
+        branch: String,
         /// Ask the serving slatefsd admin endpoint to use its active writer.
         #[arg(long)]
         live: bool,
@@ -357,6 +360,9 @@ enum VersioningCmd {
         /// Continue after the last commit ID returned by a previous page.
         #[arg(long)]
         page_token: Option<String>,
+        /// Branch whose history to list.
+        #[arg(long, default_value = "main")]
+        branch: String,
         #[arg(long)]
         live: bool,
     },
@@ -2087,6 +2093,7 @@ async fn run(
             paths,
             message,
             idempotency_key,
+            branch,
             live,
         }) => {
             if *live {
@@ -2099,6 +2106,7 @@ async fn run(
                         "paths": paths,
                         "message": message,
                         "idempotency_key": idempotency_key,
+                        "branch": branch,
                     }),
                 )
                 .await?;
@@ -2121,14 +2129,20 @@ async fn run(
             let live = volume::Volume::open(&record, dek, Arc::clone(&object_store)).await?;
             let commit = match idempotency_key.as_deref() {
                 Some(key) => repository
-                    .commit_volume_paths_idempotent(live.as_ref(), paths, message.clone(), key)
+                    .commit_volume_paths_on_branch_idempotent(
+                        live.as_ref(),
+                        branch,
+                        paths,
+                        message.clone(),
+                        key,
+                    )
                     .await
                     .map(|result| {
                         let replayed = result.replayed();
                         (result.into_commit(), replayed)
                     }),
                 None => repository
-                    .commit_volume_paths(live.as_ref(), paths, message.clone())
+                    .commit_volume_paths_on_branch(live.as_ref(), branch, paths, message.clone())
                     .await
                     .map(|commit| (commit, false)),
             };
@@ -2148,6 +2162,10 @@ async fn run(
                         AuditDetailValue::String(commit.id.clone()),
                     ),
                     ("replayed".to_string(), AuditDetailValue::Bool(replayed)),
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(branch.clone()),
+                    ),
                 ],
             )
             .await?;
@@ -2162,10 +2180,12 @@ async fn run(
             path,
             limit,
             page_token,
+            branch,
             live,
         }) => {
             if *live {
                 let mut query = vec![("limit", limit.to_string())];
+                query.push(("branch", branch.clone()));
                 if let Some(path) = path {
                     query.push(("path", path.clone()));
                 }
@@ -2188,7 +2208,7 @@ async fn run(
             }
             let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
             let history = repository
-                .history_page(path.as_deref(), *limit, page_token.as_deref())
+                .history_page_on_branch(branch, path.as_deref(), *limit, page_token.as_deref())
                 .await;
             let repository_close = repository.close().await;
             let (commits, next_page_token) = history?;
@@ -3682,6 +3702,8 @@ mod tests {
             "save notes",
             "--idempotency-key",
             "retry-1",
+            "--branch",
+            "draft",
             "--live",
         ])
         .unwrap();
@@ -3689,9 +3711,10 @@ mod tests {
             cli.command,
             Command::Versioning(VersioningCmd::Commit {
                 idempotency_key: Some(key),
+                branch,
                 live: true,
                 ..
-            }) if key == "retry-1"
+            }) if key == "retry-1" && branch == "draft"
         ));
 
         let cli = Cli::try_parse_from([

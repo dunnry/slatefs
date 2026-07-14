@@ -148,8 +148,9 @@ tenant, volume, path, and `-m <message>` arguments. `versioning log`,
 and recover those commits. `versioning tag`, `tags`, and `untag` manage
 immutable names for important commits. `versioning branch`, `branches`, and
 `delete-branch` manage durable branch references; a branch name can be used
-where a commit or tag is accepted. Commits continue to advance `main` unless a
-branch is only being used as a named retention root.
+where a commit or tag is accepted. `commit --branch <name>` advances an
+existing branch instead of `main`, and `log --branch <name>` follows that
+branch's history.
 Show and restore stream versioned data in bounded chunks rather than loading a
 complete large file into memory.
 `versioning disable` stops all version operations but retains existing history;
@@ -253,7 +254,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshot-retention` | Set nullable `keep_last` and/or `max_age_secs`, or `{"clear":true}`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Opt-in state, retention policy, and current or last repository lease. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Enable or disable with `{"enabled":true|false}`; disabling retains history. |
-| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Commit history with optional `path`, `limit`, and exclusive `page_token`; returns `next_page_token`. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Commit history with optional `branch` (default `main`), `path`, `limit`, and exclusive `page_token`; returns `next_page_token`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/diff` | Added, modified, and deleted paths between required `from` and `to` commit IDs or tags; supports `limit` and exclusive path `page_token`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/tags` | List immutable commit tags. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/tags` | Create a retention-pinning tag from `{"name":"...","commit":"..."}`. |
@@ -261,7 +262,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | List branch heads, including `main`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | Create a branch from `{"name":"...","commit":"commit-or-ref"}`. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}` | Delete a non-main branch without deleting its commit immediately. |
-| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"...","idempotency_key":"..."}`; the retry key is optional and singular `path` remains accepted. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"...","idempotency_key":"...","branch":"main"}`; retry key and branch are optional and singular `path` remains accepted. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit-or-tag}/content?path=&offset=&length=` | Read a bounded file or symlink range as base64 JSON; defaults to 1 MiB and rejects ranges over 4 MiB. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore` | Atomically restore one file through the live writer from a commit ID or tag in `{"commit":"...","path":"..."}`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/stats` | Logical history bytes, nodes, blobs, and commits. |
