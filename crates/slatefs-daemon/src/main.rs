@@ -4657,6 +4657,154 @@ async fn enforce_snapshot_retention(
     Ok(())
 }
 
+fn automatic_version_gc_audit_record(
+    policy: &VersioningRetentionPolicy,
+    report: &slatefs_core::versioning::VersionGcReport,
+) -> AuditRecord {
+    let mut record = AuditRecord::new(
+        AuditActor {
+            plane: AuditPlane::Admin,
+            principal: None,
+            source_ip: None,
+            client_agent: Some("slatefsd version-retention".to_string()),
+        },
+        AuditAction::VersionGc,
+        AuditScope {
+            tenant: Some(policy.tenant.clone()),
+            volume: Some(policy.volume.clone()),
+            node: None,
+        },
+        format!("version-retention-{}", uuid::Uuid::new_v4()),
+        AuditOutcome::Success,
+    );
+    for (key, value) in [
+        ("retained_commits", report.retained_commits),
+        ("deleted_commits", report.deleted_commits),
+        ("deleted_nodes", report.deleted_nodes),
+        ("deleted_blobs", report.deleted_blobs),
+        ("reclaimed_bytes", report.reclaimed_bytes),
+    ] {
+        record
+            .details
+            .insert(key.to_string(), AuditDetailValue::U64(value));
+    }
+    record
+        .details
+        .insert("automatic".to_string(), AuditDetailValue::Bool(true));
+    record
+}
+
+async fn enforce_version_retention(
+    reader: &ControlReader,
+    object_store: Arc<dyn ObjectStore>,
+    kms: Arc<dyn kms::Kms>,
+    targets: &AdminTargets,
+    metrics: ExportMetrics,
+) -> anyhow::Result<()> {
+    let served = targets
+        .lock()
+        .expect("admin targets poisoned")
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+    if served.is_empty() {
+        return Ok(());
+    }
+    let mut policies = Vec::new();
+    for policy in reader.list_versioning_retention_policies().await? {
+        let id = VolumeId::from_parts(&policy.tenant, &policy.volume);
+        if !served.contains(&id) || (policy.keep_last.is_none() && policy.max_age_secs.is_none()) {
+            continue;
+        }
+        let Some(record) = reader
+            .try_get_volume(&policy.tenant, &policy.volume)
+            .await?
+        else {
+            continue;
+        };
+        if matches!(record.state, slatefs_core::control::VolumeState::Active)
+            && reader
+                .versioning_enabled(&policy.tenant, &policy.volume)
+                .await?
+        {
+            policies.push(policy);
+        }
+    }
+    if policies.is_empty() {
+        return Ok(());
+    }
+
+    let mut audits = Vec::new();
+    for policy in policies {
+        let repository = match VersionRepository::open_existing_readonly(
+            reader,
+            Arc::clone(&object_store),
+            &policy.tenant,
+            &policy.volume,
+        )
+        .await
+        {
+            Ok(Some(repository)) => repository,
+            Ok(None) => continue,
+            Err(slatefs_core::error::Error::AlreadyExists { .. }) => {
+                tracing::debug!(
+                    tenant = policy.tenant.as_str(),
+                    volume = policy.volume.as_str(),
+                    "automatic version retention deferred while repository is busy"
+                );
+                continue;
+            }
+            Err(error) => {
+                metrics.failure();
+                tracing::error!(
+                    tenant = policy.tenant.as_str(),
+                    volume = policy.volume.as_str(),
+                    %error,
+                    "automatic version retention could not open repository"
+                );
+                continue;
+            }
+        };
+        let report = repository
+            .garbage_collect(policy.keep_last, policy.max_age_secs, false)
+            .await;
+        let close = repository.close().await;
+        let report = match (report, close) {
+            (Ok(report), Ok(())) => report,
+            (Err(error), _) | (_, Err(error)) => {
+                metrics.failure();
+                tracing::error!(
+                    tenant = policy.tenant.as_str(),
+                    volume = policy.volume.as_str(),
+                    %error,
+                    "automatic version retention failed"
+                );
+                continue;
+            }
+        };
+        if report.reclaimed_bytes == 0 {
+            continue;
+        }
+        metrics.version_operation(&policy.tenant, &policy.volume, "gc-auto");
+        tracing::info!(
+            tenant = policy.tenant.as_str(),
+            volume = policy.volume.as_str(),
+            deleted_commits = report.deleted_commits,
+            reclaimed_bytes = report.reclaimed_bytes,
+            "automatic version retention reclaimed history"
+        );
+        audits.push(automatic_version_gc_audit_record(&policy, &report));
+    }
+    if !audits.is_empty() {
+        let control = ControlPlane::open(object_store, kms).await?;
+        let audit_result = control.append_audit_records(audits).await;
+        let close = control.close().await;
+        audit_result?;
+        close?;
+    }
+    Ok(())
+}
+
 fn quota_rejection_audit(
     object_store: Arc<dyn ObjectStore>,
     kms: Arc<dyn kms::Kms>,
@@ -5751,6 +5899,7 @@ async fn main() -> anyhow::Result<()> {
     let watcher_store = Arc::clone(&object_store);
     let watcher_kms = Arc::clone(&kms);
     let watcher_metrics = export_metrics.clone();
+    let watcher_admin_targets = Arc::clone(&admin_targets);
     let poll_interval = Duration::from_secs(config.export_control.poll_interval_secs);
     servers.spawn(async move {
         let mut tick = tokio::time::interval(poll_interval);
@@ -5781,6 +5930,18 @@ async fn main() -> anyhow::Result<()> {
             {
                 watcher_metrics.failure();
                 tracing::error!("snapshot retention enforcement failed: {error:#}");
+            }
+            if let Err(error) = enforce_version_retention(
+                &reader,
+                Arc::clone(&watcher_store),
+                Arc::clone(&watcher_kms),
+                &watcher_admin_targets,
+                watcher_metrics.clone(),
+            )
+            .await
+            {
+                watcher_metrics.failure();
+                tracing::error!("version retention enforcement failed: {error:#}");
             }
             reader.close().await.map_err(std::io::Error::other)?;
         }
@@ -8881,6 +9042,168 @@ mod tests {
         );
         control.close().await.unwrap();
         manager.lock().await.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn automatic_version_retention_collects_only_existing_served_history() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([38; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        let record = slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        let empty_record = slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "empty",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        for volume in ["v", "empty"] {
+            control
+                .set_versioning_enabled("t", volume, true)
+                .await
+                .unwrap();
+            control
+                .set_versioning_retention_policy("t", volume, Some(1), None, None)
+                .await
+                .unwrap();
+        }
+        let dek = control.unwrap_volume_dek(&record).await.unwrap();
+        let empty_dek = control.unwrap_volume_dek(&empty_record).await.unwrap();
+        let volume = Volume::open(&record, dek, Arc::clone(&object_store))
+            .await
+            .unwrap();
+        let empty = Volume::open(&empty_record, empty_dek, Arc::clone(&object_store))
+            .await
+            .unwrap();
+        let creds = Credentials::root();
+        let file = volume
+            .create(&creds, ROOT_INO, b"notes.txt", 0o640, true)
+            .await
+            .unwrap();
+        volume.write(&creds, file.ino, 0, b"one").await.unwrap();
+        let repository = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
+            .await
+            .unwrap();
+        repository
+            .commit_volume_paths(volume.as_ref(), &["/notes.txt".into()], "first".into())
+            .await
+            .unwrap();
+        volume.write(&creds, file.ino, 0, b"two").await.unwrap();
+        repository
+            .commit_volume_paths(volume.as_ref(), &["/notes.txt".into()], "second".into())
+            .await
+            .unwrap();
+        repository.close().await.unwrap();
+        control
+            .set_versioning_enabled("t", "v", false)
+            .await
+            .unwrap();
+        assert!(
+            !store::prefix_exists(&object_store, &store::version_db_prefix("t", "empty"))
+                .await
+                .unwrap()
+        );
+        control.close().await.unwrap();
+
+        let targets = Arc::new(Mutex::new(HashMap::from([
+            (VolumeId::from_parts("t", "v"), Arc::clone(&volume)),
+            (VolumeId::from_parts("t", "empty"), Arc::clone(&empty)),
+        ])));
+        let metrics = ExportMetrics::default();
+        let reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        enforce_version_retention(
+            &reader,
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            &targets,
+            metrics.clone(),
+        )
+        .await
+        .unwrap();
+        reader.close().await.unwrap();
+
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control
+            .set_versioning_enabled("t", "v", true)
+            .await
+            .unwrap();
+        let repository =
+            VersionRepository::open_existing(&control, Arc::clone(&object_store), "t", "v")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(repository.history(None, 10).await.unwrap().len(), 2);
+        repository.close().await.unwrap();
+        control.close().await.unwrap();
+
+        let reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        enforce_version_retention(
+            &reader,
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            &targets,
+            metrics.clone(),
+        )
+        .await
+        .unwrap();
+        reader.close().await.unwrap();
+
+        assert!(
+            !store::prefix_exists(&object_store, &store::version_db_prefix("t", "empty"))
+                .await
+                .unwrap()
+        );
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        let repository =
+            VersionRepository::open_existing(&control, Arc::clone(&object_store), "t", "v")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(repository.history(None, 10).await.unwrap().len(), 1);
+        repository.close().await.unwrap();
+        let (audits, _) = control
+            .list_audit(AuditQuery {
+                action: Some(AuditAction::VersionGc),
+                ..AuditQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(
+            audits[0].details.get("automatic"),
+            Some(&AuditDetailValue::Bool(true))
+        );
+        control.close().await.unwrap();
+        let rendered = render_daemon_metrics_with_exports(&[], &metrics);
+        assert!(
+            rendered.contains(
+                "slatefs_version_operations_total{tenant=\"t\",volume=\"v\",operation=\"gc-auto\"} 1"
+            ),
+            "{rendered}"
+        );
+        volume.shutdown().await.unwrap();
+        empty.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

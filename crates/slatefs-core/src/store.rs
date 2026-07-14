@@ -381,6 +381,12 @@ pub async fn delete_prefix(object_store: &Arc<dyn ObjectStore>, prefix: &ObjPath
     Ok(count)
 }
 
+/// Return whether an object-store prefix contains at least one object without
+/// materializing the full listing.
+pub async fn prefix_exists(object_store: &Arc<dyn ObjectStore>, prefix: &ObjPath) -> Result<bool> {
+    Ok(object_store.list(Some(prefix)).try_next().await?.is_some())
+}
+
 /// Tenant and volume names become object-store path segments, wrap contexts,
 /// and control-DB key components, so the charset is strict.
 pub fn validate_name(kind: &'static str, name: &str) -> Result<()> {

@@ -54,6 +54,21 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         version_objects.is_empty(),
         "enabling must not create a version repository"
     );
+    assert!(
+        VersionRepository::open_existing(&control, Arc::clone(&object_store), "t", "v")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let version_objects: Vec<_> = object_store
+        .list(Some(&store::version_db_prefix("t", "v")))
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(
+        version_objects.is_empty(),
+        "maintenance probes must preserve lazy repository creation"
+    );
 
     let dek = control.unwrap_volume_dek(&record).await.unwrap();
     let live = Volume::open(&record, dek, Arc::clone(&object_store))

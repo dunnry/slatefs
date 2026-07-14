@@ -235,7 +235,9 @@ capture and immediately before publishing history. HTTP `503` means that
 daemon was fenced; discover the current primary and retry there. The failed
 attempt does not advance the version-history head.
 
-Configure and enforce version-history lifecycle offline:
+Configure version-history lifecycle offline. A daemon serving the writable
+volume enforces count and age limits on its export-control poll; these commands
+remain available for previews and immediate collection:
 
 ```sh
 slatefs -c /etc/slatefs/slatefs.toml versioning retention <tenant> <volume> --keep-last 100 --max-age 2592000 --max-bytes 10737418240

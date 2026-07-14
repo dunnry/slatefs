@@ -106,8 +106,11 @@ An optional control-plane retention record bounds commit count, age, and
 logical history bytes. Maintenance retains the selected commit roots, uses
 Prolly reachability for nodes and content blobs, and deletes unreachable
 objects and expired commit records in one SlateDB batch. The head commit is
-always retained. A physical purge deletes the separate version database prefix
-and is therefore restricted to an offline/no-open-repository operation.
+always retained. The daemon enforces count and age policies only for enabled
+filesystem volumes whose writable backend it currently serves. It opens only
+an existing history under the repository lease, preserving lazy creation and
+avoiding work on disabled, unserved, or policyless volumes. A physical purge
+deletes the separate version database prefix under the same lease.
 
 ## Request Path
 

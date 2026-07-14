@@ -21,7 +21,7 @@ use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 
 use crate::config::AtimeMode;
-use crate::control::{ControlPlane, VolumeRecord};
+use crate::control::{ControlPlane, ControlReader, VolumeRecord};
 use crate::crypto::transformer::SlateBlockTransformer;
 use crate::error::{Error, Result};
 use crate::meta::inode::{FileKind, ROOT_INO, Timespec};
@@ -872,6 +872,84 @@ impl VersionRepository {
         Self::open_for_record(&record, dek, object_store, max_bytes, maintenance).await
     }
 
+    /// Open a repository only when history has already been created. The
+    /// existence check runs while holding the maintenance lease, so background
+    /// maintenance cannot recreate history concurrently with a purge.
+    pub async fn open_existing(
+        control: &ControlPlane,
+        object_store: Arc<dyn ObjectStore>,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<Option<Self>> {
+        if !control.versioning_enabled(tenant, volume).await? {
+            return Err(Error::Versioning(format!(
+                "versioning is disabled for {tenant}/{volume}"
+            )));
+        }
+        let max_bytes = control
+            .try_get_versioning_retention_policy(tenant, volume)
+            .await?
+            .and_then(|policy| policy.max_bytes);
+        let record = control.get_mountable_volume(tenant, volume).await?;
+        let dek = control.unwrap_volume_dek(&record).await?;
+        Self::open_existing_for_record(&record, dek, object_store, max_bytes, tenant, volume).await
+    }
+
+    /// Read-only-control-plane variant of [`Self::open_existing`] for daemon
+    /// maintenance loops that must not hold a control writer during GC.
+    pub async fn open_existing_readonly(
+        control: &ControlReader,
+        object_store: Arc<dyn ObjectStore>,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<Option<Self>> {
+        if !control.versioning_enabled(tenant, volume).await? {
+            return Err(Error::Versioning(format!(
+                "versioning is disabled for {tenant}/{volume}"
+            )));
+        }
+        let max_bytes = control
+            .try_get_versioning_retention_policy(tenant, volume)
+            .await?
+            .and_then(|policy| policy.max_bytes);
+        let record = control.get_mountable_volume(tenant, volume).await?;
+        let dek = control.unwrap_volume_dek(&record).await?;
+        Self::open_existing_for_record(&record, dek, object_store, max_bytes, tenant, volume).await
+    }
+
+    async fn open_existing_for_record(
+        record: &VolumeRecord,
+        dek: crate::crypto::Secret32,
+        object_store: Arc<dyn ObjectStore>,
+        max_bytes: Option<u64>,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<Option<Self>> {
+        let maintenance = VersionMaintenanceGuard::acquire(
+            Arc::clone(&object_store),
+            tenant,
+            volume,
+            "repository",
+        )
+        .await?;
+        let exists =
+            store::prefix_exists(&object_store, &store::version_db_prefix(tenant, volume)).await;
+        let exists = match exists {
+            Ok(exists) => exists,
+            Err(error) => {
+                let _ = maintenance.close().await;
+                return Err(error);
+            }
+        };
+        if !exists {
+            maintenance.close().await?;
+            return Ok(None);
+        }
+        Self::open_for_record(record, dek, object_store, max_bytes, maintenance)
+            .await
+            .map(Some)
+    }
+
     async fn open_for_record(
         record: &VolumeRecord,
         dek: crate::crypto::Secret32,
@@ -880,6 +958,7 @@ impl VersionRepository {
         maintenance: VersionMaintenanceGuard,
     ) -> Result<Self> {
         if !matches!(record.kind, crate::meta::superblock::VolumeKind::Filesystem) {
+            maintenance.close().await?;
             return Err(Error::invalid(
                 "versioning volume",
                 "file versioning is available only for filesystem volumes",
@@ -895,7 +974,14 @@ impl VersionRepository {
         })
         .with_block_transformer(Arc::new(SlateBlockTransformer::new(record.cipher, dek)))
         .build()
-        .await?;
+        .await;
+        let db = match db {
+            Ok(db) => db,
+            Err(error) => {
+                let _ = maintenance.close().await;
+                return Err(error.into());
+            }
+        };
         let store = VersionStore::new(db);
         let prolly = AsyncProlly::new(store.clone(), ProllyConfig::default());
         Ok(Self {

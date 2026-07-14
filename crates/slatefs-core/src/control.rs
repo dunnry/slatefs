@@ -1335,6 +1335,12 @@ impl ControlPlane {
             .transpose()
     }
 
+    pub async fn list_versioning_retention_policies(
+        &self,
+    ) -> Result<Vec<VersioningRetentionPolicy>> {
+        list_versioning_retention_policies_impl(&self.db).await
+    }
+
     pub async fn clear_versioning_retention_policy(
         &self,
         tenant: &str,
@@ -2230,6 +2236,37 @@ impl ControlReader {
         list_volumes_impl(&self.db, tenant).await
     }
 
+    pub async fn try_get_versioning_policy(
+        &self,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<Option<VersioningPolicy>> {
+        self.get_volume(tenant, volume).await?;
+        try_get_versioning_policy_impl(&self.db, tenant, volume).await
+    }
+
+    pub async fn versioning_enabled(&self, tenant: &str, volume: &str) -> Result<bool> {
+        Ok(self
+            .try_get_versioning_policy(tenant, volume)
+            .await?
+            .is_some_and(|policy| policy.enabled))
+    }
+
+    pub async fn try_get_versioning_retention_policy(
+        &self,
+        tenant: &str,
+        volume: &str,
+    ) -> Result<Option<VersioningRetentionPolicy>> {
+        self.get_volume(tenant, volume).await?;
+        try_get_versioning_retention_policy_impl(&self.db, tenant, volume).await
+    }
+
+    pub async fn list_versioning_retention_policies(
+        &self,
+    ) -> Result<Vec<VersioningRetentionPolicy>> {
+        list_versioning_retention_policies_impl(&self.db).await
+    }
+
     pub async fn try_get_snapshot_retention_policy(
         &self,
         tenant: &str,
@@ -2403,6 +2440,52 @@ async fn try_get_snapshot_retention_policy_impl<R: ControlRead>(
         Some(bytes) => Ok(Some(decode_snapshot_retention_policy(&bytes)?)),
         None => Ok(None),
     }
+}
+
+async fn try_get_versioning_policy_impl<R: ControlRead>(
+    db: &R,
+    tenant: &str,
+    volume: &str,
+) -> Result<Option<VersioningPolicy>> {
+    let key = versioning_policy_key(tenant, volume);
+    match db.get_bytes(key.as_bytes()).await? {
+        Some(bytes) => Ok(Some(decode_versioning_policy(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
+async fn try_get_versioning_retention_policy_impl<R: ControlRead>(
+    db: &R,
+    tenant: &str,
+    volume: &str,
+) -> Result<Option<VersioningRetentionPolicy>> {
+    let key = versioning_retention_key(tenant, volume);
+    match db.get_bytes(key.as_bytes()).await? {
+        Some(bytes) => Ok(Some(decode_versioned(
+            VERSIONING_RETENTION_RECORD_VERSION,
+            &bytes,
+        )?)),
+        None => Ok(None),
+    }
+}
+
+async fn list_versioning_retention_policies_impl<R: ControlRead>(
+    db: &R,
+) -> Result<Vec<VersioningRetentionPolicy>> {
+    let mut iter = db.scan_control_prefix(b"vrr/").await?;
+    let mut policies: Vec<VersioningRetentionPolicy> = Vec::new();
+    while let Some(kv) = iter.next().await? {
+        policies.push(decode_versioned(
+            VERSIONING_RETENTION_RECORD_VERSION,
+            &kv.value,
+        )?);
+    }
+    policies.sort_by(|a, b| {
+        a.tenant
+            .cmp(&b.tenant)
+            .then_with(|| a.volume.cmp(&b.volume))
+    });
+    Ok(policies)
 }
 
 async fn list_snapshot_retention_policies_impl<R: ControlRead>(

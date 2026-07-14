@@ -161,16 +161,19 @@ Live commits verify and flush the volume writer lease before capture and again
 before publishing the Prolly head. A fenced daemon returns `503` without
 creating a commit so the caller can retry the promoted primary.
 
-History lifecycle is explicit. `versioning retention` sets `--keep-last`,
-`--max-age`, and/or a hard `--max-bytes` history quota. `versioning gc`
-removes commits outside that policy plus unreachable Prolly nodes and content
-blobs (`--dry-run` reports first); `versioning stats` reports logical usage.
+History lifecycle remains opt-in. `versioning retention` sets `--keep-last`,
+`--max-age`, and/or a hard `--max-bytes` history quota. For an enabled volume
+served by `slatefsd`, the daemon applies count and age retention on its normal
+export-control poll; disabled, unserved, policyless, and never-committed
+volumes are untouched. `versioning gc` runs the same collection explicitly
+and `--dry-run` reports first; `versioning stats` reports logical usage.
 `versioning verify` checks the reachable commit hash chain and reads every
 referenced Prolly node and content blob.
 `versioning purge --yes` permanently removes the physical history prefix while
 leaving versioning enabled for a fresh next commit. Commit, restore, retention,
 GC, and purge actions emit durable audit records, and live daemon operations
-increment `slatefs_version_operations_total{tenant,volume,operation}`.
+increment `slatefs_version_operations_total{tenant,volume,operation}`. An
+automatic collection uses the `gc-auto` operation label.
 
 Every explicit repository operation and purge acquires a per-volume lease with
 an atomic object-store conditional write. The lease is renewed while work is
