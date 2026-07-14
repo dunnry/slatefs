@@ -261,6 +261,13 @@ Certificate auth records audit principals as `cert:<SAN-or-CN>`. If a bearer
 token is configured without TLS, startup warns that the token is accepted over
 cleartext HTTP.
 
+The `slatefs ... versioning ... --live` client uses HTTPS whenever an admin TLS
+client field is configured. Set `[admin].tls_server_ca` for a private server CA
+and `[admin].tls_server_name` when the certificate name differs from the
+listener IP. For mTLS, also set `[admin].tls_client_cert` and
+`[admin].tls_client_key`. Public WebPKI roots remain trusted. A shared
+daemon-and-CLI config may omit `tls_server_ca`; the CLI then trusts `tls_cert`.
+
 Admin TLS certificates and TLS-wrapped 9P export certificates are reloaded for
 new connections without restarting `slatefsd`; existing TLS sessions continue
 on the config they handshook with. The daemon polls cert/key/client-CA file
@@ -287,6 +294,10 @@ token_file = "/run/slatefs/admin-token"
 tls_cert = "/etc/slatefs/admin.pem"
 tls_key = "/etc/slatefs/admin.key"
 tls_client_ca = "/etc/slatefs/admin-ca.pem"
+tls_server_ca = "/etc/slatefs/admin-ca.pem"
+tls_server_name = "slatefs-admin.internal"
+tls_client_cert = "/etc/slatefs/operator.pem"
+tls_client_key = "/etc/slatefs/operator.key"
 allow_cert_auth = false
 
 [admin.tenant_tokens]

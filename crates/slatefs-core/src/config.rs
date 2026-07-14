@@ -191,6 +191,16 @@ pub struct AdminConfig {
     /// Optional PEM CA bundle. When set, admin TLS clients must present a
     /// certificate chaining to one of these roots.
     pub tls_client_ca: Option<std::path::PathBuf>,
+    /// Optional PEM CA bundle used by the CLI to verify the admin server.
+    /// Public WebPKI roots are always available as well.
+    pub tls_server_ca: Option<std::path::PathBuf>,
+    /// Optional PEM client certificate chain used by the CLI for admin mTLS.
+    pub tls_client_cert: Option<std::path::PathBuf>,
+    /// Optional PEM private key for `tls_client_cert`.
+    pub tls_client_key: Option<std::path::PathBuf>,
+    /// Optional DNS name used by the CLI for admin TLS verification. The
+    /// listener host is used when omitted.
+    pub tls_server_name: Option<String>,
     /// Allows a verified client certificate to satisfy `/admin/v1` auth
     /// without a bearer token.
     pub allow_cert_auth: bool,
@@ -617,6 +627,12 @@ impl Config {
                 "admin.tls_client_ca requires admin.tls_cert and admin.tls_key".into(),
             ));
         }
+        if self.admin.tls_client_cert.is_some() != self.admin.tls_client_key.is_some() {
+            return Err(Error::Config(
+                "admin.tls_client_cert and admin.tls_client_key must both be set, or neither"
+                    .into(),
+            ));
+        }
         if self.admin.allow_cert_auth && !has_admin_tls_client_ca {
             return Err(Error::Config(
                 "admin.allow_cert_auth requires admin.tls_client_ca".into(),
@@ -986,6 +1002,10 @@ mod tests {
             tls_cert = "/tmp/slatefs-admin.pem"
             tls_key = "/tmp/slatefs-admin.key"
             tls_client_ca = "/tmp/slatefs-admin-ca.pem"
+            tls_server_ca = "/tmp/slatefs-admin-ca.pem"
+            tls_client_cert = "/tmp/slatefs-operator.pem"
+            tls_client_key = "/tmp/slatefs-operator.key"
+            tls_server_name = "slatefs-admin.internal"
             allow_cert_auth = true
         "#;
         let config = Config::parse(raw).unwrap();
@@ -1000,6 +1020,14 @@ mod tests {
         assert_eq!(
             config.admin.tls_client_ca.as_deref(),
             Some(std::path::Path::new("/tmp/slatefs-admin-ca.pem"))
+        );
+        assert_eq!(
+            config.admin.tls_server_ca.as_deref(),
+            Some(std::path::Path::new("/tmp/slatefs-admin-ca.pem"))
+        );
+        assert_eq!(
+            config.admin.tls_server_name.as_deref(),
+            Some("slatefs-admin.internal")
         );
         assert!(config.admin.allow_cert_auth);
 
@@ -1030,6 +1058,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(Config::parse(&allow_without_client_ca).is_err());
+
+        let missing_client_key = raw
+            .lines()
+            .filter(|line| !line.contains("tls_client_key"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(Config::parse(&missing_client_key).is_err());
     }
 
     #[test]

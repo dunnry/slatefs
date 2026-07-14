@@ -214,6 +214,13 @@ cannot access another tenant or global admin routes. All versioning subcommands
 accept `--live`; direct repository commands without it must not be run while
 `slatefsd` serves that volume.
 
+For an HTTPS admin endpoint, configure `admin.tls_server_ca` and, when the
+certificate is issued to a DNS name rather than the listener IP,
+`admin.tls_server_name` in the CLI config. Add `admin.tls_client_cert` and
+`admin.tls_client_key` when the daemon requires mTLS. A config shared with the
+daemon can use `admin.tls_cert` as its trust anchor when `tls_server_ca` is
+omitted.
+
 Live version commits flush and validate the SlateDB writer lease before file
 capture and immediately before publishing history. HTTP `503` means that
 daemon was fenced; discover the current primary and retry there. The failed

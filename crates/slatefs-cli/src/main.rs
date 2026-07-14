@@ -2,7 +2,7 @@
 //! lifecycle, volume create/info/list/fsck, and quota metadata.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use anyhow::Context;
 use base64::Engine as _;
@@ -21,6 +21,11 @@ use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
 use slatefs_core::{config, store};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+
+static RUSTLS_PROVIDER: Once = Once::new();
 
 #[derive(Parser)]
 #[command(name = "slatefs", version, about = "SlateFS management CLI")]
@@ -1314,6 +1319,98 @@ fn admin_bearer_token(config: &Config, tenant: &str) -> anyhow::Result<Option<St
     }
 }
 
+fn load_pem_certificates(path: &std::path::Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading certificate file {}", path.display()))?;
+    rustls_pemfile::certs(&mut bytes.as_slice())
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("parsing certificate file {}", path.display()))
+}
+
+fn load_pem_private_key(path: &std::path::Path) -> anyhow::Result<PrivateKeyDer<'static>> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading private key file {}", path.display()))?;
+    rustls_pemfile::private_key(&mut bytes.as_slice())
+        .with_context(|| format!("parsing private key file {}", path.display()))?
+        .ok_or_else(|| anyhow::anyhow!("private key file {} contains no key", path.display()))
+}
+
+fn admin_tls_client_config(config: &Config) -> anyhow::Result<Arc<ClientConfig>> {
+    RUSTLS_PROVIDER.call_once(|| {
+        let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let custom_trust = config
+        .admin
+        .tls_server_ca
+        .as_deref()
+        .or(config.admin.tls_cert.as_deref());
+    if let Some(path) = custom_trust {
+        for certificate in load_pem_certificates(path)? {
+            roots
+                .add(certificate)
+                .with_context(|| format!("adding admin TLS trust from {}", path.display()))?;
+        }
+    }
+    let builder = ClientConfig::builder().with_root_certificates(roots);
+    let client = match (
+        config.admin.tls_client_cert.as_deref(),
+        config.admin.tls_client_key.as_deref(),
+    ) {
+        (Some(cert), Some(key)) => builder
+            .with_client_auth_cert(load_pem_certificates(cert)?, load_pem_private_key(key)?)
+            .context("configuring admin mTLS client identity")?,
+        (None, None) => builder.with_no_client_auth(),
+        _ => {
+            anyhow::bail!("admin.tls_client_cert and admin.tls_client_key must both be configured")
+        }
+    };
+    Ok(Arc::new(client))
+}
+
+async fn exchange_admin_stream<S>(mut stream: S, request: &[u8]) -> anyhow::Result<String>
+where
+    S: tokio::io::AsyncRead + AsyncWrite + Unpin,
+{
+    stream.write_all(request).await?;
+    stream.shutdown().await?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await?;
+    Ok(response)
+}
+
+async fn admin_http_exchange(
+    config: &Config,
+    listen: &str,
+    request: &[u8],
+) -> anyhow::Result<String> {
+    let stream = TcpStream::connect(listen)
+        .await
+        .with_context(|| format!("connecting to slatefsd admin endpoint at {listen}"))?;
+    let tls_enabled = config.admin.tls_cert.is_some()
+        || config.admin.tls_server_ca.is_some()
+        || config.admin.tls_server_name.is_some()
+        || config.admin.tls_client_cert.is_some();
+    if !tls_enabled {
+        return exchange_admin_stream(stream, request).await;
+    }
+    let addr = stream
+        .peer_addr()
+        .context("reading admin TLS peer address")?;
+    let server_name = match &config.admin.tls_server_name {
+        Some(name) => ServerName::try_from(name.clone())
+            .map_err(|error| anyhow::anyhow!("invalid admin.tls_server_name: {error}"))?,
+        None => ServerName::IpAddress(addr.ip().into()),
+    };
+    let connector = TlsConnector::from(admin_tls_client_config(config)?);
+    let stream = connector
+        .connect(server_name, stream)
+        .await
+        .context("establishing admin TLS connection")?;
+    exchange_admin_stream(stream, request).await
+}
+
 async fn live_versioning_json(
     config: &Config,
     tenant: &str,
@@ -1323,11 +1420,6 @@ async fn live_versioning_json(
     query: &[(&str, String)],
     body: Option<serde_json::Value>,
 ) -> anyhow::Result<serde_json::Value> {
-    if config.admin.tls_cert.is_some() {
-        anyhow::bail!(
-            "live versioning through a TLS admin listener is not yet supported by the CLI"
-        );
-    }
     let listen = config
         .admin
         .listen
@@ -1360,14 +1452,7 @@ async fn live_versioning_json(
         "{method} {path} HTTP/1.1\r\nHost: {listen}\r\nContent-Type: application/json\r\n{authorization}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    let mut stream = TcpStream::connect(listen)
-        .await
-        .with_context(|| format!("connecting to slatefsd admin endpoint at {listen}"))?;
-    stream.write_all(request.as_bytes()).await?;
-    stream.shutdown().await?;
-
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await?;
+    let response = admin_http_exchange(config, listen, request.as_bytes()).await?;
     let (head, body) = response
         .split_once("\r\n\r\n")
         .ok_or_else(|| anyhow::anyhow!("malformed admin response"))?;
@@ -2775,6 +2860,48 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+        KeyPair, KeyUsagePurpose,
+    };
+
+    fn generate_admin_server_certificate(
+        directory: &std::path::Path,
+    ) -> anyhow::Result<(PathBuf, PathBuf, PathBuf)> {
+        let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "slatefs-cli-test-ca");
+        ca_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+        ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+        ca_params.key_usages.push(KeyUsagePurpose::CrlSign);
+        let ca_key = KeyPair::generate()?;
+        let ca_cert = ca_params.self_signed(&ca_key)?;
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let mut server_params = CertificateParams::new(vec!["localhost".to_string()])?;
+        server_params
+            .distinguished_name
+            .push(DnType::CommonName, "slatefs-admin");
+        server_params.use_authority_key_identifier_extension = true;
+        server_params
+            .key_usages
+            .push(KeyUsagePurpose::DigitalSignature);
+        server_params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ServerAuth);
+        let server_key = KeyPair::generate()?;
+        let server_cert = server_params.signed_by(&server_key, &issuer)?;
+
+        let ca_path = directory.join("ca.pem");
+        let cert_path = directory.join("server.pem");
+        let key_path = directory.join("server-key.pem");
+        std::fs::write(&ca_path, ca_cert.pem())?;
+        std::fs::write(&cert_path, server_cert.pem())?;
+        std::fs::write(&key_path, server_key.serialize_pem())?;
+        Ok((ca_path, cert_path, key_path))
+    }
 
     #[tokio::test]
     async fn live_versioning_client_sends_tenant_auth_and_encoded_query() {
@@ -2841,6 +2968,77 @@ mod tests {
             request.contains("Authorization: Bearer tenant-secret\r\n"),
             "{request}"
         );
+    }
+
+    #[tokio::test]
+    async fn live_versioning_client_supports_custom_ca_tls() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let (ca_path, cert_path, key_path) = generate_admin_server_certificate(directory.path())?;
+        RUSTLS_PROVIDER.call_once(|| {
+            let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+        let server_config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                load_pem_certificates(&cert_path)?,
+                load_pem_private_key(&key_path)?,
+            )?;
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let listen = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut stream = acceptor.accept(stream).await?;
+            let mut request = Vec::new();
+            loop {
+                let mut bytes = [0; 1024];
+                let read = stream.read(&mut bytes).await?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&bytes[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = r#"{"commits":[]}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            stream.shutdown().await?;
+            Ok::<_, anyhow::Error>(String::from_utf8(request)?)
+        });
+        let config = Config::parse(&format!(
+            r#"
+                [object_store]
+                url = "memory:///"
+
+                [kms]
+                provider = "static"
+                key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+                [admin]
+                listen = "{listen}"
+                tls_server_ca = "{}"
+                tls_server_name = "localhost"
+
+                [admin.tenant_tokens]
+                tenant-a = "tenant-secret"
+            "#,
+            ca_path.display()
+        ))?;
+        let response =
+            live_versioning_json(&config, "tenant-a", "docs", "GET", "commits", &[], None).await?;
+        assert_eq!(response["commits"], serde_json::json!([]));
+        let request = server.await??;
+        assert!(request.contains("Authorization: Bearer tenant-secret\r\n"));
+        Ok(())
     }
 
     #[test]

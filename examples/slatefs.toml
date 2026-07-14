@@ -43,6 +43,12 @@ cipher = "auto"              # auto | aes256gcm | xchacha20poly1305
 # listen = "127.0.0.1:12081"
 # token = "replace-me"        # required if listen is not loopback
 # token_file = "/run/slatefs/admin-token"
+# tls_cert = "/etc/slatefs/admin.pem"
+# tls_key = "/etc/slatefs/admin.key"
+# tls_server_ca = "/etc/slatefs/admin-ca.pem" # CLI private-CA trust
+# tls_server_name = "slatefs-admin.internal"  # CLI certificate name
+# tls_client_cert = "/etc/slatefs/operator.pem" # optional CLI mTLS
+# tls_client_key = "/etc/slatefs/operator.key"
 # Per-customer credentials are restricted to their own /admin/v1 tenant subtree:
 # [admin.tenant_tokens]
 # customer-a = "replace-with-customer-token"

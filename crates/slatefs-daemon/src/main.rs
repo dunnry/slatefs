@@ -5997,6 +5997,10 @@ mod tests {
             tls_cert: Some(certs.server_cert.clone()),
             tls_key: Some(certs.server_key.clone()),
             tls_client_ca: client_ca.then(|| certs.ca.clone()),
+            tls_server_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            tls_server_name: None,
             allow_cert_auth: false,
         })?
         .unwrap();
