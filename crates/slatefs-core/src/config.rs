@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use serde::de::Error as _;
@@ -184,6 +185,10 @@ pub struct AdminConfig {
     /// Optional tenant-scoped bearer tokens. A matching token may access only
     /// `/admin/v1/tenants/<tenant>/...` for its configured tenant.
     pub tenant_tokens: BTreeMap<String, String>,
+    /// Optional per-tenant files containing one or more bearer tokens, one per
+    /// line. Files are re-read for each admin request so atomic replacement
+    /// rotates credentials without restarting the daemon.
+    pub tenant_token_files: BTreeMap<String, PathBuf>,
     /// Optional PEM certificate chain served by the admin listener.
     pub tls_cert: Option<std::path::PathBuf>,
     /// Optional PEM private key for `tls_cert`.
@@ -614,6 +619,19 @@ impl Config {
                 )));
             }
         }
+        for (tenant, path) in &self.admin.tenant_token_files {
+            crate::store::validate_name("admin tenant token file name", tenant)?;
+            if path.as_os_str().is_empty() {
+                return Err(Error::Config(format!(
+                    "admin.tenant_token_files.{tenant} must not be empty"
+                )));
+            }
+            if self.admin.tenant_tokens.contains_key(tenant) {
+                return Err(Error::Config(format!(
+                    "tenant {tenant} may appear in only one of admin.tenant_tokens or admin.tenant_token_files"
+                )));
+            }
+        }
         let has_admin_tls_cert = self.admin.tls_cert.is_some();
         let has_admin_tls_key = self.admin.tls_key.is_some();
         let has_admin_tls_client_ca = self.admin.tls_client_ca.is_some();
@@ -649,7 +667,8 @@ impl Config {
             })?;
             let has_token = self.admin.token.is_some()
                 || self.admin.token_file.is_some()
-                || !self.admin.tenant_tokens.is_empty();
+                || !self.admin.tenant_tokens.is_empty()
+                || !self.admin.tenant_token_files.is_empty();
             let has_cert_auth = has_admin_tls_cert
                 && has_admin_tls_key
                 && has_admin_tls_client_ca
@@ -675,6 +694,46 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// Load a newline-delimited bearer-token file. The first token is the active
+/// client credential; servers accept every listed token to permit overlap
+/// during rotation.
+pub fn load_bearer_token_file(path: &Path) -> Result<Vec<String>> {
+    let contents = std::fs::read_to_string(path).map_err(|error| {
+        Error::Config(format!(
+            "reading bearer token file {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut tokens = Vec::new();
+    let mut unique = BTreeSet::new();
+    for line in contents.lines() {
+        let token = line.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if token.chars().any(char::is_whitespace) {
+            return Err(Error::Config(format!(
+                "bearer token file {} contains whitespace within a token",
+                path.display()
+            )));
+        }
+        if !unique.insert(token.to_string()) {
+            return Err(Error::Config(format!(
+                "bearer token file {} contains a duplicate token",
+                path.display()
+            )));
+        }
+        tokens.push(token.to_string());
+    }
+    if tokens.is_empty() {
+        return Err(Error::Config(format!(
+            "bearer token file {} contains no tokens",
+            path.display()
+        )));
+    }
+    Ok(tokens)
 }
 
 pub fn validate_export_config(export: &ExportConfig) -> Result<()> {
@@ -985,6 +1044,51 @@ mod tests {
             tenant-b = "shared-secret"
         "#;
         assert!(Config::parse(raw).is_err());
+    }
+
+    #[test]
+    fn admin_tenant_token_files_parse_and_do_not_overlap_inline_tokens() {
+        let raw = r#"
+            [object_store]
+            url = "memory:///"
+
+            [kms]
+            provider = "static"
+            key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+            [admin.tenant_token_files]
+            tenant-a = "/run/slatefs/tenant-a.tokens"
+        "#;
+        let config = Config::parse(raw).unwrap();
+        assert_eq!(
+            config
+                .admin
+                .tenant_token_files
+                .get("tenant-a")
+                .map(PathBuf::as_path),
+            Some(Path::new("/run/slatefs/tenant-a.tokens"))
+        );
+
+        let overlapping = format!("{raw}\n[admin.tenant_tokens]\ntenant-a = \"inline-secret\"\n");
+        assert!(Config::parse(&overlapping).is_err());
+    }
+
+    #[test]
+    fn bearer_token_files_support_rotation_overlap() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tenant.tokens");
+        std::fs::write(&path, "new-secret\nold-secret\n\n").unwrap();
+        assert_eq!(
+            load_bearer_token_file(&path).unwrap(),
+            vec!["new-secret", "old-secret"]
+        );
+
+        std::fs::write(&path, "duplicate\nduplicate\n").unwrap();
+        assert!(load_bearer_token_file(&path).is_err());
+        std::fs::write(&path, "contains whitespace\n").unwrap();
+        assert!(load_bearer_token_file(&path).is_err());
+        std::fs::write(&path, "\n").unwrap();
+        assert!(load_bearer_token_file(&path).is_err());
     }
 
     #[test]

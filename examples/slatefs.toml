@@ -52,6 +52,10 @@ cipher = "auto"              # auto | aes256gcm | xchacha20poly1305
 # Per-customer credentials are restricted to their own /admin/v1 tenant subtree:
 # [admin.tenant_tokens]
 # customer-a = "replace-with-customer-token"
+# Restart-free rotation files contain the active token first and optional
+# overlapping old tokens on following lines. Replace files atomically.
+# [admin.tenant_token_files]
+# customer-b = "/run/slatefs/customer-b.tokens"
 
 # Control-plane exports are reconciled live by slatefsd. Static [[exports]]
 # below are still supported as immutable bootstrap/compatibility exports.

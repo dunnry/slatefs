@@ -1301,6 +1301,10 @@ fn admin_bearer_token(config: &Config, tenant: &str) -> anyhow::Result<Option<St
     if let Some(token) = config.admin.tenant_tokens.get(tenant) {
         return Ok(Some(token.clone()));
     }
+    if let Some(path) = config.admin.tenant_token_files.get(tenant) {
+        let tokens = config::load_bearer_token_file(path)?;
+        return Ok(tokens.into_iter().next());
+    }
     match (&config.admin.token, &config.admin.token_file) {
         (Some(token), None) => Ok(Some(token.clone())),
         (None, Some(path)) => {
@@ -3048,6 +3052,32 @@ mod tests {
         assert_eq!(parse_size_bytes("2m").unwrap(), 2 * 1024 * 1024);
         assert_eq!(parse_size_bytes("100G").unwrap(), 100 * 1024 * 1024 * 1024);
         assert_eq!(parse_size_bytes("1T").unwrap(), 1024_u64.pow(4));
+    }
+
+    #[test]
+    fn tenant_token_file_uses_first_rotation_credential() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tenant-a.tokens");
+        std::fs::write(&path, "new-secret\nold-secret\n").unwrap();
+        let config = Config::parse(&format!(
+            r#"
+                [object_store]
+                url = "memory:///"
+
+                [kms]
+                provider = "static"
+                key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+                [admin.tenant_token_files]
+                tenant-a = "{}"
+            "#,
+            path.display()
+        ))
+        .unwrap();
+        assert_eq!(
+            admin_bearer_token(&config, "tenant-a").unwrap().as_deref(),
+            Some("new-secret")
+        );
     }
 
     #[test]

@@ -253,6 +253,15 @@ mTLS cert auth. Per-customer bearer tokens may be configured in
 authentication; `/livez` and `/readyz` remain unauthenticated but are still
 served over HTTPS/mTLS when admin TLS is enabled.
 
+For restart-free customer credential rotation, map tenants to files in
+`[admin.tenant_token_files]`. Each file contains one token per line. The daemon
+re-reads it for every authenticated request and accepts every listed token;
+the CLI sends the first token. Put the new token first and retain the old token
+on a second line during the overlap window, atomically replace the file, update
+clients, then atomically replace it again with only the new token. Empty,
+duplicate, whitespace-containing, unreadable, or cross-tenant ambiguous token
+sources fail closed.
+
 Enable HTTPS on the admin listener with `[admin].tls_cert` and
 `[admin].tls_key`. Add `[admin].tls_client_ca` to require and verify client
 certificates. Set `[admin].allow_cert_auth = true` only when a verified client
@@ -302,6 +311,10 @@ allow_cert_auth = false
 
 [admin.tenant_tokens]
 customer-a = "replace-with-customer-token"
+
+# Prefer this file-backed form when customer credentials must rotate live.
+[admin.tenant_token_files]
+customer-b = "/run/slatefs/customer-b.tokens"
 ```
 
 For a local lab CA and leaf certificates:

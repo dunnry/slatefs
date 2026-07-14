@@ -26,7 +26,7 @@ use slatefs_core::block::{
 };
 use slatefs_core::config::{
     AdminConfig, AtimeMode, ClientAddrRule, Config, ExportConfig, ExportProtocol, NbdSyncMode,
-    SquashMode, validate_export_volume_kind,
+    SquashMode, load_bearer_token_file, validate_export_volume_kind,
 };
 use slatefs_core::control::{
     AuditAction, AuditActor, AuditDetailValue, AuditOutcome, AuditPlane, AuditQuery, AuditRecord,
@@ -903,6 +903,7 @@ struct AdminState {
     started_at: Instant,
     auth_token: Option<String>,
     tenant_tokens: BTreeMap<String, String>,
+    tenant_token_files: BTreeMap<String, PathBuf>,
     version_locks: Arc<Mutex<HashMap<VolumeId, Arc<AsyncMutex<()>>>>>,
     allow_cert_auth: bool,
     node_id: Option<String>,
@@ -1604,7 +1605,10 @@ fn authenticate_admin_request(
     state: &AdminState,
     request: &AdminHttpRequest,
 ) -> Result<Option<String>, AdminError> {
-    if state.auth_token.is_some() || !state.tenant_tokens.is_empty() {
+    if state.auth_token.is_some()
+        || !state.tenant_tokens.is_empty()
+        || !state.tenant_token_files.is_empty()
+    {
         let Some(presented) = bearer_token_from_headers(&request.headers) else {
             if state.allow_cert_auth
                 && let Some(principal) = cert_auth_principal(request)
@@ -1624,17 +1628,45 @@ fn authenticate_admin_request(
             return Ok(admin_principal_from_headers(&request.headers)
                 .or_else(|| Some("admin-token".to_string())));
         }
-        if let Some((tenant, _)) = state
-            .tenant_tokens
-            .iter()
-            .find(|(_, expected)| token_matches(expected, presented))
-        {
-            return Ok(Some(format!("tenant:{tenant}")));
-        }
         if state.allow_cert_auth
             && let Some(principal) = cert_auth_principal(request)
         {
             return Ok(Some(principal));
+        }
+        let mut matched_tenant = None;
+        for (tenant, expected) in &state.tenant_tokens {
+            if token_matches(expected, presented) {
+                matched_tenant = Some(tenant.as_str());
+            }
+        }
+        for (tenant, path) in &state.tenant_token_files {
+            let tokens = load_bearer_token_file(path).map_err(|error| {
+                tracing::error!(tenant, %error, "failed to reload tenant bearer tokens");
+                AdminError {
+                    status: 503,
+                    message: "tenant credential source is temporarily unavailable".to_string(),
+                }
+            })?;
+            if tokens
+                .iter()
+                .any(|expected| token_matches(expected, presented))
+            {
+                if matched_tenant.is_some_and(|matched| matched != tenant) {
+                    tracing::error!(
+                        first_tenant = matched_tenant,
+                        second_tenant = tenant,
+                        "tenant bearer token is ambiguous after credential reload"
+                    );
+                    return Err(AdminError {
+                        status: 503,
+                        message: "tenant credential sources contain an ambiguous token".to_string(),
+                    });
+                }
+                matched_tenant = Some(tenant);
+            }
+        }
+        if let Some(tenant) = matched_tenant {
+            return Ok(Some(format!("tenant:{tenant}")));
         }
         return Err(AdminError {
             status: 401,
@@ -4196,6 +4228,31 @@ fn load_admin_token(config: &AdminConfig) -> anyhow::Result<Option<String>> {
     }
 }
 
+fn validate_tenant_token_files(
+    config: &AdminConfig,
+    admin_token: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut owners = BTreeMap::<String, String>::new();
+    for (tenant, token) in &config.tenant_tokens {
+        owners.insert(token.clone(), tenant.clone());
+    }
+    for (tenant, path) in &config.tenant_token_files {
+        for token in load_bearer_token_file(path)? {
+            if admin_token.is_some_and(|admin| token_matches(admin, &token)) {
+                anyhow::bail!(
+                    "admin token must differ from tokens in admin.tenant_token_files.{tenant}"
+                );
+            }
+            if let Some(owner) = owners.insert(token, tenant.clone())
+                && owner != *tenant
+            {
+                anyhow::bail!("tenant token files for {owner} and {tenant} contain the same token");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn config_export_records(exports: &[ExportConfig]) -> Arc<Vec<ConfigExportRecord>> {
     Arc::new(
         exports
@@ -5477,6 +5534,7 @@ async fn main() -> anyhow::Result<()> {
     {
         anyhow::bail!("admin token must differ from every admin.tenant_tokens value");
     }
+    validate_tenant_token_files(&config.admin, admin_token.as_deref())?;
     let export_metrics = ExportMetrics::default();
     let admin_tls_loaded = load_admin_tls_config(&config.admin)?;
     let admin_tls = admin_tls_loaded.map(|loaded| {
@@ -5508,7 +5566,9 @@ async fn main() -> anyhow::Result<()> {
     let admin_tls_target = admin_tls.as_ref().map(|(_, target)| Arc::clone(target));
     let admin_cert_auth_allowed = config.admin.allow_cert_auth;
     if config.admin.listen.is_some() {
-        let has_bearer_auth = admin_token.is_some() || !config.admin.tenant_tokens.is_empty();
+        let has_bearer_auth = admin_token.is_some()
+            || !config.admin.tenant_tokens.is_empty()
+            || !config.admin.tenant_token_files.is_empty();
         if !has_bearer_auth && !admin_cert_auth_allowed {
             tracing::warn!(
                 "slatefs admin API is unauthenticated; set admin.token/admin.token_file or enable mTLS cert auth on untrusted networks"
@@ -5638,6 +5698,7 @@ async fn main() -> anyhow::Result<()> {
             started_at: Instant::now(),
             auth_token: admin_token,
             tenant_tokens: config.admin.tenant_tokens.clone(),
+            tenant_token_files: config.admin.tenant_token_files.clone(),
             version_locks: Arc::new(Mutex::new(HashMap::new())),
             allow_cert_auth: admin_cert_auth_allowed,
             node_id: None,
@@ -5790,6 +5851,7 @@ mod tests {
             started_at: Instant::now(),
             auth_token,
             tenant_tokens: BTreeMap::new(),
+            tenant_token_files: BTreeMap::new(),
             version_locks: Arc::new(Mutex::new(HashMap::new())),
             allow_cert_auth: false,
             node_id: None,
@@ -5812,6 +5874,7 @@ mod tests {
             started_at: Instant::now(),
             auth_token,
             tenant_tokens: BTreeMap::new(),
+            tenant_token_files: BTreeMap::new(),
             version_locks: Arc::new(Mutex::new(HashMap::new())),
             allow_cert_auth: false,
             node_id: None,
@@ -5994,6 +6057,7 @@ mod tests {
             token: None,
             token_file: None,
             tenant_tokens: Default::default(),
+            tenant_token_files: Default::default(),
             tls_cert: Some(certs.server_cert.clone()),
             tls_key: Some(certs.server_key.clone()),
             tls_client_ca: client_ca.then(|| certs.ca.clone()),
@@ -6943,6 +7007,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tenant_bearer_token_file_rotates_without_restarting_admin() {
+        let directory = tempfile::tempdir().unwrap();
+        let token_path = directory.path().join("tenant-a.tokens");
+        fs::write(&token_path, "new-secret\nold-secret\n").unwrap();
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([93; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("tenant-a", None).await.unwrap();
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "tenant-a",
+            "docs",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        control.close().await.unwrap();
+
+        let state = available_admin_state(object_store, kms, HashMap::new(), None).await;
+        let mut state = (*state).clone();
+        state
+            .tenant_token_files
+            .insert("tenant-a".to_string(), token_path.clone());
+        let state = Arc::new(state);
+        let request = |token: &str| {
+            format!(
+                "GET /admin/v1/tenants/tenant-a/volumes/docs/versioning HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n\r\n"
+            )
+        };
+
+        let old = admin_exchange(Arc::clone(&state), request("old-secret").as_bytes()).await;
+        let new = admin_exchange(Arc::clone(&state), request("new-secret").as_bytes()).await;
+        assert_eq!(response_status(&old), 200, "{old}");
+        assert_eq!(response_status(&new), 200, "{new}");
+
+        fs::write(&token_path, "new-secret\n").unwrap();
+        let retired = admin_exchange(Arc::clone(&state), request("old-secret").as_bytes()).await;
+        let active = admin_exchange(state, request("new-secret").as_bytes()).await;
+        assert_eq!(response_status(&retired), 401, "{retired}");
+        assert_eq!(response_status(&active), 200, "{active}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn https_admin_serves_tls_and_rejects_plain_http() -> TestResult<()> {
         let dir = tempfile::tempdir()?;
         let certs = TestCerts::generate(dir.path())?;
@@ -7202,6 +7312,7 @@ mod tests {
             started_at: Instant::now(),
             auth_token: None,
             tenant_tokens: BTreeMap::new(),
+            tenant_token_files: BTreeMap::new(),
             version_locks: Arc::new(Mutex::new(HashMap::new())),
             allow_cert_auth: false,
             node_id: None,
@@ -7582,6 +7693,7 @@ mod tests {
             started_at: Instant::now(),
             auth_token: None,
             tenant_tokens: BTreeMap::new(),
+            tenant_token_files: BTreeMap::new(),
             version_locks: Arc::new(Mutex::new(HashMap::new())),
             allow_cert_auth: false,
             node_id: None,
@@ -8333,6 +8445,7 @@ mod tests {
             started_at: Instant::now(),
             auth_token: None,
             tenant_tokens: BTreeMap::new(),
+            tenant_token_files: BTreeMap::new(),
             version_locks: Arc::new(Mutex::new(HashMap::new())),
             allow_cert_auth: false,
             node_id: None,
@@ -8493,6 +8606,7 @@ mod tests {
             started_at: Instant::now(),
             auth_token: None,
             tenant_tokens: BTreeMap::new(),
+            tenant_token_files: BTreeMap::new(),
             version_locks: Arc::new(Mutex::new(HashMap::new())),
             allow_cert_auth: false,
             node_id: None,

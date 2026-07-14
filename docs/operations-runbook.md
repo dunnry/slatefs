@@ -221,6 +221,15 @@ certificate is issued to a DNS name rather than the listener IP,
 daemon can use `admin.tls_cert` as its trust anchor when `tls_server_ca` is
 omitted.
 
+Rotate a customer bearer token without restarting `slatefsd` by configuring
+`[admin.tenant_token_files]` and atomically replacing that tenant's file. Files
+are newline-delimited: the CLI sends the first token and the daemon accepts all
+listed tokens. First write `new-token` followed by `old-token`, migrate clients,
+then write only `new-token`. Use a same-directory temporary file plus `mv` so
+readers never observe a partial write, and restrict file permissions to the
+daemon and authorized operators. A malformed or unreadable source fails tenant
+authentication closed; the global operator token remains usable for repair.
+
 Live version commits flush and validate the SlateDB writer lease before file
 capture and immediately before publishing history. HTTP `503` means that
 daemon was fenced; discover the current primary and retry there. The failed
