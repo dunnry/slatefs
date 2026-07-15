@@ -11,7 +11,7 @@ use bytes::Bytes;
 use ed25519_dalek::{Signature, VerifyingKey};
 use prolly::{
     AsyncBlobStore, AsyncProlly, AsyncStore, BatchOp, BlobRef, Cid, Config as ProllyConfig, Diff,
-    Mutation, RootManifest, Tree, ValueRef,
+    Mutation, Node, RootManifest, Tree, ValueRef,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -51,6 +51,10 @@ const BRANCH_PROTECTION_VERSION: u8 = 1;
 const REFLOG_VERSION: u8 = 1;
 const TAG_VERSION: u8 = 1;
 const REPOSITORY_IDENTITY_VERSION: u8 = 1;
+const REPOSITORY_BUNDLE_MAGIC: &[u8; 8] = b"SLATEVCS";
+const REPOSITORY_BUNDLE_VERSION: u8 = 1;
+const REPOSITORY_BUNDLE_HEADER_LEN: usize = REPOSITORY_BUNDLE_MAGIC.len() + 1 + 8;
+const SHA256_LEN: usize = 32;
 const REFLOG_RETAIN_PER_BRANCH: usize = 100;
 const MAINTENANCE_LEASE_VERSION: u8 = 1;
 const MAINTENANCE_LEASE_TTL_SECS: u64 = 120;
@@ -2158,6 +2162,36 @@ pub struct VersionStoreStats {
     pub attestations: u64,
 }
 
+/// Summary of the logical records contained in a portable repository bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionRepositoryBundleReport {
+    pub identity: VersionRepositoryIdentity,
+    pub objects: u64,
+    pub commits: u64,
+    pub pruned_commits: u64,
+    pub attestations: u64,
+    pub nodes: u64,
+    pub blobs: u64,
+    pub branches: u64,
+    pub tags: u64,
+    pub reflogs: u64,
+    pub logical_bytes: u64,
+    pub bundle_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VersionRepositoryBundlePayload {
+    identity: VersionRepositoryIdentity,
+    objects: Vec<VersionRepositoryBundleObject>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VersionRepositoryBundleObject {
+    key: Vec<u8>,
+    value: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VersionGcReport {
     pub retained_commits: u64,
@@ -2710,6 +2744,102 @@ impl VersionRepository {
 
     pub fn identity(&self) -> &VersionRepositoryIdentity {
         &self.identity
+    }
+
+    /// Export every durable logical object in this repository. The returned
+    /// bundle is independent of the source volume's encryption key and can be
+    /// imported into a differently encrypted destination volume.
+    pub async fn export_bundle(&self) -> Result<(Vec<u8>, VersionRepositoryBundleReport)> {
+        self.verify().await?;
+        let mut objects = Vec::new();
+        let mut iter = self.store.db.scan(..).await?;
+        while let Some(entry) = iter.next().await? {
+            if is_repository_bundle_object_key(&entry.key) {
+                objects.push(VersionRepositoryBundleObject {
+                    key: entry.key.to_vec(),
+                    value: entry.value.to_vec(),
+                });
+            }
+        }
+        let payload = VersionRepositoryBundlePayload {
+            identity: self.identity.clone(),
+            objects,
+        };
+        let mut report = validate_repository_bundle_payload(&payload)?;
+        let bundle = encode_repository_bundle(&payload)?;
+        report.bundle_bytes = bundle.len() as u64;
+        Ok((bundle, report))
+    }
+
+    /// Import a complete logical repository into an empty, versioning-enabled
+    /// destination volume. All records are validated before one atomic batch
+    /// makes them visible, and SlateDB encrypts that batch with the destination
+    /// volume's key.
+    pub async fn import_bundle(
+        control: &ControlPlane,
+        object_store: Arc<dyn ObjectStore>,
+        tenant: &str,
+        volume: &str,
+        bundle: &[u8],
+    ) -> Result<VersionRepositoryBundleReport> {
+        let (payload, mut report) = decode_repository_bundle(bundle)?;
+        let repository = Self::open_with_identity(
+            control,
+            object_store,
+            tenant,
+            volume,
+            payload.identity.clone(),
+        )
+        .await?;
+        let result = async {
+            let mut iter = repository.store.db.scan(..).await?;
+            let mut existing_bytes = 0u64;
+            while let Some(entry) = iter.next().await? {
+                if entry.key.as_ref() != REPOSITORY_IDENTITY_KEY {
+                    return Err(Error::invalid(
+                        "version repository bundle import",
+                        "destination repository is not empty",
+                    ));
+                }
+                existing_bytes =
+                    existing_bytes.saturating_add((entry.key.len() + entry.value.len()) as u64);
+            }
+            if let Some(max_bytes) = repository.max_bytes
+                && existing_bytes.saturating_add(report.logical_bytes) > max_bytes
+            {
+                return Err(Error::Versioning(format!(
+                    "version history quota exceeded: {} bytes required, {max_bytes} bytes allowed",
+                    existing_bytes.saturating_add(report.logical_bytes)
+                )));
+            }
+            let imported_keys = payload
+                .objects
+                .iter()
+                .map(|object| object.key.clone())
+                .collect::<Vec<_>>();
+            let mut batch = WriteBatch::new();
+            for object in payload.objects {
+                batch.put(object.key, object.value);
+            }
+            repository.store.db.write(batch).await?;
+            repository.store.db.flush().await?;
+            if let Err(error) = repository.verify().await {
+                let mut rollback = WriteBatch::new();
+                for key in imported_keys {
+                    rollback.delete(key);
+                }
+                repository.store.db.write(rollback).await?;
+                repository.store.db.flush().await?;
+                return Err(error);
+            }
+            Ok(())
+        }
+        .await;
+        let close = repository.close().await;
+        result?;
+        close?;
+        report.bundle_bytes = bundle.len() as u64;
+        Ok(report)
     }
 
     pub async fn stats(&self) -> Result<VersionStoreStats> {
@@ -5285,6 +5415,415 @@ fn pruned_commit_key(id: &[u8; 32]) -> Vec<u8> {
 
 fn pruned_commit_key_bytes(id: &[u8]) -> Vec<u8> {
     prefixed_key(PRUNED_COMMIT_PREFIX, id)
+}
+
+fn is_repository_bundle_object_key(key: &[u8]) -> bool {
+    key.starts_with(NODE_PREFIX)
+        || key.starts_with(BLOB_PREFIX)
+        || key.starts_with(COMMIT_PREFIX)
+        || key.starts_with(ATTESTATION_PREFIX)
+        || key.starts_with(PRUNED_COMMIT_PREFIX)
+        || key.starts_with(BRANCH_PREFIX)
+        || key.starts_with(REFLOG_PREFIX)
+        || key.starts_with(TAG_PREFIX)
+}
+
+fn repository_bundle_object_id(key: &[u8], prefix: &[u8], kind: &'static str) -> Result<[u8; 32]> {
+    key.strip_prefix(prefix)
+        .and_then(|id| id.try_into().ok())
+        .ok_or_else(|| {
+            Error::invalid(
+                "version repository bundle",
+                format!("{kind} key does not contain an exact SHA-256 ID"),
+            )
+        })
+}
+
+fn validate_repository_bundle_payload(
+    payload: &VersionRepositoryBundlePayload,
+) -> Result<VersionRepositoryBundleReport> {
+    validate_version_repository_identity(&payload.identity)?;
+    let mut report = VersionRepositoryBundleReport {
+        identity: payload.identity.clone(),
+        objects: payload.objects.len() as u64,
+        commits: 0,
+        pruned_commits: 0,
+        attestations: 0,
+        nodes: 0,
+        blobs: 0,
+        branches: 0,
+        tags: 0,
+        reflogs: 0,
+        logical_bytes: 0,
+        bundle_bytes: 0,
+    };
+    let mut previous_key: Option<&[u8]> = None;
+    let mut nodes = BTreeMap::<[u8; 32], Node>::new();
+    let mut blobs = BTreeMap::<[u8; 32], u64>::new();
+    let mut commits = BTreeMap::<[u8; 32], VersionCommit>::new();
+    let mut pruned_commits = BTreeSet::<[u8; 32]>::new();
+    let mut attestations = Vec::<([u8; 32], VersionCommitAttestation)>::new();
+    let mut branches = Vec::<(String, VersionRef)>::new();
+    let mut tags = Vec::<VersionTag>::new();
+    let mut reflogs = Vec::<VersionReflogRecord>::new();
+
+    for object in &payload.objects {
+        if previous_key.is_some_and(|previous| previous >= object.key.as_slice()) {
+            return Err(Error::invalid(
+                "version repository bundle",
+                "object keys must be unique and strictly ordered",
+            ));
+        }
+        previous_key = Some(&object.key);
+        report.logical_bytes = report
+            .logical_bytes
+            .saturating_add((object.key.len() + object.value.len()) as u64);
+
+        if object.key.starts_with(NODE_PREFIX) {
+            let id = repository_bundle_object_id(&object.key, NODE_PREFIX, "Prolly node")?;
+            let actual: [u8; 32] = Sha256::digest(&object.value).into();
+            if actual != id {
+                return Err(Error::invalid(
+                    "version repository bundle",
+                    format!(
+                        "Prolly node {} does not match its content hash",
+                        hex::encode(id)
+                    ),
+                ));
+            }
+            let node = Node::from_bytes(&object.value).map_err(prolly_error)?;
+            if node.keys.len() != node.vals.len()
+                || node.keys.windows(2).any(|keys| keys[0] >= keys[1])
+            {
+                return Err(Error::invalid(
+                    "version repository bundle",
+                    format!("Prolly node {} is not structurally valid", hex::encode(id)),
+                ));
+            }
+            nodes.insert(id, node);
+            report.nodes += 1;
+        } else if object.key.starts_with(BLOB_PREFIX) {
+            let id = repository_bundle_object_id(&object.key, BLOB_PREFIX, "blob")?;
+            let reference = BlobRef::from_bytes(&object.value);
+            if reference.cid.as_bytes() != id {
+                return Err(Error::invalid(
+                    "version repository bundle",
+                    format!("blob {} does not match its content hash", hex::encode(id)),
+                ));
+            }
+            blobs.insert(id, reference.len);
+            report.blobs += 1;
+        } else if object.key.starts_with(COMMIT_PREFIX) {
+            let id = repository_bundle_object_id(&object.key, COMMIT_PREFIX, "commit")?;
+            let commit: VersionCommit =
+                decode_versioned(COMMIT_VERSION, &object.value, "version commit")?;
+            let body = VersionCommitBody {
+                parents: commit.parents.clone(),
+                tree: commit.tree.clone(),
+                created_at: commit.created_at,
+                message: commit.message.clone(),
+                paths: commit.paths.clone(),
+                provenance: commit.provenance.clone(),
+            };
+            let actual: [u8; 32] = Sha256::digest(postcard::to_allocvec(&body)?).into();
+            if commit.id != id || actual != id {
+                return Err(Error::invalid(
+                    "version repository bundle",
+                    format!("commit {} does not match its content hash", hex::encode(id)),
+                ));
+            }
+            commits.insert(id, commit);
+            report.commits += 1;
+        } else if object.key.starts_with(ATTESTATION_PREFIX) {
+            let (commit, key_id) = parse_attestation_key(&object.key)?;
+            let attestation: VersionCommitAttestation = decode_versioned(
+                ATTESTATION_VERSION,
+                &object.value,
+                "version commit attestation",
+            )?;
+            if attestation.key_id() != key_id {
+                return Err(Error::invalid(
+                    "version repository bundle",
+                    format!("attestation key {key_id} does not match its record"),
+                ));
+            }
+            attestations.push((commit, attestation));
+            report.attestations += 1;
+        } else if object.key.starts_with(PRUNED_COMMIT_PREFIX) {
+            let id = repository_bundle_object_id(
+                &object.key,
+                PRUNED_COMMIT_PREFIX,
+                "pruned commit marker",
+            )?;
+            if !object.value.is_empty() {
+                return Err(Error::invalid(
+                    "version repository bundle",
+                    format!("pruned commit marker {} is not empty", hex::encode(id)),
+                ));
+            }
+            pruned_commits.insert(id);
+            report.pruned_commits += 1;
+        } else if object.key.starts_with(BRANCH_PREFIX) {
+            let name = std::str::from_utf8(&object.key[BRANCH_PREFIX.len()..]).map_err(|_| {
+                Error::invalid("version repository bundle", "branch name is not UTF-8")
+            })?;
+            validate_version_branch_name(name)?;
+            let reference: VersionRef =
+                decode_versioned(REF_VERSION, &object.value, "version branch")?;
+            branches.push((name.to_string(), reference));
+            report.branches += 1;
+        } else if object.key.starts_with(REFLOG_PREFIX) {
+            let record: VersionReflogRecord =
+                decode_versioned(REFLOG_VERSION, &object.value, "version branch reflog")?;
+            validate_version_branch_name(&record.branch)?;
+            if reflog_key(&record.branch, record.sequence) != object.key {
+                return Err(Error::invalid(
+                    "version repository bundle",
+                    "reflog record does not match its key",
+                ));
+            }
+            reflogs.push(record);
+            report.reflogs += 1;
+        } else if object.key.starts_with(TAG_PREFIX) {
+            let tag: VersionTag = decode_versioned(TAG_VERSION, &object.value, "version tag")?;
+            validate_version_tag_name(&tag.name)?;
+            if tag_key(&tag.name) != object.key {
+                return Err(Error::invalid(
+                    "version repository bundle",
+                    "tag record does not match its key",
+                ));
+            }
+            tags.push(tag);
+            report.tags += 1;
+        } else {
+            return Err(Error::invalid(
+                "version repository bundle",
+                "payload contains a non-portable object key",
+            ));
+        }
+    }
+
+    for (id, commit) in &commits {
+        for parent in &commit.parents {
+            if !commits.contains_key(parent) && !pruned_commits.contains(parent) {
+                return Err(Error::invalid(
+                    "version repository bundle",
+                    format!(
+                        "commit {} references missing parent {}",
+                        hex::encode(id),
+                        hex::encode(parent)
+                    ),
+                ));
+            }
+        }
+        if let Some(root) = &commit.tree.root
+            && !nodes.contains_key(&root.0)
+        {
+            return Err(Error::invalid(
+                "version repository bundle",
+                format!(
+                    "commit {} references missing Prolly root {}",
+                    hex::encode(id),
+                    hex::encode(root.as_bytes())
+                ),
+            ));
+        }
+    }
+    for (id, node) in &nodes {
+        if node.leaf {
+            for value in &node.vals {
+                if let ValueRef::Blob(reference) =
+                    ValueRef::from_stored_bytes(value).map_err(prolly_error)?
+                {
+                    let blob_id: [u8; 32] = reference.cid.0;
+                    match blobs.get(&blob_id) {
+                        Some(length) if *length == reference.len => {}
+                        Some(_) => {
+                            return Err(Error::invalid(
+                                "version repository bundle",
+                                format!(
+                                    "Prolly node {} references blob {} with the wrong length",
+                                    hex::encode(id),
+                                    hex::encode(blob_id)
+                                ),
+                            ));
+                        }
+                        None => {
+                            return Err(Error::invalid(
+                                "version repository bundle",
+                                format!(
+                                    "Prolly node {} references missing blob {}",
+                                    hex::encode(id),
+                                    hex::encode(blob_id)
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        } else {
+            for child in &node.vals {
+                let child: [u8; 32] = child.as_slice().try_into().map_err(|_| {
+                    Error::invalid(
+                        "version repository bundle",
+                        format!(
+                            "internal Prolly node {} has a non-CID child",
+                            hex::encode(id)
+                        ),
+                    )
+                })?;
+                if !nodes.contains_key(&child) {
+                    return Err(Error::invalid(
+                        "version repository bundle",
+                        format!(
+                            "Prolly node {} references missing child {}",
+                            hex::encode(id),
+                            hex::encode(child)
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    for (commit, attestation) in &attestations {
+        if !commits.contains_key(commit) {
+            return Err(Error::invalid(
+                "version repository bundle",
+                format!(
+                    "attestation {} references missing commit {}",
+                    attestation.key_id(),
+                    hex::encode(commit)
+                ),
+            ));
+        }
+        verify_version_commit_attestation(payload.identity.id(), commit, attestation)?;
+    }
+    for (name, reference) in &branches {
+        let commit = commits.get(&reference.commit_id).ok_or_else(|| {
+            Error::invalid(
+                "version repository bundle",
+                format!(
+                    "branch {name} references missing commit {}",
+                    hex::encode(reference.commit_id)
+                ),
+            )
+        })?;
+        if reference.tree.to_tree() != commit.tree.to_tree() {
+            return Err(Error::invalid(
+                "version repository bundle",
+                format!("branch {name} tree does not match its commit"),
+            ));
+        }
+    }
+    for tag in &tags {
+        if !commits.contains_key(&tag.commit_id) {
+            return Err(Error::invalid(
+                "version repository bundle",
+                format!(
+                    "tag {} references missing commit {}",
+                    tag.name,
+                    hex::encode(tag.commit_id)
+                ),
+            ));
+        }
+    }
+    for reflog in &reflogs {
+        for commit in reflog.previous.iter().chain(reflog.commit.iter()) {
+            if !commits.contains_key(commit) {
+                return Err(Error::invalid(
+                    "version repository bundle",
+                    format!(
+                        "reflog for branch {} references missing commit {}",
+                        reflog.branch,
+                        hex::encode(commit)
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(report)
+}
+
+fn encode_repository_bundle(payload: &VersionRepositoryBundlePayload) -> Result<Vec<u8>> {
+    let payload = postcard::to_allocvec(payload)?;
+    let payload_len = u64::try_from(payload.len()).map_err(|_| {
+        Error::invalid(
+            "version repository bundle",
+            "payload exceeds the format limit",
+        )
+    })?;
+    let mut bundle = Vec::with_capacity(REPOSITORY_BUNDLE_HEADER_LEN + payload.len() + SHA256_LEN);
+    bundle.extend_from_slice(REPOSITORY_BUNDLE_MAGIC);
+    bundle.push(REPOSITORY_BUNDLE_VERSION);
+    bundle.extend_from_slice(&payload_len.to_be_bytes());
+    bundle.extend_from_slice(&payload);
+    bundle.extend_from_slice(&Sha256::digest(&payload));
+    Ok(bundle)
+}
+
+fn decode_repository_bundle(
+    bundle: &[u8],
+) -> Result<(
+    VersionRepositoryBundlePayload,
+    VersionRepositoryBundleReport,
+)> {
+    if bundle.len() < REPOSITORY_BUNDLE_HEADER_LEN + SHA256_LEN {
+        return Err(Error::invalid(
+            "version repository bundle",
+            "bundle is truncated",
+        ));
+    }
+    if &bundle[..REPOSITORY_BUNDLE_MAGIC.len()] != REPOSITORY_BUNDLE_MAGIC {
+        return Err(Error::invalid(
+            "version repository bundle",
+            "magic header does not match SLATEVCS",
+        ));
+    }
+    let version = bundle[REPOSITORY_BUNDLE_MAGIC.len()];
+    if version != REPOSITORY_BUNDLE_VERSION {
+        return Err(Error::invalid(
+            "version repository bundle",
+            format!("format version {version}, expected {REPOSITORY_BUNDLE_VERSION}"),
+        ));
+    }
+    let length_offset = REPOSITORY_BUNDLE_MAGIC.len() + 1;
+    let payload_len = u64::from_be_bytes(
+        bundle[length_offset..REPOSITORY_BUNDLE_HEADER_LEN]
+            .try_into()
+            .expect("bundle length field has a fixed width"),
+    );
+    let payload_len = usize::try_from(payload_len).map_err(|_| {
+        Error::invalid(
+            "version repository bundle",
+            "payload length does not fit this platform",
+        )
+    })?;
+    let expected_len = REPOSITORY_BUNDLE_HEADER_LEN
+        .checked_add(payload_len)
+        .and_then(|length| length.checked_add(SHA256_LEN))
+        .ok_or_else(|| Error::invalid("version repository bundle", "payload length overflows"))?;
+    if bundle.len() != expected_len {
+        return Err(Error::invalid(
+            "version repository bundle",
+            format!(
+                "declared payload requires {expected_len} bytes, found {}",
+                bundle.len()
+            ),
+        ));
+    }
+    let payload_bytes = &bundle[REPOSITORY_BUNDLE_HEADER_LEN..][..payload_len];
+    let checksum = &bundle[REPOSITORY_BUNDLE_HEADER_LEN + payload_len..];
+    let actual: [u8; 32] = Sha256::digest(payload_bytes).into();
+    if checksum != actual {
+        return Err(Error::invalid(
+            "version repository bundle",
+            "payload checksum does not match",
+        ));
+    }
+    let payload: VersionRepositoryBundlePayload = postcard::from_bytes(payload_bytes)?;
+    let mut report = validate_repository_bundle_payload(&payload)?;
+    report.bundle_bytes = bundle.len() as u64;
+    Ok((payload, report))
 }
 
 fn parse_commit_id(value: &str) -> Result<[u8; 32]> {

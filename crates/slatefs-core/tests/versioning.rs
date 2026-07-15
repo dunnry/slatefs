@@ -1122,6 +1122,20 @@ async fn detached_commit_attestations_are_optional_immutable_and_verified() {
         .unwrap();
     assert!(promoted.fast_forward());
     assert_eq!(promoted.commit(), feature.id);
+    repository
+        .create_tag("release-candidate", &feature.id)
+        .await
+        .unwrap();
+    let (bundle, exported) = repository.export_bundle().await.unwrap();
+    assert!(bundle.starts_with(b"SLATEVCS"));
+    assert_eq!(exported.identity, repository_identity);
+    assert_eq!(exported.commits, 2);
+    assert_eq!(exported.attestations, 4);
+    assert_eq!(exported.branches, 3);
+    assert_eq!(exported.tags, 1);
+    assert!(exported.nodes > 0);
+    assert!(exported.blobs > 0);
+    assert_eq!(exported.bundle_bytes, bundle.len() as u64);
 
     repository.close().await.unwrap();
     let reopened = VersionRepository::open_with_identity(
@@ -1148,20 +1162,106 @@ async fn detached_commit_attestations_are_optional_immutable_and_verified() {
         .set_versioning_enabled("t", "imported-copy", true)
         .await
         .unwrap();
-    let imported = VersionRepository::open_with_identity(
+    let imported_report = VersionRepository::import_bundle(
         &control,
         Arc::clone(&object_store),
         "t",
         "imported-copy",
-        repository_identity,
+        &bundle,
     )
     .await
     .unwrap();
+    assert_eq!(imported_report, exported);
+    let imported =
+        VersionRepository::open(&control, Arc::clone(&object_store), "t", "imported-copy")
+            .await
+            .unwrap();
     assert_eq!(imported.identity().id(), repository_id);
+    assert_eq!(
+        imported
+            .read_file(&feature.id, "/signed.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"new signed contents"
+    );
+    assert_eq!(
+        imported
+            .list_commit_attestations(&feature.id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let imported_branches = imported.list_branches().await.unwrap();
+    assert_eq!(imported_branches.len(), 3);
+    assert!(
+        imported_branches
+            .iter()
+            .find(|branch| branch.name() == "release")
+            .is_some_and(|branch| !branch.protected())
+    );
+    assert_eq!(imported.list_tags().await.unwrap().len(), 1);
+    imported.verify().await.unwrap();
     imported.close().await.unwrap();
+    assert!(matches!(
+        VersionRepository::import_bundle(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "imported-copy",
+            &bundle,
+        )
+        .await,
+        Err(Error::Invalid {
+            what: "version repository bundle import",
+            ..
+        })
+    ));
+
+    volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "tampered-copy",
+        common::create_opts(None, None),
+    )
+    .await
+    .unwrap();
+    control
+        .set_versioning_enabled("t", "tampered-copy", true)
+        .await
+        .unwrap();
+    let mut tampered_bundle = bundle.clone();
+    *tampered_bundle.last_mut().unwrap() ^= 1;
+    assert!(matches!(
+        VersionRepository::import_bundle(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "tampered-copy",
+            &tampered_bundle,
+        )
+        .await,
+        Err(Error::Invalid {
+            what: "version repository bundle",
+            ..
+        })
+    ));
+    assert!(
+        VersionRepository::open_existing(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "tampered-copy",
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
     let mismatched_identity = VersionRepositoryIdentity::from_parts(
         wrong_repository_id,
-        repository.identity().created_at(),
+        repository_identity.created_at(),
     )
     .unwrap();
     assert!(matches!(
