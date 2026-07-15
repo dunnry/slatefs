@@ -1063,6 +1063,18 @@ async fn detached_commit_attestations_are_optional_immutable_and_verified() {
             ..
         })
     ));
+    let pending_quorum = repository
+        .attestation_quorum("release", "feature")
+        .await
+        .unwrap();
+    assert_eq!(pending_quorum.commit(), feature.id);
+    assert_eq!(pending_quorum.required_attestations(), 2);
+    assert_eq!(
+        pending_quorum.trusted_key_ids(),
+        ["release-2026", "security-2026"]
+    );
+    assert_eq!(pending_quorum.matching_key_ids(), ["release-2026"]);
+    assert!(!pending_quorum.satisfied());
     let security_feature_time = feature_time + 1;
     let security_feature_payload = version_commit_attestation_payload(
         "t",
@@ -1088,6 +1100,15 @@ async fn detached_commit_attestations_are_optional_immutable_and_verified() {
         )
         .await
         .unwrap();
+    let satisfied_quorum = repository
+        .attestation_quorum("release", &feature.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        satisfied_quorum.matching_key_ids(),
+        ["release-2026", "security-2026"]
+    );
+    assert!(satisfied_quorum.satisfied());
     let promoted = repository
         .merge_branch(
             "feature",

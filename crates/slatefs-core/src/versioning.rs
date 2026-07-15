@@ -647,8 +647,20 @@ impl VersionStore {
         commit: &[u8; 32],
         trusted_keys: &[VersionTrustedAttestationKey],
     ) -> Result<usize> {
-        let attestations = self.list_attestations(commit).await?;
-        Ok(attestations
+        Ok(self
+            .trusted_attestation_key_ids(commit, trusted_keys)
+            .await?
+            .len())
+    }
+
+    async fn trusted_attestation_key_ids(
+        &self,
+        commit: &[u8; 32],
+        trusted_keys: &[VersionTrustedAttestationKey],
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .list_attestations(commit)
+            .await?
             .iter()
             .filter(|attestation| {
                 trusted_keys.iter().any(|trusted| {
@@ -657,7 +669,8 @@ impl VersionStore {
                         && trusted.public_key() == attestation.public_key()
                 })
             })
-            .count())
+            .map(|attestation| attestation.key_id().to_string())
+            .collect())
     }
 
     async fn authorize_branch_policy_manager(&self, name: &str, manager: &str) -> Result<()> {
@@ -1689,6 +1702,19 @@ pub struct VersionBranchInfo {
     required_attestations: u32,
 }
 
+/// Read-only evaluation of a commit against one branch's signer policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionAttestationQuorumInfo {
+    branch: String,
+    commit: String,
+    protected: bool,
+    required_attestations: u32,
+    trusted_key_ids: Vec<String>,
+    matching_key_ids: Vec<String>,
+    satisfied: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct VersionBranchResetInfo {
@@ -1898,6 +1924,36 @@ impl VersionBranchInfo {
 
     pub fn required_attestations(&self) -> u32 {
         self.required_attestations
+    }
+}
+
+impl VersionAttestationQuorumInfo {
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
+
+    pub fn protected(&self) -> bool {
+        self.protected
+    }
+
+    pub fn required_attestations(&self) -> u32 {
+        self.required_attestations
+    }
+
+    pub fn trusted_key_ids(&self) -> &[String] {
+        &self.trusted_key_ids
+    }
+
+    pub fn matching_key_ids(&self) -> &[String] {
+        &self.matching_key_ids
+    }
+
+    pub fn satisfied(&self) -> bool {
+        self.satisfied
     }
 }
 
@@ -3462,6 +3518,47 @@ impl VersionRepository {
                 }
             })
             .collect())
+    }
+
+    /// Evaluate a commit or named reference against a branch's trusted-signer
+    /// policy without moving the branch.
+    pub async fn attestation_quorum(
+        &self,
+        branch: &str,
+        commit: &str,
+    ) -> Result<VersionAttestationQuorumInfo> {
+        validate_version_branch_name(branch)?;
+        self.store
+            .get_branch(branch)
+            .await?
+            .ok_or_else(|| Error::not_found("version branch", branch))?;
+        let commit = self.resolve_commit(commit).await?;
+        let protection = self.store.branch_protection(branch).await?;
+        let (trusted_keys, required_attestations) = protection
+            .as_ref()
+            .map(|policy| {
+                (
+                    policy.trusted_attestation_keys.as_slice(),
+                    policy.required_attestations,
+                )
+            })
+            .unwrap_or((&[], 0));
+        let matching_key_ids = self
+            .store
+            .trusted_attestation_key_ids(&commit.id, trusted_keys)
+            .await?;
+        Ok(VersionAttestationQuorumInfo {
+            branch: branch.to_string(),
+            commit: hex::encode(commit.id),
+            protected: protection.is_some(),
+            required_attestations,
+            trusted_key_ids: trusted_keys
+                .iter()
+                .map(|key| key.key_id().to_string())
+                .collect(),
+            satisfied: matching_key_ids.len() >= required_attestations as usize,
+            matching_key_ids,
+        })
     }
 
     /// Enable or disable destructive-ref protection for an existing branch.
