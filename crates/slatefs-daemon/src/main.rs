@@ -2548,6 +2548,8 @@ async fn add_version_commit_attestation_response(
     reference: &str,
 ) -> Result<AdminHttpResponse, AdminError> {
     let attestation: VersionCommitAttestation = parse_json_body(request)?;
+    let attempted_key_id = attestation.key_id().to_string();
+    let attempted_algorithm = attestation.algorithm().as_str().to_string();
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
     let (control, repository) = open_version_repository(state, tenant, volume).await?;
@@ -2562,7 +2564,38 @@ async fn add_version_commit_attestation_response(
     let (commit, attestation) = match result {
         Ok(result) => result,
         Err(error) => {
-            return finish_version_repository(control, repository, Err(error)).await;
+            state
+                .export_metrics
+                .version_operation_denied(tenant, volume, "attest");
+            let audit = append_version_audit_with_outcome(
+                &control,
+                request,
+                AuditAction::VersionAttest,
+                tenant,
+                volume,
+                AuditOutcome::Denied,
+                [
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(reference.to_string()),
+                    ),
+                    (
+                        "key_id".to_string(),
+                        AuditDetailValue::String(attempted_key_id),
+                    ),
+                    (
+                        "algorithm".to_string(),
+                        AuditDetailValue::String(attempted_algorithm),
+                    ),
+                ],
+            )
+            .await;
+            let repository_close = repository.close().await;
+            let control_close = control.close().await;
+            audit?;
+            repository_close.map_err(core_error)?;
+            control_close.map_err(core_error)?;
+            return Err(core_error(error));
         }
     };
     let audit = append_version_audit(
@@ -8293,6 +8326,21 @@ mod tests {
             attestation_response["attestation"]["key_id"],
             "release-2026"
         );
+        let forged = slatefs_core::versioning::VersionCommitAttestation::new_ed25519(
+            "forged-key",
+            public_key,
+            [0; 64],
+            1_700_000_001,
+        )
+        .unwrap();
+        let forged_body = serde_json::to_string(&forged).unwrap();
+        let forged_request = format!(
+            "POST /admin/v1/tenants/t/volumes/v/versioning/commits/{commit_id}/attestations HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nX-Request-Id: forged-attest\r\nContent-Length: {}\r\n\r\n{}",
+            forged_body.len(),
+            forged_body
+        );
+        let forged_response = admin_exchange(Arc::clone(&state), forged_request.as_bytes()).await;
+        assert_eq!(response_status(&forged_response), 400, "{forged_response}");
         let attestations_request = format!(
             "GET /admin/v1/tenants/t/volumes/v/versioning/commits/{commit_id}/attestations HTTP/1.1\r\nHost: localhost\r\n\r\n"
         );
@@ -8949,7 +8997,7 @@ mod tests {
             "{metrics}"
         );
         for operation in [
-            "policy", "commit", "merge", "reset", "delete", "recover", "purge",
+            "policy", "commit", "merge", "reset", "delete", "recover", "purge", "attest",
         ] {
             assert!(
                 metrics.contains(&format!(
@@ -8978,6 +9026,8 @@ mod tests {
                 .unwrap();
             let expected = if action == AuditAction::VersionCommit {
                 5
+            } else if action == AuditAction::VersionAttest {
+                2
             } else if action == AuditAction::Maintain {
                 18
             } else {
@@ -9008,6 +9058,21 @@ mod tests {
                         "/notes.txt".to_string()
                     )]))
                 );
+            }
+            if action == AuditAction::VersionAttest {
+                let denied = records
+                    .iter()
+                    .find(|record| {
+                        record.request_id == "forged-attest"
+                            && record.outcome == AuditOutcome::Denied
+                    })
+                    .expect("forged attestation denial audit");
+                assert_eq!(
+                    denied.details.get("key_id"),
+                    Some(&AuditDetailValue::String("forged-key".to_string()))
+                );
+                assert!(!denied.details.contains_key("signature"));
+                assert!(!denied.details.contains_key("public_key"));
             }
             if action == AuditAction::Maintain {
                 for (request_id, maintenance) in [
