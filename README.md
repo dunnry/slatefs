@@ -163,7 +163,9 @@ repeatable `--allow-committer <identity>` arguments can restrict those
 publications to exact committer identities. An empty allowlist permits any
 committer. Repeatable `--allow-manager <identity>` arguments independently
 restrict live policy changes and removal; an empty manager list permits any
-authorized live operator. `unprotect-branch --yes` removes that guard. `versioning reflog <branch>` lists
+authorized live operator. Successful and denied live policy changes are
+durably audited with both identity lists, but never bearer tokens.
+`unprotect-branch --yes` removes that guard. `versioning reflog <branch>` lists
 the newest 100 head
 transitions even after branch deletion. Every create, commit, fast-forward,
 merge, reset, and delete records its ref change atomically; retained reflog

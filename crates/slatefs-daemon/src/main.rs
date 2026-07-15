@@ -2695,29 +2695,38 @@ async fn set_version_branch_protection_response(
         .await;
     let audit = match &result {
         Ok(branch) => {
-            append_version_audit(
+            append_version_audit_with_outcome(
                 &control,
                 request,
                 AuditAction::Maintain,
                 tenant,
                 volume,
-                [
-                    (
-                        "maintenance".to_string(),
-                        AuditDetailValue::String(
-                            if protected {
-                                "version-branch-protect"
-                            } else {
-                                "version-branch-unprotect"
-                            }
-                            .to_string(),
-                        ),
-                    ),
-                    (
-                        "branch".to_string(),
-                        AuditDetailValue::String(branch.name().to_string()),
-                    ),
-                ],
+                AuditOutcome::Success,
+                version_branch_policy_audit_details(
+                    branch.name(),
+                    protected,
+                    branch.allowed_committers(),
+                    branch.allowed_managers(),
+                ),
+            )
+            .await
+        }
+        Err(slatefs_core::error::Error::Invalid { what, .. })
+            if *what == "version branch policy authorization" =>
+        {
+            append_version_audit_with_outcome(
+                &control,
+                request,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                AuditOutcome::Denied,
+                version_branch_policy_audit_details(
+                    name,
+                    protected,
+                    &allowed_committers,
+                    &allowed_managers,
+                ),
             )
             .await
         }
@@ -3586,6 +3595,27 @@ async fn append_version_audit(
     volume: &str,
     details: impl IntoIterator<Item = (String, AuditDetailValue)>,
 ) -> Result<(), AdminError> {
+    append_version_audit_with_outcome(
+        control,
+        request,
+        action,
+        tenant,
+        volume,
+        AuditOutcome::Success,
+        details,
+    )
+    .await
+}
+
+async fn append_version_audit_with_outcome(
+    control: &ControlPlane,
+    request: &AdminHttpRequest,
+    action: AuditAction,
+    tenant: &str,
+    volume: &str,
+    outcome: AuditOutcome,
+    details: impl IntoIterator<Item = (String, AuditDetailValue)>,
+) -> Result<(), AdminError> {
     let mut audit = AuditRecord::new(
         admin_actor(request),
         action,
@@ -3595,7 +3625,7 @@ async fn append_version_audit(
             node: None,
         },
         request.request_id.clone(),
-        AuditOutcome::Success,
+        outcome,
     );
     audit.details.extend(details);
     control
@@ -3603,6 +3633,46 @@ async fn append_version_audit(
         .await
         .map_err(core_error)?;
     Ok(())
+}
+
+fn version_branch_policy_audit_details(
+    branch: &str,
+    protected: bool,
+    allowed_committers: &[String],
+    allowed_managers: &[String],
+) -> Vec<(String, AuditDetailValue)> {
+    let identities = |values: &[String]| {
+        AuditDetailValue::Array(
+            values
+                .iter()
+                .cloned()
+                .map(AuditDetailValue::String)
+                .collect(),
+        )
+    };
+    vec![
+        (
+            "maintenance".to_string(),
+            AuditDetailValue::String(
+                if protected {
+                    "version-branch-protect"
+                } else {
+                    "version-branch-unprotect"
+                }
+                .to_string(),
+            ),
+        ),
+        (
+            "branch".to_string(),
+            AuditDetailValue::String(branch.to_string()),
+        ),
+        ("protected".to_string(), AuditDetailValue::Bool(protected)),
+        (
+            "allowed_committers".to_string(),
+            identities(allowed_committers),
+        ),
+        ("allowed_managers".to_string(), identities(allowed_managers)),
+    ]
 }
 
 async fn append_export_audit(
@@ -7867,9 +7937,9 @@ mod tests {
         );
         let branches: Value = serde_json::from_str(response_body(&branches_response)).unwrap();
         assert_eq!(branches["branches"].as_array().unwrap().len(), 2);
-        let protect_body = r#"{"allowed_committers":["other-committer"],"allowed_managers":["admin:unauthenticated"]}"#;
+        let protect_body = r#"{"allowed_committers":["other-committer","other-committer"],"allowed_managers":["admin:unauthenticated","admin:unauthenticated"]}"#;
         let protect_request = format!(
-            "PUT /admin/v1/tenants/t/volumes/v/versioning/branches/release/protection HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            "PUT /admin/v1/tenants/t/volumes/v/versioning/branches/release/protection HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: protect-policy\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             protect_body.len(),
             protect_body
         );
@@ -7889,6 +7959,32 @@ mod tests {
             protected["branch"]["allowed_managers"],
             json!(["admin:unauthenticated"])
         );
+        let denied_policy_request = AdminHttpRequest {
+            method: "DELETE".to_string(),
+            path: "/admin/v1/tenants/t/volumes/v/versioning/branches/release/protection"
+                .to_string(),
+            query: HashMap::new(),
+            headers: HashMap::new(),
+            request_id: "denied-policy".to_string(),
+            peer: None,
+            cert_principal: None,
+            authenticated_principal: Some("other-manager".to_string()),
+            body: String::new(),
+        };
+        let denied_policy = match set_version_branch_protection_response(
+            &state,
+            &denied_policy_request,
+            "t",
+            "v",
+            "release",
+            false,
+        )
+        .await
+        {
+            Ok(_) => panic!("unauthorized manager changed branch protection"),
+            Err(error) => error,
+        };
+        assert_eq!(denied_policy.status, 403);
         let blocked_reset_body = r#"{"commit":"baseline"}"#;
         let blocked_reset_request = format!(
             "POST /admin/v1/tenants/t/volumes/v/versioning/branches/release/reset HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -8339,11 +8435,51 @@ mod tests {
             let expected = if action == AuditAction::VersionCommit {
                 3
             } else if action == AuditAction::Maintain {
-                12
+                13
             } else {
                 1
             };
             assert_eq!(records.len(), expected);
+            if action == AuditAction::Maintain {
+                let protected = records
+                    .iter()
+                    .find(|record| record.request_id == "protect-policy")
+                    .expect("successful branch policy audit");
+                assert_eq!(protected.outcome, AuditOutcome::Success);
+                assert_eq!(
+                    protected.details.get("allowed_committers"),
+                    Some(&AuditDetailValue::Array(vec![AuditDetailValue::String(
+                        "other-committer".to_string()
+                    ),]))
+                );
+                assert_eq!(
+                    protected.details.get("allowed_managers"),
+                    Some(&AuditDetailValue::Array(vec![AuditDetailValue::String(
+                        "admin:unauthenticated".to_string()
+                    ),]))
+                );
+                let denied = records
+                    .iter()
+                    .find(|record| record.request_id == "denied-policy")
+                    .expect("denied branch policy audit");
+                assert_eq!(denied.outcome, AuditOutcome::Denied);
+                assert_eq!(
+                    denied.details.get("branch"),
+                    Some(&AuditDetailValue::String("release".to_string()))
+                );
+                assert_eq!(
+                    denied.details.get("protected"),
+                    Some(&AuditDetailValue::Bool(false))
+                );
+                assert_eq!(
+                    denied.details.get("allowed_committers"),
+                    Some(&AuditDetailValue::Array(Vec::new()))
+                );
+                assert_eq!(
+                    denied.details.get("allowed_managers"),
+                    Some(&AuditDetailValue::Array(Vec::new()))
+                );
+            }
         }
         audit_control.close().await.unwrap();
 

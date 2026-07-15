@@ -241,10 +241,13 @@ those operations preserve the protected head as an ancestor. Repeat
 `--allow-committer` to restrict publication to exact server-derived committer
 identities such as `tenant:<tenant>`, `admin-token`, or a configured admin
 principal. Repeat `--allow-manager` to independently restrict live policy
-updates and removal to exact authenticated identities. Omitting either list
+updates and removal to exact server-derived identities. Omitting either list
 leaves that operation unrestricted. Unauthorized live publication or policy
 management returns HTTP `403`. Removing the guard requires
 `unprotect-branch --yes` and emits a durable maintenance audit record.
+Successful changes record the normalized policy, and denied manager attempts
+record the requested policy with a `Denied` outcome. Audit records contain
+identity names and the server-derived actor, never bearer tokens.
 
 Live commit and divergent-merge provenance records the authenticated admin or
 tenant principal as committer and the HTTP request ID for audit correlation.

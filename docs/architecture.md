@@ -103,7 +103,9 @@ fast-forward. A separate exact manager allowlist controls live changes to the
 protection record itself, with authorization checked under the same ref lock
 against the existing policy. Empty publisher or manager allowlists leave that
 operation unrestricted. Offline repository access is the administrative
-recovery boundary.
+recovery boundary. The live control plane durably audits successful and denied
+policy changes with the requested identity lists and server-derived actor; it
+does not record bearer credentials.
 Disabling versioning blocks repository operations
 without deleting its history. Volume deletion removes both the live and
 optional version-store prefixes.
