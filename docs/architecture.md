@@ -109,17 +109,19 @@ may also carry an exact committer allowlist. Publication authorization is
 checked under the ref lock against hash-bound commit provenance for ordinary
 and divergent commits, and against the merge request provenance before a
 fast-forward. Protection may also contain exact trusted `(key ID, algorithm,
-public key)` tuples. Enabling signer enforcement requires the existing head to
-have a matching valid attestation. Subsequent publications check the candidate
-commit under the ref lock; this permits pre-attested fast-forwards and rejects
-direct unsigned commits, unsigned fast-forwards, and unsigned merge commits.
+public key)` tuples and a required signature count. The default is 1-of-M when
+keys are configured; operators can require any N-of-M quorum. Enabling or
+changing signer enforcement requires the existing head to satisfy the new
+quorum. Subsequent publications count distinct matching attestations under the
+ref lock; this permits pre-attested fast-forwards and rejects direct commits,
+fast-forwards below quorum, and unattested merge commits.
 A separate exact manager allowlist controls live changes to the protection
 record itself, with authorization checked under the same ref lock against the
 existing policy. Empty publisher, manager, or trusted-key lists leave that
 operation unrestricted. Offline repository access is the administrative
 recovery boundary. The live control plane durably audits successful and denied
-policy changes with the requested identity and trusted-key ID lists and
-server-derived actor; it
+policy changes with the requested identity lists, trusted-key ID list,
+signature quorum, and server-derived actor; it
 also audits publication denials with branch, path or merge metadata, author,
 and committer. Protected reset, delete, reflog recovery, and history-purge
 denials are audited with their requested target metadata. Audit records do not

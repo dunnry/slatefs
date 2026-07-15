@@ -244,22 +244,28 @@ volume, canonical commit ID, and detached attestations. Bundle verification is
 standalone: it does not load `/etc/slatefs/slatefs.toml` or contact SlateFS.
 
 To require a signer on a protected branch, first attest its current head, then
-configure the trust anchor:
+configure the trust anchor. One trusted signature is required by default. This
+example uses two independent keys and requires both approvals:
 
 ```sh
-slatefs -c /etc/slatefs/slatefs.toml versioning protect-branch <tenant> <volume> main --trust-attestation-key release-2026=release.pub --allow-manager <admin-principal> --live
+slatefs versioning attestation-keygen --out security.key --public-out security.pub
+slatefs -c /etc/slatefs/slatefs.toml versioning attest <tenant> <volume> main --key-id release-2026 --key-file release.key --live
+slatefs -c /etc/slatefs/slatefs.toml versioning attest <tenant> <volume> main --key-id security-2026 --key-file security.key --live
+slatefs -c /etc/slatefs/slatefs.toml versioning protect-branch <tenant> <volume> main --trust-attestation-key release-2026=release.pub --trust-attestation-key security-2026=security.pub --require-attestations 2 --allow-manager <admin-principal> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning branch <tenant> <volume> candidate main --live
 slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path>... -m <message> --branch candidate --live
 slatefs -c /etc/slatefs/slatefs.toml versioning attest <tenant> <volume> candidate --key-id release-2026 --key-file release.key --live
+slatefs -c /etc/slatefs/slatefs.toml versioning attest <tenant> <volume> candidate --key-id security-2026 --key-file security.key --live
 slatefs -c /etc/slatefs/slatefs.toml versioning merge <tenant> <volume> candidate main --live
 ```
 
 The final merge must be a fast-forward from the still-current protected head.
-Direct commits and unsigned candidates are rejected. A divergent merge would
-create a new, unsigned merge commit and is therefore rejected; create a fresh
-candidate from the new protected head instead. Removing all trusted keys by
-updating protection disables signature enforcement, while `unprotect-branch`
-removes the entire destructive-ref guard.
+Direct commits and candidates below the configured quorum are rejected. A
+divergent merge would create a new, unattested merge commit and is therefore
+rejected; create a fresh candidate from the new protected head instead.
+Changing the key set or quorum requires the current head to satisfy the new
+policy. Removing all trusted keys with a zero quorum disables signature
+enforcement, while `unprotect-branch` removes the entire destructive-ref guard.
 
 Merge conflicts fail without moving either branch by default. After reviewing
 `merge-preview`, use `--conflict-strategy ours` to keep each conflicting path
