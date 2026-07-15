@@ -1138,6 +1138,18 @@ struct VersionBranchMergeRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct VersionCherryPickRequest {
+    source: String,
+    #[serde(default)]
+    mainline: Option<u32>,
+    #[serde(default)]
+    author: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VersionPolicyPatchRequest {
     enabled: bool,
 }
@@ -1668,6 +1680,17 @@ fn core_error(error: slatefs_core::error::Error) -> AdminError {
 
 fn version_merge_error(error: slatefs_core::error::Error) -> AdminError {
     if matches!(&error, slatefs_core::error::Error::Versioning(message) if message.contains("merge conflict"))
+    {
+        return AdminError {
+            status: 409,
+            message: error.to_string(),
+        };
+    }
+    core_error(error)
+}
+
+fn version_cherry_pick_error(error: slatefs_core::error::Error) -> AdminError {
+    if matches!(&error, slatefs_core::error::Error::Versioning(message) if message.contains("cherry-pick conflict"))
     {
         return AdminError {
             status: 409,
@@ -3799,6 +3822,152 @@ async fn preview_version_branch_merge_response(
     Ok(AdminHttpResponse::json(200, json!({ "preview": preview })))
 }
 
+async fn cherry_pick_version_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+    target: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let body: VersionCherryPickRequest = parse_json_body(request)?;
+    let provenance = admin_commit_provenance(request, body.author.clone())?;
+    let attempted_author = provenance.author().to_string();
+    let attempted_committer = provenance.committer().to_string();
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository
+        .cherry_pick(
+            &body.source,
+            target,
+            body.mainline,
+            provenance,
+            body.idempotency_key.as_deref(),
+        )
+        .await;
+    let audit = match &result {
+        Ok(cherry_pick) => {
+            append_version_audit(
+                &control,
+                request,
+                AuditAction::VersionCherryPick,
+                tenant,
+                volume,
+                [
+                    (
+                        "source".to_string(),
+                        AuditDetailValue::String(cherry_pick.source().to_string()),
+                    ),
+                    (
+                        "target".to_string(),
+                        AuditDetailValue::String(cherry_pick.target().to_string()),
+                    ),
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(cherry_pick.commit().to_string()),
+                    ),
+                    (
+                        "paths".to_string(),
+                        AuditDetailValue::Array(
+                            cherry_pick
+                                .paths()
+                                .iter()
+                                .cloned()
+                                .map(AuditDetailValue::String)
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "applied".to_string(),
+                        AuditDetailValue::Bool(cherry_pick.applied()),
+                    ),
+                    (
+                        "replayed".to_string(),
+                        AuditDetailValue::Bool(cherry_pick.replayed()),
+                    ),
+                ],
+            )
+            .await
+        }
+        Err(error) if is_version_publication_authorization_error(error) => {
+            state
+                .export_metrics
+                .version_operation_denied(tenant, volume, "cherry-pick");
+            append_version_audit_with_outcome(
+                &control,
+                request,
+                AuditAction::VersionCherryPick,
+                tenant,
+                volume,
+                AuditOutcome::Denied,
+                [
+                    (
+                        "source".to_string(),
+                        AuditDetailValue::String(body.source.clone()),
+                    ),
+                    (
+                        "target".to_string(),
+                        AuditDetailValue::String(target.to_string()),
+                    ),
+                    (
+                        "author".to_string(),
+                        AuditDetailValue::String(attempted_author),
+                    ),
+                    (
+                        "committer".to_string(),
+                        AuditDetailValue::String(attempted_committer),
+                    ),
+                ],
+            )
+            .await
+        }
+        Err(_) => Ok(()),
+    };
+    let repository_close = repository.close().await;
+    let control_close = control.close().await;
+    let cherry_pick = result.map_err(version_cherry_pick_error)?;
+    audit?;
+    repository_close.map_err(core_error)?;
+    control_close.map_err(core_error)?;
+    state
+        .export_metrics
+        .version_operation(tenant, volume, "cherry-pick");
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "cherry_pick": cherry_pick }),
+    ))
+}
+
+async fn preview_version_cherry_pick_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+    target: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let source = request
+        .query
+        .get("source")
+        .ok_or_else(|| bad_request("source query parameter is required"))?;
+    let mainline = request
+        .query
+        .get("mainline")
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .map_err(|error| bad_request(format!("invalid mainline: {error}")))
+        })
+        .transpose()?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository
+        .preview_cherry_pick(source, target, mainline)
+        .await;
+    let preview = finish_version_repository(control, repository, result).await?;
+    Ok(AdminHttpResponse::json(200, json!({ "preview": preview })))
+}
+
 async fn get_version_content_response(
     state: &AdminState,
     request: &AdminHttpRequest,
@@ -5774,6 +5943,36 @@ async fn route_admin_request(
                 "merge",
             ],
         ) => merge_version_branch_response(state, request, tenant, volume, target).await,
+        (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "branches",
+                target,
+                "cherry-pick",
+            ],
+        ) => preview_version_cherry_pick_response(state, request, tenant, volume, target).await,
+        (
+            "POST",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "branches",
+                target,
+                "cherry-pick",
+            ],
+        ) => cherry_pick_version_response(state, request, tenant, volume, target).await,
         (
             "POST",
             [
@@ -8246,6 +8445,14 @@ mod tests {
     }
 
     #[test]
+    fn conflicting_version_cherry_pick_maps_to_conflict() {
+        let error = version_cherry_pick_error(slatefs_core::error::Error::Versioning(
+            "cherry-pick conflict applying source to main at /notes.txt".into(),
+        ));
+        assert_eq!(error.status, 409);
+    }
+
+    #[test]
     fn version_branch_policy_authorization_maps_to_forbidden() {
         let error = core_error(slatefs_core::error::Error::invalid(
             "version branch policy authorization",
@@ -10282,6 +10489,153 @@ mod tests {
         }
         audit_control.close().await.unwrap();
 
+        volume.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_previews_and_applies_idempotent_version_cherry_pick() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([92; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        let record = slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        control
+            .set_versioning_enabled("t", "v", true)
+            .await
+            .unwrap();
+        let dek = control.unwrap_volume_dek(&record).await.unwrap();
+        control.close().await.unwrap();
+        let volume = Volume::open(&record, dek, Arc::clone(&object_store))
+            .await
+            .unwrap();
+        let creds = Credentials::root();
+        let file = volume
+            .create(&creds, ROOT_INO, b"notes.txt", 0o644, true)
+            .await
+            .unwrap();
+        volume.write(&creds, file.ino, 0, b"base").await.unwrap();
+
+        let mut targets = HashMap::new();
+        targets.insert(VolumeId::from_parts("t", "v"), Arc::clone(&volume));
+        let state =
+            available_admin_state(Arc::clone(&object_store), Arc::clone(&kms), targets, None).await;
+        let baseline_request = post_request(
+            "/admin/v1/tenants/t/volumes/v/versioning/commits",
+            "cherry-baseline",
+            r#"{"path":"/notes.txt","message":"baseline"}"#,
+        );
+        let baseline_response =
+            admin_exchange(Arc::clone(&state), baseline_request.as_bytes()).await;
+        assert_eq!(
+            response_status(&baseline_response),
+            201,
+            "{baseline_response}"
+        );
+        let baseline: Value = serde_json::from_str(response_body(&baseline_response)).unwrap();
+        let baseline_id = baseline["commit"]["id"].as_str().unwrap();
+        for branch in ["feature", "target"] {
+            let branch_body = format!(r#"{{"name":"{branch}","commit":"{baseline_id}"}}"#);
+            let branch_request = post_request(
+                "/admin/v1/tenants/t/volumes/v/versioning/branches",
+                &format!("create-{branch}"),
+                &branch_body,
+            );
+            let branch_response =
+                admin_exchange(Arc::clone(&state), branch_request.as_bytes()).await;
+            assert_eq!(response_status(&branch_response), 201, "{branch_response}");
+        }
+
+        volume
+            .write(&creds, file.ino, 0, b"feature value")
+            .await
+            .unwrap();
+        let feature_request = post_request(
+            "/admin/v1/tenants/t/volumes/v/versioning/commits",
+            "cherry-source",
+            r#"{"path":"/notes.txt","message":"feature change","branch":"feature"}"#,
+        );
+        let feature_response = admin_exchange(Arc::clone(&state), feature_request.as_bytes()).await;
+        assert_eq!(
+            response_status(&feature_response),
+            201,
+            "{feature_response}"
+        );
+        let feature: Value = serde_json::from_str(response_body(&feature_response)).unwrap();
+        let feature_id = feature["commit"]["id"].as_str().unwrap();
+
+        let preview_request = format!(
+            "GET /admin/v1/tenants/t/volumes/v/versioning/branches/target/cherry-pick?source={feature_id} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        let preview_response = admin_exchange(Arc::clone(&state), preview_request.as_bytes()).await;
+        assert_eq!(
+            response_status(&preview_response),
+            200,
+            "{preview_response}"
+        );
+        let preview: Value = serde_json::from_str(response_body(&preview_response)).unwrap();
+        assert_eq!(preview["preview"]["source"], feature_id);
+        assert_eq!(preview["preview"]["target_head"], baseline_id);
+        assert_eq!(preview["preview"]["paths"], json!(["/notes.txt"]));
+        assert_eq!(preview["preview"]["conflicts"], json!([]));
+
+        let cherry_body =
+            format!(r#"{{"source":"{feature_id}","idempotency_key":"admin-cherry-1"}}"#);
+        let cherry_request = post_request(
+            "/admin/v1/tenants/t/volumes/v/versioning/branches/target/cherry-pick",
+            "apply-cherry",
+            &cherry_body,
+        );
+        let cherry_response = admin_exchange(Arc::clone(&state), cherry_request.as_bytes()).await;
+        assert_eq!(response_status(&cherry_response), 200, "{cherry_response}");
+        let cherry: Value = serde_json::from_str(response_body(&cherry_response)).unwrap();
+        assert_eq!(cherry["cherry_pick"]["source"], feature_id);
+        assert_eq!(cherry["cherry_pick"]["previous"], baseline_id);
+        assert_eq!(cherry["cherry_pick"]["applied"], true);
+        assert_eq!(cherry["cherry_pick"]["replayed"], false);
+        let picked_id = cherry["cherry_pick"]["commit"].as_str().unwrap();
+
+        let replay_request = post_request(
+            "/admin/v1/tenants/t/volumes/v/versioning/branches/target/cherry-pick",
+            "replay-cherry",
+            &cherry_body,
+        );
+        let replay_response = admin_exchange(Arc::clone(&state), replay_request.as_bytes()).await;
+        assert_eq!(response_status(&replay_response), 200, "{replay_response}");
+        let replay: Value = serde_json::from_str(response_body(&replay_response)).unwrap();
+        assert_eq!(replay["cherry_pick"]["commit"], picked_id);
+        assert_eq!(replay["cherry_pick"]["replayed"], true);
+
+        let metrics = render_daemon_metrics_with_exports(&[], &state.export_metrics);
+        assert!(metrics.contains(
+            "slatefs_version_operations_total{tenant=\"t\",volume=\"v\",operation=\"cherry-pick\"} 2"
+        ));
+        let audit_control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        let (audits, _) = audit_control
+            .list_audit(AuditQuery {
+                action: Some(AuditAction::VersionCherryPick),
+                ..AuditQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(audits.len(), 2);
+        assert!(
+            audits
+                .iter()
+                .all(|audit| audit.outcome == AuditOutcome::Success)
+        );
+        audit_control.close().await.unwrap();
         volume.shutdown().await.unwrap();
     }
 

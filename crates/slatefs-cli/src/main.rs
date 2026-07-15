@@ -20,13 +20,14 @@ use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{
     VersionAttestationQuorumInfo, VersionBranchInfo, VersionBranchProtectionPolicy,
-    VersionBranchRecoveryInfo, VersionBranchResetInfo, VersionCommitAttestation, VersionCommitInfo,
-    VersionCommitOrigin, VersionCommitProvenance, VersionMergeConflictStrategy, VersionMergeInfo,
-    VersionMergePreview, VersionPathChangeKind, VersionReflogEntry, VersionRepository,
-    VersionRepositoryBundleReport, VersionRepositorySyncReport, VersionRepositorySyncState,
-    VersionRestoreActionKind, VersionRestoreApplyInfo, VersionRestoreMode, VersionRestorePreview,
-    VersionTagInfo, VersionTrustedAttestationKey, VersionWorkingTreeChangeKind,
-    VersionWorkingTreeStatus, force_break_expired_version_maintenance_lease, purge_version_history,
+    VersionBranchRecoveryInfo, VersionBranchResetInfo, VersionCherryPickInfo,
+    VersionCherryPickPreview, VersionCommitAttestation, VersionCommitInfo, VersionCommitOrigin,
+    VersionCommitProvenance, VersionMergeConflictStrategy, VersionMergeInfo, VersionMergePreview,
+    VersionPathChangeKind, VersionReflogEntry, VersionRepository, VersionRepositoryBundleReport,
+    VersionRepositorySyncReport, VersionRepositorySyncState, VersionRestoreActionKind,
+    VersionRestoreApplyInfo, VersionRestoreMode, VersionRestorePreview, VersionTagInfo,
+    VersionTrustedAttestationKey, VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
+    force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease, version_commit_attestation_payload,
 };
 use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
@@ -675,6 +676,36 @@ enum VersioningCmd {
         volume: String,
         source: String,
         target: String,
+        #[arg(long)]
+        live: bool,
+    },
+    /// Apply one commit's changes to a target branch as a new commit.
+    CherryPick {
+        tenant: String,
+        volume: String,
+        source: String,
+        target: String,
+        /// One-based parent to use when the source is a merge commit.
+        #[arg(long)]
+        mainline: Option<u32>,
+        /// Claimed author. Required for offline cherry-picks.
+        #[arg(long)]
+        author: Option<String>,
+        /// Retry key; reuse only for the same source, target, mainline, author, and committer.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        #[arg(long)]
+        live: bool,
+    },
+    /// Preview a cherry-pick and report path conflicts without moving the target branch.
+    CherryPickPreview {
+        tenant: String,
+        volume: String,
+        source: String,
+        target: String,
+        /// One-based parent to use when the source is a merge commit.
+        #[arg(long)]
+        mainline: Option<u32>,
         #[arg(long)]
         live: bool,
     },
@@ -1489,6 +1520,54 @@ fn print_version_merge_preview(preview: &VersionMergePreview) {
     println!("fast_forward {}", preview.fast_forward());
     println!("already_up_to_date {}", preview.already_up_to_date());
     println!("can_merge {}", preview.can_merge());
+    for conflict in preview.conflicts() {
+        println!("conflict {conflict}");
+    }
+}
+
+fn print_version_cherry_pick(cherry_pick: &VersionCherryPickInfo) {
+    println!(
+        "{} -> {}\t{}\t{}",
+        cherry_pick.source(),
+        cherry_pick.target(),
+        cherry_pick.commit(),
+        if cherry_pick.replayed() {
+            "replayed"
+        } else if cherry_pick.already_applied() {
+            "already-applied"
+        } else {
+            "applied"
+        }
+    );
+    if let Some(parent) = cherry_pick.parent() {
+        println!("source_parent {parent}");
+    }
+    if let Some(mainline) = cherry_pick.mainline() {
+        println!("mainline {mainline}");
+    }
+    for path in cherry_pick.paths() {
+        println!("path {path}");
+    }
+}
+
+fn print_version_cherry_pick_preview(preview: &VersionCherryPickPreview) {
+    println!("source {}", preview.source());
+    println!(
+        "target {}\t{}",
+        preview.target(),
+        preview.target_head().unwrap_or("unborn")
+    );
+    if let Some(parent) = preview.parent() {
+        println!("source_parent {parent}");
+    }
+    if let Some(mainline) = preview.mainline() {
+        println!("mainline {mainline}");
+    }
+    println!("already_applied {}", preview.already_applied());
+    println!("can_apply {}", preview.can_apply());
+    for path in preview.paths() {
+        println!("path {path}");
+    }
     for conflict in preview.conflicts() {
         println!("conflict {conflict}");
     }
@@ -4487,6 +4566,127 @@ async fn run(
             repository_close?;
             print_version_merge_preview(&preview);
         }
+        Command::Versioning(VersioningCmd::CherryPick {
+            tenant,
+            volume,
+            source,
+            target,
+            mainline,
+            author,
+            idempotency_key,
+            live,
+        }) => {
+            if *live {
+                let endpoint = format!("branches/{target}/cherry-pick");
+                let response = post_live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    &endpoint,
+                    serde_json::json!({
+                        "source": source,
+                        "mainline": mainline,
+                        "author": author,
+                        "idempotency_key": idempotency_key,
+                    }),
+                )
+                .await?;
+                let cherry_pick: VersionCherryPickInfo =
+                    serde_json::from_value(response["cherry_pick"].clone())
+                        .context("parsing admin version cherry-pick")?;
+                print_version_cherry_pick(&cherry_pick);
+                return Ok(());
+            }
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let request_id = format!("cli-versioning-{}", uuid::Uuid::new_v4());
+            let provenance = offline_commit_provenance(author.as_ref(), request_id.clone())?;
+            let result = repository
+                .cherry_pick(
+                    source,
+                    target,
+                    *mainline,
+                    provenance,
+                    idempotency_key.as_deref(),
+                )
+                .await;
+            let repository_close = repository.close().await;
+            let cherry_pick = result?;
+            repository_close?;
+            append_cli_version_audit_with_request_id(
+                control,
+                AuditAction::VersionCherryPick,
+                tenant,
+                volume,
+                request_id,
+                [
+                    (
+                        "source".to_string(),
+                        AuditDetailValue::String(cherry_pick.source().to_string()),
+                    ),
+                    (
+                        "target".to_string(),
+                        AuditDetailValue::String(cherry_pick.target().to_string()),
+                    ),
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(cherry_pick.commit().to_string()),
+                    ),
+                    (
+                        "paths".to_string(),
+                        AuditDetailValue::Array(
+                            cherry_pick
+                                .paths()
+                                .iter()
+                                .cloned()
+                                .map(AuditDetailValue::String)
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "applied".to_string(),
+                        AuditDetailValue::Bool(cherry_pick.applied()),
+                    ),
+                    (
+                        "replayed".to_string(),
+                        AuditDetailValue::Bool(cherry_pick.replayed()),
+                    ),
+                ],
+            )
+            .await?;
+            print_version_cherry_pick(&cherry_pick);
+        }
+        Command::Versioning(VersioningCmd::CherryPickPreview {
+            tenant,
+            volume,
+            source,
+            target,
+            mainline,
+            live,
+        }) => {
+            if *live {
+                let endpoint = format!("branches/{target}/cherry-pick");
+                let mut query = vec![("source", source.clone())];
+                if let Some(mainline) = mainline {
+                    query.push(("mainline", mainline.to_string()));
+                }
+                let response =
+                    live_versioning_json(config, tenant, volume, "GET", &endpoint, &query, None)
+                        .await?;
+                let preview: VersionCherryPickPreview =
+                    serde_json::from_value(response["preview"].clone())
+                        .context("parsing admin version cherry-pick preview")?;
+                print_version_cherry_pick_preview(&preview);
+                return Ok(());
+            }
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let result = repository
+                .preview_cherry_pick(source, target, *mainline)
+                .await;
+            let repository_close = repository.close().await;
+            let preview = result?;
+            repository_close?;
+            print_version_cherry_pick_preview(&preview);
+        }
         Command::Versioning(VersioningCmd::Show {
             tenant,
             volume,
@@ -6696,6 +6896,61 @@ mod tests {
                 live: true,
                 ..
             }) if source == "draft" && target == "main"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "cherry-pick",
+            "tenant-a",
+            "docs",
+            "release-candidate",
+            "main",
+            "--mainline",
+            "2",
+            "--author",
+            "alice",
+            "--idempotency-key",
+            "pick-42",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::CherryPick {
+                source,
+                target,
+                mainline: Some(2),
+                author: Some(author),
+                idempotency_key: Some(key),
+                live: true,
+                ..
+            }) if source == "release-candidate"
+                && target == "main"
+                && author == "alice"
+                && key == "pick-42"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "cherry-pick-preview",
+            "tenant-a",
+            "docs",
+            "release-candidate",
+            "main",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::CherryPickPreview {
+                source,
+                target,
+                mainline: None,
+                live: true,
+                ..
+            }) if source == "release-candidate" && target == "main"
         ));
     }
 }
