@@ -369,6 +369,14 @@ Alert on sustained increases in
 minutes; tune its threshold only after establishing expected administrative
 traffic.
 
+For native push/pull health, monitor
+`slatefs_version_sync_bytes_total` and `slatefs_version_sync_objects_total` by
+`direction=sent|received`. Alert on increases in
+`slatefs_version_sync_failures_total`, and compare
+`slatefs_version_sync_last_success_timestamp_seconds` with wall clock time to
+detect a silent or stalled replication path even when no request is currently
+failing.
+
 Live commit and divergent-merge provenance records the authenticated admin or
 tenant principal as committer and the HTTP request ID for audit correlation.
 An allowed unauthenticated loopback request records `admin:unauthenticated`

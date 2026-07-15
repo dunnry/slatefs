@@ -339,6 +339,11 @@ increment `slatefs_version_operations_total{tenant,volume,operation}`. An
 automatic collection uses the `gc-auto` operation label. Protected-operation
 rejections increment
 `slatefs_version_operation_denials_total{tenant,volume,operation}`.
+Native synchronization additionally reports cumulative bytes and objects,
+failures, and the last successful transfer timestamp per `sent` or `received`
+direction through `slatefs_version_sync_bytes_total`,
+`slatefs_version_sync_objects_total`, `slatefs_version_sync_failures_total`,
+and `slatefs_version_sync_last_success_timestamp_seconds`.
 
 Every explicit repository operation and purge acquires a per-volume lease with
 an atomic object-store conditional write. The lease is renewed while work is

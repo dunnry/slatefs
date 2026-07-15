@@ -163,6 +163,9 @@ struct ExportMetrics {
     version_operations: Arc<Mutex<HashMap<(VolumeId, String), u64>>>,
     version_operation_denials: Arc<Mutex<HashMap<(VolumeId, String), u64>>>,
     version_sync_bytes: Arc<Mutex<HashMap<(VolumeId, String), u64>>>,
+    version_sync_objects: Arc<Mutex<HashMap<(VolumeId, String), u64>>>,
+    version_sync_failures: Arc<Mutex<HashMap<(VolumeId, String), u64>>>,
+    version_sync_last_success: Arc<Mutex<HashMap<(VolumeId, String), u64>>>,
     tls_reloads: Arc<Mutex<HashMap<String, u64>>>,
     tls_reload_failures: Arc<Mutex<HashMap<String, u64>>>,
     tls_expiry: Arc<Mutex<HashMap<String, i64>>>,
@@ -232,14 +235,41 @@ impl ExportMetrics {
             .or_insert(0) += 1;
     }
 
-    fn version_sync_bytes(&self, tenant: &str, volume: &str, direction: &str, bytes: u64) {
+    fn version_sync_success(
+        &self,
+        tenant: &str,
+        volume: &str,
+        direction: &str,
+        bytes: u64,
+        objects: u64,
+    ) {
+        let key = (VolumeId::from_parts(tenant, volume), direction.to_string());
         let mut transfers = self
             .version_sync_bytes
             .lock()
             .expect("version sync metrics poisoned");
-        *transfers
+        *transfers.entry(key.clone()).or_insert(0) += bytes;
+        drop(transfers);
+        let mut transferred_objects = self
+            .version_sync_objects
+            .lock()
+            .expect("version sync object metrics poisoned");
+        *transferred_objects.entry(key.clone()).or_insert(0) += objects;
+        drop(transferred_objects);
+        self.version_sync_last_success
+            .lock()
+            .expect("version sync timestamp metrics poisoned")
+            .insert(key, slatefs_core::control::now_unix());
+    }
+
+    fn version_sync_failure(&self, tenant: &str, volume: &str, direction: &str) {
+        let mut failures = self
+            .version_sync_failures
+            .lock()
+            .expect("version sync failure metrics poisoned");
+        *failures
             .entry((VolumeId::from_parts(tenant, volume), direction.to_string()))
-            .or_insert(0) += bytes;
+            .or_insert(0) += 1;
     }
 
     fn register_tls_surface(&self, surface: &str, expiry_timestamp_seconds: i64) {
@@ -370,6 +400,54 @@ impl ExportMetrics {
         {
             samples.push(PrometheusSample::new(
                 "slatefs_version_sync_bytes_total",
+                [
+                    ("tenant", volume_id.tenant.as_str()),
+                    ("volume", volume_id.volume.as_str()),
+                    ("direction", direction.as_str()),
+                ],
+                *value as f64,
+            ));
+        }
+        for ((volume_id, direction), value) in self
+            .version_sync_objects
+            .lock()
+            .expect("version sync object metrics poisoned")
+            .iter()
+        {
+            samples.push(PrometheusSample::new(
+                "slatefs_version_sync_objects_total",
+                [
+                    ("tenant", volume_id.tenant.as_str()),
+                    ("volume", volume_id.volume.as_str()),
+                    ("direction", direction.as_str()),
+                ],
+                *value as f64,
+            ));
+        }
+        for ((volume_id, direction), value) in self
+            .version_sync_failures
+            .lock()
+            .expect("version sync failure metrics poisoned")
+            .iter()
+        {
+            samples.push(PrometheusSample::new(
+                "slatefs_version_sync_failures_total",
+                [
+                    ("tenant", volume_id.tenant.as_str()),
+                    ("volume", volume_id.volume.as_str()),
+                    ("direction", direction.as_str()),
+                ],
+                *value as f64,
+            ));
+        }
+        for ((volume_id, direction), value) in self
+            .version_sync_last_success
+            .lock()
+            .expect("version sync timestamp metrics poisoned")
+            .iter()
+        {
+            samples.push(PrometheusSample::new(
+                "slatefs_version_sync_last_success_timestamp_seconds",
                 [
                     ("tenant", volume_id.tenant.as_str()),
                     ("volume", volume_id.volume.as_str()),
@@ -2668,6 +2746,9 @@ async fn export_version_repository_bundle_response(
     let (bundle, report) = match result {
         Ok(exported) => exported,
         Err(error) => {
+            state
+                .export_metrics
+                .version_sync_failure(tenant, volume, "sent");
             return finish_version_repository(control, repository, Err(error)).await;
         }
     };
@@ -2842,9 +2923,13 @@ async fn export_version_sync_response(
     state
         .export_metrics
         .version_operation(tenant, volume, "sync-export");
-    state
-        .export_metrics
-        .version_sync_bytes(tenant, volume, "sent", report.bundle_bytes);
+    state.export_metrics.version_sync_success(
+        tenant,
+        volume,
+        "sent",
+        report.bundle_bytes,
+        report.objects,
+    );
     let mut response = AdminHttpResponse::binary(200, VERSION_REPOSITORY_SYNC_CONTENT_TYPE, bundle);
     response.headers.extend([
         ("X-SlateFS-Repository-Id", report.identity.id().to_string()),
@@ -2911,6 +2996,9 @@ async fn apply_version_sync_response(
             state
                 .export_metrics
                 .version_operation_denied(tenant, volume, "sync-apply");
+            state
+                .export_metrics
+                .version_sync_failure(tenant, volume, "received");
             return Err(response_error);
         }
     };
@@ -2954,9 +3042,13 @@ async fn apply_version_sync_response(
     state
         .export_metrics
         .version_operation(tenant, volume, "sync-apply");
-    state
-        .export_metrics
-        .version_sync_bytes(tenant, volume, "received", report.bundle_bytes);
+    state.export_metrics.version_sync_success(
+        tenant,
+        volume,
+        "received",
+        report.bundle_bytes,
+        report.objects,
+    );
     Ok(AdminHttpResponse::json(200, json!({ "sync": report })))
 }
 
@@ -9485,6 +9577,21 @@ mod tests {
         ));
         assert!(metrics.contains(
             "slatefs_version_sync_bytes_total{tenant=\"t\",volume=\"destination\",direction=\"received\"}"
+        ));
+        assert!(metrics.contains(
+            "slatefs_version_sync_objects_total{tenant=\"t\",volume=\"source\",direction=\"sent\"}"
+        ));
+        assert!(metrics.contains(
+            "slatefs_version_sync_objects_total{tenant=\"t\",volume=\"destination\",direction=\"received\"}"
+        ));
+        assert!(metrics.contains(
+            "slatefs_version_sync_failures_total{tenant=\"t\",volume=\"destination\",direction=\"received\"} 1"
+        ));
+        assert!(metrics.contains(
+            "slatefs_version_sync_last_success_timestamp_seconds{tenant=\"t\",volume=\"source\",direction=\"sent\"}"
+        ));
+        assert!(metrics.contains(
+            "slatefs_version_sync_last_success_timestamp_seconds{tenant=\"t\",volume=\"destination\",direction=\"received\"}"
         ));
     }
 
