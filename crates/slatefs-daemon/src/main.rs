@@ -42,7 +42,8 @@ use slatefs_core::store;
 use slatefs_core::versioning::{
     VersionCommitAttestation, VersionCommitOrigin, VersionCommitProvenance,
     VersionMaintenanceLeaseInfo, VersionMergeConflictStrategy, VersionRepository,
-    VersionRestoreMode, force_break_expired_version_maintenance_lease, purge_version_history,
+    VersionRestoreMode, VersionTrustedAttestationKey,
+    force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease,
 };
 use slatefs_core::vfs::Vfs;
@@ -1064,6 +1065,8 @@ struct VersionBranchProtectionRequest {
     allowed_committers: Vec<String>,
     #[serde(default)]
     allowed_managers: Vec<String>,
+    #[serde(default)]
+    trusted_attestation_keys: Vec<VersionTrustedAttestationKey>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2851,11 +2854,15 @@ async fn set_version_branch_protection_response(
     name: &str,
     protected: bool,
 ) -> Result<AdminHttpResponse, AdminError> {
-    let (allowed_committers, allowed_managers) = if protected {
+    let (allowed_committers, allowed_managers, trusted_attestation_keys) = if protected {
         let policy = parse_json_body::<VersionBranchProtectionRequest>(request)?;
-        (policy.allowed_committers, policy.allowed_managers)
+        (
+            policy.allowed_committers,
+            policy.allowed_managers,
+            policy.trusted_attestation_keys,
+        )
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), Vec::new())
     };
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
@@ -2866,7 +2873,7 @@ async fn set_version_branch_protection_response(
             protected,
             &allowed_committers,
             &allowed_managers,
-            &[],
+            &trusted_attestation_keys,
             &admin_committer(request),
         )
         .await;
@@ -2884,6 +2891,7 @@ async fn set_version_branch_protection_response(
                     protected,
                     branch.allowed_committers(),
                     branch.allowed_managers(),
+                    branch.trusted_attestation_keys(),
                 ),
             )
             .await
@@ -2906,6 +2914,7 @@ async fn set_version_branch_protection_response(
                     protected,
                     &allowed_committers,
                     &allowed_managers,
+                    &trusted_attestation_keys,
                 ),
             )
             .await
@@ -3975,6 +3984,7 @@ fn version_branch_policy_audit_details(
     protected: bool,
     allowed_committers: &[String],
     allowed_managers: &[String],
+    trusted_attestation_keys: &[VersionTrustedAttestationKey],
 ) -> Vec<(String, AuditDetailValue)> {
     let identities = |values: &[String]| {
         AuditDetailValue::Array(
@@ -4007,6 +4017,15 @@ fn version_branch_policy_audit_details(
             identities(allowed_committers),
         ),
         ("allowed_managers".to_string(), identities(allowed_managers)),
+        (
+            "trusted_attestation_key_ids".to_string(),
+            AuditDetailValue::Array(
+                trusted_attestation_keys
+                    .iter()
+                    .map(|key| AuditDetailValue::String(key.key_id().to_string()))
+                    .collect(),
+            ),
+        ),
     ]
 }
 
@@ -8356,7 +8375,16 @@ mod tests {
         );
         let branches: Value = serde_json::from_str(response_body(&branches_response)).unwrap();
         assert_eq!(branches["branches"].as_array().unwrap().len(), 2);
-        let protect_body = r#"{"allowed_committers":["other-committer","other-committer"],"allowed_managers":["admin:unauthenticated","admin:unauthenticated"]}"#;
+        let protect_body = json!({
+            "allowed_committers": ["other-committer", "other-committer"],
+            "allowed_managers": ["admin:unauthenticated", "admin:unauthenticated"],
+            "trusted_attestation_keys": [{
+                "key_id": "release-2026",
+                "algorithm": "ed25519",
+                "public_key": public_key,
+            }],
+        })
+        .to_string();
         let protect_request = format!(
             "PUT /admin/v1/tenants/t/volumes/v/versioning/branches/release/protection HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: protect-policy\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             protect_body.len(),
@@ -8377,6 +8405,10 @@ mod tests {
         assert_eq!(
             protected["branch"]["allowed_managers"],
             json!(["admin:unauthenticated"])
+        );
+        assert_eq!(
+            protected["branch"]["trusted_attestation_keys"][0]["key_id"],
+            "release-2026"
         );
         let denied_policy_request = AdminHttpRequest {
             method: "DELETE".to_string(),
@@ -9034,6 +9066,12 @@ mod tests {
                     Some(&AuditDetailValue::Array(vec![AuditDetailValue::String(
                         "admin:unauthenticated".to_string()
                     ),]))
+                );
+                assert_eq!(
+                    protected.details.get("trusted_attestation_key_ids"),
+                    Some(&AuditDetailValue::Array(vec![AuditDetailValue::String(
+                        "release-2026".to_string()
+                    )]))
                 );
                 let denied = records
                     .iter()

@@ -22,7 +22,8 @@ use slatefs_core::versioning::{
     VersionCommitInfo, VersionCommitOrigin, VersionCommitProvenance, VersionMergeConflictStrategy,
     VersionMergeInfo, VersionMergePreview, VersionPathChangeKind, VersionReflogEntry,
     VersionRepository, VersionRestoreActionKind, VersionRestoreApplyInfo, VersionRestoreMode,
-    VersionRestorePreview, VersionTagInfo, VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
+    VersionRestorePreview, VersionTagInfo, VersionTrustedAttestationKey,
+    VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
     force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease, version_commit_attestation_payload,
 };
@@ -490,6 +491,9 @@ enum VersioningCmd {
         /// Server-derived identity allowed to change protection; repeatable. Empty allows any manager.
         #[arg(long = "allow-manager")]
         allowed_managers: Vec<String>,
+        /// Trusted signer as KEY_ID=PUBLIC_KEY_FILE; repeatable. Non-empty requires signed publication.
+        #[arg(long = "trust-attestation-key", value_parser = parse_trusted_attestation_key)]
+        trusted_attestation_keys: Vec<VersionTrustedAttestationKey>,
         #[arg(long)]
         live: bool,
     },
@@ -1279,6 +1283,13 @@ fn print_version_branch(branch: &VersionBranchInfo) {
     }
     if !branch.allowed_managers().is_empty() {
         println!("allowed_managers {}", branch.allowed_managers().join(","));
+    }
+    for key in branch.trusted_attestation_keys() {
+        println!(
+            "trusted_attestation_key {}={}",
+            key.key_id(),
+            hex::encode(key.public_key())
+        );
     }
 }
 
@@ -2074,6 +2085,15 @@ fn read_hex_key<const N: usize>(path: &std::path::Path, what: &str) -> anyhow::R
             bytes.len()
         )
     })
+}
+
+fn parse_trusted_attestation_key(value: &str) -> Result<VersionTrustedAttestationKey, String> {
+    let (key_id, path) = value
+        .split_once('=')
+        .ok_or_else(|| "expected KEY_ID=PUBLIC_KEY_FILE".to_string())?;
+    let public_key = read_hex_key::<32>(std::path::Path::new(path), "trusted Ed25519 public key")
+        .map_err(|error| error.to_string())?;
+    VersionTrustedAttestationKey::new_ed25519(key_id, public_key).map_err(|error| error.to_string())
 }
 
 fn print_version_attestation(attestation: &VersionCommitAttestation, trusted: Option<bool>) {
@@ -3161,6 +3181,7 @@ async fn run(
             name,
             allowed_committers,
             allowed_managers,
+            trusted_attestation_keys,
             live,
         }) => {
             if *live {
@@ -3175,6 +3196,7 @@ async fn run(
                     Some(serde_json::json!({
                         "allowed_committers": allowed_committers,
                         "allowed_managers": allowed_managers,
+                        "trusted_attestation_keys": trusted_attestation_keys,
                     })),
                 )
                 .await?;
@@ -3185,7 +3207,13 @@ async fn run(
             }
             let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
             let result = repository
-                .set_branch_protected(name, true, allowed_committers, allowed_managers, &[])
+                .set_branch_protected(
+                    name,
+                    true,
+                    allowed_committers,
+                    allowed_managers,
+                    trusted_attestation_keys,
+                )
                 .await;
             let repository_close = repository.close().await;
             let branch = result?;
@@ -3203,6 +3231,16 @@ async fn run(
                     (
                         "branch".to_string(),
                         AuditDetailValue::String(branch.name().to_string()),
+                    ),
+                    (
+                        "trusted_attestation_key_ids".to_string(),
+                        AuditDetailValue::Array(
+                            branch
+                                .trusted_attestation_keys()
+                                .iter()
+                                .map(|key| AuditDetailValue::String(key.key_id().to_string()))
+                                .collect(),
+                        ),
                     ),
                 ],
             )
@@ -4826,6 +4864,31 @@ mod tests {
                 live: true,
                 ..
             })
+        ));
+
+        let directory = tempfile::tempdir().unwrap();
+        let public_path = directory.path().join("release.pub");
+        let public_key = SigningKey::from_bytes(&[31; 32]).verifying_key().to_bytes();
+        std::fs::write(&public_path, format!("{}\n", hex::encode(public_key))).unwrap();
+        let trusted = format!("release-2026={}", public_path.display());
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "protect-branch",
+            "tenant-a",
+            "docs",
+            "release",
+            "--trust-attestation-key",
+            trusted.as_str(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::ProtectBranch {
+                trusted_attestation_keys,
+                ..
+            }) if trusted_attestation_keys.len() == 1
+                && trusted_attestation_keys[0].key_id() == "release-2026"
         ));
     }
 
