@@ -197,7 +197,9 @@ committed on an unprotected candidate branch, attested by enough signers, and
 then fast-forwarded into the protected branch. Candidates below quorum, direct
 commits, and newly created unsigned merge commits are rejected. An empty
 trusted-key list keeps signature enforcement disabled and requires a zero
-quorum.
+quorum. `versioning quorum-status <tenant> <volume> <protected-branch>
+<candidate>` resolves the candidate and reports the required count, matching
+trusted key IDs, and whether promotion is ready without moving either branch.
 
 `unprotect-branch --yes` removes that guard. `versioning reflog <branch>` lists
 the newest 100 head
@@ -351,6 +353,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | Create a branch from `{"name":"...","commit":"commit-or-ref"}`. |
 | `PUT` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/protection` | Protect a branch with optional `allowed_committers`, `allowed_managers`, `trusted_attestation_keys` objects containing `key_id`, `algorithm`, and `public_key`, and `required_attestations`. Trusted keys default to a 1-of-M signature quorum; the explicit count must be between 1 and M. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/protection` | Remove destructive-ref protection from a branch. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/attestation-quorum?commit=` | Resolve a candidate commit or named reference and report its matching trusted key IDs and readiness against the branch's current signature quorum without moving the branch. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}` | Delete a non-main branch without deleting its commit immediately. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/reset` | Compare-and-swap an existing branch, including `main`, to `{"commit":"commit-or-ref"}`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/recover` | Restore the head preceding a retained reflog entry from `{"sequence":42}`, recreating a deleted branch when needed. |

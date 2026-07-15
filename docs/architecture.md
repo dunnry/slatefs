@@ -114,7 +114,9 @@ keys are configured; operators can require any N-of-M quorum. Enabling or
 changing signer enforcement requires the existing head to satisfy the new
 quorum. Subsequent publications count distinct matching attestations under the
 ref lock; this permits pre-attested fast-forwards and rejects direct commits,
-fast-forwards below quorum, and unattested merge commits.
+fast-forwards below quorum, and unattested merge commits. The same evaluation
+is exposed read-only for a candidate commit so operators can inspect its exact
+matching key IDs and readiness before attempting publication.
 A separate exact manager allowlist controls live changes to the protection
 record itself, with authorization checked under the same ref lock against the
 existing policy. Empty publisher, manager, or trusted-key lists leave that
