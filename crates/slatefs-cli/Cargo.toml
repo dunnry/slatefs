@@ -25,6 +25,9 @@ tracing-subscriber.workspace = true
 age.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true

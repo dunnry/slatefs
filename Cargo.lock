@@ -4183,6 +4183,8 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "clap",
+ "ed25519-dalek",
+ "hex",
  "rcgen",
  "rustls-pemfile",
  "serde_json",
@@ -4194,6 +4196,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]

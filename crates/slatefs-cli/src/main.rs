@@ -7,6 +7,7 @@ use std::sync::{Arc, Once};
 use anyhow::Context;
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
+use ed25519_dalek::{Signer, SigningKey};
 use slatefs_core::config::{ClientAddrRule, Config};
 use slatefs_core::control::{
     AuditAction, AuditActor, AuditDetailValue, AuditOutcome, AuditPlane, AuditRecord, AuditScope,
@@ -17,13 +18,13 @@ use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{
-    VersionBranchInfo, VersionBranchRecoveryInfo, VersionBranchResetInfo, VersionCommitInfo,
-    VersionCommitOrigin, VersionCommitProvenance, VersionMergeConflictStrategy, VersionMergeInfo,
-    VersionMergePreview, VersionPathChangeKind, VersionReflogEntry, VersionRepository,
-    VersionRestoreActionKind, VersionRestoreApplyInfo, VersionRestoreMode, VersionRestorePreview,
-    VersionTagInfo, VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
+    VersionBranchInfo, VersionBranchRecoveryInfo, VersionBranchResetInfo, VersionCommitAttestation,
+    VersionCommitInfo, VersionCommitOrigin, VersionCommitProvenance, VersionMergeConflictStrategy,
+    VersionMergeInfo, VersionMergePreview, VersionPathChangeKind, VersionReflogEntry,
+    VersionRepository, VersionRestoreActionKind, VersionRestoreApplyInfo, VersionRestoreMode,
+    VersionRestorePreview, VersionTagInfo, VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
     force_break_expired_version_maintenance_lease, purge_version_history,
-    try_get_version_maintenance_lease,
+    try_get_version_maintenance_lease, version_commit_attestation_payload,
 };
 use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
 use slatefs_core::{config, store};
@@ -32,6 +33,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use zeroize::Zeroizing;
 
 static RUSTLS_PROVIDER: Once = Once::new();
 
@@ -393,6 +395,31 @@ enum VersioningCmd {
         reference: String,
         #[arg(long)]
         live: bool,
+    },
+    /// Generate a client-side Ed25519 key for signing version commits.
+    AttestationKeygen {
+        /// New file that will receive the 32-byte private key with mode 0600.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Sign a commit with a client-side Ed25519 key and attach the signature.
+    Attest {
+        tenant: String,
+        volume: String,
+        reference: String,
+        #[arg(long)]
+        key_id: String,
+        #[arg(long)]
+        key_file: PathBuf,
+    },
+    /// List commit signatures and optionally require a trusted public key.
+    Attestations {
+        tenant: String,
+        volume: String,
+        reference: String,
+        /// File containing a trusted 32-byte Ed25519 public key in hex.
+        #[arg(long)]
+        trusted_public_key: Option<PathBuf>,
     },
     /// Compare two commits and list changed paths.
     Diff {
@@ -1933,6 +1960,9 @@ async fn main() -> anyhow::Result<()> {
     if let Command::Keygen { out } = &cli.command {
         return keygen(out.as_deref());
     }
+    if let Command::Versioning(VersioningCmd::AttestationKeygen { out }) = &cli.command {
+        return version_attestation_keygen(out);
+    }
 
     let config = Config::load(&cli.config)
         .with_context(|| format!("loading config from {}", cli.config.display()))?;
@@ -1974,6 +2004,85 @@ fn keygen(out: Option<&std::path::Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn version_attestation_keygen(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let secret = slatefs_core::crypto::Secret32::generate();
+    let signing_key = SigningKey::from_bytes(secret.expose_secret());
+    let public_key = signing_key.verifying_key().to_bytes();
+    let contents = Zeroizing::new(format!(
+        "# slatefs Ed25519 version attestation private key\n# public: {}\n{}\n",
+        hex::encode(public_key),
+        hex::encode(secret.expose_secret())
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    file.write_all(contents.as_bytes())?;
+    println!("wrote Ed25519 private key to {}", path.display());
+    println!("public_key: {}", hex::encode(public_key));
+    Ok(())
+}
+
+fn read_ed25519_signing_key(path: &std::path::Path) -> anyhow::Result<SigningKey> {
+    let contents = Zeroizing::new(
+        std::fs::read_to_string(path)
+            .with_context(|| format!("reading Ed25519 private key from {}", path.display()))?,
+    );
+    let value = contents
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .ok_or_else(|| anyhow::anyhow!("private key file {} is empty", path.display()))?;
+    let decoded = Zeroizing::new(
+        hex::decode(value)
+            .with_context(|| format!("decoding private key in {} as hex", path.display()))?,
+    );
+    let bytes: [u8; 32] = decoded.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "private key in {} must contain exactly 32 bytes, found {}",
+            path.display(),
+            decoded.len()
+        )
+    })?;
+    let bytes = Zeroizing::new(bytes);
+    Ok(SigningKey::from_bytes(&bytes))
+}
+
+fn read_hex_key<const N: usize>(path: &std::path::Path, what: &str) -> anyhow::Result<[u8; N]> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {what} from {}", path.display()))?;
+    let value = contents
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .ok_or_else(|| anyhow::anyhow!("{what} file {} is empty", path.display()))?;
+    let decoded = hex::decode(value)
+        .with_context(|| format!("decoding {what} in {} as hex", path.display()))?;
+    decoded.try_into().map_err(|bytes: Vec<u8>| {
+        anyhow::anyhow!(
+            "{what} in {} must contain exactly {N} bytes, found {}",
+            path.display(),
+            bytes.len()
+        )
+    })
+}
+
+fn print_version_attestation(attestation: &VersionCommitAttestation, trusted: Option<bool>) {
+    println!("key_id: {}", attestation.key_id());
+    println!("algorithm: {}", attestation.algorithm().as_str());
+    println!("public_key: {}", hex::encode(attestation.public_key()));
+    println!("signature: {}", hex::encode(attestation.signature()));
+    println!("created_at: {}", attestation.created_at());
+    if let Some(trusted) = trusted {
+        println!("trusted: {trusted}");
+    }
+}
+
 async fn run(
     command: &Command,
     config: &Config,
@@ -1982,6 +2091,9 @@ async fn run(
 ) -> anyhow::Result<()> {
     match command {
         Command::Keygen { .. } => unreachable!("handled before control-plane open"),
+        Command::Versioning(VersioningCmd::AttestationKeygen { .. }) => {
+            unreachable!("handled before control-plane open")
+        }
         Command::Key(KeyCmd::RotateKek { tenant }) => {
             let count = control.rotate_tenant_kek(tenant).await?;
             println!("rotated tenant KEK for {tenant}; rewrapped {count} volume DEKs");
@@ -2632,6 +2744,80 @@ async fn run(
             let commit = result?;
             repository_close?;
             print_version_commit(&commit);
+        }
+        Command::Versioning(VersioningCmd::Attest {
+            tenant,
+            volume,
+            reference,
+            key_id,
+            key_file,
+        }) => {
+            let signing_key = read_ed25519_signing_key(key_file)?;
+            let public_key = signing_key.verifying_key().to_bytes();
+            let created_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .context("system clock is before the Unix epoch")?
+                .as_secs();
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let result = async {
+                let commit = repository.inspect_commit(reference).await?;
+                let payload = version_commit_attestation_payload(
+                    tenant,
+                    volume,
+                    &commit.id,
+                    key_id,
+                    &public_key,
+                    created_at,
+                )?;
+                let attestation = VersionCommitAttestation::new_ed25519(
+                    key_id,
+                    public_key,
+                    signing_key.sign(&payload).to_bytes(),
+                    created_at,
+                )?;
+                repository
+                    .add_commit_attestation(&commit.id, attestation)
+                    .await
+                    .map(|attestation| (commit.id, attestation))
+            }
+            .await;
+            let close = repository.close().await;
+            let (commit, attestation) = result?;
+            close?;
+            println!("commit: {commit}");
+            print_version_attestation(&attestation, None);
+        }
+        Command::Versioning(VersioningCmd::Attestations {
+            tenant,
+            volume,
+            reference,
+            trusted_public_key,
+        }) => {
+            let trusted = trusted_public_key
+                .as_deref()
+                .map(|path| read_hex_key::<32>(path, "trusted Ed25519 public key"))
+                .transpose()?;
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let result = repository.list_commit_attestations(reference).await;
+            let close = repository.close().await;
+            let attestations = result?;
+            close?;
+            if let Some(trusted) = trusted
+                && !attestations
+                    .iter()
+                    .any(|attestation| attestation.public_key() == trusted)
+            {
+                anyhow::bail!("commit {reference} has no attestation from the trusted public key");
+            }
+            for (index, attestation) in attestations.iter().enumerate() {
+                if index > 0 {
+                    println!();
+                }
+                print_version_attestation(
+                    attestation,
+                    trusted.map(|key| attestation.public_key() == key),
+                );
+            }
         }
         Command::Versioning(VersioningCmd::Diff {
             tenant,
@@ -3558,6 +3744,7 @@ async fn run(
                 let stats = &response["stats"];
                 println!("bytes: {}", stats["bytes"]);
                 println!("commits: {}", stats["commits"]);
+                println!("attestations: {}", stats["attestations"]);
                 println!("nodes: {}", stats["nodes"]);
                 println!("blobs: {}", stats["blobs"]);
                 return Ok(());
@@ -3569,6 +3756,7 @@ async fn run(
             close?;
             println!("bytes: {}", stats.bytes);
             println!("commits: {}", stats.commits);
+            println!("attestations: {}", stats.attestations);
             println!("nodes: {}", stats.nodes);
             println!("blobs: {}", stats.blobs);
         }
@@ -3583,6 +3771,7 @@ async fn run(
                         .await?;
                 let report = &response["verify"];
                 println!("commits: {}", report["commits"]);
+                println!("attestations: {}", report["attestations"]);
                 println!("nodes: {}", report["nodes"]);
                 println!("node_bytes: {}", report["node_bytes"]);
                 println!("blobs: {}", report["blobs"]);
@@ -3595,6 +3784,7 @@ async fn run(
             let report = report?;
             close?;
             println!("commits: {}", report.commits);
+            println!("attestations: {}", report.attestations);
             println!("nodes: {}", report.nodes);
             println!("node_bytes: {}", report.node_bytes);
             println!("blobs: {}", report.blobs);
@@ -4483,6 +4673,75 @@ mod tests {
             config::NbdSyncMode::Strict
         );
         assert!(parse_nbd_sync_mode("always").is_err());
+    }
+
+    #[test]
+    fn parses_version_attestation_commands() {
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "attestation-keygen",
+            "--out",
+            "/tmp/release.key",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::AttestationKeygen { .. })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "attest",
+            "tenant-a",
+            "docs",
+            "main",
+            "--key-id",
+            "release-2026",
+            "--key-file",
+            "/tmp/release.key",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::Attest { key_id, .. }) if key_id == "release-2026"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "attestations",
+            "tenant-a",
+            "docs",
+            "main",
+            "--trusted-public-key",
+            "/tmp/release.pub",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::Attestations {
+                trusted_public_key: Some(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn version_attestation_keygen_creates_a_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("release.key");
+        version_attestation_keygen(&path).unwrap();
+        let private_key = read_ed25519_signing_key(&path).unwrap();
+        assert_ne!(private_key.to_bytes(), [0; 32]);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(version_attestation_keygen(&path).is_err());
     }
 
     #[test]
