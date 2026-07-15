@@ -102,7 +102,8 @@ can be used by read, restore, diff, and history operations. Commits advance
 or an existing named branch when selected explicitly. Publishing a commit and
 its branch reference is one SlateDB batch after the new immutable tree nodes
 and blobs have been written. The same batch records a per-branch reflog entry
-for every create, commit, fast-forward, merge, reset, delete, or native sync.
+for every create, commit, fast-forward, merge, cherry-pick, reset, delete, or
+native sync.
 Native sync negotiates from the receiving branch head and packages only the
 reachable commit, attestation, node, blob, and pruned-parent delta in a
 checksummed version-1 `SLATESYN` envelope. The receiver validates that delta
@@ -165,6 +166,16 @@ applying mutations and folds metadata/chunk conflicts into logical file paths.
 Commit inspection resolves an ID, tag, or branch to its immutable commit and
 exposes the complete parent list so merge ancestry remains directly navigable
 even though ordinary log pagination follows first parents.
+A cherry-pick computes the source commit's Prolly-tree delta against its sole
+parent, or against an explicitly selected one-based mainline parent for a
+merge commit. Planning folds every metadata and chunk key into complete
+logical path state. A path is skipped when the target already equals the
+source, applied when the target still equals the selected parent, and reported
+as a conflict otherwise. Any conflict prevents ref publication. A successful
+plan is applied to the target tree and published as one new single-parent
+commit, branch compare-and-swap, reflog entry, and optional idempotency record.
+Preview runs the same planner without writing. Neither operation reads from or
+writes to the live filesystem.
 Working-tree status scans one live subtree and the corresponding versioned
 metadata, then compares ownership, mode, kind, size, and bounded file or
 symlink contents. It ignores atime and mtime noise, performs no version-store

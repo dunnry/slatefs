@@ -253,6 +253,17 @@ atomic two-parent three-way merge commit for divergent trees. The default
 non-conflicting changes from both branches.
 `versioning merge-preview` reports the merge base, ahead/behind counts,
 fast-forward state, and every conflicting logical path without writing.
+`versioning cherry-pick <commit-or-ref> <target>` applies only the selected
+commit's change relative to its parent and publishes the result as a new
+single-parent commit on the target branch. Use `cherry-pick-preview` to inspect
+the complete changed-path set and conflicts first. A target path that already
+matches the selected commit is skipped; a target path that differs from both
+the selected commit and its parent is a conflict, and any conflict leaves the
+entire target branch unchanged. Cherry-picking a merge commit requires a
+one-based `--mainline <parent-number>`; root and ordinary commits reject that
+option. `--idempotency-key` makes an uncertain retry return the first result.
+Cherry-pick changes version history only and never restores content into the
+live filesystem.
 `versioning inspect <commit-or-ref>` resolves a commit ID, tag, or branch and
 shows the complete parent list, including both parents of a merge commit.
 `versioning status [path] --reference <commit-or-ref>` compares the live
@@ -417,6 +428,8 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/recover` | Restore the head preceding a retained reflog entry from `{"sequence":42}`, recreating a deleted branch when needed. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{target}/merge` | Fast-forward or three-way merge a target from `{"source":"...","conflict_strategy":"fail|ours|theirs","author":"..."}`; strategy defaults to `fail`, author defaults to the server-derived committer, and conflicts return `409`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{target}/merge?source=` | Preview ancestry and logical-path conflicts without moving either branch. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{target}/cherry-pick` | Atomically apply one parent-relative commit delta from `{"source":"commit-or-ref","mainline":1,"author":"...","idempotency_key":"..."}`; optional `mainline` is required only for merge commits, and conflicts return `409`. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{target}/cherry-pick?source=&mainline=` | Preview the canonical source, selected parent, changed paths, already-applied state, and conflicts without moving the target branch. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"...","author":"...","idempotency_key":"...","branch":"main"}`; author, retry key, and branch are optional and singular `path` remains accepted. The response includes hash-bound `provenance`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit-or-ref}/attestations` | Verify and immutably attach a detached Ed25519 attestation. Reposting the identical record is idempotent. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit-or-ref}/attestations` | List detached commit attestations ordered by key ID. |

@@ -232,6 +232,11 @@ slatefs -c /etc/slatefs/slatefs.toml versioning pull <tenant> <local-volume> --r
 slatefs -c /etc/slatefs/slatefs.toml versioning merge <tenant> <volume> <source> <target> --author <content-author> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning merge <tenant> <volume> <source> <target> --conflict-strategy ours --live
 slatefs -c /etc/slatefs/slatefs.toml versioning merge-preview <tenant> <volume> <source> <target> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning cherry-pick-preview <tenant> <volume> <commit-or-ref> <target> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning cherry-pick <tenant> <volume> <commit-or-ref> <target> --author <content-author> --idempotency-key <retry-key> --live
+# A merge commit needs the same one-based parent selection on both commands:
+slatefs -c /etc/slatefs/slatefs.toml versioning cherry-pick-preview <tenant> <volume> <merge-commit> <target> --mainline 1 --live
+slatefs -c /etc/slatefs/slatefs.toml versioning cherry-pick <tenant> <volume> <merge-commit> <target> --mainline 1 --live
 slatefs -c /etc/slatefs/slatefs.toml versioning show <tenant> <volume> <commit> <path> --out restored.bin --live
 slatefs -c /etc/slatefs/slatefs.toml versioning retention <tenant> <volume> --keep-last 100 --live
 slatefs -c /etc/slatefs/slatefs.toml versioning gc <tenant> <volume> --dry-run --live
@@ -324,6 +329,19 @@ Merge conflicts fail without moving either branch by default. After reviewing
 from the target or `--conflict-strategy theirs` to keep it from the source.
 Resolution is applied to the complete logical path, while non-conflicting
 changes from both branches are still merged.
+
+Cherry-pick is narrower than merge: it applies only the selected commit's
+change relative to its parent and creates a new single-parent commit on the
+target. Always review `cherry-pick-preview` before an operational promotion.
+Paths already equal to the source are harmless no-ops. If the target changed a
+selected path differently from the source parent, the command returns HTTP
+`409` and publishes none of the other paths. The operation compares and
+replaces complete logical path state, including metadata and content chunks.
+Merge commits require an explicit one-based `--mainline`; do not pass it for a
+root or ordinary commit. Reuse an idempotency key only for the exact same
+source, target, mainline, author, and committer. Cherry-pick advances version
+history but does not modify the mounted filesystem; use restore separately if
+the live tree should receive the result.
 
 Protect long-lived or release branches before exposing reset, deletion, or
 recovery workflows to operators. Protection does not block commits or merges;
