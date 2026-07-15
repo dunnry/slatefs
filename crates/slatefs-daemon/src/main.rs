@@ -1175,25 +1175,16 @@ struct VersionLeaseBreakRequest {
     confirm: bool,
 }
 
-#[derive(Debug)]
-struct RequiredNullableString(Option<String>);
-
-impl<'de> Deserialize<'de> for RequiredNullableString {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Option::<String>::deserialize(deserializer).map(Self)
-    }
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExportCreateRequest {
     name: String,
     tenant: String,
     volume: String,
-    snapshot: RequiredNullableString,
+    #[serde(default)]
+    snapshot: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
     listen: String,
     allowed_clients: Vec<ClientAddrRule>,
     protocol: ExportProtocol,
@@ -1208,8 +1199,8 @@ impl ExportCreateRequest {
             ExportConfig {
                 tenant: self.tenant,
                 volume: self.volume,
-                snapshot: self.snapshot.0,
-                version: None,
+                snapshot: self.snapshot,
+                version: self.version,
                 listen: self.listen,
                 allowed_clients: self.allowed_clients,
                 protocol: self.protocol,
@@ -1240,6 +1231,8 @@ struct ExportPatchRequest {
     volume: Option<String>,
     #[serde(default)]
     snapshot: Option<Option<String>>,
+    #[serde(default)]
+    version: Option<Option<String>>,
     #[serde(default)]
     listen: Option<String>,
     #[serde(default)]
@@ -1284,6 +1277,15 @@ impl ExportPatchRequest {
         }
         if let Some(snapshot) = self.snapshot {
             record.snapshot = snapshot;
+            if record.snapshot.is_some() {
+                record.version = None;
+            }
+        }
+        if let Some(version) = self.version {
+            record.version = version;
+            if record.version.is_some() {
+                record.snapshot = None;
+            }
         }
         if let Some(listen) = self.listen {
             record.listen = listen;
@@ -4326,6 +4328,8 @@ fn export_create_json(record: &ExportRecord) -> Value {
         "name": record.id,
         "listen": record.listen,
         "protocol": record.protocol,
+        "snapshot": record.snapshot,
+        "version": record.version,
     })
 }
 
@@ -4573,6 +4577,18 @@ async fn append_export_audit(
         "enabled".to_string(),
         slatefs_core::control::AuditDetailValue::Bool(record.enabled),
     );
+    if let Some(snapshot) = &record.snapshot {
+        audit.details.insert(
+            "snapshot".to_string(),
+            AuditDetailValue::String(snapshot.clone()),
+        );
+    }
+    if let Some(commit) = &record.version {
+        audit.details.insert(
+            "version".to_string(),
+            AuditDetailValue::String(commit.clone()),
+        );
+    }
     control
         .append_audit_record(audit)
         .await
@@ -4973,11 +4989,33 @@ async fn get_export_response(
     ))
 }
 
+async fn resolve_managed_export_version(
+    control: &ControlPlane,
+    object_store: Arc<dyn ObjectStore>,
+    tenant: &str,
+    volume: &str,
+    reference: &str,
+) -> Result<String, AdminError> {
+    let repository = VersionRepository::open_existing(control, object_store, tenant, volume)
+        .await
+        .map_err(core_error)?
+        .ok_or_else(|| {
+            bad_request(format!(
+                "version repository {tenant}/{volume} does not exist"
+            ))
+        })?;
+    let resolved = repository.inspect_commit(reference).await;
+    let close = repository.close().await;
+    let resolved = resolved.map_err(core_error)?;
+    close.map_err(core_error)?;
+    Ok(resolved.id)
+}
+
 async fn create_export_response(
     state: &AdminState,
     request: &AdminHttpRequest,
 ) -> Result<AdminHttpResponse, AdminError> {
-    let body: ExportCreateRequest = parse_json_body(request)?;
+    let mut body: ExportCreateRequest = parse_json_body(request)?;
     if state
         .config_exports
         .iter()
@@ -4985,10 +5023,19 @@ async fn create_export_response(
     {
         return Err(export_name_exists_error(&body.name));
     }
-    if body.protocol != ExportProtocol::Nbd {
-        return Err(bad_request("protocol must be nbd"));
-    }
     let control = state.control_writer().await?;
+    if let Some(reference) = body.version.clone() {
+        body.version = Some(
+            resolve_managed_export_version(
+                &control,
+                Arc::clone(&state.object_store),
+                &body.tenant,
+                &body.volume,
+                &reference,
+            )
+            .await?,
+        );
+    }
     let record = body.into_record();
     ensure_export_listen_available(state, &control, &record).await?;
     let record = control.create_export(record).await.map_err(core_error)?;
@@ -5011,7 +5058,23 @@ async fn patch_export_response(
     let body: ExportPatchRequest = parse_json_body(request)?;
     let control = state.control_writer().await?;
     let mut record = control.get_export(id).await.map_err(core_error)?;
+    let source_changed = body.tenant.is_some() || body.volume.is_some();
+    let requested_version = body.version.as_ref().and_then(|value| value.clone());
     body.apply_to(&mut record);
+    let version_to_resolve =
+        requested_version.or_else(|| source_changed.then(|| record.version.clone()).flatten());
+    if let Some(reference) = version_to_resolve {
+        record.version = Some(
+            resolve_managed_export_version(
+                &control,
+                Arc::clone(&state.object_store),
+                &record.tenant,
+                &record.volume,
+                &reference,
+            )
+            .await?,
+        );
+    }
     let record = control.update_export(record).await.map_err(core_error)?;
     append_export_audit(&control, request, AuditAction::ExportUpdate, &record).await?;
     control.close().await.map_err(core_error)?;
@@ -11240,6 +11303,116 @@ mod tests {
             .unwrap();
         assert_eq!(delete_records.len(), 1);
         assert_eq!(delete_records[0].request_id, "export-delete");
+        control.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_v1_historical_export_resolves_symbolic_reference() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([47; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        let record = slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        control
+            .set_versioning_enabled("t", "v", true)
+            .await
+            .unwrap();
+        let dek = control.unwrap_volume_dek(&record).await.unwrap();
+        let live = Volume::open(&record, dek, Arc::clone(&object_store))
+            .await
+            .unwrap();
+        let creds = Credentials::root();
+        let file = live
+            .create(&creds, ROOT_INO, b"release.txt", 0o644, true)
+            .await
+            .unwrap();
+        live.write(&creds, file.ino, 0, b"release").await.unwrap();
+        let repository = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
+            .await
+            .unwrap();
+        let commit = repository
+            .commit_file(
+                live.as_ref(),
+                "/release.txt",
+                "release".into(),
+                test_commit_provenance(),
+            )
+            .await
+            .unwrap();
+        repository.create_tag("release", &commit.id).await.unwrap();
+        repository.close().await.unwrap();
+        live.shutdown().await.unwrap();
+        control.close().await.unwrap();
+
+        let state = available_admin_state(
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            HashMap::new(),
+            None,
+        )
+        .await;
+        let body = format!(
+            r#"{{"name":"history","tenant":"t","volume":"v","version":"release","protocol":"nfs","listen":"{}","allowed_clients":[],"read_only":false,"sync":"default"}}"#,
+            free_loopback_addr()
+        );
+        let request = post_request("/admin/v1/exports", "history-create", &body);
+        let response = admin_exchange(Arc::clone(&state), request.as_bytes()).await;
+        assert_eq!(response_status(&response), 200, "{response}");
+        let created: Value = serde_json::from_str(response_body(&response)).unwrap();
+        assert_eq!(created["export"]["version"], commit.id);
+        assert!(created["export"]["snapshot"].is_null());
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let get = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/exports/history HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&get), 200, "{get}");
+        let get_body: Value = serde_json::from_str(response_body(&get)).unwrap();
+        assert_eq!(get_body["export"]["version"], commit.id);
+        assert_eq!(get_body["export"]["read_only"], true);
+
+        let invalid = format!(
+            r#"{{"name":"missing","tenant":"t","volume":"v","version":"missing-branch","protocol":"nfs","listen":"{}","allowed_clients":[],"read_only":false,"sync":"default"}}"#,
+            free_loopback_addr()
+        );
+        let invalid_request = post_request("/admin/v1/exports", "history-missing", &invalid);
+        let invalid_response = admin_exchange(state, invalid_request.as_bytes()).await;
+        assert_ne!(
+            response_status(&invalid_response),
+            200,
+            "{invalid_response}"
+        );
+
+        let control = ControlPlane::open(Arc::clone(&object_store), kms)
+            .await
+            .unwrap();
+        let (audits, _) = control
+            .list_audit(AuditQuery {
+                action: Some(AuditAction::ExportCreate),
+                ..AuditQuery::default()
+            })
+            .await
+            .unwrap();
+        let audit = audits
+            .iter()
+            .find(|audit| audit.request_id == "history-create")
+            .unwrap();
+        assert_eq!(
+            audit.details.get("version"),
+            Some(&AuditDetailValue::String(commit.id))
+        );
         control.close().await.unwrap();
     }
 

@@ -804,11 +804,14 @@ enum ExportCmd {
         tenant: String,
         #[arg(long)]
         volume: String,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "version")]
         snapshot: Option<String>,
+        /// Export this commit, tag, or branch as an immutable filesystem.
+        #[arg(long, conflicts_with = "snapshot")]
+        version: Option<String>,
         #[arg(long, default_value = "nfs", value_parser = parse_export_protocol)]
         protocol: config::ExportProtocol,
-        /// NBD only: export as read-only. Snapshot exports are always read-only.
+        /// NBD only: export as read-only. Snapshot and version exports are always read-only.
         #[arg(long)]
         read_only: bool,
         /// NBD only: strict forces every write/write-zeroes request to use FUA.
@@ -852,10 +855,21 @@ enum ExportCmd {
         tenant: Option<String>,
         #[arg(long)]
         volume: Option<String>,
-        #[arg(long, conflicts_with = "clear_snapshot")]
+        #[arg(
+            long,
+            conflicts_with_all = ["clear_snapshot", "version", "clear_version"]
+        )]
         snapshot: Option<String>,
-        #[arg(long, conflicts_with = "snapshot")]
+        #[arg(long, conflicts_with_all = ["snapshot", "version"])]
         clear_snapshot: bool,
+        /// Switch the export to this commit, tag, or branch.
+        #[arg(
+            long,
+            conflicts_with_all = ["snapshot", "clear_snapshot", "clear_version"]
+        )]
+        version: Option<String>,
+        #[arg(long, conflicts_with_all = ["snapshot", "version"])]
+        clear_version: bool,
         #[arg(long, value_parser = parse_export_protocol)]
         protocol: Option<config::ExportProtocol>,
         #[arg(long)]
@@ -1678,6 +1692,7 @@ fn print_export(export: &ExportRecord) {
     println!("export:      {}", export.id);
     println!("target:      {}/{}", export.tenant, export.volume);
     println!("snapshot:    {}", export.snapshot.as_deref().unwrap_or("-"));
+    println!("version:     {}", export.version.as_deref().unwrap_or("-"));
     println!("protocol:    {}", protocol_name(export.protocol));
     println!("read_only:   {}", export.effective_read_only());
     println!("sync:        {}", nbd_sync_name(export.sync));
@@ -1745,6 +1760,23 @@ fn print_export(export: &ExportRecord) {
     println!("enabled:     {}", export.enabled);
     println!("created_at:  {}", export.created_at);
     println!("updated_at:  {}", export.updated_at);
+}
+
+async fn resolve_export_version(
+    control: &ControlPlane,
+    object_store: Arc<dyn store::ObjectStore>,
+    tenant: &str,
+    volume: &str,
+    reference: &str,
+) -> anyhow::Result<String> {
+    let repository = VersionRepository::open_existing(control, object_store, tenant, volume)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("version repository {tenant}/{volume} does not exist"))?;
+    let resolved = repository.inspect_commit(reference).await;
+    let close = repository.close().await;
+    let resolved = resolved?;
+    close?;
+    Ok(resolved.id)
 }
 
 fn print_daemon_node(node: &DaemonNodeRecord) {
@@ -5066,6 +5098,7 @@ async fn run(
                 tenant,
                 volume,
                 snapshot,
+                version,
                 protocol,
                 read_only,
                 sync,
@@ -5083,13 +5116,26 @@ async fn run(
                 nbd_tls_client_ca,
                 disabled,
             } => {
+                let version = match version.as_deref() {
+                    Some(reference) => Some(
+                        resolve_export_version(
+                            control,
+                            Arc::clone(&object_store),
+                            tenant,
+                            volume,
+                            reference,
+                        )
+                        .await?,
+                    ),
+                    None => None,
+                };
                 let record = ExportRecord::from_config(
                     id.clone(),
                     config::ExportConfig {
                         tenant: tenant.clone(),
                         volume: volume.clone(),
                         snapshot: snapshot.clone(),
-                        version: None,
+                        version,
                         listen: listen.clone(),
                         allowed_clients: allowed_clients.clone(),
                         protocol: *protocol,
@@ -5114,12 +5160,13 @@ async fn run(
             ExportCmd::List => {
                 for export in control.list_exports().await? {
                     println!(
-                        "{}\t{}\t{}/{}\tsnapshot={}\tread_only={}\tsync={}\tlisten={}\tenabled={}",
+                        "{}\t{}\t{}/{}\tsnapshot={}\tversion={}\tread_only={}\tsync={}\tlisten={}\tenabled={}",
                         export.id,
                         protocol_name(export.protocol),
                         export.tenant,
                         export.volume,
                         export.snapshot.as_deref().unwrap_or("-"),
+                        export.version.as_deref().unwrap_or("-"),
                         export.effective_read_only(),
                         nbd_sync_name(export.sync),
                         export.listen,
@@ -5137,6 +5184,8 @@ async fn run(
                 volume,
                 snapshot,
                 clear_snapshot,
+                version,
+                clear_version,
                 protocol,
                 read_only,
                 sync,
@@ -5170,6 +5219,24 @@ async fn run(
                 }
                 FieldUpdate::from_option(snapshot.clone(), *clear_snapshot)
                     .apply_option(&mut record.snapshot);
+                if snapshot.is_some() {
+                    record.version = None;
+                }
+                if let Some(reference) = version.as_deref() {
+                    record.version = Some(
+                        resolve_export_version(
+                            control,
+                            Arc::clone(&object_store),
+                            &record.tenant,
+                            &record.volume,
+                            reference,
+                        )
+                        .await?,
+                    );
+                    record.snapshot = None;
+                } else if *clear_version {
+                    record.version = None;
+                }
                 if let Some(protocol) = protocol {
                     record.protocol = *protocol;
                 }
@@ -6153,6 +6220,53 @@ mod tests {
                     attestations: Vec::new(),
                 },
             )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn export_cli_accepts_symbolic_version_and_rejects_multiple_sources() {
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "export",
+            "add",
+            "release-view",
+            "--tenant",
+            "tenant-a",
+            "--volume",
+            "docs",
+            "--version",
+            "release",
+            "--listen",
+            "127.0.0.1:12049",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Export(ExportCmd::Add {
+                version: Some(version),
+                snapshot: None,
+                ..
+            }) if version == "release"
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "slatefs",
+                "export",
+                "add",
+                "invalid",
+                "--tenant",
+                "tenant-a",
+                "--volume",
+                "docs",
+                "--snapshot",
+                "checkpoint",
+                "--version",
+                "release",
+                "--listen",
+                "127.0.0.1:12050",
+            ])
             .is_err()
         );
     }

@@ -239,6 +239,28 @@ slatefs -c /etc/slatefs/slatefs.toml versioning stats <tenant> <volume> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning verify <tenant> <volume> --live
 ```
 
+### Historical read-only exports
+
+Serve a committed filesystem state without restoring it over the live volume:
+
+```sh
+slatefs -c /etc/slatefs/slatefs.toml export add release-view \
+  --tenant <tenant> --volume <volume> --version <commit-or-tag-or-branch> \
+  --protocol nfs --listen 127.0.0.1:12050
+slatefs -c /etc/slatefs/slatefs.toml export show release-view
+# Mount and inspect the second NFS or 9P listener.
+slatefs -c /etc/slatefs/slatefs.toml export remove release-view
+```
+
+The add command resolves a tag or branch immediately and stores the printed
+64-character commit ID. Moving the branch later does not alter the mounted
+view. The export is read-only regardless of other flags, cannot also specify
+`--snapshot`, and is not available over NBD. Disabling or removing its last
+listener lets `slatefsd` close the historical reader and release the internal
+checkpoint that protects the view from version-history garbage collection.
+For static configuration, set `version` to the exact commit ID rather than a
+symbolic reference.
+
 Attestation is optional and client-side: `slatefsd` receives the public key and
 signature, never `release.key`. The signed statement binds the stable logical
 repository UUID, resolved commit ID, key ID, algorithm, public key, and

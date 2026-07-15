@@ -266,6 +266,25 @@ subtree fingerprint. `versioning restore` requires that token and `--yes`, and
 rejects stale plans before mutation. File replacements are staged atomically;
 multi-path restores are serialized but not globally atomic.
 `versioning policy` reports opt-in and repository-lease state.
+
+Any commit, immutable tag, or branch head can also be served as its own
+read-only NFS or 9P export without restoring it into the live filesystem:
+
+```sh
+slatefs export add release-view --tenant <tenant> --volume <volume> \
+  --version <commit-or-tag-or-branch> --protocol nfs --listen 127.0.0.1:12050
+```
+
+SlateFS resolves the supplied reference once and persists the exact commit ID,
+so later branch movement cannot change an existing export. The daemon builds a
+stable inode/directory view directly from that commit's Prolly tree and pins
+the encrypted version store with an internal checkpoint for the lifetime of
+the export. It does not copy content, restore files, or modify the live volume.
+Historical exports are filesystem-only, always read-only, mutually exclusive
+with `snapshot`, and support NFS or 9P but not NBD. Static `[[exports]]`
+configuration uses `version = "<64-character-commit-id>"`; symbolic references
+are accepted by the CLI and admin API because they are resolved before the
+durable export record is written.
 Show and restore stream versioned data in bounded chunks rather than loading a
 complete large file into memory.
 `versioning disable` stops all version operations but retains existing history;
@@ -359,8 +378,8 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/audit` | Audit records with `since`, `until`, `tenant`, `volume`, `action`, `limit`, `page_token`, `newest_first`. |
 | `GET` | `/admin/v1/exports` | All exports with `source=config|control`; config exports are read-only. |
 | `GET` | `/admin/v1/exports/{id}` | Export detail. |
-| `POST` | `/admin/v1/exports` | Create an enabled control-plane export from JSON fields including `name`, `tenant`, `volume`, `protocol`, `listen`, `allowed_clients`, `read_only`, `sync`, and `snapshot`. |
-| `PATCH` | `/admin/v1/exports/{id}` | Update a control-plane export; use JSON `null` to clear optional fields. |
+| `POST` | `/admin/v1/exports` | Create an enabled control-plane export from JSON fields including `name`, `tenant`, `volume`, `protocol`, `listen`, `allowed_clients`, `read_only`, `sync`, and mutually exclusive `snapshot` or `version`; a symbolic version reference is persisted as its exact commit ID. |
+| `PATCH` | `/admin/v1/exports/{id}` | Update a control-plane export; use JSON `null` to clear optional fields. Setting `version` resolves it against the resulting tenant and volume. |
 | `DELETE` | `/admin/v1/exports/{id}` | Remove a control-plane export. |
 | `GET` | `/admin/v1/tenants` | Tenant inventory with `limit` and `page_token`. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/rate` | Set nullable `ops_per_second` and/or `bytes_per_second`; `null` means unlimited. |
