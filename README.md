@@ -150,9 +150,13 @@ immutable names for important commits. `versioning branch`, `branches`, and
 `delete-branch` manage durable branch references; a branch name can be used
 where a commit or tag is accepted. `commit --branch <name>` advances an
 existing branch instead of `main`, and `log --branch <name>` follows that
-branch's history. `reset-branch <name> <commit-or-ref> --yes` deliberately
+branch's history. `versioning reflog <branch>` lists the newest 100 head
+transitions even after branch deletion. Every create, commit, fast-forward,
+merge, reset, and delete records its ref change atomically; retained reflog
+heads are GC roots, so this recovery window takes precedence over stricter
+count or age retention. `reset-branch <name> <commit-or-ref> --yes` deliberately
 moves any existing branch, including `main`, without rewriting commits or file
-data; the previous head remains recoverable until retention GC reclaims it.
+data; the previous head remains recoverable while its reflog entry is retained.
 `versioning merge <source> <target>` fast-forwards when possible or creates an
 atomic two-parent three-way merge commit for divergent trees. The default
 `--conflict-strategy fail` leaves both branches unchanged on a conflict.
@@ -286,6 +290,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/tags` | Create a retention-pinning tag from `{"name":"...","commit":"..."}`. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/tags/{name}` | Delete a tag without deleting its commit immediately. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | List branch heads, including `main`. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/reflog` | List up to 100 retained head transitions, newest first, including deleted branches; optional `limit`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | Create a branch from `{"name":"...","commit":"commit-or-ref"}`. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}` | Delete a non-main branch without deleting its commit immediately. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/reset` | Compare-and-swap an existing branch, including `main`, to `{"commit":"commit-or-ref"}`. |

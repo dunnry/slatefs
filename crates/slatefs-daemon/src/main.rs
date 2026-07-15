@@ -2546,6 +2546,22 @@ async fn list_version_branches_response(
     ))
 }
 
+async fn list_version_reflog_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+    branch: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let limit = page_limit(&request.query)?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository.reflog(branch, limit).await;
+    let entries = finish_version_repository(control, repository, result).await?;
+    Ok(AdminHttpResponse::json(200, json!({ "entries": entries })))
+}
+
 async fn create_version_branch_response(
     state: &AdminState,
     request: &AdminHttpRequest,
@@ -4333,6 +4349,21 @@ async fn route_admin_request(
                 "branches",
             ],
         ) => list_version_branches_response(state, tenant, volume).await,
+        (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "branches",
+                branch,
+                "reflog",
+            ],
+        ) => list_version_reflog_response(state, request, tenant, volume, branch).await,
         (
             "POST",
             [
@@ -7847,6 +7878,19 @@ mod tests {
             200,
             "{delete_branch_response}"
         );
+        let reflog_response = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning/branches/release/reflog?limit=3 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&reflog_response), 200, "{reflog_response}");
+        let reflog: Value = serde_json::from_str(response_body(&reflog_response)).unwrap();
+        let entries = reflog["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["action"], "delete");
+        assert!(entries[0]["commit"].is_null());
+        assert_eq!(entries[1]["action"], "reset");
+        assert_eq!(entries[2]["action"], "reset");
 
         volume
             .write(&creds, file.ino, 0, b"changed data!")
@@ -10035,7 +10079,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn automatic_version_retention_collects_only_existing_served_history() {
+    async fn automatic_version_retention_preserves_reflog_recovery_window() {
         let object_store = store::resolve_root("memory:///").unwrap();
         let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([38; 32])));
         let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
@@ -10170,7 +10214,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-        assert_eq!(repository.history(None, 10).await.unwrap().len(), 1);
+        assert_eq!(repository.history(None, 10).await.unwrap().len(), 2);
         repository.close().await.unwrap();
         let (audits, _) = control
             .list_audit(AuditQuery {
@@ -10179,19 +10223,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(audits.len(), 1);
-        assert_eq!(
-            audits[0].details.get("automatic"),
-            Some(&AuditDetailValue::Bool(true))
-        );
+        assert!(audits.is_empty());
         control.close().await.unwrap();
         let rendered = render_daemon_metrics_with_exports(&[], &metrics);
-        assert!(
-            rendered.contains(
-                "slatefs_version_operations_total{tenant=\"t\",volume=\"v\",operation=\"gc-auto\"} 1"
-            ),
-            "{rendered}"
-        );
+        assert!(!rendered.contains("operation=\"gc-auto\""), "{rendered}");
         volume.shutdown().await.unwrap();
         empty.shutdown().await.unwrap();
     }

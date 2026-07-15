@@ -18,9 +18,9 @@ use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{
     VersionBranchInfo, VersionBranchResetInfo, VersionCommitInfo, VersionMergeConflictStrategy,
-    VersionMergeInfo, VersionMergePreview, VersionPathChangeKind, VersionRepository,
-    VersionRestoreActionKind, VersionRestoreApplyInfo, VersionRestoreMode, VersionRestorePreview,
-    VersionTagInfo, VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
+    VersionMergeInfo, VersionMergePreview, VersionPathChangeKind, VersionReflogEntry,
+    VersionRepository, VersionRestoreActionKind, VersionRestoreApplyInfo, VersionRestoreMode,
+    VersionRestorePreview, VersionTagInfo, VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
     force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease,
 };
@@ -441,6 +441,16 @@ enum VersioningCmd {
     Branches {
         tenant: String,
         volume: String,
+        #[arg(long)]
+        live: bool,
+    },
+    /// List retained branch-head transitions, including deleted branch history.
+    Reflog {
+        tenant: String,
+        volume: String,
+        branch: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
         #[arg(long)]
         live: bool,
     },
@@ -1187,6 +1197,17 @@ fn print_version_branch_reset(reset: &VersionBranchResetInfo) {
         reset.name(),
         reset.previous(),
         reset.commit()
+    );
+}
+
+fn print_version_reflog_entry(entry: &VersionReflogEntry) {
+    println!(
+        "{}\t{}\t{}\t{} -> {}",
+        entry.created_at(),
+        entry.action().as_str(),
+        entry.branch(),
+        entry.previous().unwrap_or("-"),
+        entry.commit().unwrap_or("-")
     );
 }
 
@@ -2731,6 +2752,41 @@ async fn run(
             let repository_close = repository.close().await;
             for branch in result? {
                 print_version_branch(&branch);
+            }
+            repository_close?;
+        }
+        Command::Versioning(VersioningCmd::Reflog {
+            tenant,
+            volume,
+            branch,
+            limit,
+            live,
+        }) => {
+            if *live {
+                let endpoint = format!("branches/{branch}/reflog");
+                let response = live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    "GET",
+                    &endpoint,
+                    &[("limit", limit.to_string())],
+                    None,
+                )
+                .await?;
+                let entries: Vec<VersionReflogEntry> =
+                    serde_json::from_value(response["entries"].clone())
+                        .context("parsing admin version branch reflog")?;
+                for entry in entries {
+                    print_version_reflog_entry(&entry);
+                }
+                return Ok(());
+            }
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let result = repository.reflog(branch, *limit).await;
+            let repository_close = repository.close().await;
+            for entry in result? {
+                print_version_reflog_entry(&entry);
             }
             repository_close?;
         }
@@ -4378,6 +4434,28 @@ mod tests {
                 live: true,
                 ..
             }) if name == "release" && commit == "baseline"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "reflog",
+            "tenant-a",
+            "docs",
+            "release",
+            "--limit",
+            "25",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::Reflog {
+                branch,
+                limit: 25,
+                live: true,
+                ..
+            }) if branch == "release"
         ));
 
         let cli = Cli::try_parse_from([

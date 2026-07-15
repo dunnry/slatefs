@@ -10,7 +10,7 @@ use slatefs_core::error::Error;
 use slatefs_core::meta::inode::ROOT_INO;
 use slatefs_core::store::{self, ObjectStore};
 use slatefs_core::versioning::{
-    VersionMergeConflictStrategy, VersionPathChangeKind, VersionRepository,
+    VersionMergeConflictStrategy, VersionPathChangeKind, VersionReflogAction, VersionRepository,
     VersionRestoreActionKind, VersionRestoreMode, VersionWorkingTreeChangeKind,
     force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease,
@@ -216,6 +216,14 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
     let reset = repository.reset_branch("release", "main").await.unwrap();
     assert_eq!(reset.previous(), first.id);
     assert_eq!(reset.commit(), second.id);
+    let release_reflog = repository.reflog("release", 100).await.unwrap();
+    assert_eq!(release_reflog.len(), 4);
+    assert_eq!(release_reflog[0].action(), VersionReflogAction::Reset);
+    assert_eq!(release_reflog[0].previous(), Some(first.id.as_str()));
+    assert_eq!(release_reflog[0].commit(), Some(second.id.as_str()));
+    assert_eq!(release_reflog[1].action(), VersionReflogAction::Reset);
+    assert_eq!(release_reflog[2].action(), VersionReflogAction::FastForward);
+    assert_eq!(release_reflog[3].action(), VersionReflogAction::Create);
     repository
         .create_branch("feature", &first.id)
         .await
@@ -487,6 +495,13 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
     assert!(verified.nodes > 0);
     assert!(verified.blobs > 0);
     repository.delete_branch("feature").await.unwrap();
+    let feature_reflog = repository.reflog("feature", 100).await.unwrap();
+    assert_eq!(feature_reflog[0].action(), VersionReflogAction::Delete);
+    assert_eq!(
+        feature_reflog[0].previous(),
+        Some(feature_commit.id.as_str())
+    );
+    assert_eq!(feature_reflog[0].commit(), None);
     let complete_dag_gc = repository.garbage_collect(None, None, true).await.unwrap();
     assert_eq!(complete_dag_gc.retained_commits, 7);
     assert_eq!(complete_dag_gc.deleted_commits, 0);
@@ -681,12 +696,19 @@ async fn idempotent_commit_retries_return_the_original_commit() {
     assert_eq!(left.commit().id, right.commit().id);
     assert_ne!(left.replayed(), right.replayed());
     assert_eq!(repository.history(None, 10).await.unwrap().len(), 2);
+    let reflog = repository.reflog("main", 100).await.unwrap();
+    assert_eq!(reflog.len(), 2);
+    assert!(
+        reflog
+            .iter()
+            .all(|entry| entry.action() == VersionReflogAction::Commit)
+    );
     let gc = repository
         .garbage_collect(Some(1), None, false)
         .await
         .unwrap();
-    assert_eq!(gc.deleted_commits, 1);
-    let pruned_retry = repository
+    assert_eq!(gc.deleted_commits, 0);
+    let retained_retry = repository
         .commit_volume_paths_idempotent(
             live.as_ref(),
             &["/notes.txt".into()],
@@ -694,8 +716,9 @@ async fn idempotent_commit_retries_return_the_original_commit() {
             "retry-1",
         )
         .await
-        .unwrap_err();
-    assert!(pruned_retry.to_string().contains("no changes"));
+        .unwrap();
+    assert!(retained_retry.replayed());
+    assert_eq!(retained_retry.commit().id, first_id);
 
     repository.close().await.unwrap();
     live.shutdown().await.unwrap();
@@ -1322,20 +1345,19 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
         .garbage_collect(Some(1), None, true)
         .await
         .unwrap();
-    assert_eq!(dry_run.deleted_commits, 1);
+    assert_eq!(dry_run.deleted_commits, 0);
     assert_eq!(repository.history(None, 10).await.unwrap().len(), 3);
 
     let collected = repository
         .garbage_collect(Some(1), None, false)
         .await
         .unwrap();
-    assert_eq!(collected.retained_commits, 2);
-    assert_eq!(collected.deleted_commits, 1);
-    assert!(collected.reclaimed_bytes > 0);
+    assert_eq!(collected.retained_commits, 3);
+    assert_eq!(collected.deleted_commits, 0);
     let history = repository.history(None, 10).await.unwrap();
-    assert_eq!(history.len(), 1);
+    assert_eq!(history.len(), 3);
     assert_eq!(history[0].id, commits[2].id);
-    assert_eq!(repository.verify().await.unwrap().commits, 2);
+    assert_eq!(repository.verify().await.unwrap().commits, 3);
     assert_eq!(
         repository
             .read_file("milestone-1", "/history.txt")
@@ -1364,7 +1386,7 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
         .garbage_collect(Some(1), None, false)
         .await
         .unwrap();
-    assert_eq!(still_branch_pinned.retained_commits, 2);
+    assert_eq!(still_branch_pinned.retained_commits, 3);
     assert_eq!(still_branch_pinned.deleted_commits, 0);
     assert_eq!(repository.delete_branch("release").await.unwrap(), branch);
     assert_eq!(repository.list_branches().await.unwrap().len(), 1);
@@ -1376,13 +1398,15 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
         .garbage_collect(Some(1), None, false)
         .await
         .unwrap();
-    assert_eq!(unpinned.retained_commits, 1);
-    assert_eq!(unpinned.deleted_commits, 1);
-    assert!(
+    assert_eq!(unpinned.retained_commits, 3);
+    assert_eq!(unpinned.deleted_commits, 0);
+    assert_eq!(
         repository
             .read_file(&commits[0].id, "/history.txt")
             .await
-            .is_err()
+            .unwrap()
+            .as_ref(),
+        b"one"
     );
     repository.close().await.unwrap();
 
@@ -1416,7 +1440,7 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
     assert_eq!(recovered.deleted_commits, 0);
     assert!(recovered.deleted_nodes + recovered.deleted_blobs > 0);
     assert!(quota_repository.stats().await.unwrap().bytes < with_unpublished_objects.bytes);
-    assert_eq!(quota_repository.history(None, 10).await.unwrap().len(), 1);
+    assert_eq!(quota_repository.history(None, 10).await.unwrap().len(), 3);
     quota_repository.close().await.unwrap();
     live.shutdown().await.unwrap();
 

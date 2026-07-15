@@ -79,14 +79,17 @@ references can point to any existing commit, tag, or branch and can be used by
 read, restore, diff, and history operations. Commits advance `main` by default
 or an existing named branch when selected explicitly. Publishing a commit and
 its branch reference is one SlateDB batch after the new immutable tree nodes
-and blobs have been written. Disabling versioning blocks repository operations
+and blobs have been written. The same batch records a per-branch reflog entry
+for every create, commit, fast-forward, merge, reset, or delete. Reflogs retain
+the newest 100 transitions per branch name and remain readable after deletion.
+Disabling versioning blocks repository operations
 without deleting its history. Volume deletion removes both the live and
 optional version-store prefixes.
 
 An explicit branch reset may move any existing branch, including `main`, to an
 existing commit, tag, or branch. The update is compare-and-swapped against the
 head observed while preparing it, changes no immutable data, and leaves the
-previous commit recoverable until retention GC makes it unreachable.
+previous commit recoverable through the bounded reflog.
 
 SlateFS atomically fast-forwards a target when its head is an ancestor of the
 source and reports an already-current target as a no-op. Divergent branches
@@ -153,9 +156,11 @@ The daemon enforces count and age policies only for enabled
 filesystem volumes whose writable backend it currently serves. It opens only
 an existing history under the repository lease, preserving lazy creation and
 avoiding work on disabled, unserved, or policyless volumes. Immutable named
-tags and named branch heads add their referenced commit and tree to the GC
-reachability roots. A physical purge deletes the separate version database
-prefix under the same lease.
+tags, named branch heads, and commits named by retained reflog entries add their
+referenced commit and tree to the GC reachability roots. The 100-transition
+recovery window therefore takes precedence over lower count or age limits. A
+physical purge deletes the separate version database prefix under the same
+lease.
 
 ## Request Path
 

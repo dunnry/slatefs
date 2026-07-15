@@ -36,12 +36,15 @@ const IDEMPOTENCY_PREFIX: &[u8] = b"pi/";
 const PRUNED_COMMIT_PREFIX: &[u8] = b"pp/";
 const BRANCH_PREFIX: &[u8] = b"pr/heads/";
 const HEAD_KEY: &[u8] = b"pr/heads/main";
+const REFLOG_PREFIX: &[u8] = b"pr/logs/";
 const TAG_PREFIX: &[u8] = b"pr/tags/";
 const ENTRY_META_VERSION: u8 = 1;
 const COMMIT_VERSION: u8 = 1;
 const IDEMPOTENCY_VERSION: u8 = 1;
 const REF_VERSION: u8 = 1;
+const REFLOG_VERSION: u8 = 1;
 const TAG_VERSION: u8 = 1;
+const REFLOG_RETAIN_PER_BRANCH: usize = 100;
 const MAINTENANCE_LEASE_VERSION: u8 = 1;
 const MAINTENANCE_LEASE_TTL_SECS: u64 = 120;
 const MAINTENANCE_LEASE_RENEW_SECS: u64 = 30;
@@ -444,6 +447,7 @@ struct VersionPublishRequest<'a> {
     encoded_commit: Vec<u8>,
     idempotency: Option<VersionCommitIdempotencyIntent>,
     max_bytes: Option<u64>,
+    reflog_action: VersionReflogAction,
 }
 
 impl VersionStore {
@@ -523,6 +527,7 @@ impl VersionStore {
             encoded_commit,
             idempotency,
             max_bytes,
+            reflog_action,
         } = request;
         let _guard = self.ref_lock.lock().await;
         if let Some(intent) = idempotency
@@ -577,6 +582,8 @@ impl VersionStore {
         let mut batch = WriteBatch::new();
         batch.put(commit_key(&commit.id), encoded_commit);
         batch.put(ref_key, encode_versioned(REF_VERSION, &head)?);
+        self.append_reflog(&mut batch, branch, expected, Some(commit.id), reflog_action)
+            .await?;
         if let Some(intent) = idempotency {
             let record = VersionCommitIdempotencyRecord {
                 commit_id: commit.id,
@@ -691,9 +698,17 @@ impl VersionStore {
         if self.try_get_tag(name).await?.is_some() {
             return Err(Error::already_exists("version tag", name));
         }
-        self.db
-            .put_bytes(key.into(), encode_versioned(REF_VERSION, reference)?.into())
-            .await?;
+        let mut batch = WriteBatch::new();
+        batch.put(key, encode_versioned(REF_VERSION, reference)?);
+        self.append_reflog(
+            &mut batch,
+            name,
+            None,
+            Some(reference.commit_id),
+            VersionReflogAction::Create,
+        )
+        .await?;
+        self.db.write(batch).await?;
         self.db.flush().await?;
         Ok(())
     }
@@ -705,7 +720,17 @@ impl VersionStore {
             .get_ref(&key)
             .await?
             .ok_or_else(|| Error::not_found("version branch", name))?;
-        self.db.delete(key).await?;
+        let mut batch = WriteBatch::new();
+        batch.delete(key);
+        self.append_reflog(
+            &mut batch,
+            name,
+            Some(reference.commit_id),
+            None,
+            VersionReflogAction::Delete,
+        )
+        .await?;
+        self.db.write(batch).await?;
         self.db.flush().await?;
         Ok(reference)
     }
@@ -729,9 +754,17 @@ impl VersionStore {
                 hex::encode(current.commit_id)
             )));
         }
-        self.db
-            .put_bytes(key.into(), encode_versioned(REF_VERSION, reference)?.into())
-            .await?;
+        let mut batch = WriteBatch::new();
+        batch.put(key, encode_versioned(REF_VERSION, reference)?);
+        self.append_reflog(
+            &mut batch,
+            name,
+            Some(current.commit_id),
+            Some(reference.commit_id),
+            VersionReflogAction::Reset,
+        )
+        .await?;
+        self.db.write(batch).await?;
         self.db.flush().await?;
         Ok(())
     }
@@ -757,14 +790,101 @@ impl VersionStore {
                 "branch moved while preparing fast-forward merge".into(),
             ));
         }
-        self.db
-            .put_bytes(
-                branch_key(target).into(),
-                encode_versioned(REF_VERSION, &source_ref)?.into(),
-            )
-            .await?;
+        let mut batch = WriteBatch::new();
+        batch.put(
+            branch_key(target),
+            encode_versioned(REF_VERSION, &source_ref)?,
+        );
+        self.append_reflog(
+            &mut batch,
+            target,
+            Some(target_ref.commit_id),
+            Some(source_ref.commit_id),
+            VersionReflogAction::FastForward,
+        )
+        .await?;
+        self.db.write(batch).await?;
         self.db.flush().await?;
         Ok(source_ref)
+    }
+
+    async fn list_reflog(&self, branch: &str) -> Result<Vec<VersionReflogRecord>> {
+        let mut iter = self
+            .db
+            .scan_prefix(&reflog_branch_prefix(branch), ..)
+            .await?;
+        let mut entries = Vec::new();
+        while let Some(entry) = iter.next().await? {
+            entries.push(decode_versioned(
+                REFLOG_VERSION,
+                &entry.value,
+                "version branch reflog",
+            )?);
+        }
+        entries.sort_by(|left: &VersionReflogRecord, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.sequence.cmp(&left.sequence))
+        });
+        Ok(entries)
+    }
+
+    async fn reflog_commit_ids(&self) -> Result<HashSet<[u8; 32]>> {
+        let mut iter = self.db.scan_prefix(REFLOG_PREFIX, ..).await?;
+        let mut ids = HashSet::new();
+        while let Some(entry) = iter.next().await? {
+            let record: VersionReflogRecord =
+                decode_versioned(REFLOG_VERSION, &entry.value, "version branch reflog")?;
+            ids.extend(record.previous);
+            ids.extend(record.commit);
+        }
+        Ok(ids)
+    }
+
+    async fn append_reflog(
+        &self,
+        batch: &mut WriteBatch,
+        branch: &str,
+        previous: Option<[u8; 32]>,
+        commit: Option<[u8; 32]>,
+        action: VersionReflogAction,
+    ) -> Result<()> {
+        let prefix = reflog_branch_prefix(branch);
+        let mut iter = self.db.scan_prefix(&prefix, ..).await?;
+        let mut existing = Vec::new();
+        while let Some(entry) = iter.next().await? {
+            existing.push(entry.key.to_vec());
+        }
+        existing.sort();
+        let sequence = existing
+            .last()
+            .and_then(|key| key.get(prefix.len()..))
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| Error::Versioning(format!("branch {branch} reflog is exhausted")))?;
+        let excess = existing
+            .len()
+            .saturating_add(1)
+            .saturating_sub(REFLOG_RETAIN_PER_BRANCH);
+        for key in existing.into_iter().take(excess) {
+            batch.delete(key);
+        }
+        let record = VersionReflogRecord {
+            sequence,
+            branch: branch.to_string(),
+            previous,
+            commit,
+            action,
+            created_at: crate::control::now_unix(),
+        };
+        batch.put(
+            reflog_key(branch, record.sequence),
+            encode_versioned(REFLOG_VERSION, &record)?,
+        );
+        Ok(())
     }
 }
 
@@ -898,6 +1018,16 @@ struct VersionRef {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct VersionReflogRecord {
+    sequence: u64,
+    branch: String,
+    previous: Option<[u8; 32]>,
+    commit: Option<[u8; 32]>,
+    action: VersionReflogAction,
+    created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct VersionTag {
     name: String,
     commit_id: [u8; 32],
@@ -934,6 +1064,42 @@ pub struct VersionBranchResetInfo {
     name: String,
     previous: String,
     commit: String,
+}
+
+/// The operation that changed a version branch head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VersionReflogAction {
+    Create,
+    Commit,
+    FastForward,
+    Merge,
+    Reset,
+    Delete,
+}
+
+impl VersionReflogAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Commit => "commit",
+            Self::FastForward => "fast-forward",
+            Self::Merge => "merge",
+            Self::Reset => "reset",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// One retained branch-head transition, newest first when listed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionReflogEntry {
+    branch: String,
+    previous: Option<String>,
+    commit: Option<String>,
+    action: VersionReflogAction,
+    created_at: u64,
 }
 
 /// Policy used when both sides of a branch merge changed the same logical path.
@@ -1083,6 +1249,40 @@ impl VersionBranchResetInfo {
 
     pub fn commit(&self) -> &str {
         &self.commit
+    }
+}
+
+impl VersionReflogEntry {
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    pub fn previous(&self) -> Option<&str> {
+        self.previous.as_deref()
+    }
+
+    pub fn commit(&self) -> Option<&str> {
+        self.commit.as_deref()
+    }
+
+    pub fn action(&self) -> VersionReflogAction {
+        self.action
+    }
+
+    pub fn created_at(&self) -> u64 {
+        self.created_at
+    }
+}
+
+impl From<VersionReflogRecord> for VersionReflogEntry {
+    fn from(record: VersionReflogRecord) -> Self {
+        Self {
+            branch: record.branch,
+            previous: record.previous.map(hex::encode),
+            commit: record.commit.map(hex::encode),
+            action: record.action,
+            created_at: record.created_at,
+        }
     }
 }
 
@@ -1656,6 +1856,15 @@ impl VersionRepository {
             })?;
             pending.push(tag.commit_id);
         }
+        for id in self.store.reflog_commit_ids().await? {
+            self.store.try_get_commit(&id).await?.ok_or_else(|| {
+                Error::Versioning(format!(
+                    "version reflog references missing commit {}",
+                    hex::encode(id)
+                ))
+            })?;
+            pending.push(id);
+        }
         let mut seen = HashSet::new();
         let mut trees = Vec::new();
         let mut commits = 0u64;
@@ -1810,6 +2019,17 @@ impl VersionRepository {
                             ))
                         })?
                 };
+                retained.push(commit);
+            }
+        }
+        for id in self.store.reflog_commit_ids().await? {
+            if retained_commit_ids.insert(id) {
+                let commit = self.store.try_get_commit(&id).await?.ok_or_else(|| {
+                    Error::Versioning(format!(
+                        "version reflog references missing commit {}",
+                        hex::encode(id)
+                    ))
+                })?;
                 retained.push(commit);
             }
         }
@@ -2141,6 +2361,7 @@ impl VersionRepository {
                 encoded_commit: encoded,
                 idempotency,
                 max_bytes: self.max_bytes,
+                reflog_action: VersionReflogAction::Commit,
             })
             .await?
         {
@@ -2316,6 +2537,26 @@ impl VersionRepository {
                 name,
                 commit: hex::encode(reference.commit_id),
             })
+            .collect())
+    }
+
+    /// List the newest retained head transitions for a branch. Reflogs remain
+    /// available after branch deletion and retain at most 100 entries per name.
+    pub async fn reflog(&self, branch: &str, limit: usize) -> Result<Vec<VersionReflogEntry>> {
+        validate_version_branch_name(branch)?;
+        if limit == 0 || limit > REFLOG_RETAIN_PER_BRANCH {
+            return Err(Error::invalid(
+                "version reflog limit",
+                format!("must be between 1 and {REFLOG_RETAIN_PER_BRANCH}"),
+            ));
+        }
+        Ok(self
+            .store
+            .list_reflog(branch)
+            .await?
+            .into_iter()
+            .take(limit)
+            .map(VersionReflogEntry::from)
             .collect())
     }
 
@@ -2545,6 +2786,7 @@ impl VersionRepository {
                 encoded_commit: encoded,
                 idempotency: None,
                 max_bytes: self.max_bytes,
+                reflog_action: VersionReflogAction::Merge,
             })
             .await?;
         Ok(VersionMergeInfo {
@@ -3735,6 +3977,18 @@ fn tag_key(name: &str) -> Vec<u8> {
 
 fn branch_key(name: &str) -> Vec<u8> {
     prefixed_key(BRANCH_PREFIX, name.as_bytes())
+}
+
+fn reflog_branch_prefix(name: &str) -> Vec<u8> {
+    let mut key = prefixed_key(REFLOG_PREFIX, name.as_bytes());
+    key.push(b'/');
+    key
+}
+
+fn reflog_key(name: &str, sequence: u64) -> Vec<u8> {
+    let mut key = reflog_branch_prefix(name);
+    key.extend_from_slice(&sequence.to_be_bytes());
+    key
 }
 
 fn idempotency_key(key_hash: &[u8; 32]) -> Vec<u8> {

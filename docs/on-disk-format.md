@@ -126,6 +126,7 @@ the live VFS request path. Its logical key prefixes are:
 | `pc/<sha256-commit-id>` | 1 | `VersionCommit` |
 | `pi/<sha256-idempotency-key>` | 1 | commit ID and branch-aware canonical request fingerprint |
 | `pr/heads/<name>` | 1 | mutable branch `VersionRef`; `main` is the default commit head |
+| `pr/logs/<name>/<sequence>` | 1 | bounded branch-head transition record; the newest 100 per name are retained |
 | `pr/tags/<name>` | 1 | immutable named commit reference and creation time |
 
 Entry metadata (`m/<canonical-path>`) and file chunk references
