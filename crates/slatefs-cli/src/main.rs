@@ -7,7 +7,7 @@ use std::sync::{Arc, Once};
 use anyhow::Context;
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use slatefs_core::config::{ClientAddrRule, Config};
 use slatefs_core::control::{
     AuditAction, AuditActor, AuditDetailValue, AuditOutcome, AuditPlane, AuditRecord, AuditScope,
@@ -2158,16 +2158,21 @@ fn create_version_attestation(
 }
 
 fn print_version_attestations(
-    reference: &str,
+    tenant: &str,
+    volume: &str,
+    commit: &str,
     attestations: &[VersionCommitAttestation],
     trusted: Option<[u8; 32]>,
 ) -> anyhow::Result<()> {
+    for attestation in attestations {
+        verify_version_attestation(tenant, volume, commit, attestation)?;
+    }
     if let Some(trusted) = trusted
         && !attestations
             .iter()
             .any(|attestation| attestation.public_key() == trusted)
     {
-        anyhow::bail!("commit {reference} has no attestation from the trusted public key");
+        anyhow::bail!("commit {commit} has no attestation from the trusted public key");
     }
     for (index, attestation) in attestations.iter().enumerate() {
         if index > 0 {
@@ -2179,6 +2184,33 @@ fn print_version_attestations(
         );
     }
     Ok(())
+}
+
+fn verify_version_attestation(
+    tenant: &str,
+    volume: &str,
+    commit: &str,
+    attestation: &VersionCommitAttestation,
+) -> anyhow::Result<()> {
+    let public_key: &[u8; 32] = attestation
+        .public_key()
+        .try_into()
+        .context("attestation Ed25519 public key is not 32 bytes")?;
+    let verifying_key = VerifyingKey::from_bytes(public_key)
+        .context("attestation contains an invalid Ed25519 public key")?;
+    let signature = Signature::from_slice(attestation.signature())
+        .context("attestation Ed25519 signature is not 64 bytes")?;
+    let payload = version_commit_attestation_payload(
+        tenant,
+        volume,
+        commit,
+        attestation.key_id(),
+        attestation.public_key(),
+        attestation.created_at(),
+    )?;
+    verifying_key
+        .verify_strict(&payload, &signature)
+        .context("attestation signature verification failed")
 }
 
 async fn run(
@@ -2929,12 +2961,25 @@ async fn run(
                 .map(|path| read_hex_key::<32>(path, "trusted Ed25519 public key"))
                 .transpose()?;
             if *live {
+                let commit_response = live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    "GET",
+                    &format!("commits/{reference}"),
+                    &[],
+                    None,
+                )
+                .await?;
+                let commit: VersionCommitInfo =
+                    serde_json::from_value(commit_response["commit"].clone())
+                        .context("parsing admin version commit")?;
                 let response = live_versioning_json(
                     config,
                     tenant,
                     volume,
                     "GET",
-                    &format!("commits/{reference}/attestations"),
+                    &format!("commits/{}/attestations", commit.id),
                     &[],
                     None,
                 )
@@ -2942,15 +2987,20 @@ async fn run(
                 let attestations: Vec<VersionCommitAttestation> =
                     serde_json::from_value(response["attestations"].clone())
                         .context("parsing admin version commit attestations")?;
-                print_version_attestations(reference, &attestations, trusted)?;
+                print_version_attestations(tenant, volume, &commit.id, &attestations, trusted)?;
                 return Ok(());
             }
             let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
-            let result = repository.list_commit_attestations(reference).await;
+            let result: anyhow::Result<_> = async {
+                let commit = repository.inspect_commit(reference).await?;
+                let attestations = repository.list_commit_attestations(&commit.id).await?;
+                Ok((commit.id, attestations))
+            }
+            .await;
             let close = repository.close().await;
-            let attestations = result?;
+            let (commit, attestations) = result?;
             close?;
-            print_version_attestations(reference, &attestations, trusted)?;
+            print_version_attestations(tenant, volume, &commit, &attestations, trusted)?;
         }
         Command::Versioning(VersioningCmd::Diff {
             tenant,
@@ -4946,6 +4996,40 @@ mod tests {
             0o644
         );
         assert!(version_attestation_keygen(&private_path, &public_path).is_err());
+    }
+
+    #[test]
+    fn trusted_attestation_check_verifies_the_signature_locally() {
+        let signing_key = SigningKey::from_bytes(&[41; 32]);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let commit = "ab".repeat(32);
+        let payload = version_commit_attestation_payload(
+            "tenant-a",
+            "docs",
+            &commit,
+            "release-2026",
+            &public_key,
+            1_700_000_000,
+        )
+        .unwrap();
+        let attestation = VersionCommitAttestation::new_ed25519(
+            "release-2026",
+            public_key,
+            signing_key.sign(&payload).to_bytes(),
+            1_700_000_000,
+        )
+        .unwrap();
+        verify_version_attestation("tenant-a", "docs", &commit, &attestation).unwrap();
+        assert!(verify_version_attestation("tenant-b", "docs", &commit, &attestation).is_err());
+
+        let forged = VersionCommitAttestation::new_ed25519(
+            "release-2026",
+            public_key,
+            [0; 64],
+            1_700_000_000,
+        )
+        .unwrap();
+        assert!(verify_version_attestation("tenant-a", "docs", &commit, &forged).is_err());
     }
 
     #[test]
