@@ -4,17 +4,18 @@ mod common;
 
 use std::sync::Arc;
 
+use ed25519_dalek::{Signer, SigningKey};
 use futures::TryStreamExt;
 use slatefs_core::control::ControlPlane;
 use slatefs_core::error::Error;
 use slatefs_core::meta::inode::ROOT_INO;
 use slatefs_core::store::{self, ObjectStore};
 use slatefs_core::versioning::{
-    VersionCommitOrigin, VersionCommitProvenance, VersionMergeConflictStrategy,
-    VersionPathChangeKind, VersionReflogAction, VersionRepository, VersionRestoreActionKind,
-    VersionRestoreMode, VersionWorkingTreeChangeKind,
+    VersionCommitAttestation, VersionCommitOrigin, VersionCommitProvenance,
+    VersionMergeConflictStrategy, VersionPathChangeKind, VersionReflogAction, VersionRepository,
+    VersionRestoreActionKind, VersionRestoreMode, VersionWorkingTreeChangeKind,
     force_break_expired_version_maintenance_lease, purge_version_history,
-    try_get_version_maintenance_lease,
+    try_get_version_maintenance_lease, version_commit_attestation_payload,
 };
 use slatefs_core::vfs::{Credentials, Vfs};
 use slatefs_core::volume::{self, Volume};
@@ -759,6 +760,147 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         b"ordinary write"
     );
 
+    live.shutdown().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn detached_commit_attestations_are_optional_immutable_and_verified() {
+    let object_store: Arc<dyn ObjectStore> = store::resolve_root("memory:///").unwrap();
+    let control = ControlPlane::open(Arc::clone(&object_store), common::test_kms())
+        .await
+        .unwrap();
+    control.create_tenant("t", None).await.unwrap();
+    let record = volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "v",
+        common::create_opts(None, None),
+    )
+    .await
+    .unwrap();
+    control
+        .set_versioning_enabled("t", "v", true)
+        .await
+        .unwrap();
+    let dek = control.unwrap_volume_dek(&record).await.unwrap();
+    let live = Volume::open(&record, dek, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let creds = Credentials::root();
+    let file = live
+        .create(&creds, ROOT_INO, b"signed.txt", 0o640, true)
+        .await
+        .unwrap();
+    live.write(&creds, file.ino, 0, b"signed contents")
+        .await
+        .unwrap();
+    let repository = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap();
+    let commit = repository
+        .commit_file(
+            live.as_ref(),
+            "/signed.txt",
+            "content to attest".to_string(),
+            test_provenance(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        repository
+            .list_commit_attestations(&commit.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let signing_key = SigningKey::from_bytes(&[7; 32]);
+    let public_key = signing_key.verifying_key().to_bytes();
+    let created_at = 1_700_000_000;
+    let payload = version_commit_attestation_payload(
+        "t",
+        "v",
+        &commit.id,
+        "release-2026",
+        &public_key,
+        created_at,
+    )
+    .unwrap();
+    let attestation = VersionCommitAttestation::new_ed25519(
+        "release-2026",
+        public_key,
+        signing_key.sign(&payload).to_bytes(),
+        created_at,
+    )
+    .unwrap();
+    assert_eq!(
+        repository
+            .add_commit_attestation(&commit.id, attestation.clone())
+            .await
+            .unwrap(),
+        attestation
+    );
+    repository
+        .add_commit_attestation("main", attestation.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        repository.list_commit_attestations("main").await.unwrap(),
+        vec![attestation]
+    );
+    assert_eq!(repository.stats().await.unwrap().attestations, 1);
+    assert_eq!(repository.verify().await.unwrap().attestations, 1);
+
+    let replacement_time = created_at + 1;
+    let replacement_payload = version_commit_attestation_payload(
+        "t",
+        "v",
+        &commit.id,
+        "release-2026",
+        &public_key,
+        replacement_time,
+    )
+    .unwrap();
+    let replacement = VersionCommitAttestation::new_ed25519(
+        "release-2026",
+        public_key,
+        signing_key.sign(&replacement_payload).to_bytes(),
+        replacement_time,
+    )
+    .unwrap();
+    assert!(matches!(
+        repository
+            .add_commit_attestation(&commit.id, replacement)
+            .await,
+        Err(Error::AlreadyExists { .. })
+    ));
+
+    let wrong_payload = version_commit_attestation_payload(
+        "t",
+        "other-volume",
+        &commit.id,
+        "wrong-context",
+        &public_key,
+        created_at,
+    )
+    .unwrap();
+    let wrong_context = VersionCommitAttestation::new_ed25519(
+        "wrong-context",
+        public_key,
+        signing_key.sign(&wrong_payload).to_bytes(),
+        created_at,
+    )
+    .unwrap();
+    assert!(matches!(
+        repository
+            .add_commit_attestation(&commit.id, wrong_context)
+            .await,
+        Err(Error::Invalid { .. })
+    ));
+
+    repository.close().await.unwrap();
     live.shutdown().await.unwrap();
     control.close().await.unwrap();
 }

@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use ed25519_dalek::{Signature, VerifyingKey};
 use prolly::{
     AsyncBlobStore, AsyncProlly, AsyncStore, BatchOp, BlobRef, Cid, Config as ProllyConfig, Diff,
     Mutation, RootManifest, Tree, ValueRef,
@@ -32,6 +33,7 @@ use crate::volume::Volume;
 const NODE_PREFIX: &[u8] = b"pn/";
 const BLOB_PREFIX: &[u8] = b"pb/";
 const COMMIT_PREFIX: &[u8] = b"pc/";
+const ATTESTATION_PREFIX: &[u8] = b"pa/";
 const IDEMPOTENCY_PREFIX: &[u8] = b"pi/";
 const PRUNED_COMMIT_PREFIX: &[u8] = b"pp/";
 const BRANCH_PREFIX: &[u8] = b"pr/heads/";
@@ -41,6 +43,7 @@ const REFLOG_PREFIX: &[u8] = b"pr/logs/";
 const TAG_PREFIX: &[u8] = b"pr/tags/";
 const ENTRY_META_VERSION: u8 = 1;
 const COMMIT_VERSION: u8 = 2;
+const ATTESTATION_VERSION: u8 = 1;
 const IDEMPOTENCY_VERSION: u8 = 1;
 const REF_VERSION: u8 = 1;
 const BRANCH_PROTECTION_VERSION: u8 = 1;
@@ -648,6 +651,92 @@ impl VersionStore {
             .map_err(version_store_error)
     }
 
+    async fn put_attestation(
+        &self,
+        commit: &[u8; 32],
+        attestation: &VersionCommitAttestation,
+        max_bytes: Option<u64>,
+    ) -> Result<()> {
+        let key = attestation_key(commit, attestation.key_id());
+        let encoded = encode_versioned(ATTESTATION_VERSION, attestation)?;
+        if let Some(existing) = self.get_raw(&key).await.map_err(version_store_error)? {
+            let existing: VersionCommitAttestation =
+                decode_versioned(ATTESTATION_VERSION, &existing, "version commit attestation")?;
+            if existing == *attestation {
+                return Ok(());
+            }
+            return Err(Error::already_exists(
+                "version commit attestation key",
+                attestation.key_id(),
+            ));
+        }
+        if let Some(max_bytes) = max_bytes {
+            let mut bytes = 0u64;
+            let mut iter = self.db.scan(..).await?;
+            while let Some(entry) = iter.next().await? {
+                bytes = bytes.saturating_add((entry.key.len() + entry.value.len()) as u64);
+            }
+            let projected = bytes.saturating_add((key.len() + encoded.len()) as u64);
+            if projected > max_bytes {
+                return Err(Error::Versioning(format!(
+                    "version history quota exceeded: {projected} bytes projected, {max_bytes} bytes allowed"
+                )));
+            }
+        }
+        self.db.put_bytes(key.into(), encoded.into()).await?;
+        self.db.flush().await?;
+        Ok(())
+    }
+
+    async fn list_attestations(&self, commit: &[u8; 32]) -> Result<Vec<VersionCommitAttestation>> {
+        let mut iter = self
+            .db
+            .scan_prefix(attestation_commit_prefix(commit), ..)
+            .await?;
+        let mut attestations: Vec<VersionCommitAttestation> = Vec::new();
+        while let Some(entry) = iter.next().await? {
+            let (stored_commit, key_id) = parse_attestation_key(&entry.key)?;
+            if stored_commit != *commit {
+                return Err(Error::Versioning(
+                    "version commit attestation scan crossed a commit boundary".into(),
+                ));
+            }
+            let attestation: VersionCommitAttestation = decode_versioned(
+                ATTESTATION_VERSION,
+                &entry.value,
+                "version commit attestation",
+            )?;
+            if attestation.key_id() != key_id {
+                return Err(Error::Versioning(format!(
+                    "version commit attestation key {key_id} does not match its record"
+                )));
+            }
+            attestations.push(attestation);
+        }
+        attestations.sort_by(|left, right| left.key_id.cmp(&right.key_id));
+        Ok(attestations)
+    }
+
+    async fn all_attestations(&self) -> Result<Vec<([u8; 32], VersionCommitAttestation)>> {
+        let mut iter = self.db.scan_prefix(ATTESTATION_PREFIX, ..).await?;
+        let mut attestations = Vec::new();
+        while let Some(entry) = iter.next().await? {
+            let (commit, key_id) = parse_attestation_key(&entry.key)?;
+            let attestation: VersionCommitAttestation = decode_versioned(
+                ATTESTATION_VERSION,
+                &entry.value,
+                "version commit attestation",
+            )?;
+            if attestation.key_id() != key_id {
+                return Err(Error::Versioning(format!(
+                    "version commit attestation key {key_id} does not match its record"
+                )));
+            }
+            attestations.push((commit, attestation));
+        }
+        Ok(attestations)
+    }
+
     async fn publish_commit(
         &self,
         request: VersionPublishRequest<'_>,
@@ -1208,6 +1297,118 @@ struct VersionCommitBody {
     provenance: VersionCommitProvenance,
 }
 
+/// Signature algorithm used by a detached version commit attestation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum VersionCommitAttestationAlgorithm {
+    Ed25519,
+}
+
+impl VersionCommitAttestationAlgorithm {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ed25519 => "ed25519",
+        }
+    }
+}
+
+/// A detached signature over one immutable version commit and its repository
+/// identity. The private key never enters SlateFS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionCommitAttestation {
+    key_id: String,
+    algorithm: VersionCommitAttestationAlgorithm,
+    public_key: Vec<u8>,
+    signature: Vec<u8>,
+    created_at: u64,
+}
+
+impl VersionCommitAttestation {
+    /// Construct an Ed25519 attestation supplied by an external signer.
+    pub fn new_ed25519(
+        key_id: impl Into<String>,
+        public_key: impl Into<Vec<u8>>,
+        signature: impl Into<Vec<u8>>,
+        created_at: u64,
+    ) -> Result<Self> {
+        let attestation = Self {
+            key_id: key_id.into(),
+            algorithm: VersionCommitAttestationAlgorithm::Ed25519,
+            public_key: public_key.into(),
+            signature: signature.into(),
+            created_at,
+        };
+        validate_version_attestation(&attestation)?;
+        Ok(attestation)
+    }
+
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    pub fn algorithm(&self) -> VersionCommitAttestationAlgorithm {
+        self.algorithm
+    }
+
+    pub fn public_key(&self) -> &[u8] {
+        &self.public_key
+    }
+
+    pub fn signature(&self) -> &[u8] {
+        &self.signature
+    }
+
+    pub fn created_at(&self) -> u64 {
+        self.created_at
+    }
+}
+
+#[derive(Serialize)]
+struct VersionCommitAttestationStatement<'a> {
+    version: u8,
+    tenant: &'a str,
+    volume: &'a str,
+    commit: [u8; 32],
+    key_id: &'a str,
+    algorithm: VersionCommitAttestationAlgorithm,
+    public_key: &'a [u8],
+    created_at: u64,
+}
+
+/// Build the canonical bytes an external Ed25519 signer must sign.
+pub fn version_commit_attestation_payload(
+    tenant: &str,
+    volume: &str,
+    commit: &str,
+    key_id: &str,
+    public_key: &[u8],
+    created_at: u64,
+) -> Result<Vec<u8>> {
+    store::validate_name("tenant name", tenant)?;
+    store::validate_name("volume name", volume)?;
+    validate_version_attestation_key_id(key_id)?;
+    if public_key.len() != 32 {
+        return Err(Error::invalid(
+            "version commit attestation public key",
+            "Ed25519 public keys must contain exactly 32 bytes",
+        ));
+    }
+    let commit = parse_commit_id(commit)?;
+    postcard::to_allocvec(&VersionCommitAttestationStatement {
+        version: 1,
+        tenant,
+        volume,
+        commit,
+        key_id,
+        algorithm: VersionCommitAttestationAlgorithm::Ed25519,
+        public_key,
+        created_at,
+    })
+    .map_err(Into::into)
+}
+
 struct VersionCommitOperation<'a> {
     branch: &'a str,
     paths: &'a [String],
@@ -1678,12 +1879,14 @@ pub struct VersionStoreStats {
     pub nodes: u64,
     pub blobs: u64,
     pub commits: u64,
+    pub attestations: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VersionGcReport {
     pub retained_commits: u64,
     pub deleted_commits: u64,
+    pub deleted_attestations: u64,
     pub deleted_nodes: u64,
     pub deleted_blobs: u64,
     pub reclaimed_bytes: u64,
@@ -1693,6 +1896,7 @@ pub struct VersionGcReport {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionVerifyReport {
     pub commits: u64,
+    pub attestations: u64,
     pub nodes: u64,
     pub node_bytes: u64,
     pub blobs: u64,
@@ -1956,6 +2160,8 @@ impl From<VersionCommit> for VersionCommitInfo {
 pub struct VersionRepository {
     store: VersionStore,
     prolly: AsyncProlly<VersionStore>,
+    tenant: String,
+    volume: String,
     max_bytes: Option<u64>,
     chunk_size: u64,
     maintenance: VersionMaintenanceGuard,
@@ -2178,6 +2384,8 @@ impl VersionRepository {
         Ok(Self {
             store,
             prolly,
+            tenant: record.tenant.clone(),
+            volume: record.name.clone(),
             max_bytes,
             chunk_size: u64::from(record.chunk_size),
             maintenance,
@@ -2204,6 +2412,8 @@ impl VersionRepository {
                 stats.blobs += 1;
             } else if entry.key.starts_with(COMMIT_PREFIX) {
                 stats.commits += 1;
+            } else if entry.key.starts_with(ATTESTATION_PREFIX) {
+                stats.attestations += 1;
             }
         }
         Ok(stats)
@@ -2297,6 +2507,18 @@ impl VersionRepository {
             commits += 1;
         }
 
+        let attestations = self.store.all_attestations().await?;
+        for (commit, attestation) in &attestations {
+            if self.store.try_get_commit(commit).await?.is_none() {
+                return Err(Error::Versioning(format!(
+                    "version commit attestation {} references missing commit {}",
+                    attestation.key_id(),
+                    hex::encode(commit)
+                )));
+            }
+            verify_version_commit_attestation(&self.tenant, &self.volume, commit, attestation)?;
+        }
+
         let nodes = self
             .prolly
             .mark_reachable(&trees)
@@ -2321,6 +2543,7 @@ impl VersionRepository {
         }
         Ok(VersionVerifyReport {
             commits,
+            attestations: attestations.len() as u64,
             nodes: nodes.live_nodes as u64,
             node_bytes: nodes.live_bytes as u64,
             blobs: blobs.live_blob_count as u64,
@@ -2494,6 +2717,14 @@ impl VersionRepository {
                     }
                     true
                 }
+            } else if key.starts_with(ATTESTATION_PREFIX) {
+                let (commit, _) = parse_attestation_key(key)?;
+                if retained_ids.contains(commit.as_slice()) {
+                    false
+                } else {
+                    report.deleted_attestations += 1;
+                    true
+                }
             } else if key.starts_with(IDEMPOTENCY_PREFIX) {
                 let record: VersionCommitIdempotencyRecord = decode_versioned(
                     IDEMPOTENCY_VERSION,
@@ -2513,7 +2744,13 @@ impl VersionRepository {
                 }
             }
         }
-        if !dry_run && (report.deleted_nodes + report.deleted_blobs + report.deleted_commits > 0) {
+        if !dry_run
+            && (report.deleted_nodes
+                + report.deleted_blobs
+                + report.deleted_commits
+                + report.deleted_attestations
+                > 0)
+        {
             self.store.db.write(deletions).await?;
             self.store.db.flush().await?;
             self.prolly.clear_cache();
@@ -3567,6 +3804,30 @@ impl VersionRepository {
         Ok(self.resolve_commit(reference).await?.into())
     }
 
+    /// Verify and immutably attach an externally produced signature to a
+    /// commit. Repeating the identical attestation is idempotent.
+    pub async fn add_commit_attestation(
+        &self,
+        reference: &str,
+        attestation: VersionCommitAttestation,
+    ) -> Result<VersionCommitAttestation> {
+        let commit = self.resolve_commit(reference).await?;
+        verify_version_commit_attestation(&self.tenant, &self.volume, &commit.id, &attestation)?;
+        self.store
+            .put_attestation(&commit.id, &attestation, self.max_bytes)
+            .await?;
+        Ok(attestation)
+    }
+
+    /// List detached signatures attached to a commit, ordered by key ID.
+    pub async fn list_commit_attestations(
+        &self,
+        reference: &str,
+    ) -> Result<Vec<VersionCommitAttestation>> {
+        let commit = self.resolve_commit(reference).await?;
+        self.store.list_attestations(&commit.id).await
+    }
+
     /// Compare a live filesystem subtree with a commit, tag, or branch without
     /// modifying either side. The root path `/` compares every live path with
     /// every path tracked by the referenced tree.
@@ -4587,6 +4848,37 @@ fn commit_key(id: &[u8; 32]) -> Vec<u8> {
     prefixed_key(COMMIT_PREFIX, id)
 }
 
+fn attestation_commit_prefix(id: &[u8; 32]) -> Vec<u8> {
+    let mut key = prefixed_key(ATTESTATION_PREFIX, id);
+    key.push(b'/');
+    key
+}
+
+fn attestation_key(id: &[u8; 32], key_id: &str) -> Vec<u8> {
+    let mut key = attestation_commit_prefix(id);
+    key.extend_from_slice(key_id.as_bytes());
+    key
+}
+
+fn parse_attestation_key(key: &[u8]) -> Result<([u8; 32], &str)> {
+    let suffix = key.strip_prefix(ATTESTATION_PREFIX).ok_or_else(|| {
+        Error::Versioning("version commit attestation has an invalid key prefix".into())
+    })?;
+    let (commit, key_id) = suffix.split_at_checked(32).ok_or_else(|| {
+        Error::Versioning("version commit attestation has a truncated key".into())
+    })?;
+    let key_id = key_id.strip_prefix(b"/").ok_or_else(|| {
+        Error::Versioning("version commit attestation key is missing its separator".into())
+    })?;
+    let commit = commit.try_into().map_err(|_| {
+        Error::Versioning("version commit attestation has an invalid commit ID".into())
+    })?;
+    let key_id = std::str::from_utf8(key_id)
+        .map_err(|_| Error::Versioning("version commit attestation key ID is not UTF-8".into()))?;
+    validate_version_attestation_key_id(key_id)?;
+    Ok((commit, key_id))
+}
+
 fn tag_key(name: &str) -> Vec<u8> {
     prefixed_key(TAG_PREFIX, name.as_bytes())
 }
@@ -4637,6 +4929,68 @@ fn commit_id_string(id: &[u8; 32]) -> String {
 
 fn validate_version_tag_name(name: &str) -> Result<()> {
     validate_version_named_ref("version tag", name)
+}
+
+fn validate_version_attestation_key_id(key_id: &str) -> Result<()> {
+    validate_version_named_ref("version commit attestation key ID", key_id)
+}
+
+fn validate_version_attestation(attestation: &VersionCommitAttestation) -> Result<()> {
+    validate_version_attestation_key_id(attestation.key_id())?;
+    match attestation.algorithm() {
+        VersionCommitAttestationAlgorithm::Ed25519 => {
+            if attestation.public_key().len() != 32 {
+                return Err(Error::invalid(
+                    "version commit attestation public key",
+                    "Ed25519 public keys must contain exactly 32 bytes",
+                ));
+            }
+            if attestation.signature().len() != 64 {
+                return Err(Error::invalid(
+                    "version commit attestation signature",
+                    "Ed25519 signatures must contain exactly 64 bytes",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_version_commit_attestation(
+    tenant: &str,
+    volume: &str,
+    commit: &[u8; 32],
+    attestation: &VersionCommitAttestation,
+) -> Result<()> {
+    validate_version_attestation(attestation)?;
+    let public_key: &[u8; 32] = attestation.public_key().try_into().map_err(|_| {
+        Error::invalid(
+            "version commit attestation public key",
+            "Ed25519 public keys must contain exactly 32 bytes",
+        )
+    })?;
+    let verifying_key = VerifyingKey::from_bytes(public_key).map_err(|error| {
+        Error::invalid("version commit attestation public key", error.to_string())
+    })?;
+    let signature = Signature::from_slice(attestation.signature()).map_err(|error| {
+        Error::invalid("version commit attestation signature", error.to_string())
+    })?;
+    let payload = version_commit_attestation_payload(
+        tenant,
+        volume,
+        &hex::encode(commit),
+        attestation.key_id(),
+        attestation.public_key(),
+        attestation.created_at(),
+    )?;
+    verifying_key
+        .verify_strict(&payload, &signature)
+        .map_err(|_| {
+            Error::invalid(
+                "version commit attestation",
+                "signature verification failed",
+            )
+        })
 }
 
 fn validate_version_branch_name(name: &str) -> Result<()> {
