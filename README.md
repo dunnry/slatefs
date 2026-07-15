@@ -164,7 +164,9 @@ publications to exact committer identities. An empty allowlist permits any
 committer. Repeatable `--allow-manager <identity>` arguments independently
 restrict live policy changes and removal; an empty manager list permits any
 authorized live operator. Successful and denied live policy changes are
-durably audited with both identity lists, but never bearer tokens.
+durably audited with both identity lists. Denied protected-branch commits and
+merges also record their server-derived author/committer and target metadata,
+but never messages, file contents, or bearer tokens.
 `unprotect-branch --yes` removes that guard. `versioning reflog <branch>` lists
 the newest 100 head
 transitions even after branch deletion. Every create, commit, fast-forward,

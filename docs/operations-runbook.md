@@ -248,6 +248,9 @@ management returns HTTP `403`. Removing the guard requires
 Successful changes record the normalized policy, and denied manager attempts
 record the requested policy with a `Denied` outcome. Audit records contain
 identity names and the server-derived actor, never bearer tokens.
+Denied protected-branch publications likewise record a `Denied` commit or
+merge event with the branch, selected paths or merge endpoints, author, and
+committer. They do not record the commit message or file contents.
 
 Live commit and divergent-merge provenance records the authenticated admin or
 tenant principal as committer and the HTTP request ID for audit correlation.

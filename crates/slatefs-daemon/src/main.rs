@@ -1564,6 +1564,14 @@ fn version_merge_error(error: slatefs_core::error::Error) -> AdminError {
     core_error(error)
 }
 
+fn is_version_publication_authorization_error(error: &slatefs_core::error::Error) -> bool {
+    matches!(
+        error,
+        slatefs_core::error::Error::Invalid { what, .. }
+            if *what == "version branch authorization"
+    )
+}
+
 fn version_restore_error(error: slatefs_core::error::Error) -> AdminError {
     if matches!(&error, slatefs_core::error::Error::Versioning(message) if message.contains("restore preview is stale"))
     {
@@ -2012,6 +2020,8 @@ async fn commit_live_version_response(
         author,
     } = body.normalize()?;
     let provenance = admin_commit_provenance(request, author)?;
+    let attempted_author = provenance.author().to_string();
+    let attempted_committer = provenance.committer().to_string();
     let target = live_filesystem_target(state, tenant, volume)?;
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
@@ -2084,6 +2094,41 @@ async fn commit_live_version_response(
                         ),
                     ),
                     ("replayed".to_string(), AuditDetailValue::Bool(*replayed)),
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(branch.clone()),
+                    ),
+                ],
+            )
+            .await
+        }
+        Err(error) if is_version_publication_authorization_error(error) => {
+            append_version_audit_with_outcome(
+                &control,
+                request,
+                AuditAction::VersionCommit,
+                tenant,
+                volume,
+                AuditOutcome::Denied,
+                [
+                    (
+                        "author".to_string(),
+                        AuditDetailValue::String(attempted_author),
+                    ),
+                    (
+                        "committer".to_string(),
+                        AuditDetailValue::String(attempted_committer),
+                    ),
+                    (
+                        "paths".to_string(),
+                        AuditDetailValue::Array(
+                            paths
+                                .iter()
+                                .cloned()
+                                .map(AuditDetailValue::String)
+                                .collect(),
+                        ),
+                    ),
                     (
                         "branch".to_string(),
                         AuditDetailValue::String(branch.clone()),
@@ -2906,6 +2951,8 @@ async fn merge_version_branch_response(
 ) -> Result<AdminHttpResponse, AdminError> {
     let body: VersionBranchMergeRequest = parse_json_body(request)?;
     let provenance = admin_commit_provenance(request, body.author.clone())?;
+    let attempted_author = provenance.author().to_string();
+    let attempted_committer = provenance.committer().to_string();
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
     let (control, repository) = open_version_repository(state, tenant, volume).await?;
@@ -2944,6 +2991,43 @@ async fn merge_version_branch_response(
                     (
                         "fast_forward".to_string(),
                         AuditDetailValue::Bool(merge.fast_forward()),
+                    ),
+                ],
+            )
+            .await
+        }
+        Err(error) if is_version_publication_authorization_error(error) => {
+            append_version_audit_with_outcome(
+                &control,
+                request,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                AuditOutcome::Denied,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-branch-merge".to_string()),
+                    ),
+                    (
+                        "source".to_string(),
+                        AuditDetailValue::String(body.source.clone()),
+                    ),
+                    (
+                        "target".to_string(),
+                        AuditDetailValue::String(target.to_string()),
+                    ),
+                    (
+                        "conflict_strategy".to_string(),
+                        AuditDetailValue::String(body.conflict_strategy.as_str().to_string()),
+                    ),
+                    (
+                        "author".to_string(),
+                        AuditDetailValue::String(attempted_author),
+                    ),
+                    (
+                        "committer".to_string(),
+                        AuditDetailValue::String(attempted_committer),
                     ),
                 ],
             )
@@ -8054,7 +8138,7 @@ mod tests {
         let branch_commit_body =
             r#"{"path":"/notes.txt","message":"release update","branch":"release"}"#;
         let branch_commit_request = format!(
-            "POST /admin/v1/tenants/t/volumes/v/versioning/commits HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            "POST /admin/v1/tenants/t/volumes/v/versioning/commits HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: release-commit-attempt\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             branch_commit_body.len(),
             branch_commit_body
         );
@@ -8065,6 +8149,32 @@ mod tests {
             403,
             "{denied_branch_commit}"
         );
+        let main_commit_body =
+            r#"{"path":"/notes.txt","message":"advance main before protected merge"}"#;
+        let main_commit_request = format!(
+            "POST /admin/v1/tenants/t/volumes/v/versioning/commits HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: protected-merge-source\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            main_commit_body.len(),
+            main_commit_body
+        );
+        let main_commit_response =
+            admin_exchange(Arc::clone(&state), main_commit_request.as_bytes()).await;
+        assert_eq!(
+            response_status(&main_commit_response),
+            201,
+            "{main_commit_response}"
+        );
+        let main_commit: Value =
+            serde_json::from_str(response_body(&main_commit_response)).unwrap();
+        assert_eq!(main_commit["branch"], "main");
+        let protected_merge_body = r#"{"source":"main"}"#;
+        let protected_merge_request = format!(
+            "POST /admin/v1/tenants/t/volumes/v/versioning/branches/release/merge HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: denied-release-merge\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            protected_merge_body.len(),
+            protected_merge_body
+        );
+        let denied_merge =
+            admin_exchange(Arc::clone(&state), protected_merge_request.as_bytes()).await;
+        assert_eq!(response_status(&denied_merge), 403, "{denied_merge}");
         let authorize_body = r#"{"allowed_committers":["admin:unauthenticated"],"allowed_managers":["admin:unauthenticated"]}"#;
         let authorize_request = format!(
             "PUT /admin/v1/tenants/t/volumes/v/versioning/branches/release/protection HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -8078,6 +8188,24 @@ mod tests {
             200,
             "{authorize_response}"
         );
+        let protected_merge_response =
+            admin_exchange(Arc::clone(&state), protected_merge_request.as_bytes()).await;
+        assert_eq!(
+            response_status(&protected_merge_response),
+            200,
+            "{protected_merge_response}"
+        );
+        let protected_merge: Value =
+            serde_json::from_str(response_body(&protected_merge_response)).unwrap();
+        assert_eq!(protected_merge["merge"]["fast_forward"], true);
+        assert_eq!(
+            protected_merge["merge"]["commit"],
+            main_commit["commit"]["id"]
+        );
+        volume
+            .write(&creds, file.ino, 0, b"release branch update")
+            .await
+            .unwrap();
         let branch_commit_response =
             admin_exchange(Arc::clone(&state), branch_commit_request.as_bytes()).await;
         assert_eq!(
@@ -8088,7 +8216,10 @@ mod tests {
         let branch_commit: Value =
             serde_json::from_str(response_body(&branch_commit_response)).unwrap();
         assert_eq!(branch_commit["branch"], "release");
-        assert_eq!(branch_commit["commit"]["parents"][0], commit_id);
+        assert_eq!(
+            branch_commit["commit"]["parents"][0],
+            main_commit["commit"]["id"]
+        );
         let inspected = admin_exchange(
             Arc::clone(&state),
             b"GET /admin/v1/tenants/t/volumes/v/versioning/commits/release HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -8097,7 +8228,10 @@ mod tests {
         assert_eq!(response_status(&inspected), 200, "{inspected}");
         let inspected: Value = serde_json::from_str(response_body(&inspected)).unwrap();
         assert_eq!(inspected["commit"]["id"], branch_commit["commit"]["id"]);
-        assert_eq!(inspected["commit"]["parents"][0], commit_id);
+        assert_eq!(
+            inspected["commit"]["parents"][0],
+            main_commit["commit"]["id"]
+        );
         assert_eq!(inspected["commit"]["provenance"]["origin"], "admin");
         assert_ne!(branch_commit["commit"]["id"], commit_id);
         let branch_history_response = admin_exchange(
@@ -8112,7 +8246,7 @@ mod tests {
         );
         let branch_history: Value =
             serde_json::from_str(response_body(&branch_history_response)).unwrap();
-        assert_eq!(branch_history["commits"].as_array().unwrap().len(), 2);
+        assert_eq!(branch_history["commits"].as_array().unwrap().len(), 3);
         assert_eq!(
             branch_history["commits"][0]["id"],
             branch_commit["commit"]["id"]
@@ -8193,8 +8327,13 @@ mod tests {
             "{history_response}"
         );
         let history: Value = serde_json::from_str(response_body(&history_response)).unwrap();
-        assert_eq!(history["commits"][0]["id"], commit_id);
-        assert_eq!(history["commits"][0]["provenance"]["author"], "Alice");
+        assert_eq!(history["commits"][0]["id"], main_commit["commit"]["id"]);
+        assert_eq!(
+            history["commits"][0]["provenance"]["author"],
+            "admin:unauthenticated"
+        );
+        assert_eq!(history["commits"][1]["id"], commit_id);
+        assert_eq!(history["commits"][1]["provenance"]["author"], "Alice");
         assert!(history["next_page_token"].is_null());
 
         let content_request = format!(
@@ -8303,7 +8442,7 @@ mod tests {
         .await;
         assert_eq!(response_status(&stats_response), 200, "{stats_response}");
         let stats: Value = serde_json::from_str(response_body(&stats_response)).unwrap();
-        assert_eq!(stats["stats"]["commits"], 2);
+        assert_eq!(stats["stats"]["commits"], 3);
 
         let verify_response = admin_exchange(
             Arc::clone(&state),
@@ -8312,7 +8451,7 @@ mod tests {
         .await;
         assert_eq!(response_status(&verify_response), 200, "{verify_response}");
         let verify: Value = serde_json::from_str(response_body(&verify_response)).unwrap();
-        assert_eq!(verify["verify"]["commits"], 2);
+        assert_eq!(verify["verify"]["commits"], 3);
         assert!(verify["verify"]["nodes"].as_u64().unwrap() > 0);
         assert!(verify["verify"]["blobs"].as_u64().unwrap() > 0);
 
@@ -8326,7 +8465,7 @@ mod tests {
         assert_eq!(response_status(&gc_response), 200, "{gc_response}");
         let gc: Value = serde_json::from_str(response_body(&gc_response)).unwrap();
         assert_eq!(gc["gc"]["dry_run"], true);
-        assert_eq!(gc["gc"]["retained_commits"], 2);
+        assert_eq!(gc["gc"]["retained_commits"], 3);
         assert_eq!(gc["gc"]["deleted_commits"], 0);
         let delete_branch_response = admin_exchange(
             Arc::clone(&state),
@@ -8418,7 +8557,7 @@ mod tests {
         let metrics = render_daemon_metrics_with_exports(&[], &state.export_metrics);
         assert!(
             metrics.contains(
-                "slatefs_version_operations_total{tenant=\"t\",volume=\"v\",operation=\"commit\"} 3"
+                "slatefs_version_operations_total{tenant=\"t\",volume=\"v\",operation=\"commit\"} 4"
             ),
             "{metrics}"
         );
@@ -8444,14 +8583,60 @@ mod tests {
                 .await
                 .unwrap();
             let expected = if action == AuditAction::VersionCommit {
-                3
+                5
             } else if action == AuditAction::Maintain {
-                13
+                15
             } else {
                 1
             };
             assert_eq!(records.len(), expected);
+            if action == AuditAction::VersionCommit {
+                let denied = records
+                    .iter()
+                    .find(|record| {
+                        record.request_id == "release-commit-attempt"
+                            && record.outcome == AuditOutcome::Denied
+                    })
+                    .expect("denied protected branch commit audit");
+                assert_eq!(
+                    denied.details.get("branch"),
+                    Some(&AuditDetailValue::String("release".to_string()))
+                );
+                assert_eq!(
+                    denied.details.get("committer"),
+                    Some(&AuditDetailValue::String(
+                        "admin:unauthenticated".to_string()
+                    ))
+                );
+                assert_eq!(
+                    denied.details.get("paths"),
+                    Some(&AuditDetailValue::Array(vec![AuditDetailValue::String(
+                        "/notes.txt".to_string()
+                    )]))
+                );
+            }
             if action == AuditAction::Maintain {
+                let denied_merge = records
+                    .iter()
+                    .find(|record| {
+                        record.request_id == "denied-release-merge"
+                            && record.outcome == AuditOutcome::Denied
+                    })
+                    .expect("denied protected branch merge audit");
+                assert_eq!(
+                    denied_merge.details.get("source"),
+                    Some(&AuditDetailValue::String("main".to_string()))
+                );
+                assert_eq!(
+                    denied_merge.details.get("target"),
+                    Some(&AuditDetailValue::String("release".to_string()))
+                );
+                assert_eq!(
+                    denied_merge.details.get("committer"),
+                    Some(&AuditDetailValue::String(
+                        "admin:unauthenticated".to_string()
+                    ))
+                );
                 let protected = records
                     .iter()
                     .find(|record| record.request_id == "protect-policy")
