@@ -543,9 +543,7 @@ impl VersionStore {
         &self,
         name: &str,
         protected: bool,
-        allowed_committers: &[String],
-        allowed_managers: &[String],
-        trusted_attestation_keys: &[VersionTrustedAttestationKey],
+        policy: &VersionBranchProtectionPolicy,
         manager: Option<&str>,
     ) -> Result<VersionRef> {
         let _guard = self.ref_lock.lock().await;
@@ -557,16 +555,17 @@ impl VersionStore {
             self.authorize_branch_policy_manager(name, manager).await?;
         }
         if protected
-            && !trusted_attestation_keys.is_empty()
-            && !self
-                .commit_has_trusted_attestation(&reference.commit_id, trusted_attestation_keys)
+            && self
+                .trusted_attestation_count(&reference.commit_id, &policy.trusted_attestation_keys)
                 .await?
+                < policy.required_attestations as usize
         {
             return Err(Error::invalid(
                 "version branch protection",
                 format!(
-                    "branch {name} head {} has no attestation from a trusted key",
-                    hex::encode(reference.commit_id)
+                    "branch {name} head {} does not have the required {} trusted attestations",
+                    hex::encode(reference.commit_id),
+                    policy.required_attestations,
                 ),
             ));
         }
@@ -575,9 +574,10 @@ impl VersionStore {
             let protection = VersionBranchProtection {
                 branch: name.to_string(),
                 protected_at: crate::control::now_unix(),
-                allowed_committers: allowed_committers.to_vec(),
-                allowed_managers: allowed_managers.to_vec(),
-                trusted_attestation_keys: trusted_attestation_keys.to_vec(),
+                allowed_committers: policy.allowed_committers.clone(),
+                allowed_managers: policy.allowed_managers.clone(),
+                trusted_attestation_keys: policy.trusted_attestation_keys.clone(),
+                required_attestations: policy.required_attestations,
             };
             self.db
                 .put_bytes(
@@ -625,35 +625,39 @@ impl VersionStore {
                 ),
             ));
         }
-        if !protection.trusted_attestation_keys.is_empty()
-            && !self
-                .commit_has_trusted_attestation(commit, &protection.trusted_attestation_keys)
-                .await?
+        if self
+            .trusted_attestation_count(commit, &protection.trusted_attestation_keys)
+            .await?
+            < protection.required_attestations as usize
         {
             return Err(Error::invalid(
                 "version branch attestation authorization",
                 format!(
-                    "commit {} has no attestation trusted by protected branch {name}",
-                    hex::encode(commit)
+                    "commit {} does not have the {} trusted attestations required by protected branch {name}",
+                    hex::encode(commit),
+                    protection.required_attestations,
                 ),
             ));
         }
         Ok(())
     }
 
-    async fn commit_has_trusted_attestation(
+    async fn trusted_attestation_count(
         &self,
         commit: &[u8; 32],
         trusted_keys: &[VersionTrustedAttestationKey],
-    ) -> Result<bool> {
+    ) -> Result<usize> {
         let attestations = self.list_attestations(commit).await?;
-        Ok(attestations.iter().any(|attestation| {
-            trusted_keys.iter().any(|trusted| {
-                trusted.key_id() == attestation.key_id()
-                    && trusted.algorithm() == attestation.algorithm()
-                    && trusted.public_key() == attestation.public_key()
+        Ok(attestations
+            .iter()
+            .filter(|attestation| {
+                trusted_keys.iter().any(|trusted| {
+                    trusted.key_id() == attestation.key_id()
+                        && trusted.algorithm() == attestation.algorithm()
+                        && trusted.public_key() == attestation.public_key()
+                })
             })
-        }))
+            .count())
     }
 
     async fn authorize_branch_policy_manager(&self, name: &str, manager: &str) -> Result<()> {
@@ -1420,6 +1424,57 @@ pub struct VersionTrustedAttestationKey {
     public_key: Vec<u8>,
 }
 
+/// Complete authorization policy for a protected version branch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct VersionBranchProtectionPolicy {
+    allowed_committers: Vec<String>,
+    allowed_managers: Vec<String>,
+    trusted_attestation_keys: Vec<VersionTrustedAttestationKey>,
+    required_attestations: u32,
+}
+
+impl VersionBranchProtectionPolicy {
+    pub fn new(
+        allowed_committers: &[String],
+        allowed_managers: &[String],
+        trusted_attestation_keys: &[VersionTrustedAttestationKey],
+        required_attestations: u32,
+    ) -> Result<Self> {
+        let trusted_attestation_keys =
+            normalize_trusted_attestation_keys(trusted_attestation_keys)?;
+        validate_required_attestations(&trusted_attestation_keys, required_attestations)?;
+        Ok(Self {
+            allowed_committers: normalize_branch_identities(
+                "version branch allowed committers",
+                allowed_committers,
+            )?,
+            allowed_managers: normalize_branch_identities(
+                "version branch allowed managers",
+                allowed_managers,
+            )?,
+            trusted_attestation_keys,
+            required_attestations,
+        })
+    }
+
+    pub fn allowed_committers(&self) -> &[String] {
+        &self.allowed_committers
+    }
+
+    pub fn allowed_managers(&self) -> &[String] {
+        &self.allowed_managers
+    }
+
+    pub fn trusted_attestation_keys(&self) -> &[VersionTrustedAttestationKey] {
+        &self.trusted_attestation_keys
+    }
+
+    pub fn required_attestations(&self) -> u32 {
+        self.required_attestations
+    }
+}
+
 impl VersionTrustedAttestationKey {
     pub fn new_ed25519(key_id: impl Into<String>, public_key: impl Into<Vec<u8>>) -> Result<Self> {
         let key = Self {
@@ -1519,6 +1574,7 @@ struct VersionBranchProtection {
     allowed_committers: Vec<String>,
     allowed_managers: Vec<String>,
     trusted_attestation_keys: Vec<VersionTrustedAttestationKey>,
+    required_attestations: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1630,6 +1686,7 @@ pub struct VersionBranchInfo {
     allowed_committers: Vec<String>,
     allowed_managers: Vec<String>,
     trusted_attestation_keys: Vec<VersionTrustedAttestationKey>,
+    required_attestations: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1837,6 +1894,10 @@ impl VersionBranchInfo {
 
     pub fn trusted_attestation_keys(&self) -> &[VersionTrustedAttestationKey] {
         &self.trusted_attestation_keys
+    }
+
+    pub fn required_attestations(&self) -> u32 {
+        self.required_attestations
     }
 }
 
@@ -2527,16 +2588,18 @@ impl VersionRepository {
                 .expect("protected branch was checked above");
             let trusted_keys =
                 normalize_trusted_attestation_keys(&protection.trusted_attestation_keys)?;
-            if !trusted_keys.is_empty()
-                && !self
-                    .store
-                    .commit_has_trusted_attestation(&branch.commit_id, &trusted_keys)
-                    .await?
+            validate_required_attestations(&trusted_keys, protection.required_attestations)?;
+            if self
+                .store
+                .trusted_attestation_count(&branch.commit_id, &trusted_keys)
+                .await?
+                < protection.required_attestations as usize
             {
                 return Err(Error::Versioning(format!(
-                    "protected version branch {} head {} has no trusted attestation",
+                    "protected version branch {} head {} does not satisfy its {}-signature quorum",
                     protection.branch,
-                    hex::encode(branch.commit_id)
+                    hex::encode(branch.commit_id),
+                    protection.required_attestations,
                 )));
             }
         }
@@ -3354,6 +3417,7 @@ impl VersionRepository {
             allowed_committers: Vec::new(),
             allowed_managers: Vec::new(),
             trusted_attestation_keys: Vec::new(),
+            required_attestations: 0,
         })
     }
 
@@ -3370,6 +3434,7 @@ impl VersionRepository {
                         protection.allowed_committers,
                         protection.allowed_managers,
                         protection.trusted_attestation_keys,
+                        protection.required_attestations,
                     ),
                 )
             })
@@ -3380,8 +3445,12 @@ impl VersionRepository {
             .await?
             .into_iter()
             .map(|(name, reference)| {
-                let (allowed_committers, allowed_managers, trusted_attestation_keys) =
-                    protections.get(&name).cloned().unwrap_or_default();
+                let (
+                    allowed_committers,
+                    allowed_managers,
+                    trusted_attestation_keys,
+                    required_attestations,
+                ) = protections.get(&name).cloned().unwrap_or_default();
                 VersionBranchInfo {
                     protected: protections.contains_key(&name),
                     name,
@@ -3389,6 +3458,7 @@ impl VersionRepository {
                     allowed_committers,
                     allowed_managers,
                     trusted_attestation_keys,
+                    required_attestations,
                 }
             })
             .collect())
@@ -3402,19 +3472,10 @@ impl VersionRepository {
         &self,
         name: &str,
         protected: bool,
-        allowed_committers: &[String],
-        allowed_managers: &[String],
-        trusted_attestation_keys: &[VersionTrustedAttestationKey],
+        policy: &VersionBranchProtectionPolicy,
     ) -> Result<VersionBranchInfo> {
-        self.set_branch_protection(
-            name,
-            protected,
-            allowed_committers,
-            allowed_managers,
-            trusted_attestation_keys,
-            None,
-        )
-        .await
+        self.set_branch_protection(name, protected, policy, None)
+            .await
     }
 
     /// Change branch protection as a server-derived policy manager. Existing
@@ -3423,63 +3484,39 @@ impl VersionRepository {
         &self,
         name: &str,
         protected: bool,
-        allowed_committers: &[String],
-        allowed_managers: &[String],
-        trusted_attestation_keys: &[VersionTrustedAttestationKey],
+        policy: &VersionBranchProtectionPolicy,
         manager: &str,
     ) -> Result<VersionBranchInfo> {
         validate_version_identity("version branch policy manager", manager)?;
-        self.set_branch_protection(
-            name,
-            protected,
-            allowed_committers,
-            allowed_managers,
-            trusted_attestation_keys,
-            Some(manager),
-        )
-        .await
+        self.set_branch_protection(name, protected, policy, Some(manager))
+            .await
     }
 
     async fn set_branch_protection(
         &self,
         name: &str,
         protected: bool,
-        allowed_committers: &[String],
-        allowed_managers: &[String],
-        trusted_attestation_keys: &[VersionTrustedAttestationKey],
+        policy: &VersionBranchProtectionPolicy,
         manager: Option<&str>,
     ) -> Result<VersionBranchInfo> {
         validate_version_branch_name(name)?;
-        let (allowed_committers, allowed_managers, trusted_attestation_keys) = if protected {
-            (
-                normalize_branch_identities(
-                    "version branch allowed committers",
-                    allowed_committers,
-                )?,
-                normalize_branch_identities("version branch allowed managers", allowed_managers)?,
-                normalize_trusted_attestation_keys(trusted_attestation_keys)?,
-            )
+        let policy = if protected {
+            policy.clone()
         } else {
-            (Vec::new(), Vec::new(), Vec::new())
+            VersionBranchProtectionPolicy::default()
         };
         let reference = self
             .store
-            .set_branch_protected(
-                name,
-                protected,
-                &allowed_committers,
-                &allowed_managers,
-                &trusted_attestation_keys,
-                manager,
-            )
+            .set_branch_protected(name, protected, &policy, manager)
             .await?;
         Ok(VersionBranchInfo {
             name: name.to_string(),
             commit: hex::encode(reference.commit_id),
             protected,
-            allowed_committers,
-            allowed_managers,
-            trusted_attestation_keys,
+            allowed_committers: policy.allowed_committers,
+            allowed_managers: policy.allowed_managers,
+            trusted_attestation_keys: policy.trusted_attestation_keys,
+            required_attestations: policy.required_attestations,
         })
     }
 
@@ -3542,6 +3579,7 @@ impl VersionRepository {
             allowed_committers: Vec::new(),
             allowed_managers: Vec::new(),
             trusted_attestation_keys: Vec::new(),
+            required_attestations: 0,
         })
     }
 
@@ -5251,6 +5289,31 @@ fn normalize_trusted_attestation_keys(
     }
     normalized.dedup();
     Ok(normalized)
+}
+
+fn validate_required_attestations(
+    trusted_keys: &[VersionTrustedAttestationKey],
+    required_attestations: u32,
+) -> Result<()> {
+    if trusted_keys.is_empty() {
+        if required_attestations != 0 {
+            return Err(Error::invalid(
+                "version branch attestation quorum",
+                "must be zero when no trusted attestation keys are configured",
+            ));
+        }
+        return Ok(());
+    }
+    if required_attestations == 0 || required_attestations as usize > trusted_keys.len() {
+        return Err(Error::invalid(
+            "version branch attestation quorum",
+            format!(
+                "must be between 1 and the {} configured trusted keys",
+                trusted_keys.len()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_version_request_id(value: &str) -> Result<()> {

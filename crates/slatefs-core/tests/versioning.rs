@@ -11,11 +11,12 @@ use slatefs_core::error::Error;
 use slatefs_core::meta::inode::ROOT_INO;
 use slatefs_core::store::{self, ObjectStore};
 use slatefs_core::versioning::{
-    VersionCommitAttestation, VersionCommitOrigin, VersionCommitProvenance,
-    VersionMergeConflictStrategy, VersionPathChangeKind, VersionReflogAction, VersionRepository,
-    VersionRestoreActionKind, VersionRestoreMode, VersionTrustedAttestationKey,
-    VersionWorkingTreeChangeKind, force_break_expired_version_maintenance_lease,
-    purge_version_history, try_get_version_maintenance_lease, version_commit_attestation_payload,
+    VersionBranchProtectionPolicy, VersionCommitAttestation, VersionCommitOrigin,
+    VersionCommitProvenance, VersionMergeConflictStrategy, VersionPathChangeKind,
+    VersionReflogAction, VersionRepository, VersionRestoreActionKind, VersionRestoreMode,
+    VersionTrustedAttestationKey, VersionWorkingTreeChangeKind,
+    force_break_expired_version_maintenance_lease, purge_version_history,
+    try_get_version_maintenance_lease, version_commit_attestation_payload,
 };
 use slatefs_core::vfs::{Credentials, Vfs};
 use slatefs_core::volume::{self, Volume};
@@ -272,14 +273,15 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         repository.reflog("release", 1).await.unwrap()[0].action(),
         VersionReflogAction::Recover
     );
+    let other_policy = VersionBranchProtectionPolicy::new(
+        &["other-committer".into()],
+        &["test-manager".into()],
+        &[],
+        0,
+    )
+    .unwrap();
     let protected = repository
-        .set_branch_protected(
-            "release",
-            true,
-            &["other-committer".into()],
-            &["test-manager".into()],
-            &[],
-        )
+        .set_branch_protected("release", true, &other_policy)
         .await
         .unwrap();
     assert!(protected.protected());
@@ -306,34 +308,32 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
             .await,
         Err(Error::Invalid { .. })
     ));
+    let managed_policy = VersionBranchProtectionPolicy::new(
+        &["test-committer".into()],
+        &["test-manager".into()],
+        &[],
+        0,
+    )
+    .unwrap();
+    assert!(matches!(
+        repository
+            .set_branch_protected_as("release", true, &managed_policy, "other-manager")
+            .await,
+        Err(Error::Invalid { .. })
+    ));
     assert!(matches!(
         repository
             .set_branch_protected_as(
                 "release",
-                true,
-                &["test-committer".into()],
-                &["test-manager".into()],
-                &[],
+                false,
+                &VersionBranchProtectionPolicy::default(),
                 "other-manager",
             )
             .await,
         Err(Error::Invalid { .. })
     ));
-    assert!(matches!(
-        repository
-            .set_branch_protected_as("release", false, &[], &[], &[], "other-manager")
-            .await,
-        Err(Error::Invalid { .. })
-    ));
     let protected = repository
-        .set_branch_protected_as(
-            "release",
-            true,
-            &["test-committer".into()],
-            &["test-manager".into()],
-            &[],
-            "test-manager",
-        )
+        .set_branch_protected_as("release", true, &managed_policy, "test-manager")
         .await
         .unwrap();
     assert_eq!(protected.allowed_committers(), &["test-committer"]);
@@ -373,7 +373,12 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         .await
         .unwrap();
     let unprotected = repository
-        .set_branch_protected_as("release", false, &[], &[], &[], "test-manager")
+        .set_branch_protected_as(
+            "release",
+            false,
+            &VersionBranchProtectionPolicy::default(),
+            "test-manager",
+        )
         .await
         .unwrap();
     assert!(!unprotected.protected());
@@ -903,29 +908,68 @@ async fn detached_commit_attestations_are_optional_immutable_and_verified() {
         Err(Error::Invalid { .. })
     ));
 
+    let security_signing_key = SigningKey::from_bytes(&[8; 32]);
+    let security_public_key = security_signing_key.verifying_key().to_bytes();
+    let security_payload = version_commit_attestation_payload(
+        "t",
+        "v",
+        &commit.id,
+        "security-2026",
+        &security_public_key,
+        created_at,
+    )
+    .unwrap();
+    repository
+        .add_commit_attestation(
+            &commit.id,
+            VersionCommitAttestation::new_ed25519(
+                "security-2026",
+                security_public_key,
+                security_signing_key.sign(&security_payload).to_bytes(),
+                created_at,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
     let trusted_key = VersionTrustedAttestationKey::new_ed25519(
         "release-2026",
         signing_key.verifying_key().to_bytes(),
     )
     .unwrap();
+    let security_trusted_key = VersionTrustedAttestationKey::new_ed25519(
+        "security-2026",
+        security_signing_key.verifying_key().to_bytes(),
+    )
+    .unwrap();
+    let trusted_keys = vec![trusted_key, security_trusted_key];
     repository
         .create_branch("release", &commit.id)
         .await
         .unwrap();
+    assert!(matches!(
+        VersionBranchProtectionPolicy::new(&[], &[], &trusted_keys, 0),
+        Err(Error::Invalid {
+            what: "version branch attestation quorum",
+            ..
+        })
+    ));
+    assert!(matches!(
+        VersionBranchProtectionPolicy::new(&[], &[], &trusted_keys, 3),
+        Err(Error::Invalid {
+            what: "version branch attestation quorum",
+            ..
+        })
+    ));
+    let two_signature_policy =
+        VersionBranchProtectionPolicy::new(&[], &[], &trusted_keys, 2).unwrap();
     let protected = repository
-        .set_branch_protected(
-            "release",
-            true,
-            &[],
-            &[],
-            std::slice::from_ref(&trusted_key),
-        )
+        .set_branch_protected("release", true, &two_signature_policy)
         .await
         .unwrap();
-    assert_eq!(
-        protected.trusted_attestation_keys(),
-        std::slice::from_ref(&trusted_key)
-    );
+    assert_eq!(protected.trusted_attestation_keys(), trusted_keys);
+    assert_eq!(protected.required_attestations(), 2);
 
     repository
         .create_branch("feature", &commit.id)
@@ -961,13 +1005,7 @@ async fn detached_commit_attestations_are_optional_immutable_and_verified() {
         .unwrap();
     assert!(matches!(
         repository
-            .set_branch_protected(
-                "feature",
-                true,
-                &[],
-                &[],
-                std::slice::from_ref(&trusted_key),
-            )
+            .set_branch_protected("feature", true, &two_signature_policy)
             .await,
         Err(Error::Invalid {
             what: "version branch protection",
@@ -1006,6 +1044,45 @@ async fn detached_commit_attestations_are_optional_immutable_and_verified() {
                 public_key,
                 signing_key.sign(&feature_payload).to_bytes(),
                 feature_time,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        repository
+            .merge_branch(
+                "feature",
+                "release",
+                VersionMergeConflictStrategy::Fail,
+                test_provenance(),
+            )
+            .await,
+        Err(Error::Invalid {
+            what: "version branch attestation authorization",
+            ..
+        })
+    ));
+    let security_feature_time = feature_time + 1;
+    let security_feature_payload = version_commit_attestation_payload(
+        "t",
+        "v",
+        &feature.id,
+        "security-2026",
+        &security_public_key,
+        security_feature_time,
+    )
+    .unwrap();
+    repository
+        .add_commit_attestation(
+            &feature.id,
+            VersionCommitAttestation::new_ed25519(
+                "security-2026",
+                security_public_key,
+                security_signing_key
+                    .sign(&security_feature_payload)
+                    .to_bytes(),
+                security_feature_time,
             )
             .unwrap(),
         )

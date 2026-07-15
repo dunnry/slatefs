@@ -19,12 +19,12 @@ use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{
-    VersionBranchInfo, VersionBranchRecoveryInfo, VersionBranchResetInfo, VersionCommitAttestation,
-    VersionCommitInfo, VersionCommitOrigin, VersionCommitProvenance, VersionMergeConflictStrategy,
-    VersionMergeInfo, VersionMergePreview, VersionPathChangeKind, VersionReflogEntry,
-    VersionRepository, VersionRestoreActionKind, VersionRestoreApplyInfo, VersionRestoreMode,
-    VersionRestorePreview, VersionTagInfo, VersionTrustedAttestationKey,
-    VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
+    VersionBranchInfo, VersionBranchProtectionPolicy, VersionBranchRecoveryInfo,
+    VersionBranchResetInfo, VersionCommitAttestation, VersionCommitInfo, VersionCommitOrigin,
+    VersionCommitProvenance, VersionMergeConflictStrategy, VersionMergeInfo, VersionMergePreview,
+    VersionPathChangeKind, VersionReflogEntry, VersionRepository, VersionRestoreActionKind,
+    VersionRestoreApplyInfo, VersionRestoreMode, VersionRestorePreview, VersionTagInfo,
+    VersionTrustedAttestationKey, VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
     force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease, version_commit_attestation_payload,
 };
@@ -3432,15 +3432,17 @@ async fn run(
                 return Ok(());
             }
             let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
-            let result = repository
-                .set_branch_protected(
-                    name,
-                    true,
-                    allowed_committers,
-                    allowed_managers,
-                    trusted_attestation_keys,
-                )
-                .await;
+            let policy = VersionBranchProtectionPolicy::new(
+                allowed_committers,
+                allowed_managers,
+                trusted_attestation_keys,
+                if trusted_attestation_keys.is_empty() {
+                    0
+                } else {
+                    1
+                },
+            )?;
+            let result = repository.set_branch_protected(name, true, &policy).await;
             let repository_close = repository.close().await;
             let branch = result?;
             repository_close?;
@@ -3497,7 +3499,7 @@ async fn run(
             }
             let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
             let result = repository
-                .set_branch_protected(name, false, &[], &[], &[])
+                .set_branch_protected(name, false, &VersionBranchProtectionPolicy::default())
                 .await;
             let repository_close = repository.close().await;
             let branch = result?;

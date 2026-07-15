@@ -40,9 +40,9 @@ use slatefs_core::rate::{RateLimiter, RateLimits};
 use slatefs_core::snapshot::SnapshotVolume;
 use slatefs_core::store;
 use slatefs_core::versioning::{
-    VersionCommitAttestation, VersionCommitOrigin, VersionCommitProvenance,
-    VersionMaintenanceLeaseInfo, VersionMergeConflictStrategy, VersionRepository,
-    VersionRestoreMode, VersionTrustedAttestationKey,
+    VersionBranchProtectionPolicy, VersionCommitAttestation, VersionCommitOrigin,
+    VersionCommitProvenance, VersionMaintenanceLeaseInfo, VersionMergeConflictStrategy,
+    VersionRepository, VersionRestoreMode, VersionTrustedAttestationKey,
     force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease,
 };
@@ -2900,15 +2900,19 @@ async fn set_version_branch_protection_response(
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
     let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let policy = VersionBranchProtectionPolicy::new(
+        &allowed_committers,
+        &allowed_managers,
+        &trusted_attestation_keys,
+        if trusted_attestation_keys.is_empty() {
+            0
+        } else {
+            1
+        },
+    )
+    .map_err(core_error)?;
     let result = repository
-        .set_branch_protected_as(
-            name,
-            protected,
-            &allowed_committers,
-            &allowed_managers,
-            &trusted_attestation_keys,
-            &admin_committer(request),
-        )
+        .set_branch_protected_as(name, protected, &policy, &admin_committer(request))
         .await;
     let audit = match &result {
         Ok(branch) => {
