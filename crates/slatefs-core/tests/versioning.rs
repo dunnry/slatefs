@@ -1283,6 +1283,261 @@ async fn detached_commit_attestations_are_optional_immutable_and_verified() {
 }
 
 #[tokio::test]
+async fn native_sync_is_incremental_atomic_and_force_protected() {
+    let object_store: Arc<dyn ObjectStore> = store::resolve_root("memory:///").unwrap();
+    let control = ControlPlane::open(Arc::clone(&object_store), common::test_kms())
+        .await
+        .unwrap();
+    control.create_tenant("t", None).await.unwrap();
+    for volume_name in ["source", "destination"] {
+        volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            volume_name,
+            common::create_opts(None, None),
+        )
+        .await
+        .unwrap();
+        control
+            .set_versioning_enabled("t", volume_name, true)
+            .await
+            .unwrap();
+    }
+    let source_record = control.get_mountable_volume("t", "source").await.unwrap();
+    let source_dek = control.unwrap_volume_dek(&source_record).await.unwrap();
+    let source_live = Volume::open(&source_record, source_dek, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let destination_record = control
+        .get_mountable_volume("t", "destination")
+        .await
+        .unwrap();
+    let destination_dek = control
+        .unwrap_volume_dek(&destination_record)
+        .await
+        .unwrap();
+    let destination_live = Volume::open(
+        &destination_record,
+        destination_dek,
+        Arc::clone(&object_store),
+    )
+    .await
+    .unwrap();
+    let creds = Credentials::root();
+    let source_file = source_live
+        .create(&creds, ROOT_INO, b"sync.txt", 0o640, true)
+        .await
+        .unwrap();
+    source_live
+        .write(&creds, source_file.ino, 0, b"source-one")
+        .await
+        .unwrap();
+    let source = VersionRepository::open(&control, Arc::clone(&object_store), "t", "source")
+        .await
+        .unwrap();
+    let first = source
+        .commit_file(
+            source_live.as_ref(),
+            "/sync.txt",
+            "first sync commit".into(),
+            test_provenance(),
+        )
+        .await
+        .unwrap();
+    let (initial_pack, initial_export) = source.export_sync_bundle("main", None).await.unwrap();
+    assert!(initial_pack.starts_with(b"SLATESYN"));
+    assert_eq!(initial_export.commits, 1);
+    let initial_apply = VersionRepository::apply_sync_bundle(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "destination",
+        &initial_pack,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(initial_apply.fast_forward);
+    assert!(initial_apply.updated);
+    assert_eq!(initial_apply.target, first.id);
+
+    source_live
+        .write(&creds, source_file.ino, 0, b"source-two")
+        .await
+        .unwrap();
+    let second = source
+        .commit_file(
+            source_live.as_ref(),
+            "/sync.txt",
+            "second sync commit".into(),
+            test_provenance(),
+        )
+        .await
+        .unwrap();
+    let (incremental_pack, incremental_export) = source
+        .export_sync_bundle("main", Some(&first.id))
+        .await
+        .unwrap();
+    assert_eq!(incremental_export.commits, 1);
+    assert!(incremental_pack.len() < initial_pack.len() * 2);
+    VersionRepository::apply_sync_bundle(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "destination",
+        &incremental_pack,
+        false,
+    )
+    .await
+    .unwrap();
+    let destination =
+        VersionRepository::open(&control, Arc::clone(&object_store), "t", "destination")
+            .await
+            .unwrap();
+    assert_eq!(destination.identity(), source.identity());
+    assert_eq!(
+        destination.sync_state("main").await.unwrap().head,
+        Some(second.id.clone())
+    );
+    assert_eq!(
+        destination
+            .read_file(&second.id, "/sync.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"source-two"
+    );
+    assert_eq!(
+        destination.reflog("main", 1).await.unwrap()[0].action(),
+        VersionReflogAction::Sync
+    );
+    destination.close().await.unwrap();
+
+    let destination_file = destination_live
+        .create(&creds, ROOT_INO, b"sync.txt", 0o640, true)
+        .await
+        .unwrap();
+    destination_live
+        .write(&creds, destination_file.ino, 0, b"destination")
+        .await
+        .unwrap();
+    let destination =
+        VersionRepository::open(&control, Arc::clone(&object_store), "t", "destination")
+            .await
+            .unwrap();
+    let divergent = destination
+        .commit_file(
+            destination_live.as_ref(),
+            "/sync.txt",
+            "destination divergence".into(),
+            test_provenance(),
+        )
+        .await
+        .unwrap();
+    destination.close().await.unwrap();
+
+    source_live
+        .write(&creds, source_file.ino, 0, b"source-three")
+        .await
+        .unwrap();
+    let third = source
+        .commit_file(
+            source_live.as_ref(),
+            "/sync.txt",
+            "third sync commit".into(),
+            test_provenance(),
+        )
+        .await
+        .unwrap();
+    let (divergent_pack, divergent_export) = source
+        .export_sync_bundle("main", Some(&divergent.id))
+        .await
+        .unwrap();
+    assert!(!divergent_export.fast_forward);
+    assert!(matches!(
+        VersionRepository::apply_sync_bundle(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "destination",
+            &divergent_pack,
+            false,
+        )
+        .await,
+        Err(Error::Invalid {
+            what: "version repository sync fast-forward",
+            ..
+        })
+    ));
+    let destination =
+        VersionRepository::open(&control, Arc::clone(&object_store), "t", "destination")
+            .await
+            .unwrap();
+    destination
+        .set_branch_protected("main", true, &VersionBranchProtectionPolicy::default())
+        .await
+        .unwrap();
+    destination.close().await.unwrap();
+    assert!(matches!(
+        VersionRepository::apply_sync_bundle(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "destination",
+            &divergent_pack,
+            true,
+        )
+        .await,
+        Err(Error::Invalid {
+            what: "version repository sync force",
+            ..
+        })
+    ));
+    let destination =
+        VersionRepository::open(&control, Arc::clone(&object_store), "t", "destination")
+            .await
+            .unwrap();
+    destination
+        .set_branch_protected("main", false, &VersionBranchProtectionPolicy::default())
+        .await
+        .unwrap();
+    destination.close().await.unwrap();
+    let forced = VersionRepository::apply_sync_bundle(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "destination",
+        &divergent_pack,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(forced.forced);
+    assert_eq!(forced.target, third.id);
+    assert!(matches!(
+        VersionRepository::apply_sync_bundle(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "destination",
+            &divergent_pack,
+            true,
+        )
+        .await,
+        Err(Error::Invalid {
+            what: "version repository sync compare-and-swap",
+            ..
+        })
+    ));
+
+    source.close().await.unwrap();
+    source_live.shutdown().await.unwrap();
+    destination_live.shutdown().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn idempotent_commit_retries_return_the_original_commit() {
     let object_store: Arc<dyn ObjectStore> = store::resolve_root("memory:///").unwrap();
     let control = ControlPlane::open(Arc::clone(&object_store), common::test_kms())

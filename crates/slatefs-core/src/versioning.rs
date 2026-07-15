@@ -54,6 +54,9 @@ const REPOSITORY_IDENTITY_VERSION: u8 = 1;
 const REPOSITORY_BUNDLE_MAGIC: &[u8; 8] = b"SLATEVCS";
 const REPOSITORY_BUNDLE_VERSION: u8 = 1;
 const REPOSITORY_BUNDLE_HEADER_LEN: usize = REPOSITORY_BUNDLE_MAGIC.len() + 1 + 8;
+const REPOSITORY_SYNC_MAGIC: &[u8; 8] = b"SLATESYN";
+const REPOSITORY_SYNC_VERSION: u8 = 1;
+const REPOSITORY_SYNC_HEADER_LEN: usize = REPOSITORY_SYNC_MAGIC.len() + 1 + 8;
 const SHA256_LEN: usize = 32;
 const REFLOG_RETAIN_PER_BRANCH: usize = 100;
 const MAINTENANCE_LEASE_VERSION: u8 = 1;
@@ -1821,6 +1824,7 @@ pub enum VersionReflogAction {
     Reset,
     Delete,
     Recover,
+    Sync,
 }
 
 impl VersionReflogAction {
@@ -1833,6 +1837,7 @@ impl VersionReflogAction {
             Self::Reset => "reset",
             Self::Delete => "delete",
             Self::Recover => "recover",
+            Self::Sync => "sync",
         }
     }
 }
@@ -2180,6 +2185,37 @@ pub struct VersionRepositoryBundleReport {
     pub bundle_bytes: u64,
 }
 
+/// The repository identity and current head advertised during native sync.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionRepositorySyncState {
+    pub identity: VersionRepositoryIdentity,
+    pub branch: String,
+    pub head: Option<String>,
+}
+
+/// Summary of one incremental native repository synchronization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionRepositorySyncReport {
+    pub identity: VersionRepositoryIdentity,
+    pub branch: String,
+    pub expected: Option<String>,
+    pub previous: Option<String>,
+    pub target: String,
+    pub objects: u64,
+    pub commits: u64,
+    pub pruned_commits: u64,
+    pub attestations: u64,
+    pub nodes: u64,
+    pub blobs: u64,
+    pub logical_bytes: u64,
+    pub bundle_bytes: u64,
+    pub fast_forward: bool,
+    pub forced: bool,
+    pub updated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VersionRepositoryBundlePayload {
     identity: VersionRepositoryIdentity,
@@ -2190,6 +2226,15 @@ struct VersionRepositoryBundlePayload {
 struct VersionRepositoryBundleObject {
     key: Vec<u8>,
     value: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VersionRepositorySyncPayload {
+    identity: VersionRepositoryIdentity,
+    branch: String,
+    expected: Option<[u8; 32]>,
+    target: [u8; 32],
+    objects: Vec<VersionRepositoryBundleObject>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2774,6 +2819,426 @@ impl VersionRepository {
         let bundle = encode_repository_bundle(&payload)?;
         report.bundle_bytes = bundle.len() as u64;
         Ok((bundle, report))
+    }
+
+    /// Advertise the logical repository identity and current branch head.
+    pub async fn sync_state(&self, branch: &str) -> Result<VersionRepositorySyncState> {
+        validate_version_branch_name(branch)?;
+        Ok(VersionRepositorySyncState {
+            identity: self.identity.clone(),
+            branch: branch.to_string(),
+            head: self
+                .store
+                .get_branch(branch)
+                .await?
+                .map(|reference| hex::encode(reference.commit_id)),
+        })
+    }
+
+    /// Export the objects needed to advance one destination branch from its
+    /// advertised head. Destination policy and reflog records are deliberately
+    /// excluded and remain local to the receiving repository.
+    pub async fn export_sync_bundle(
+        &self,
+        branch: &str,
+        expected_remote_head: Option<&str>,
+    ) -> Result<(Vec<u8>, VersionRepositorySyncReport)> {
+        validate_version_branch_name(branch)?;
+        let target = self
+            .store
+            .get_branch(branch)
+            .await?
+            .ok_or_else(|| Error::not_found("version branch", branch))?;
+        let expected = expected_remote_head.map(parse_commit_id).transpose()?;
+        let (source_commits, source_pruned) = self.reachable_sync_history(target.commit_id).await?;
+        let (remote_commits, remote_pruned) = match expected {
+            Some(id) if self.store.try_get_commit(&id).await?.is_some() => {
+                self.reachable_sync_history(id).await?
+            }
+            _ => (BTreeMap::new(), BTreeSet::new()),
+        };
+
+        let source_trees = source_commits
+            .values()
+            .map(|commit| commit.tree.to_tree())
+            .collect::<Vec<_>>();
+        let remote_trees = remote_commits
+            .values()
+            .map(|commit| commit.tree.to_tree())
+            .collect::<Vec<_>>();
+        let source_nodes = self
+            .prolly
+            .mark_reachable(&source_trees)
+            .await
+            .map_err(prolly_error)?
+            .live_cids
+            .into_iter()
+            .map(|cid| cid.as_bytes().to_vec())
+            .collect::<BTreeSet<_>>();
+        let remote_nodes = self
+            .prolly
+            .mark_reachable(&remote_trees)
+            .await
+            .map_err(prolly_error)?
+            .live_cids
+            .into_iter()
+            .map(|cid| cid.as_bytes().to_vec())
+            .collect::<BTreeSet<_>>();
+        let source_blobs = self
+            .prolly
+            .mark_reachable_blobs(&source_trees)
+            .await
+            .map_err(prolly_error)?
+            .live_blobs
+            .into_iter()
+            .map(|reference| reference.cid.as_bytes().to_vec())
+            .collect::<BTreeSet<_>>();
+        let remote_blobs = self
+            .prolly
+            .mark_reachable_blobs(&remote_trees)
+            .await
+            .map_err(prolly_error)?
+            .live_blobs
+            .into_iter()
+            .map(|reference| reference.cid.as_bytes().to_vec())
+            .collect::<BTreeSet<_>>();
+
+        let mut keys = BTreeSet::new();
+        for id in source_commits.keys() {
+            if !remote_commits.contains_key(id) {
+                keys.insert(commit_key(id));
+            }
+        }
+        for id in source_pruned.difference(&remote_pruned) {
+            keys.insert(pruned_commit_key(id));
+        }
+        for id in source_nodes.difference(&remote_nodes) {
+            keys.insert(prefixed_key(NODE_PREFIX, id));
+        }
+        for id in source_blobs.difference(&remote_blobs) {
+            keys.insert(prefixed_key(BLOB_PREFIX, id));
+        }
+        let mut attestation_commits = source_commits
+            .keys()
+            .filter(|id| !remote_commits.contains_key(*id))
+            .copied()
+            .collect::<BTreeSet<_>>();
+        attestation_commits.insert(target.commit_id);
+        for commit in attestation_commits {
+            let mut iter = self
+                .store
+                .db
+                .scan_prefix(attestation_commit_prefix(&commit), ..)
+                .await?;
+            while let Some(entry) = iter.next().await? {
+                keys.insert(entry.key.to_vec());
+            }
+        }
+
+        let mut objects = Vec::with_capacity(keys.len());
+        for key in keys {
+            let value = self
+                .store
+                .get_raw(&key)
+                .await
+                .map_err(version_store_error)?
+                .ok_or_else(|| {
+                    Error::Versioning(format!(
+                        "version sync object {} disappeared during export",
+                        hex::encode(&key)
+                    ))
+                })?;
+            objects.push(VersionRepositoryBundleObject {
+                key,
+                value: value.to_vec(),
+            });
+        }
+        let payload = VersionRepositorySyncPayload {
+            identity: self.identity.clone(),
+            branch: branch.to_string(),
+            expected,
+            target: target.commit_id,
+            objects,
+        };
+        let bundle = encode_repository_sync_bundle(&payload)?;
+        let fast_forward = expected.is_none_or(|id| source_commits.contains_key(&id));
+        let report = repository_sync_report(
+            &payload,
+            expected,
+            fast_forward,
+            false,
+            expected != Some(target.commit_id),
+            bundle.len() as u64,
+        );
+        Ok((bundle, report))
+    }
+
+    async fn reachable_sync_history(
+        &self,
+        start: [u8; 32],
+    ) -> Result<(BTreeMap<[u8; 32], VersionCommit>, BTreeSet<[u8; 32]>)> {
+        let mut commits = BTreeMap::new();
+        let mut pruned = BTreeSet::new();
+        let mut pending = vec![start];
+        while let Some(id) = pending.pop() {
+            if commits.contains_key(&id) || pruned.contains(&id) {
+                continue;
+            }
+            if let Some(commit) = self.store.try_get_commit(&id).await? {
+                pending.extend(commit.parents.iter().copied());
+                commits.insert(id, commit);
+            } else if self.store.is_pruned_commit(&id).await? {
+                pruned.insert(id);
+            } else {
+                return Err(Error::not_found("version commit", hex::encode(id)));
+            }
+        }
+        Ok((commits, pruned))
+    }
+
+    /// Atomically import one native sync pack and compare-and-swap its branch.
+    /// Non-fast-forward updates require `force`, and protected branches never
+    /// permit forced history replacement.
+    pub async fn apply_sync_bundle(
+        control: &ControlPlane,
+        object_store: Arc<dyn ObjectStore>,
+        tenant: &str,
+        volume: &str,
+        bundle: &[u8],
+        force: bool,
+    ) -> Result<VersionRepositorySyncReport> {
+        let payload = decode_repository_sync_bundle(bundle)?;
+        if payload.expected.is_none() {
+            validate_sync_objects_as_repository(&payload)?;
+        }
+        let repository =
+            match Self::open_existing(control, Arc::clone(&object_store), tenant, volume).await? {
+                Some(repository) => repository,
+                None => {
+                    Self::open_with_identity(
+                        control,
+                        object_store,
+                        tenant,
+                        volume,
+                        payload.identity.clone(),
+                    )
+                    .await?
+                }
+            };
+        let result = repository
+            .apply_sync_payload(payload, bundle.len() as u64, force)
+            .await;
+        let close = repository.close().await;
+        result.and_then(|report| close.map(|()| report))
+    }
+
+    async fn apply_sync_payload(
+        &self,
+        payload: VersionRepositorySyncPayload,
+        bundle_bytes: u64,
+        force: bool,
+    ) -> Result<VersionRepositorySyncReport> {
+        if payload.identity != self.identity {
+            return Err(Error::invalid(
+                "version repository sync identity",
+                format!(
+                    "source repository {} does not match destination repository {}",
+                    payload.identity.id(),
+                    self.identity.id()
+                ),
+            ));
+        }
+        let _guard = self.store.ref_lock.lock().await;
+        let current = self.store.get_branch(&payload.branch).await?;
+        let previous = current.as_ref().map(|reference| reference.commit_id);
+        if previous != payload.expected {
+            return Err(Error::invalid(
+                "version repository sync compare-and-swap",
+                format!(
+                    "branch {} expected {}, found {}",
+                    payload.branch,
+                    payload
+                        .expected
+                        .map(hex::encode)
+                        .unwrap_or_else(|| "no head".into()),
+                    previous
+                        .map(hex::encode)
+                        .unwrap_or_else(|| "no head".into())
+                ),
+            ));
+        }
+        let protection = self.store.branch_protection(&payload.branch).await?;
+        if force && protection.is_some() {
+            return Err(Error::invalid(
+                "version repository sync force",
+                format!(
+                    "cannot force-update protected branch {}; unprotect it first",
+                    payload.branch
+                ),
+            ));
+        }
+
+        let mut existing = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+        let mut current_bytes = 0u64;
+        let mut iter = self.store.db.scan(..).await?;
+        while let Some(entry) = iter.next().await? {
+            current_bytes =
+                current_bytes.saturating_add((entry.key.len() + entry.value.len()) as u64);
+            if is_repository_bundle_object_key(&entry.key) {
+                existing.insert(entry.key.to_vec(), entry.value.to_vec());
+            }
+        }
+        let mut combined = existing.clone();
+        for object in &payload.objects {
+            if let Some(id) = object.key.strip_prefix(COMMIT_PREFIX) {
+                combined.remove(&pruned_commit_key_bytes(id));
+            }
+        }
+        for object in &payload.objects {
+            if let Some(id) = object.key.strip_prefix(PRUNED_COMMIT_PREFIX)
+                && combined.contains_key(&prefixed_key(COMMIT_PREFIX, id))
+            {
+                continue;
+            }
+            if let Some(value) = combined.get(&object.key) {
+                if value != &object.value {
+                    return Err(Error::invalid(
+                        "version repository sync object",
+                        format!(
+                            "object {} conflicts with destination content",
+                            hex::encode(&object.key)
+                        ),
+                    ));
+                }
+            } else {
+                combined.insert(object.key.clone(), object.value.clone());
+            }
+        }
+        let combined_payload = VersionRepositoryBundlePayload {
+            identity: self.identity.clone(),
+            objects: combined
+                .iter()
+                .map(|(key, value)| VersionRepositoryBundleObject {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        };
+        validate_repository_bundle_payload(&combined_payload)
+            .map_err(|error| Error::invalid("version repository sync", error.to_string()))?;
+        let commits = sync_commits(&combined)?;
+        let target_commit = commits.get(&payload.target).ok_or_else(|| {
+            Error::invalid(
+                "version repository sync",
+                format!(
+                    "target commit {} is not available",
+                    hex::encode(payload.target)
+                ),
+            )
+        })?;
+        let fast_forward = previous
+            .is_none_or(|ancestor| sync_commit_is_ancestor(&commits, ancestor, payload.target));
+        if !fast_forward && !force {
+            return Err(Error::invalid(
+                "version repository sync fast-forward",
+                format!(
+                    "branch {} cannot advance from {} to {}; retry with force to replace history",
+                    payload.branch,
+                    previous
+                        .map(hex::encode)
+                        .unwrap_or_else(|| "no head".into()),
+                    hex::encode(payload.target)
+                ),
+            ));
+        }
+        if let Some(protection) = &protection {
+            authorize_sync_target(
+                &payload.branch,
+                protection,
+                target_commit,
+                payload.target,
+                &combined,
+            )?;
+        }
+
+        let updated = previous != Some(payload.target);
+        let mut projected_bytes = current_bytes;
+        for object in &payload.objects {
+            if !existing.contains_key(&object.key) {
+                projected_bytes =
+                    projected_bytes.saturating_add((object.key.len() + object.value.len()) as u64);
+            }
+        }
+        if updated {
+            let encoded_ref = encode_versioned(
+                REF_VERSION,
+                &VersionRef {
+                    commit_id: payload.target,
+                    tree: target_commit.tree.clone(),
+                },
+            )?;
+            projected_bytes = projected_bytes
+                .saturating_add((branch_key(&payload.branch).len() + encoded_ref.len()) as u64)
+                .saturating_add(512);
+        }
+        if let Some(max_bytes) = self.max_bytes
+            && projected_bytes > max_bytes
+        {
+            return Err(Error::Versioning(format!(
+                "version history quota exceeded: {projected_bytes} bytes projected, {max_bytes} bytes allowed"
+            )));
+        }
+
+        let mut batch = WriteBatch::new();
+        for object in &payload.objects {
+            if object.key.starts_with(COMMIT_PREFIX) {
+                let id = object
+                    .key
+                    .strip_prefix(COMMIT_PREFIX)
+                    .expect("commit prefix was checked");
+                batch.delete(pruned_commit_key_bytes(id));
+            }
+            let redundant_pruned_marker = object.key.starts_with(PRUNED_COMMIT_PREFIX)
+                && combined.contains_key(&prefixed_key(
+                    COMMIT_PREFIX,
+                    object
+                        .key
+                        .strip_prefix(PRUNED_COMMIT_PREFIX)
+                        .expect("pruned prefix was checked"),
+                ));
+            if !(existing.contains_key(&object.key) || redundant_pruned_marker) {
+                batch.put(object.key.clone(), object.value.clone());
+            }
+        }
+        if updated {
+            let reference = VersionRef {
+                commit_id: payload.target,
+                tree: target_commit.tree.clone(),
+            };
+            batch.put(
+                branch_key(&payload.branch),
+                encode_versioned(REF_VERSION, &reference)?,
+            );
+            self.store
+                .append_reflog(
+                    &mut batch,
+                    &payload.branch,
+                    previous,
+                    Some(payload.target),
+                    VersionReflogAction::Sync,
+                )
+                .await?;
+        }
+        self.store.db.write(batch).await?;
+        self.store.db.flush().await?;
+        Ok(repository_sync_report(
+            &payload,
+            previous,
+            fast_forward,
+            force && !fast_forward,
+            updated,
+            bundle_bytes,
+        ))
     }
 
     /// Import a complete logical repository into an uninitialized,
@@ -5831,6 +6296,263 @@ fn decode_repository_bundle(
         .map_err(|error| Error::invalid("version repository bundle", error.to_string()))?;
     report.bundle_bytes = bundle.len() as u64;
     Ok((payload, report))
+}
+
+fn encode_repository_sync_bundle(payload: &VersionRepositorySyncPayload) -> Result<Vec<u8>> {
+    let payload = postcard::to_allocvec(payload)?;
+    let payload_len = u64::try_from(payload.len()).map_err(|_| {
+        Error::invalid(
+            "version repository sync",
+            "payload exceeds the format limit",
+        )
+    })?;
+    let mut bundle = Vec::with_capacity(REPOSITORY_SYNC_HEADER_LEN + payload.len() + SHA256_LEN);
+    bundle.extend_from_slice(REPOSITORY_SYNC_MAGIC);
+    bundle.push(REPOSITORY_SYNC_VERSION);
+    bundle.extend_from_slice(&payload_len.to_be_bytes());
+    bundle.extend_from_slice(&payload);
+    bundle.extend_from_slice(&Sha256::digest(&payload));
+    Ok(bundle)
+}
+
+fn decode_repository_sync_bundle(bundle: &[u8]) -> Result<VersionRepositorySyncPayload> {
+    if bundle.len() < REPOSITORY_SYNC_HEADER_LEN + SHA256_LEN {
+        return Err(Error::invalid(
+            "version repository sync",
+            "bundle is truncated",
+        ));
+    }
+    if &bundle[..REPOSITORY_SYNC_MAGIC.len()] != REPOSITORY_SYNC_MAGIC {
+        return Err(Error::invalid(
+            "version repository sync",
+            "magic header does not match SLATESYN",
+        ));
+    }
+    let version = bundle[REPOSITORY_SYNC_MAGIC.len()];
+    if version != REPOSITORY_SYNC_VERSION {
+        return Err(Error::invalid(
+            "version repository sync",
+            format!("format version {version}, expected {REPOSITORY_SYNC_VERSION}"),
+        ));
+    }
+    let length_offset = REPOSITORY_SYNC_MAGIC.len() + 1;
+    let payload_len = u64::from_be_bytes(
+        bundle[length_offset..REPOSITORY_SYNC_HEADER_LEN]
+            .try_into()
+            .expect("sync length field has a fixed width"),
+    );
+    let payload_len = usize::try_from(payload_len).map_err(|_| {
+        Error::invalid(
+            "version repository sync",
+            "payload length does not fit this platform",
+        )
+    })?;
+    let expected_len = REPOSITORY_SYNC_HEADER_LEN
+        .checked_add(payload_len)
+        .and_then(|length| length.checked_add(SHA256_LEN))
+        .ok_or_else(|| Error::invalid("version repository sync", "payload length overflows"))?;
+    if bundle.len() != expected_len {
+        return Err(Error::invalid(
+            "version repository sync",
+            format!(
+                "declared payload requires {expected_len} bytes, found {}",
+                bundle.len()
+            ),
+        ));
+    }
+    let payload_bytes = &bundle[REPOSITORY_SYNC_HEADER_LEN..][..payload_len];
+    let checksum = &bundle[REPOSITORY_SYNC_HEADER_LEN + payload_len..];
+    let actual: [u8; 32] = Sha256::digest(payload_bytes).into();
+    if checksum != actual {
+        return Err(Error::invalid(
+            "version repository sync",
+            "payload checksum does not match",
+        ));
+    }
+    let payload: VersionRepositorySyncPayload = postcard::from_bytes(payload_bytes)
+        .map_err(|error| Error::invalid("version repository sync", error.to_string()))?;
+    validate_version_repository_identity(&payload.identity)?;
+    validate_version_branch_name(&payload.branch)?;
+    let mut previous_key: Option<&[u8]> = None;
+    for object in &payload.objects {
+        if previous_key.is_some_and(|previous| previous >= object.key.as_slice()) {
+            return Err(Error::invalid(
+                "version repository sync",
+                "object keys must be unique and strictly ordered",
+            ));
+        }
+        previous_key = Some(&object.key);
+        if !is_repository_sync_object_key(&object.key) {
+            return Err(Error::invalid(
+                "version repository sync",
+                "payload contains an object outside the native sync format",
+            ));
+        }
+    }
+    Ok(payload)
+}
+
+fn is_repository_sync_object_key(key: &[u8]) -> bool {
+    key.starts_with(NODE_PREFIX)
+        || key.starts_with(BLOB_PREFIX)
+        || key.starts_with(COMMIT_PREFIX)
+        || key.starts_with(ATTESTATION_PREFIX)
+        || key.starts_with(PRUNED_COMMIT_PREFIX)
+}
+
+fn validate_sync_objects_as_repository(payload: &VersionRepositorySyncPayload) -> Result<()> {
+    let complete = VersionRepositoryBundlePayload {
+        identity: payload.identity.clone(),
+        objects: payload.objects.clone(),
+    };
+    validate_repository_bundle_payload(&complete)
+        .map_err(|error| Error::invalid("version repository sync", error.to_string()))?;
+    if !complete
+        .objects
+        .iter()
+        .any(|object| object.key == commit_key(&payload.target))
+    {
+        return Err(Error::invalid(
+            "version repository sync",
+            "a pack for an empty destination must contain its target commit",
+        ));
+    }
+    Ok(())
+}
+
+fn repository_sync_report(
+    payload: &VersionRepositorySyncPayload,
+    previous: Option<[u8; 32]>,
+    fast_forward: bool,
+    forced: bool,
+    updated: bool,
+    bundle_bytes: u64,
+) -> VersionRepositorySyncReport {
+    let mut report = VersionRepositorySyncReport {
+        identity: payload.identity.clone(),
+        branch: payload.branch.clone(),
+        expected: payload.expected.map(hex::encode),
+        previous: previous.map(hex::encode),
+        target: hex::encode(payload.target),
+        objects: payload.objects.len() as u64,
+        commits: 0,
+        pruned_commits: 0,
+        attestations: 0,
+        nodes: 0,
+        blobs: 0,
+        logical_bytes: 0,
+        bundle_bytes,
+        fast_forward,
+        forced,
+        updated,
+    };
+    for object in &payload.objects {
+        report.logical_bytes = report
+            .logical_bytes
+            .saturating_add((object.key.len() + object.value.len()) as u64);
+        if object.key.starts_with(COMMIT_PREFIX) {
+            report.commits += 1;
+        } else if object.key.starts_with(PRUNED_COMMIT_PREFIX) {
+            report.pruned_commits += 1;
+        } else if object.key.starts_with(ATTESTATION_PREFIX) {
+            report.attestations += 1;
+        } else if object.key.starts_with(NODE_PREFIX) {
+            report.nodes += 1;
+        } else if object.key.starts_with(BLOB_PREFIX) {
+            report.blobs += 1;
+        }
+    }
+    report
+}
+
+fn sync_commits(objects: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<BTreeMap<[u8; 32], VersionCommit>> {
+    objects
+        .iter()
+        .filter(|(key, _)| key.starts_with(COMMIT_PREFIX))
+        .map(|(key, value)| {
+            let id = repository_bundle_object_id(key, COMMIT_PREFIX, "commit")?;
+            let commit = decode_versioned(COMMIT_VERSION, value, "version commit")?;
+            Ok((id, commit))
+        })
+        .collect()
+}
+
+fn sync_commit_is_ancestor(
+    commits: &BTreeMap<[u8; 32], VersionCommit>,
+    ancestor: [u8; 32],
+    descendant: [u8; 32],
+) -> bool {
+    let mut pending = vec![descendant];
+    let mut seen = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if id == ancestor {
+            return true;
+        }
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some(commit) = commits.get(&id) {
+            pending.extend(commit.parents.iter().copied());
+        }
+    }
+    false
+}
+
+fn authorize_sync_target(
+    branch: &str,
+    protection: &VersionBranchProtection,
+    commit: &VersionCommit,
+    commit_id: [u8; 32],
+    objects: &BTreeMap<Vec<u8>, Vec<u8>>,
+) -> Result<()> {
+    if !protection.allowed_committers.is_empty()
+        && !protection
+            .allowed_committers
+            .iter()
+            .any(|committer| committer == commit.provenance.committer())
+    {
+        return Err(Error::invalid(
+            "version branch authorization",
+            format!(
+                "committer {} is not allowed to publish to protected branch {branch}",
+                commit.provenance.committer()
+            ),
+        ));
+    }
+    let prefix = attestation_commit_prefix(&commit_id);
+    let trusted = objects
+        .iter()
+        .filter(|(key, _)| key.starts_with(&prefix))
+        .map(|(_, value)| {
+            decode_versioned::<VersionCommitAttestation>(
+                ATTESTATION_VERSION,
+                value,
+                "version commit attestation",
+            )
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|attestation| {
+            protection.trusted_attestation_keys.iter().any(|key| {
+                key.key_id() == attestation.key_id()
+                    && key.algorithm() == attestation.algorithm()
+                    && key.public_key() == attestation.public_key()
+            })
+        })
+        .map(|attestation| attestation.key_id().to_string())
+        .collect::<BTreeSet<_>>()
+        .len();
+    if trusted < protection.required_attestations as usize {
+        return Err(Error::invalid(
+            "version branch attestation authorization",
+            format!(
+                "commit {} does not have the {} trusted attestations required by protected branch {branch}",
+                hex::encode(commit_id),
+                protection.required_attestations
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_commit_id(value: &str) -> Result<[u8; 32]> {
