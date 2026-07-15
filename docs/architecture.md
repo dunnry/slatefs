@@ -112,8 +112,10 @@ objects, compare-and-swaps the branch, and appends its local reflog. Repository
 identity must match. Non-fast-forward updates require an explicit force flag,
 and protected branches reject force while enforcing local publisher and signer
 policy on ordinary fast-forwards. Tags, source reflogs, retention, and branch
-policy never cross the synchronization boundary. Reflogs retain
-the newest 100 transitions per branch name and remain readable after deletion.
+policy never cross the synchronization boundary. Reflogs retain a configurable
+number of transitions per branch name, defaulting to 100, and remain readable
+after deletion. Reducing the window immediately deletes the oldest entries;
+their referenced commits cease to be GC roots.
 Recovery names one retained sequence and atomically restores its preceding
 head, recreating a deleted branch when necessary, then records that move as a
 new reflog transition. A durable protection record can guard any existing

@@ -1164,6 +1164,8 @@ struct VersionRetentionPatchRequest {
     #[serde(default)]
     max_bytes: Option<u64>,
     #[serde(default)]
+    reflog_keep_last: Option<u32>,
+    #[serde(default)]
     clear: bool,
 }
 
@@ -2481,6 +2483,7 @@ fn version_retention_json(policy: Option<&VersioningRetentionPolicy>) -> Value {
                 "keep_last": policy.keep_last,
                 "max_age_secs": policy.max_age_secs,
                 "max_bytes": policy.max_bytes,
+                "reflog_keep_last": policy.reflog_keep_last,
                 "updated_at": policy.updated_at,
             })
         })
@@ -4085,8 +4088,10 @@ async fn patch_version_retention_response(
     volume: &str,
 ) -> Result<AdminHttpResponse, AdminError> {
     let body: VersionRetentionPatchRequest = parse_json_body(request)?;
-    let has_limits =
-        body.keep_last.is_some() || body.max_age_secs.is_some() || body.max_bytes.is_some();
+    let has_limits = body.keep_last.is_some()
+        || body.max_age_secs.is_some()
+        || body.max_bytes.is_some()
+        || body.reflog_keep_last.is_some();
     if body.clear && has_limits {
         return Err(bad_request(
             "clear cannot be combined with retention limits",
@@ -4094,7 +4099,7 @@ async fn patch_version_retention_response(
     }
     if !body.clear && !has_limits {
         return Err(bad_request(
-            "provide keep_last, max_age_secs, max_bytes, or clear=true",
+            "provide keep_last, max_age_secs, max_bytes, reflog_keep_last, or clear=true",
         ));
     }
 
@@ -4123,11 +4128,23 @@ async fn patch_version_retention_response(
                         .or_else(|| current.as_ref().and_then(|policy| policy.max_age_secs)),
                     body.max_bytes
                         .or_else(|| current.as_ref().and_then(|policy| policy.max_bytes)),
+                    body.reflog_keep_last
+                        .or_else(|| current.as_ref().and_then(|policy| policy.reflog_keep_last)),
                 )
                 .await
                 .map_err(core_error)?,
         )
     };
+    if let Some(repository) =
+        VersionRepository::open_existing(&control, Arc::clone(&state.object_store), tenant, volume)
+            .await
+            .map_err(core_error)?
+    {
+        let prune = repository.prune_reflogs().await;
+        let close = repository.close().await;
+        prune.map_err(core_error)?;
+        close.map_err(core_error)?;
+    }
     append_version_audit(
         &control,
         request,
@@ -10051,7 +10068,7 @@ mod tests {
             b"base"
         );
 
-        let retention_body = r#"{"keep_last":2,"max_bytes":1048576}"#;
+        let retention_body = r#"{"keep_last":2,"max_bytes":1048576,"reflog_keep_last":250}"#;
         let retention_request = format!(
             "PATCH /admin/v1/tenants/t/volumes/v/versioning/retention HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             retention_body.len(),
@@ -10064,6 +10081,8 @@ mod tests {
             200,
             "{retention_response}"
         );
+        let retention: Value = serde_json::from_str(response_body(&retention_response)).unwrap();
+        assert_eq!(retention["retention"]["reflog_keep_last"], 250);
 
         let competing_control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
             .await
@@ -12952,7 +12971,7 @@ mod tests {
                 .await
                 .unwrap();
             control
-                .set_versioning_retention_policy("t", volume, Some(1), None, None)
+                .set_versioning_retention_policy("t", volume, Some(1), None, None, None)
                 .await
                 .unwrap();
         }

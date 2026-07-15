@@ -2734,7 +2734,7 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
         .await
         .unwrap();
     control
-        .set_versioning_retention_policy("t", "v", Some(1), None, None)
+        .set_versioning_retention_policy("t", "v", Some(1), None, None, None)
         .await
         .unwrap();
     let dek = control.unwrap_volume_dek(&record).await.unwrap();
@@ -2888,7 +2888,7 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
     repository.close().await.unwrap();
 
     control
-        .set_versioning_retention_policy("t", "v", Some(1), None, Some(1))
+        .set_versioning_retention_policy("t", "v", Some(1), None, Some(1), None)
         .await
         .unwrap();
     let quota_repository = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
@@ -2936,5 +2936,75 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
         .await
         .unwrap();
     assert!(remaining.is_empty());
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn configurable_reflog_retention_bounds_recovery_and_gc_roots() {
+    let object_store: Arc<dyn ObjectStore> = store::resolve_root("memory:///").unwrap();
+    let control = ControlPlane::open(Arc::clone(&object_store), common::test_kms())
+        .await
+        .unwrap();
+    control.create_tenant("t", None).await.unwrap();
+    let record = volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "v",
+        common::create_opts(None, None),
+    )
+    .await
+    .unwrap();
+    control
+        .set_versioning_enabled("t", "v", true)
+        .await
+        .unwrap();
+    control
+        .set_versioning_retention_policy("t", "v", None, None, None, Some(3))
+        .await
+        .unwrap();
+    let dek = control.unwrap_volume_dek(&record).await.unwrap();
+    let live = Volume::open(&record, dek, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let creds = Credentials::root();
+    let file = live
+        .create(&creds, ROOT_INO, b"history.txt", 0o644, true)
+        .await
+        .unwrap();
+    let repository = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap();
+    for index in 0..5 {
+        let contents = format!("version-{index}");
+        live.write(&creds, file.ino, 0, contents.as_bytes())
+            .await
+            .unwrap();
+        repository
+            .commit_file(live.as_ref(), "/history.txt", contents, test_provenance())
+            .await
+            .unwrap();
+    }
+    assert_eq!(repository.reflog("main", 3).await.unwrap().len(), 3);
+    assert!(repository.reflog("main", 4).await.is_err());
+    repository.close().await.unwrap();
+
+    control
+        .set_versioning_retention_policy("t", "v", Some(1), None, None, Some(1))
+        .await
+        .unwrap();
+    let repository = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap();
+    assert_eq!(repository.prune_reflogs().await.unwrap(), 2);
+    assert_eq!(repository.reflog("main", 1).await.unwrap().len(), 1);
+    let gc = repository
+        .garbage_collect(Some(1), None, false)
+        .await
+        .unwrap();
+    assert_eq!(gc.deleted_commits, 3);
+
+    repository.close().await.unwrap();
+    live.shutdown().await.unwrap();
     control.close().await.unwrap();
 }

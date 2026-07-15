@@ -113,7 +113,7 @@ Control DB keys are UTF-8 byte strings.
 | `t/<tenant>` | 1 | `TenantRecord` |
 | `v/<tenant>/<volume>` | 1 | `VolumeRecord` |
 | `vr/<tenant>/<volume>` | 1 | optional `VersioningPolicy`; absence means disabled |
-| `vrr/<tenant>/<volume>` | 1 | optional `VersioningRetentionPolicy` with count, age, and byte limits |
+| `vrr/<tenant>/<volume>` | 1 | optional `VersioningRetentionPolicy` with commit count, age, byte, and reflog-window limits |
 | `k/fhmac` | internal | server file-handle HMAC key |
 
 `control.dek` is not inside the control DB. It is a raw object containing a
@@ -127,7 +127,7 @@ Current record payloads:
 - `QuotaLimits { bytes, inodes }`
 - `QuotaLimit { soft, hard, grace_until }`
 - `VersioningPolicy { tenant, volume, enabled, updated_at }`
-- `VersioningRetentionPolicy { tenant, volume, keep_last, max_age_secs, max_bytes, updated_at }`
+- `VersioningRetentionPolicy { tenant, volume, keep_last, max_age_secs, max_bytes, reflog_keep_last, updated_at }`
 
 ## Optional Version Repository Records
 
@@ -144,7 +144,7 @@ the live VFS request path. Its logical key prefixes are:
 | `pi/<sha256-idempotency-key>` | 1 | commit ID and branch-aware canonical request fingerprint |
 | `pr/heads/<name>` | 1 | mutable branch `VersionRef`; `main` is the default commit head |
 | `pr/protected/<name>` | 1 | durable destructive-ref protection and normalized publisher and policy-manager allowlists for an existing branch |
-| `pr/logs/<name>/<sequence>` | 1 | bounded branch-head transition record; the newest 100 per name are retained |
+| `pr/logs/<name>/<sequence>` | 1 | bounded branch-head transition record; the configured newest entries per name are retained (default 100) |
 | `pr/tags/<name>` | 1 | immutable named commit reference and creation time |
 
 Entry metadata (`m/<canonical-path>`) and file chunk references

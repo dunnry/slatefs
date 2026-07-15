@@ -238,7 +238,7 @@ slatefs -c /etc/slatefs/slatefs.toml versioning cherry-pick <tenant> <volume> <c
 slatefs -c /etc/slatefs/slatefs.toml versioning cherry-pick-preview <tenant> <volume> <merge-commit> <target> --mainline 1 --live
 slatefs -c /etc/slatefs/slatefs.toml versioning cherry-pick <tenant> <volume> <merge-commit> <target> --mainline 1 --live
 slatefs -c /etc/slatefs/slatefs.toml versioning show <tenant> <volume> <commit> <path> --out restored.bin --live
-slatefs -c /etc/slatefs/slatefs.toml versioning retention <tenant> <volume> --keep-last 100 --live
+slatefs -c /etc/slatefs/slatefs.toml versioning retention <tenant> <volume> --keep-last 100 --reflog-keep-last 250 --live
 slatefs -c /etc/slatefs/slatefs.toml versioning gc <tenant> <volume> --dry-run --live
 slatefs -c /etc/slatefs/slatefs.toml versioning stats <tenant> <volume> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning verify <tenant> <volume> --live
@@ -420,12 +420,19 @@ volume enforces count and age limits on its export-control poll; these commands
 remain available for previews and immediate collection:
 
 ```sh
-slatefs -c /etc/slatefs/slatefs.toml versioning retention <tenant> <volume> --keep-last 100 --max-age 2592000 --max-bytes 10737418240
+slatefs -c /etc/slatefs/slatefs.toml versioning retention <tenant> <volume> --keep-last 100 --max-age 2592000 --max-bytes 10737418240 --reflog-keep-last 250
 slatefs -c /etc/slatefs/slatefs.toml versioning gc <tenant> <volume> --dry-run
 slatefs -c /etc/slatefs/slatefs.toml versioning gc <tenant> <volume>
 slatefs -c /etc/slatefs/slatefs.toml versioning stats <tenant> <volume>
 slatefs -c /etc/slatefs/slatefs.toml versioning verify <tenant> <volume>
 ```
+
+`--reflog-keep-last` is a per-branch recovery window from 1 to 100,000 and
+defaults to 100 when no value is configured. Lowering it prunes every branch immediately;
+those deleted transitions can no longer be used by `recover-branch`, and their
+commits may be reclaimed by the next GC if no other branch, tag, or retained
+reflog entry pins them. Treat a reduction as a destructive retention change
+and take a repository bundle first when a longer rollback window may be needed.
 
 `versioning show` and restore stream large files in volume-sized chunks. Admin
 API content reads are paged with `offset` and `length` (1 MiB default, 4 MiB

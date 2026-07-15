@@ -19,15 +19,15 @@ use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{
-    VersionAttestationQuorumInfo, VersionBranchInfo, VersionBranchProtectionPolicy,
-    VersionBranchRecoveryInfo, VersionBranchResetInfo, VersionCherryPickInfo,
-    VersionCherryPickPreview, VersionCommitAttestation, VersionCommitInfo, VersionCommitOrigin,
-    VersionCommitProvenance, VersionMergeConflictStrategy, VersionMergeInfo, VersionMergePreview,
-    VersionPathChangeKind, VersionReflogEntry, VersionRepository, VersionRepositoryBundleReport,
-    VersionRepositorySyncReport, VersionRepositorySyncState, VersionRestoreActionKind,
-    VersionRestoreApplyInfo, VersionRestoreMode, VersionRestorePreview, VersionTagInfo,
-    VersionTrustedAttestationKey, VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
-    force_break_expired_version_maintenance_lease, purge_version_history,
+    DEFAULT_REFLOG_KEEP_LAST, VersionAttestationQuorumInfo, VersionBranchInfo,
+    VersionBranchProtectionPolicy, VersionBranchRecoveryInfo, VersionBranchResetInfo,
+    VersionCherryPickInfo, VersionCherryPickPreview, VersionCommitAttestation, VersionCommitInfo,
+    VersionCommitOrigin, VersionCommitProvenance, VersionMergeConflictStrategy, VersionMergeInfo,
+    VersionMergePreview, VersionPathChangeKind, VersionReflogEntry, VersionRepository,
+    VersionRepositoryBundleReport, VersionRepositorySyncReport, VersionRepositorySyncState,
+    VersionRestoreActionKind, VersionRestoreApplyInfo, VersionRestoreMode, VersionRestorePreview,
+    VersionTagInfo, VersionTrustedAttestationKey, VersionWorkingTreeChangeKind,
+    VersionWorkingTreeStatus, force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease, version_commit_attestation_payload,
 };
 use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
@@ -759,6 +759,9 @@ enum VersioningCmd {
         max_age: Option<u64>,
         #[arg(long)]
         max_bytes: Option<u64>,
+        /// Number of branch-head transitions retained per branch for recovery.
+        #[arg(long)]
+        reflog_keep_last: Option<u32>,
         #[arg(long)]
         clear: bool,
         #[arg(long)]
@@ -4846,36 +4849,45 @@ async fn run(
             keep_last,
             max_age,
             max_bytes,
+            reflog_keep_last,
             clear,
             live,
         }) => {
             if *live {
-                if *clear && (keep_last.is_some() || max_age.is_some() || max_bytes.is_some()) {
-                    anyhow::bail!(
-                        "--clear cannot be combined with --keep-last, --max-age, or --max-bytes"
-                    );
+                if *clear
+                    && (keep_last.is_some()
+                        || max_age.is_some()
+                        || max_bytes.is_some()
+                        || reflog_keep_last.is_some())
+                {
+                    anyhow::bail!("--clear cannot be combined with retention limits");
                 }
-                let response =
-                    if *clear || keep_last.is_some() || max_age.is_some() || max_bytes.is_some() {
-                        live_versioning_json(
-                            config,
-                            tenant,
-                            volume,
-                            "PATCH",
-                            "retention",
-                            &[],
-                            Some(serde_json::json!({
-                                "keep_last": keep_last,
-                                "max_age_secs": max_age,
-                                "max_bytes": max_bytes,
-                                "clear": clear,
-                            })),
-                        )
+                let response = if *clear
+                    || keep_last.is_some()
+                    || max_age.is_some()
+                    || max_bytes.is_some()
+                    || reflog_keep_last.is_some()
+                {
+                    live_versioning_json(
+                        config,
+                        tenant,
+                        volume,
+                        "PATCH",
+                        "retention",
+                        &[],
+                        Some(serde_json::json!({
+                            "keep_last": keep_last,
+                            "max_age_secs": max_age,
+                            "max_bytes": max_bytes,
+                            "reflog_keep_last": reflog_keep_last,
+                            "clear": clear,
+                        })),
+                    )
+                    .await?
+                } else {
+                    live_versioning_json(config, tenant, volume, "GET", "retention", &[], None)
                         .await?
-                    } else {
-                        live_versioning_json(config, tenant, volume, "GET", "retention", &[], None)
-                            .await?
-                    };
+                };
                 let policy = &response["retention"];
                 println!("versioning_retention: {tenant}/{volume}");
                 println!(
@@ -4899,23 +4911,45 @@ async fn run(
                         .map(|value| value.to_string())
                         .unwrap_or_else(|| "unlimited".to_string())
                 );
+                println!(
+                    "reflog_keep_last: {}",
+                    policy["reflog_keep_last"]
+                        .as_u64()
+                        .unwrap_or(u64::from(DEFAULT_REFLOG_KEEP_LAST))
+                );
                 return Ok(());
             }
             let mut changed = false;
             if *clear {
-                if keep_last.is_some() || max_age.is_some() || max_bytes.is_some() {
-                    anyhow::bail!(
-                        "--clear cannot be combined with --keep-last, --max-age, or --max-bytes"
-                    );
+                if keep_last.is_some()
+                    || max_age.is_some()
+                    || max_bytes.is_some()
+                    || reflog_keep_last.is_some()
+                {
+                    anyhow::bail!("--clear cannot be combined with retention limits");
                 }
                 control
                     .clear_versioning_retention_policy(tenant, volume)
                     .await?;
                 changed = true;
-            } else if keep_last.is_some() || max_age.is_some() || max_bytes.is_some() {
+            } else if keep_last.is_some()
+                || max_age.is_some()
+                || max_bytes.is_some()
+                || reflog_keep_last.is_some()
+            {
+                let current = control
+                    .try_get_versioning_retention_policy(tenant, volume)
+                    .await?;
                 control
                     .set_versioning_retention_policy(
-                        tenant, volume, *keep_last, *max_age, *max_bytes,
+                        tenant,
+                        volume,
+                        keep_last.or_else(|| current.as_ref().and_then(|policy| policy.keep_last)),
+                        max_age.or_else(|| current.as_ref().and_then(|policy| policy.max_age_secs)),
+                        max_bytes.or_else(|| current.as_ref().and_then(|policy| policy.max_bytes)),
+                        reflog_keep_last.or_else(|| {
+                            current.as_ref().and_then(|policy| policy.reflog_keep_last)
+                        }),
                     )
                     .await?;
                 changed = true;
@@ -4940,7 +4974,27 @@ async fn run(
                 "max_bytes: {}",
                 format_limit(policy.as_ref().and_then(|policy| policy.max_bytes))
             );
+            println!(
+                "reflog_keep_last: {}",
+                policy
+                    .as_ref()
+                    .and_then(|policy| policy.reflog_keep_last)
+                    .unwrap_or(DEFAULT_REFLOG_KEEP_LAST)
+            );
             if changed {
+                if let Some(repository) = VersionRepository::open_existing(
+                    control,
+                    Arc::clone(&object_store),
+                    tenant,
+                    volume,
+                )
+                .await?
+                {
+                    let prune = repository.prune_reflogs().await;
+                    let close = repository.close().await;
+                    prune?;
+                    close?;
+                }
                 append_cli_version_audit(
                     control,
                     AuditAction::VersionRetentionSet,
@@ -6951,6 +7005,26 @@ mod tests {
                 live: true,
                 ..
             }) if source == "release-candidate" && target == "main"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "retention",
+            "tenant-a",
+            "docs",
+            "--reflog-keep-last",
+            "250",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::Retention {
+                reflog_keep_last: Some(250),
+                live: true,
+                ..
+            })
         ));
     }
 }

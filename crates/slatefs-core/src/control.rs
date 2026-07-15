@@ -128,6 +128,7 @@ pub struct VersioningRetentionPolicy {
     pub keep_last: Option<u32>,
     pub max_age_secs: Option<u64>,
     pub max_bytes: Option<u64>,
+    pub reflog_keep_last: Option<u32>,
     /// Unix seconds.
     pub updated_at: u64,
 }
@@ -1252,6 +1253,7 @@ impl ControlPlane {
         keep_last: Option<u32>,
         max_age_secs: Option<u64>,
         max_bytes: Option<u64>,
+        reflog_keep_last: Option<u32>,
     ) -> Result<VersioningRetentionPolicy> {
         self.get_volume(tenant, volume).await?;
         if keep_last == Some(0) {
@@ -1272,12 +1274,28 @@ impl ControlPlane {
                 "max_bytes must be positive",
             ));
         }
+        if reflog_keep_last == Some(0) {
+            return Err(Error::invalid(
+                "versioning retention",
+                "reflog_keep_last must be positive",
+            ));
+        }
+        if reflog_keep_last.is_some_and(|keep| keep > crate::versioning::MAX_REFLOG_KEEP_LAST) {
+            return Err(Error::invalid(
+                "versioning retention",
+                format!(
+                    "reflog_keep_last must not exceed {}",
+                    crate::versioning::MAX_REFLOG_KEEP_LAST
+                ),
+            ));
+        }
         let policy = VersioningRetentionPolicy {
             tenant: tenant.to_string(),
             volume: volume.to_string(),
             keep_last,
             max_age_secs,
             max_bytes,
+            reflog_keep_last,
             updated_at: now_unix(),
         };
         self.db

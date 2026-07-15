@@ -59,7 +59,10 @@ const REPOSITORY_SYNC_MAGIC: &[u8; 8] = b"SLATESYN";
 const REPOSITORY_SYNC_VERSION: u8 = 1;
 const REPOSITORY_SYNC_HEADER_LEN: usize = REPOSITORY_SYNC_MAGIC.len() + 1 + 8;
 const SHA256_LEN: usize = 32;
-const REFLOG_RETAIN_PER_BRANCH: usize = 100;
+/// Default number of branch transitions retained for recovery and GC roots.
+pub const DEFAULT_REFLOG_KEEP_LAST: u32 = 100;
+/// Maximum configurable per-branch recovery window.
+pub const MAX_REFLOG_KEEP_LAST: u32 = 100_000;
 const MAINTENANCE_LEASE_VERSION: u8 = 1;
 const MAINTENANCE_LEASE_TTL_SECS: u64 = 120;
 const MAINTENANCE_LEASE_RENEW_SECS: u64 = 30;
@@ -462,6 +465,7 @@ pub enum VersionStoreError {
 struct VersionStore {
     db: Db,
     ref_lock: Arc<Mutex<()>>,
+    reflog_keep_last: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -493,10 +497,11 @@ struct VersionPublishRequest<'a> {
 }
 
 impl VersionStore {
-    fn new(db: Db) -> Self {
+    fn new(db: Db, reflog_keep_last: usize) -> Self {
         Self {
             db,
             ref_lock: Arc::new(Mutex::new(())),
+            reflog_keep_last,
         }
     }
 
@@ -1222,6 +1227,37 @@ impl VersionStore {
         Ok(ids)
     }
 
+    async fn prune_reflogs(&self) -> Result<u64> {
+        let _guard = self.ref_lock.lock().await;
+        let mut iter = self.db.scan_prefix(REFLOG_PREFIX, ..).await?;
+        let mut branches = BTreeMap::<Vec<u8>, Vec<Vec<u8>>>::new();
+        while let Some(entry) = iter.next().await? {
+            let key = entry.key.to_vec();
+            let prefix_len = key.len().checked_sub(8).ok_or_else(|| {
+                Error::Versioning("version branch reflog key is truncated".to_string())
+            })?;
+            branches
+                .entry(key[..prefix_len].to_vec())
+                .or_default()
+                .push(key);
+        }
+        let mut batch = WriteBatch::new();
+        let mut deleted = 0_u64;
+        for keys in branches.values_mut() {
+            keys.sort();
+            let excess = keys.len().saturating_sub(self.reflog_keep_last);
+            for key in keys.iter().take(excess) {
+                batch.delete(key);
+                deleted += 1;
+            }
+        }
+        if deleted > 0 {
+            self.db.write(batch).await?;
+            self.db.flush().await?;
+        }
+        Ok(deleted)
+    }
+
     async fn recover_branch(
         &self,
         name: &str,
@@ -1309,7 +1345,7 @@ impl VersionStore {
         let excess = existing
             .len()
             .saturating_add(1)
-            .saturating_sub(REFLOG_RETAIN_PER_BRANCH);
+            .saturating_sub(self.reflog_keep_last);
         for key in existing.into_iter().take(excess) {
             batch.delete(key);
         }
@@ -2697,7 +2733,7 @@ async fn delete_version_history_objects_with_policy(
                 .await?
         {
             let db = open_version_db(&record, dek, Arc::clone(&object_store)).await?;
-            let version_store = VersionStore::new(db);
+            let version_store = VersionStore::new(db, DEFAULT_REFLOG_KEEP_LAST as usize);
             let protections = version_store.list_branch_protections().await;
             let db_close = version_store.db.close().await.map_err(Error::from);
             let protections = protections?;
@@ -2779,10 +2815,14 @@ impl VersionRepository {
                 "versioning is disabled for {tenant}/{volume}"
             )));
         }
-        let max_bytes = control
+        let retention = control
             .try_get_versioning_retention_policy(tenant, volume)
-            .await?
-            .and_then(|policy| policy.max_bytes);
+            .await?;
+        let max_bytes = retention.as_ref().and_then(|policy| policy.max_bytes);
+        let reflog_keep_last = retention
+            .as_ref()
+            .and_then(|policy| policy.reflog_keep_last)
+            .unwrap_or(DEFAULT_REFLOG_KEEP_LAST) as usize;
         let record = control.get_mountable_volume(tenant, volume).await?;
         let dek = control.unwrap_volume_dek(&record).await?;
         let maintenance = VersionMaintenanceGuard::acquire(
@@ -2792,7 +2832,16 @@ impl VersionRepository {
             "repository",
         )
         .await?;
-        Self::open_for_record(&record, dek, object_store, max_bytes, maintenance, identity).await
+        Self::open_for_record(
+            &record,
+            dek,
+            object_store,
+            max_bytes,
+            reflog_keep_last,
+            maintenance,
+            identity,
+        )
+        .await
     }
 
     /// Open a repository only when history has already been created. The
@@ -2809,13 +2858,26 @@ impl VersionRepository {
                 "versioning is disabled for {tenant}/{volume}"
             )));
         }
-        let max_bytes = control
+        let retention = control
             .try_get_versioning_retention_policy(tenant, volume)
-            .await?
-            .and_then(|policy| policy.max_bytes);
+            .await?;
+        let max_bytes = retention.as_ref().and_then(|policy| policy.max_bytes);
+        let reflog_keep_last = retention
+            .as_ref()
+            .and_then(|policy| policy.reflog_keep_last)
+            .unwrap_or(DEFAULT_REFLOG_KEEP_LAST) as usize;
         let record = control.get_mountable_volume(tenant, volume).await?;
         let dek = control.unwrap_volume_dek(&record).await?;
-        Self::open_existing_for_record(&record, dek, object_store, max_bytes, tenant, volume).await
+        Self::open_existing_for_record(
+            &record,
+            dek,
+            object_store,
+            max_bytes,
+            reflog_keep_last,
+            tenant,
+            volume,
+        )
+        .await
     }
 
     /// Read-only-control-plane variant of [`Self::open_existing`] for daemon
@@ -2831,13 +2893,26 @@ impl VersionRepository {
                 "versioning is disabled for {tenant}/{volume}"
             )));
         }
-        let max_bytes = control
+        let retention = control
             .try_get_versioning_retention_policy(tenant, volume)
-            .await?
-            .and_then(|policy| policy.max_bytes);
+            .await?;
+        let max_bytes = retention.as_ref().and_then(|policy| policy.max_bytes);
+        let reflog_keep_last = retention
+            .as_ref()
+            .and_then(|policy| policy.reflog_keep_last)
+            .unwrap_or(DEFAULT_REFLOG_KEEP_LAST) as usize;
         let record = control.get_mountable_volume(tenant, volume).await?;
         let dek = control.unwrap_volume_dek(&record).await?;
-        Self::open_existing_for_record(&record, dek, object_store, max_bytes, tenant, volume).await
+        Self::open_existing_for_record(
+            &record,
+            dek,
+            object_store,
+            max_bytes,
+            reflog_keep_last,
+            tenant,
+            volume,
+        )
+        .await
     }
 
     async fn open_existing_for_record(
@@ -2845,6 +2920,7 @@ impl VersionRepository {
         dek: crate::crypto::Secret32,
         object_store: Arc<dyn ObjectStore>,
         max_bytes: Option<u64>,
+        reflog_keep_last: usize,
         tenant: &str,
         volume: &str,
     ) -> Result<Option<Self>> {
@@ -2868,9 +2944,17 @@ impl VersionRepository {
             maintenance.close().await?;
             return Ok(None);
         }
-        Self::open_for_record(record, dek, object_store, max_bytes, maintenance, None)
-            .await
-            .map(Some)
+        Self::open_for_record(
+            record,
+            dek,
+            object_store,
+            max_bytes,
+            reflog_keep_last,
+            maintenance,
+            None,
+        )
+        .await
+        .map(Some)
     }
 
     async fn open_for_record(
@@ -2878,6 +2962,7 @@ impl VersionRepository {
         dek: crate::crypto::Secret32,
         object_store: Arc<dyn ObjectStore>,
         max_bytes: Option<u64>,
+        reflog_keep_last: usize,
         maintenance: VersionMaintenanceGuard,
         requested_identity: Option<VersionRepositoryIdentity>,
     ) -> Result<Self> {
@@ -2896,7 +2981,7 @@ impl VersionRepository {
                 return Err(error);
             }
         };
-        let store = VersionStore::new(db);
+        let store = VersionStore::new(db, reflog_keep_last);
         let identity = match store
             .get_or_create_repository_identity(requested_identity.as_ref())
             .await
@@ -4479,13 +4564,14 @@ impl VersionRepository {
     }
 
     /// List the newest retained head transitions for a branch. Reflogs remain
-    /// available after branch deletion and retain at most 100 entries per name.
+    /// available after branch deletion and obey the repository's configured
+    /// per-branch recovery window.
     pub async fn reflog(&self, branch: &str, limit: usize) -> Result<Vec<VersionReflogEntry>> {
         validate_version_branch_name(branch)?;
-        if limit == 0 || limit > REFLOG_RETAIN_PER_BRANCH {
+        if limit == 0 || limit > self.store.reflog_keep_last {
             return Err(Error::invalid(
                 "version reflog limit",
-                format!("must be between 1 and {REFLOG_RETAIN_PER_BRANCH}"),
+                format!("must be between 1 and {}", self.store.reflog_keep_last),
             ));
         }
         Ok(self
@@ -4496,6 +4582,12 @@ impl VersionRepository {
             .take(limit)
             .map(VersionReflogEntry::from)
             .collect())
+    }
+
+    /// Immediately trim every branch reflog to the configured recovery
+    /// window. Removed entries stop protecting their commits from GC.
+    pub async fn prune_reflogs(&self) -> Result<u64> {
+        self.store.prune_reflogs().await
     }
 
     /// Restore the head that immediately preceded one retained reflog entry.

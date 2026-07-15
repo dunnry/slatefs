@@ -236,8 +236,7 @@ trusted key IDs, and whether promotion is ready without moving either branch.
 Add `--check` to exit non-zero when the candidate is below quorum.
 
 `unprotect-branch --yes` removes that guard. `versioning reflog <branch>` lists
-the newest 100 head
-transitions even after branch deletion. Every create, commit, fast-forward,
+the retained head transitions even after branch deletion. Every create, commit, fast-forward,
 merge, reset, and delete records its ref change atomically; retained reflog
 heads are GC roots, so this recovery window takes precedence over stricter
 count or age retention. `recover-branch <name> <reflog-sequence> --yes`
@@ -313,7 +312,10 @@ before publishing the Prolly head. A fenced daemon returns `503` without
 creating a commit so the caller can retry the promoted primary.
 
 History lifecycle remains opt-in. `versioning retention` sets `--keep-last`,
-`--max-age`, and/or a hard `--max-bytes` history quota. For an enabled volume
+`--max-age`, a hard `--max-bytes` history quota, and/or
+`--reflog-keep-last` (1 to 100,000). The reflog window defaults to 100 transitions per branch;
+lowering it immediately prunes older recovery entries and releases their GC
+roots, while raising it applies to future transitions. For an enabled volume
 served by `slatefsd`, the daemon applies count and age retention on its normal
 export-control poll; disabled, unserved, policyless, and never-committed
 volumes are untouched. `versioning gc` runs the same collection explicitly
@@ -418,7 +420,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/tags` | Create a retention-pinning tag from `{"name":"...","commit":"..."}`. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/tags/{name}` | Delete a tag without deleting its commit immediately. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | List branch heads, including `main`. |
-| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/reflog` | List up to 100 retained head transitions, newest first, including deleted branches; optional `limit`. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/reflog` | List retained head transitions, newest first, including deleted branches; optional `limit` cannot exceed the configured per-branch recovery window. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | Create a branch from `{"name":"...","commit":"commit-or-ref"}`. |
 | `PUT` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/protection` | Protect a branch with optional `allowed_committers`, `allowed_managers`, `trusted_attestation_keys` objects containing `key_id`, `algorithm`, and `public_key`, and `required_attestations`. Trusted keys default to a 1-of-M signature quorum; the explicit count must be between 1 and M. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/protection` | Remove destructive-ref protection from a branch. |
@@ -438,7 +440,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/stats` | Logical history bytes, nodes, blobs, commits, and attestations. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/verify` | Verify the reachable commit DAG, attestations, branch trust rules, Prolly nodes, and content blobs. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Current history retention and quota policy. |
-| `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Set `keep_last`, `max_age_secs`, and/or `max_bytes`, or `{"clear":true}`. |
+| `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Set `keep_last`, `max_age_secs`, `max_bytes`, and/or positive `reflog_keep_last`, or `{"clear":true}`. Lowering the reflog limit prunes immediately. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/gc` | Apply retention, or report with `{"dry_run":true}`. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/lease` | Break an expired lease with its exact observed `owner` and `{"confirm":true}`. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/history` | Permanently purge history; requires `{"confirm":true}` and no protected branches. |
