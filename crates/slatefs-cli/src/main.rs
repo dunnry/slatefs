@@ -23,10 +23,10 @@ use slatefs_core::versioning::{
     VersionBranchRecoveryInfo, VersionBranchResetInfo, VersionCommitAttestation, VersionCommitInfo,
     VersionCommitOrigin, VersionCommitProvenance, VersionMergeConflictStrategy, VersionMergeInfo,
     VersionMergePreview, VersionPathChangeKind, VersionReflogEntry, VersionRepository,
-    VersionRepositoryBundleReport, VersionRestoreActionKind, VersionRestoreApplyInfo,
-    VersionRestoreMode, VersionRestorePreview, VersionTagInfo, VersionTrustedAttestationKey,
-    VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
-    force_break_expired_version_maintenance_lease, purge_version_history,
+    VersionRepositoryBundleReport, VersionRepositorySyncReport, VersionRepositorySyncState,
+    VersionRestoreActionKind, VersionRestoreApplyInfo, VersionRestoreMode, VersionRestorePreview,
+    VersionTagInfo, VersionTrustedAttestationKey, VersionWorkingTreeChangeKind,
+    VersionWorkingTreeStatus, force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease, version_commit_attestation_payload,
 };
 use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
@@ -370,6 +370,44 @@ enum VersioningCmd {
         yes: bool,
         #[arg(long)]
         live: bool,
+    },
+    /// Incrementally publish a local version branch to a remote SlateFS daemon.
+    Push {
+        tenant: String,
+        volume: String,
+        /// Remote slatefsd admin address, for example host:9494.
+        #[arg(long)]
+        remote_admin: String,
+        /// Destination tenant; defaults to the local tenant.
+        #[arg(long)]
+        remote_tenant: Option<String>,
+        /// Destination volume; defaults to the local volume.
+        #[arg(long)]
+        remote_volume: Option<String>,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        /// Permit replacement of divergent history on an unprotected destination branch.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Incrementally fetch a remote version branch into the local repository.
+    Pull {
+        tenant: String,
+        volume: String,
+        /// Remote slatefsd admin address, for example host:9494.
+        #[arg(long)]
+        remote_admin: String,
+        /// Source tenant; defaults to the local tenant.
+        #[arg(long)]
+        remote_tenant: Option<String>,
+        /// Source volume; defaults to the local volume.
+        #[arg(long)]
+        remote_volume: Option<String>,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        /// Permit replacement of divergent history on an unprotected local branch.
+        #[arg(long)]
+        force: bool,
     },
     /// Compare a live subtree with a commit, tag, or branch.
     Status {
@@ -1982,25 +2020,29 @@ async fn admin_http_exchange(
     exchange_admin_stream(stream, request).await
 }
 
-async fn live_versioning_json(
+#[derive(Clone, Copy)]
+struct VersioningAdminTarget<'a> {
+    listen: &'a str,
+    tenant: &'a str,
+    volume: &'a str,
+}
+
+async fn versioning_json_at(
     config: &Config,
-    tenant: &str,
-    volume: &str,
+    target: VersioningAdminTarget<'_>,
     method: &str,
     suffix: &str,
     query: &[(&str, String)],
     body: Option<serde_json::Value>,
 ) -> anyhow::Result<serde_json::Value> {
-    let listen = config
-        .admin
-        .listen
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("--live requires [admin].listen"))?;
     let body = body
         .map(|body| serde_json::to_string(&body))
         .transpose()?
         .unwrap_or_default();
-    let mut path = format!("/admin/v1/tenants/{tenant}/volumes/{volume}/versioning");
+    let mut path = format!(
+        "/admin/v1/tenants/{}/volumes/{}/versioning",
+        target.tenant, target.volume
+    );
     if !suffix.is_empty() {
         path.push('/');
         path.push_str(suffix);
@@ -2016,14 +2058,15 @@ async fn live_versioning_json(
             path.push_str(&percent_encode_query_value(value));
         }
     }
-    let authorization = admin_bearer_token(config, tenant)?
+    let authorization = admin_bearer_token(config, target.tenant)?
         .map(|token| format!("Authorization: Bearer {token}\r\n"))
         .unwrap_or_default();
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {listen}\r\nContent-Type: application/json\r\n{authorization}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n{authorization}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        target.listen,
         body.len()
     );
-    let response = admin_http_exchange(config, listen, request.as_bytes()).await?;
+    let response = admin_http_exchange(config, target.listen, request.as_bytes()).await?;
     let (head, body) = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -2039,6 +2082,35 @@ async fn live_versioning_json(
         anyhow::bail!("admin versioning request failed: {detail}");
     }
     serde_json::from_slice(body).context("parsing admin versioning response")
+}
+
+async fn live_versioning_json(
+    config: &Config,
+    tenant: &str,
+    volume: &str,
+    method: &str,
+    suffix: &str,
+    query: &[(&str, String)],
+    body: Option<serde_json::Value>,
+) -> anyhow::Result<serde_json::Value> {
+    let listen = config
+        .admin
+        .listen
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--live requires [admin].listen"))?;
+    versioning_json_at(
+        config,
+        VersioningAdminTarget {
+            listen,
+            tenant,
+            volume,
+        },
+        method,
+        suffix,
+        query,
+        body,
+    )
+    .await
 }
 
 async fn post_live_versioning_json(
@@ -2089,6 +2161,73 @@ async fn live_versioning_bundle(
         anyhow::bail!("admin versioning request failed: {detail}");
     }
     Ok(body.to_vec())
+}
+
+async fn versioning_sync_exchange(
+    config: &Config,
+    target: VersioningAdminTarget<'_>,
+    branch: &str,
+    method: &str,
+    body: &[u8],
+    force: bool,
+) -> anyhow::Result<Vec<u8>> {
+    let authorization = admin_bearer_token(config, target.tenant)?
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
+    let query = if force { "?force=true" } else { "" };
+    let content_type = if method == "POST" {
+        "application/json"
+    } else {
+        "application/vnd.slatefs.version-sync"
+    };
+    let mut request = format!(
+        "{method} /admin/v1/tenants/{}/volumes/{}/versioning/sync/branches/{branch}{query} HTTP/1.1\r\nHost: {}\r\nContent-Type: {content_type}\r\n{authorization}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        target.tenant,
+        target.volume,
+        target.listen,
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    let response = admin_http_exchange(config, target.listen, &request).await?;
+    let (head, body) = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| (&response[..position], &response[position + 4..]))
+        .ok_or_else(|| anyhow::anyhow!("malformed admin response"))?;
+    let head = std::str::from_utf8(head).context("admin response headers are not UTF-8")?;
+    let status = head.lines().next().unwrap_or_default();
+    if !status.starts_with("HTTP/1.1 200 ") && !status.starts_with("HTTP/1.1 201 ") {
+        let detail = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|body| body["error"]["message"].as_str().map(str::to_string))
+            .unwrap_or_else(|| String::from_utf8_lossy(body).trim().to_string());
+        anyhow::bail!("admin version sync request failed: {detail}");
+    }
+    Ok(body.to_vec())
+}
+
+async fn remote_version_sync_state(
+    config: &Config,
+    listen: &str,
+    tenant: &str,
+    volume: &str,
+    branch: &str,
+) -> anyhow::Result<Option<VersionRepositorySyncState>> {
+    let response = versioning_json_at(
+        config,
+        VersioningAdminTarget {
+            listen,
+            tenant,
+            volume,
+        },
+        "GET",
+        &format!("sync/branches/{branch}"),
+        &[],
+        None,
+    )
+    .await?;
+    serde_json::from_value(response["sync"].clone()).context("parsing remote version sync state")
 }
 
 #[tokio::main]
@@ -2293,6 +2432,23 @@ fn print_repository_bundle_report(report: &VersionRepositoryBundleReport) {
     println!("branches: {}", report.branches);
     println!("tags: {}", report.tags);
     println!("reflogs: {}", report.reflogs);
+}
+
+fn print_repository_sync_report(report: &VersionRepositorySyncReport) {
+    println!("repository_id: {}", report.identity.id());
+    println!("branch: {}", report.branch);
+    println!("previous: {}", report.previous.as_deref().unwrap_or("none"));
+    println!("target: {}", report.target);
+    println!("fast_forward: {}", report.fast_forward);
+    println!("forced: {}", report.forced);
+    println!("updated: {}", report.updated);
+    println!("bundle_bytes: {}", report.bundle_bytes);
+    println!("logical_bytes: {}", report.logical_bytes);
+    println!("objects: {}", report.objects);
+    println!("commits: {}", report.commits);
+    println!("attestations: {}", report.attestations);
+    println!("nodes: {}", report.nodes);
+    println!("blobs: {}", report.blobs);
 }
 
 fn read_attestation_bundle(path: &std::path::Path) -> anyhow::Result<VersionAttestationBundle> {
@@ -2966,6 +3122,191 @@ async fn run(
                 input.display()
             );
             print_repository_bundle_report(&report);
+        }
+        Command::Versioning(VersioningCmd::Push {
+            tenant,
+            volume,
+            remote_admin,
+            remote_tenant,
+            remote_volume,
+            branch,
+            force,
+        }) => {
+            let remote_tenant = remote_tenant.as_deref().unwrap_or(tenant);
+            let remote_volume = remote_volume.as_deref().unwrap_or(volume);
+            let remote_state = remote_version_sync_state(
+                config,
+                remote_admin,
+                remote_tenant,
+                remote_volume,
+                branch,
+            )
+            .await?;
+            let repository = VersionRepository::open_existing(
+                control,
+                Arc::clone(&object_store),
+                tenant,
+                volume,
+            )
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("local version repository {tenant}/{volume} has no history")
+            })?;
+            if let Some(remote) = &remote_state
+                && remote.identity != *repository.identity()
+            {
+                let local_id = repository.identity().id().to_string();
+                let remote_id = remote.identity.id().to_string();
+                repository.close().await?;
+                anyhow::bail!("repository identity mismatch: local {local_id}, remote {remote_id}");
+            }
+            let expected = remote_state
+                .as_ref()
+                .and_then(|state| state.head.as_deref());
+            let exported = repository.export_sync_bundle(branch, expected).await;
+            let close = repository.close().await;
+            let (pack, export_report) = exported?;
+            close?;
+            append_cli_version_audit(
+                control,
+                AuditAction::VersionSyncExport,
+                tenant,
+                volume,
+                [
+                    (
+                        "repository_id".to_string(),
+                        AuditDetailValue::String(export_report.identity.id().to_string()),
+                    ),
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(branch.clone()),
+                    ),
+                    (
+                        "bundle_bytes".to_string(),
+                        AuditDetailValue::U64(export_report.bundle_bytes),
+                    ),
+                ],
+            )
+            .await?;
+            let response = versioning_sync_exchange(
+                config,
+                VersioningAdminTarget {
+                    listen: remote_admin,
+                    tenant: remote_tenant,
+                    volume: remote_volume,
+                },
+                branch,
+                "PUT",
+                &pack,
+                *force,
+            )
+            .await?;
+            let response: serde_json::Value =
+                serde_json::from_slice(&response).context("parsing remote sync apply response")?;
+            let report: VersionRepositorySyncReport =
+                serde_json::from_value(response["sync"].clone())
+                    .context("parsing remote sync apply report")?;
+            println!(
+                "pushed {tenant}/{volume}:{branch} to {remote_tenant}/{remote_volume} at {remote_admin}"
+            );
+            print_repository_sync_report(&report);
+        }
+        Command::Versioning(VersioningCmd::Pull {
+            tenant,
+            volume,
+            remote_admin,
+            remote_tenant,
+            remote_volume,
+            branch,
+            force,
+        }) => {
+            let remote_tenant = remote_tenant.as_deref().unwrap_or(tenant);
+            let remote_volume = remote_volume.as_deref().unwrap_or(volume);
+            let remote_state = remote_version_sync_state(
+                config,
+                remote_admin,
+                remote_tenant,
+                remote_volume,
+                branch,
+            )
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "remote version repository {remote_tenant}/{remote_volume} has no history"
+                )
+            })?;
+            let local = VersionRepository::open_existing(
+                control,
+                Arc::clone(&object_store),
+                tenant,
+                volume,
+            )
+            .await?;
+            let local_head = if let Some(repository) = local {
+                if remote_state.identity != *repository.identity() {
+                    let local_id = repository.identity().id().to_string();
+                    let remote_id = remote_state.identity.id().to_string();
+                    repository.close().await?;
+                    anyhow::bail!(
+                        "repository identity mismatch: local {local_id}, remote {remote_id}"
+                    );
+                }
+                let state = repository.sync_state(branch).await?;
+                repository.close().await?;
+                state.head
+            } else {
+                None
+            };
+            let export_body = serde_json::to_vec(&serde_json::json!({ "have": local_head }))?;
+            let pack = versioning_sync_exchange(
+                config,
+                VersioningAdminTarget {
+                    listen: remote_admin,
+                    tenant: remote_tenant,
+                    volume: remote_volume,
+                },
+                branch,
+                "POST",
+                &export_body,
+                false,
+            )
+            .await?;
+            let report = VersionRepository::apply_sync_bundle(
+                control,
+                object_store,
+                tenant,
+                volume,
+                branch,
+                &pack,
+                *force,
+            )
+            .await?;
+            append_cli_version_audit(
+                control,
+                AuditAction::VersionSyncApply,
+                tenant,
+                volume,
+                [
+                    (
+                        "repository_id".to_string(),
+                        AuditDetailValue::String(report.identity.id().to_string()),
+                    ),
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(branch.clone()),
+                    ),
+                    ("forced".to_string(), AuditDetailValue::Bool(report.forced)),
+                    (
+                        "bundle_bytes".to_string(),
+                        AuditDetailValue::U64(report.bundle_bytes),
+                    ),
+                ],
+            )
+            .await?;
+            println!(
+                "pulled {remote_tenant}/{remote_volume}:{branch} from {remote_admin} into {tenant}/{volume}"
+            );
+            print_repository_sync_report(&report);
         }
         Command::Versioning(VersioningCmd::Status {
             tenant,
@@ -5254,6 +5595,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn versioning_sync_transport_preserves_pack_and_force_semantics() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let pack = vec![b'S', b'L', b'A', b'T', b'E', 0, 0xff, 0x80];
+        let expected_pack = pack.clone();
+        let response_body = serde_json::to_vec(&serde_json::json!({
+            "sync": {
+                "target": "abc"
+            }
+        }))
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        response_body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(&response_body).await.unwrap();
+            (request, expected_pack)
+        });
+        let config = Config::parse(
+            r#"
+                [object_store]
+                url = "memory:///"
+
+                [kms]
+                provider = "static"
+                key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+                [admin.tenant_tokens]
+                tenant-a = "tenant-secret"
+            "#,
+        )
+        .unwrap();
+        let listen = listen.to_string();
+        let response = versioning_sync_exchange(
+            &config,
+            VersioningAdminTarget {
+                listen: &listen,
+                tenant: "tenant-a",
+                volume: "docs",
+            },
+            "release",
+            "PUT",
+            &pack,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response).unwrap()["sync"]["target"],
+            "abc"
+        );
+        let (request, expected_pack) = server.await.unwrap();
+        let separator = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        let head = std::str::from_utf8(&request[..separator]).unwrap();
+        assert!(head.starts_with(
+            "PUT /admin/v1/tenants/tenant-a/volumes/docs/versioning/sync/branches/release?force=true HTTP/1.1"
+        ));
+        assert!(head.contains("Content-Type: application/vnd.slatefs.version-sync\r\n"));
+        assert!(head.contains("Authorization: Bearer tenant-secret\r\n"));
+        assert_eq!(&request[separator + 4..], expected_pack);
+    }
+
+    #[tokio::test]
     async fn live_versioning_client_supports_custom_ca_tls() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
         let (ca_path, cert_path, key_path) = generate_admin_server_certificate(directory.path())?;
@@ -5380,6 +5797,67 @@ mod tests {
             }) if tenant == "tenant-a"
                 && volume == "restored"
                 && input == std::path::Path::new("docs.slatevcs")
+        ));
+
+        let push = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "push",
+            "tenant-a",
+            "docs",
+            "--remote-admin",
+            "remote.example:9494",
+            "--remote-volume",
+            "backup",
+            "--branch",
+            "release",
+            "--force",
+        ])
+        .unwrap();
+        assert!(matches!(
+            push.command,
+            Command::Versioning(VersioningCmd::Push {
+                tenant,
+                volume,
+                remote_admin,
+                remote_tenant: None,
+                remote_volume: Some(remote_volume),
+                branch,
+                force: true,
+            }) if tenant == "tenant-a"
+                && volume == "docs"
+                && remote_admin == "remote.example:9494"
+                && remote_volume == "backup"
+                && branch == "release"
+        ));
+
+        let pull = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "pull",
+            "tenant-a",
+            "restored",
+            "--remote-admin",
+            "remote.example:9494",
+            "--remote-tenant",
+            "archive",
+        ])
+        .unwrap();
+        assert!(matches!(
+            pull.command,
+            Command::Versioning(VersioningCmd::Pull {
+                tenant,
+                volume,
+                remote_admin,
+                remote_tenant: Some(remote_tenant),
+                remote_volume: None,
+                branch,
+                force: false,
+            }) if tenant == "tenant-a"
+                && volume == "restored"
+                && remote_admin == "remote.example:9494"
+                && remote_tenant == "archive"
+                && branch == "main"
         ));
     }
 

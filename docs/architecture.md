@@ -102,7 +102,16 @@ can be used by read, restore, diff, and history operations. Commits advance
 or an existing named branch when selected explicitly. Publishing a commit and
 its branch reference is one SlateDB batch after the new immutable tree nodes
 and blobs have been written. The same batch records a per-branch reflog entry
-for every create, commit, fast-forward, merge, reset, or delete. Reflogs retain
+for every create, commit, fast-forward, merge, reset, delete, or native sync.
+Native sync negotiates from the receiving branch head and packages only the
+reachable commit, attestation, node, blob, and pruned-parent delta in a
+checksummed version-1 `SLATESYN` envelope. The receiver validates that delta
+against its existing logical object graph before one SlateDB batch imports new
+objects, compare-and-swaps the branch, and appends its local reflog. Repository
+identity must match. Non-fast-forward updates require an explicit force flag,
+and protected branches reject force while enforcing local publisher and signer
+policy on ordinary fast-forwards. Tags, source reflogs, retention, and branch
+policy never cross the synchronization boundary. Reflogs retain
 the newest 100 transitions per branch name and remain readable after deletion.
 Recovery names one retained sequence and atomically restores its preceding
 head, recreating a deleted branch when necessary, then records that move as a

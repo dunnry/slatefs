@@ -227,6 +227,8 @@ slatefs versioning verify-attestation-bundle --in release-attestations.json --tr
 slatefs -c /etc/slatefs/slatefs.toml versioning export-repository <tenant> <volume> --out repository.slatevcs --live
 slatefs -c /etc/slatefs/slatefs.toml versioning enable <tenant> <empty-destination-volume> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning import-repository <tenant> <empty-destination-volume> --in repository.slatevcs --yes --live
+slatefs -c /etc/slatefs/slatefs.toml versioning push <tenant> <local-volume> --remote-admin <host:port> --remote-volume <destination-volume> --branch main
+slatefs -c /etc/slatefs/slatefs.toml versioning pull <tenant> <local-volume> --remote-admin <host:port> --remote-volume <source-volume> --branch main
 slatefs -c /etc/slatefs/slatefs.toml versioning merge <tenant> <volume> <source> <target> --author <content-author> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning merge <tenant> <volume> <source> <target> --conflict-strategy ours --live
 slatefs -c /etc/slatefs/slatefs.toml versioning merge-preview <tenant> <volume> <source> <target> --live
@@ -255,6 +257,17 @@ batch. Branch protection, retention configuration, maintenance leases, and
 idempotency retry records are deliberately not imported. The live admin
 transport accepts bundles up to 512 MiB. For larger bundles, quiesce the source
 and destination volumes and omit the live flag.
+
+Push and pull are the incremental alternative to complete repository bundles.
+The local side is opened directly under its repository maintenance lease; the
+remote side uses the configured admin bearer token, CA, server name, and mTLS
+client identity against `--remote-admin`. `--remote-tenant` and
+`--remote-volume` default to the local names. The destination must have
+versioning enabled, but it may be uninitialized. SlateFS rejects stale or
+divergent heads by default. Use `--force` only for an intentional replacement
+of an unprotected destination branch; protected branches cannot be forced.
+Push/pull replicate history and move the destination version branch, but never
+write that commit into the destination live filesystem.
 
 To require a signer on a protected branch, first attest its current head, then
 configure the trust anchor. One trusted signature is required by default. This
@@ -335,9 +348,11 @@ schedule exact subtree restores during a client write quiescence window.
 
 The CLI supplies the matching `[admin.tenant_tokens]` credential when present,
 otherwise `admin.token` or `admin.token_file`, as a bearer token. Tenant tokens
-cannot access another tenant or global admin routes. All versioning subcommands
-accept `--live`; direct repository commands without it must not be run while
-`slatefsd` serves that volume.
+cannot access another tenant or global admin routes. Repository commands with a
+`--live` option should use it while `slatefsd` serves that volume. Push and pull
+instead name the peer with `--remote-admin`; their local side remains a direct
+repository operation and must not race another local repository maintenance
+operation.
 
 For an HTTPS admin endpoint, configure `admin.tls_server_ca` and, when the
 certificate is issued to a DNS name rather than the listener IP,

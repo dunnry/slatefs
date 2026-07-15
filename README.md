@@ -206,6 +206,21 @@ without base64 conversion. Live imports are limited to a 512 MiB request body;
 larger repositories can use the offline commands while the involved volumes
 are quiesced.
 
+For ongoing replication, `versioning push` and `versioning pull` synchronize a
+single branch directly with another `slatefsd` admin endpoint. The receiver
+advertises its repository UUID and current branch head; the sender then emits a
+checksummed `SLATESYN` pack containing only missing commits, attestations,
+Prolly nodes, blobs, and pruned-parent markers. Applying the pack and moving the
+branch are one atomic compare-and-swap. Fast-forward is the default: a stale
+advertisement or divergent destination is rejected. `--force` permits an
+explicit divergent replacement only when the destination branch is
+unprotected; protected branches always reject force and still enforce their
+local committer and attestation rules. Retention, protection, tags, and reflogs
+do not travel, although the receiver records its own `sync` reflog entry and
+audit event. An uninitialized, versioning-enabled destination adopts the source
+repository UUID. Sync changes version history only; it does not restore files
+into the live filesystem.
+
 A protected branch can additionally trust one or more exact signer keys with
 repeatable `--trust-attestation-key <key-id>=<public.key>`. Enabling that rule
 requires the branch's current head to satisfy the configured signature quorum.
@@ -361,6 +376,9 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Enable or disable with `{"enabled":true|false}`; disabling retains history. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/bundle` | Export the complete checksummed repository as `application/vnd.slatefs.version-repository`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/bundle` | Import a native bundle body into an uninitialized repository; the admin request-body limit is 512 MiB. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/sync/branches/{branch}` | Advertise the repository identity and current branch head, or `null` when the version repository is uninitialized. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/sync/branches/{branch}` | Negotiate an incremental `application/vnd.slatefs.version-sync` pack from JSON `{"have":"commit-or-null"}`. |
+| `PUT` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/sync/branches/{branch}` | Atomically apply a sync pack with compare-and-swap and fast-forward enforcement; `?force=true` permits divergent replacement only for an unprotected branch. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/status` | Compare the live working tree with query `reference` (default `main`) and `path` (default `/`) without modifying either side. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore-preview` | Preview `create`, `replace`, and `delete` actions for required `commit` and `path`, with optional `mode=overlay|exact`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Commit history with optional `branch` (default `main`), `path`, `limit`, and exclusive `page_token`; returns `next_page_token`. |
