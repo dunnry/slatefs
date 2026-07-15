@@ -41,6 +41,7 @@ const HEAD_KEY: &[u8] = b"pr/heads/main";
 const BRANCH_PROTECTION_PREFIX: &[u8] = b"pr/protected/";
 const REFLOG_PREFIX: &[u8] = b"pr/logs/";
 const TAG_PREFIX: &[u8] = b"pr/tags/";
+const REPOSITORY_IDENTITY_KEY: &[u8] = b"pm/repository-identity";
 const ENTRY_META_VERSION: u8 = 1;
 const COMMIT_VERSION: u8 = 2;
 const ATTESTATION_VERSION: u8 = 1;
@@ -49,10 +50,38 @@ const REF_VERSION: u8 = 1;
 const BRANCH_PROTECTION_VERSION: u8 = 1;
 const REFLOG_VERSION: u8 = 1;
 const TAG_VERSION: u8 = 1;
+const REPOSITORY_IDENTITY_VERSION: u8 = 1;
 const REFLOG_RETAIN_PER_BRANCH: usize = 100;
 const MAINTENANCE_LEASE_VERSION: u8 = 1;
 const MAINTENANCE_LEASE_TTL_SECS: u64 = 120;
 const MAINTENANCE_LEASE_RENEW_SECS: u64 = 30;
+
+/// Stable logical identity of a portable version repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionRepositoryIdentity {
+    id: String,
+    created_at: u64,
+}
+
+impl VersionRepositoryIdentity {
+    pub fn from_parts(id: impl Into<String>, created_at: u64) -> Result<Self> {
+        let identity = Self {
+            id: id.into(),
+            created_at,
+        };
+        validate_version_repository_identity(&identity)?;
+        Ok(identity)
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn created_at(&self) -> u64 {
+        self.created_at
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -469,6 +498,55 @@ impl VersionStore {
 
     async fn get_head(&self) -> Result<Option<VersionRef>> {
         self.get_ref(HEAD_KEY).await
+    }
+
+    async fn get_or_create_repository_identity(
+        &self,
+        requested: Option<&VersionRepositoryIdentity>,
+    ) -> Result<VersionRepositoryIdentity> {
+        if let Some(requested) = requested {
+            validate_version_repository_identity(requested)?;
+        }
+        let _guard = self.ref_lock.lock().await;
+        if let Some(bytes) = self
+            .get_raw(REPOSITORY_IDENTITY_KEY)
+            .await
+            .map_err(version_store_error)?
+        {
+            let identity = decode_versioned(
+                REPOSITORY_IDENTITY_VERSION,
+                &bytes,
+                "version repository identity",
+            )?;
+            validate_version_repository_identity(&identity)?;
+            if let Some(requested) = requested
+                && requested != &identity
+            {
+                return Err(Error::invalid(
+                    "version repository identity",
+                    format!(
+                        "repository is {}, requested {}",
+                        identity.id(),
+                        requested.id()
+                    ),
+                ));
+            }
+            return Ok(identity);
+        }
+        let identity = requested
+            .cloned()
+            .unwrap_or_else(|| VersionRepositoryIdentity {
+                id: uuid::Uuid::new_v4().to_string(),
+                created_at: crate::control::now_unix(),
+            });
+        self.db
+            .put_bytes(
+                REPOSITORY_IDENTITY_KEY.into(),
+                encode_versioned(REPOSITORY_IDENTITY_VERSION, &identity)?.into(),
+            )
+            .await?;
+        self.db.flush().await?;
+        Ok(identity)
     }
 
     async fn get_ref(&self, key: &[u8]) -> Result<Option<VersionRef>> {
@@ -1515,8 +1593,7 @@ impl VersionTrustedAttestationKey {
 #[derive(Serialize)]
 struct VersionCommitAttestationStatement<'a> {
     version: u8,
-    tenant: &'a str,
-    volume: &'a str,
+    repository_id: &'a str,
     commit: [u8; 32],
     key_id: &'a str,
     algorithm: VersionCommitAttestationAlgorithm,
@@ -1526,15 +1603,13 @@ struct VersionCommitAttestationStatement<'a> {
 
 /// Build the canonical bytes an external Ed25519 signer must sign.
 pub fn version_commit_attestation_payload(
-    tenant: &str,
-    volume: &str,
+    repository_id: &str,
     commit: &str,
     key_id: &str,
     public_key: &[u8],
     created_at: u64,
 ) -> Result<Vec<u8>> {
-    store::validate_name("tenant name", tenant)?;
-    store::validate_name("volume name", volume)?;
+    validate_version_repository_id(repository_id)?;
     validate_version_attestation_key_id(key_id)?;
     if public_key.len() != 32 {
         return Err(Error::invalid(
@@ -1544,9 +1619,8 @@ pub fn version_commit_attestation_payload(
     }
     let commit = parse_commit_id(commit)?;
     postcard::to_allocvec(&VersionCommitAttestationStatement {
-        version: 1,
-        tenant,
-        volume,
+        version: 2,
+        repository_id,
         commit,
         key_id,
         algorithm: VersionCommitAttestationAlgorithm::Ed25519,
@@ -2362,8 +2436,7 @@ impl From<VersionCommit> for VersionCommitInfo {
 pub struct VersionRepository {
     store: VersionStore,
     prolly: AsyncProlly<VersionStore>,
-    tenant: String,
-    volume: String,
+    identity: VersionRepositoryIdentity,
     max_bytes: Option<u64>,
     chunk_size: u64,
     maintenance: VersionMaintenanceGuard,
@@ -2460,6 +2533,29 @@ impl VersionRepository {
         tenant: &str,
         volume: &str,
     ) -> Result<Self> {
+        Self::open_with_optional_identity(control, object_store, tenant, volume, None).await
+    }
+
+    /// Open a repository with a required logical identity. An empty repository
+    /// adopts it; an existing repository must already have the exact identity.
+    pub async fn open_with_identity(
+        control: &ControlPlane,
+        object_store: Arc<dyn ObjectStore>,
+        tenant: &str,
+        volume: &str,
+        identity: VersionRepositoryIdentity,
+    ) -> Result<Self> {
+        Self::open_with_optional_identity(control, object_store, tenant, volume, Some(identity))
+            .await
+    }
+
+    async fn open_with_optional_identity(
+        control: &ControlPlane,
+        object_store: Arc<dyn ObjectStore>,
+        tenant: &str,
+        volume: &str,
+        identity: Option<VersionRepositoryIdentity>,
+    ) -> Result<Self> {
         if !control.versioning_enabled(tenant, volume).await? {
             return Err(Error::Versioning(format!(
                 "versioning is disabled for {tenant}/{volume}"
@@ -2478,7 +2574,7 @@ impl VersionRepository {
             "repository",
         )
         .await?;
-        Self::open_for_record(&record, dek, object_store, max_bytes, maintenance).await
+        Self::open_for_record(&record, dek, object_store, max_bytes, maintenance, identity).await
     }
 
     /// Open a repository only when history has already been created. The
@@ -2554,7 +2650,7 @@ impl VersionRepository {
             maintenance.close().await?;
             return Ok(None);
         }
-        Self::open_for_record(record, dek, object_store, max_bytes, maintenance)
+        Self::open_for_record(record, dek, object_store, max_bytes, maintenance, None)
             .await
             .map(Some)
     }
@@ -2565,6 +2661,7 @@ impl VersionRepository {
         object_store: Arc<dyn ObjectStore>,
         max_bytes: Option<u64>,
         maintenance: VersionMaintenanceGuard,
+        requested_identity: Option<VersionRepositoryIdentity>,
     ) -> Result<Self> {
         if !matches!(record.kind, crate::meta::superblock::VolumeKind::Filesystem) {
             maintenance.close().await?;
@@ -2582,12 +2679,22 @@ impl VersionRepository {
             }
         };
         let store = VersionStore::new(db);
+        let identity = match store
+            .get_or_create_repository_identity(requested_identity.as_ref())
+            .await
+        {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = store.db.close().await;
+                let _ = maintenance.close().await;
+                return Err(error);
+            }
+        };
         let prolly = AsyncProlly::new(store.clone(), ProllyConfig::default());
         Ok(Self {
             store,
             prolly,
-            tenant: record.tenant.clone(),
-            volume: record.name.clone(),
+            identity,
             max_bytes,
             chunk_size: u64::from(record.chunk_size),
             maintenance,
@@ -2599,6 +2706,10 @@ impl VersionRepository {
         let lease_close = self.maintenance.close().await;
         db_close?;
         lease_close
+    }
+
+    pub fn identity(&self) -> &VersionRepositoryIdentity {
+        &self.identity
     }
 
     pub async fn stats(&self) -> Result<VersionStoreStats> {
@@ -2739,7 +2850,7 @@ impl VersionRepository {
                     hex::encode(commit)
                 )));
             }
-            verify_version_commit_attestation(&self.tenant, &self.volume, commit, attestation)?;
+            verify_version_commit_attestation(self.identity.id(), commit, attestation)?;
         }
 
         let nodes = self
@@ -4073,7 +4184,7 @@ impl VersionRepository {
         attestation: VersionCommitAttestation,
     ) -> Result<VersionCommitAttestation> {
         let commit = self.resolve_commit(reference).await?;
-        verify_version_commit_attestation(&self.tenant, &self.volume, &commit.id, &attestation)?;
+        verify_version_commit_attestation(self.identity.id(), &commit.id, &attestation)?;
         self.store
             .put_attestation(&commit.id, &attestation, self.max_bytes)
             .await?;
@@ -5196,6 +5307,30 @@ fn validate_version_attestation_key_id(key_id: &str) -> Result<()> {
     validate_version_named_ref("version commit attestation key ID", key_id)
 }
 
+fn validate_version_repository_id(repository_id: &str) -> Result<()> {
+    let parsed = uuid::Uuid::parse_str(repository_id).map_err(|error| {
+        Error::invalid("version repository ID", format!("must be a UUID: {error}"))
+    })?;
+    if parsed.to_string() != repository_id {
+        return Err(Error::invalid(
+            "version repository ID",
+            "must use canonical lowercase hyphenated UUID form",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_version_repository_identity(identity: &VersionRepositoryIdentity) -> Result<()> {
+    validate_version_repository_id(identity.id())?;
+    if identity.created_at() == 0 {
+        return Err(Error::invalid(
+            "version repository identity",
+            "creation timestamp must be nonzero",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_version_attestation(attestation: &VersionCommitAttestation) -> Result<()> {
     validate_version_attestation_key_id(attestation.key_id())?;
     match attestation.algorithm() {
@@ -5236,8 +5371,7 @@ fn validate_version_trusted_attestation_key(key: &VersionTrustedAttestationKey) 
 }
 
 fn verify_version_commit_attestation(
-    tenant: &str,
-    volume: &str,
+    repository_id: &str,
     commit: &[u8; 32],
     attestation: &VersionCommitAttestation,
 ) -> Result<()> {
@@ -5255,8 +5389,7 @@ fn verify_version_commit_attestation(
         Error::invalid("version commit attestation signature", error.to_string())
     })?;
     let payload = version_commit_attestation_payload(
-        tenant,
-        volume,
+        repository_id,
         &hex::encode(commit),
         attestation.key_id(),
         attestation.public_key(),

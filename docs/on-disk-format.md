@@ -121,9 +121,11 @@ the live VFS request path. Its logical key prefixes are:
 
 | Prefix/key | Version | Value |
 |---|---:|---|
+| `pm/repository-identity` | 1 | immutable logical repository UUID and creation time |
 | `pn/<prolly-node-key>` | Prolly | immutable Prolly node bytes |
 | `pb/<content-id>` | Prolly | content-addressed file chunk blob |
 | `pc/<sha256-commit-id>` | 2 | `VersionCommit`, including hash-bound provenance |
+| `pa/<sha256-commit-id>/<key-id>` | 1 | detached Ed25519 attestation over the version-2 repository UUID statement |
 | `pi/<sha256-idempotency-key>` | 1 | commit ID and branch-aware canonical request fingerprint |
 | `pr/heads/<name>` | 1 | mutable branch `VersionRef`; `main` is the default commit head |
 | `pr/protected/<name>` | 1 | durable destructive-ref protection and normalized publisher and policy-manager allowlists for an existing branch |
@@ -135,6 +137,12 @@ Entry metadata (`m/<canonical-path>`) and file chunk references
 prefixes its structured values with `u8 format_version` and postcard-encodes
 the payload. Entry metadata version 1 distinguishes regular files,
 directories, and symlinks.
+The repository identity is generated when the encrypted version database is
+first opened and remains stable across subsequent opens. It is independent of
+the local tenant and volume names so future verified exports can preserve
+history identity while re-encrypting objects for a destination volume. An empty
+destination may be initialized with a requested identity; opening an existing
+repository with a different requested identity fails closed.
 A commit records zero, one, or two parents, its root manifest, creation time,
 message, selected paths, and provenance containing origin, author, committer,
 and request ID. All fields are covered by the commit ID. Two parents identify

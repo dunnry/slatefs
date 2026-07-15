@@ -2537,9 +2537,13 @@ async fn get_version_commit_response(
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
     let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let repository_id = repository.identity().id().to_string();
     let result = repository.inspect_commit(reference).await;
     let commit = finish_version_repository(control, repository, result).await?;
-    Ok(AdminHttpResponse::json(200, json!({ "commit": commit })))
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "repository_id": repository_id, "commit": commit }),
+    ))
 }
 
 async fn add_version_commit_attestation_response(
@@ -8315,6 +8319,19 @@ mod tests {
         assert_eq!(response_status(&commit_response), 201, "{commit_response}");
         let commit_response: Value = serde_json::from_str(response_body(&commit_response)).unwrap();
         let commit_id = commit_response["commit"]["id"].as_str().unwrap();
+        let identity_request = format!(
+            "GET /admin/v1/tenants/t/volumes/v/versioning/commits/{commit_id} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        let identity_response =
+            admin_exchange(Arc::clone(&state), identity_request.as_bytes()).await;
+        assert_eq!(
+            response_status(&identity_response),
+            200,
+            "{identity_response}"
+        );
+        let identity: Value = serde_json::from_str(response_body(&identity_response)).unwrap();
+        let repository_id = identity["repository_id"].as_str().unwrap();
+        assert_eq!(identity["commit"]["id"], commit_id);
         assert_eq!(commit_response["replayed"], false);
         assert_eq!(commit_response["commit"]["provenance"]["origin"], "admin");
         assert_eq!(commit_response["commit"]["provenance"]["author"], "Alice");
@@ -8338,8 +8355,7 @@ mod tests {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[23; 32]);
         let public_key = signing_key.verifying_key().to_bytes();
         let payload = slatefs_core::versioning::version_commit_attestation_payload(
-            "t",
-            "v",
+            repository_id,
             commit_id,
             "release-2026",
             &public_key,

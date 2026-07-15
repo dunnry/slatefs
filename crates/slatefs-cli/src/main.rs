@@ -43,8 +43,7 @@ static RUSTLS_PROVIDER: Once = Once::new();
 #[serde(deny_unknown_fields)]
 struct VersionAttestationBundle {
     version: u8,
-    tenant: String,
-    volume: String,
+    repository_id: String,
     commit: String,
     attestations: Vec<VersionCommitAttestation>,
 }
@@ -2200,7 +2199,7 @@ fn read_attestation_bundle(path: &std::path::Path) -> anyhow::Result<VersionAtte
         .with_context(|| format!("opening attestation bundle {}", path.display()))?;
     let bundle: VersionAttestationBundle = serde_json::from_reader(file)
         .with_context(|| format!("parsing attestation bundle {}", path.display()))?;
-    if bundle.version != 1 {
+    if bundle.version != 2 {
         anyhow::bail!(
             "attestation bundle {} has unsupported version {}",
             path.display(),
@@ -2217,15 +2216,13 @@ fn verify_attestation_bundle_file(
     let bundle = read_attestation_bundle(input)?;
     let trusted = read_hex_key::<32>(trusted_public_key, "trusted Ed25519 public key")?;
     print_version_attestations(
-        &bundle.tenant,
-        &bundle.volume,
+        &bundle.repository_id,
         &bundle.commit,
         &bundle.attestations,
         Some(trusted),
     )?;
     println!("bundle: verified");
-    println!("tenant: {}", bundle.tenant);
-    println!("volume: {}", bundle.volume);
+    println!("repository_id: {}", bundle.repository_id);
     println!("commit: {}", bundle.commit);
     Ok(())
 }
@@ -2251,8 +2248,7 @@ fn print_version_attestation(attestation: &VersionCommitAttestation, trusted: Op
 }
 
 fn create_version_attestation(
-    tenant: &str,
-    volume: &str,
+    repository_id: &str,
     commit: &str,
     key_id: &str,
     signing_key: &SigningKey,
@@ -2262,14 +2258,8 @@ fn create_version_attestation(
         .duration_since(std::time::UNIX_EPOCH)
         .context("system clock is before the Unix epoch")?
         .as_secs();
-    let payload = version_commit_attestation_payload(
-        tenant,
-        volume,
-        commit,
-        key_id,
-        &public_key,
-        created_at,
-    )?;
+    let payload =
+        version_commit_attestation_payload(repository_id, commit, key_id, &public_key, created_at)?;
     VersionCommitAttestation::new_ed25519(
         key_id,
         public_key,
@@ -2280,14 +2270,13 @@ fn create_version_attestation(
 }
 
 fn print_version_attestations(
-    tenant: &str,
-    volume: &str,
+    repository_id: &str,
     commit: &str,
     attestations: &[VersionCommitAttestation],
     trusted: Option<[u8; 32]>,
 ) -> anyhow::Result<()> {
     for attestation in attestations {
-        verify_version_attestation(tenant, volume, commit, attestation)?;
+        verify_version_attestation(repository_id, commit, attestation)?;
     }
     if let Some(trusted) = trusted
         && !attestations
@@ -2309,8 +2298,7 @@ fn print_version_attestations(
 }
 
 fn verify_version_attestation(
-    tenant: &str,
-    volume: &str,
+    repository_id: &str,
     commit: &str,
     attestation: &VersionCommitAttestation,
 ) -> anyhow::Result<()> {
@@ -2323,8 +2311,7 @@ fn verify_version_attestation(
     let signature = Signature::from_slice(attestation.signature())
         .context("attestation Ed25519 signature is not 64 bytes")?;
     let payload = version_commit_attestation_payload(
-        tenant,
-        volume,
+        repository_id,
         commit,
         attestation.key_id(),
         attestation.public_key(),
@@ -3022,8 +3009,11 @@ async fn run(
                 .await?;
                 let commit: VersionCommitInfo = serde_json::from_value(response["commit"].clone())
                     .context("parsing admin version commit")?;
+                let repository_id = response["repository_id"]
+                    .as_str()
+                    .context("admin version commit response is missing repository_id")?;
                 let attestation =
-                    create_version_attestation(tenant, volume, &commit.id, key_id, &signing_key)?;
+                    create_version_attestation(repository_id, &commit.id, key_id, &signing_key)?;
                 let body = serde_json::to_value(&attestation)?;
                 let response = post_live_versioning_json(
                     config,
@@ -3043,8 +3033,12 @@ async fn run(
             let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
             let result: anyhow::Result<_> = async {
                 let commit = repository.inspect_commit(reference).await?;
-                let attestation =
-                    create_version_attestation(tenant, volume, &commit.id, key_id, &signing_key)?;
+                let attestation = create_version_attestation(
+                    repository.identity().id(),
+                    &commit.id,
+                    key_id,
+                    &signing_key,
+                )?;
                 let attestation = repository
                     .add_commit_attestation(&commit.id, attestation)
                     .await?;
@@ -3099,6 +3093,9 @@ async fn run(
                 let commit: VersionCommitInfo =
                     serde_json::from_value(commit_response["commit"].clone())
                         .context("parsing admin version commit")?;
+                let repository_id = commit_response["repository_id"]
+                    .as_str()
+                    .context("admin version commit response is missing repository_id")?;
                 let response = live_versioning_json(
                     config,
                     tenant,
@@ -3112,20 +3109,24 @@ async fn run(
                 let attestations: Vec<VersionCommitAttestation> =
                     serde_json::from_value(response["attestations"].clone())
                         .context("parsing admin version commit attestations")?;
-                print_version_attestations(tenant, volume, &commit.id, &attestations, trusted)?;
+                print_version_attestations(repository_id, &commit.id, &attestations, trusted)?;
                 return Ok(());
             }
             let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
             let result: anyhow::Result<_> = async {
                 let commit = repository.inspect_commit(reference).await?;
                 let attestations = repository.list_commit_attestations(&commit.id).await?;
-                Ok((commit.id, attestations))
+                Ok((
+                    repository.identity().id().to_string(),
+                    commit.id,
+                    attestations,
+                ))
             }
             .await;
             let close = repository.close().await;
-            let (commit, attestations) = result?;
+            let (repository_id, commit, attestations) = result?;
             close?;
-            print_version_attestations(tenant, volume, &commit, &attestations, trusted)?;
+            print_version_attestations(&repository_id, &commit, &attestations, trusted)?;
         }
         Command::Versioning(VersioningCmd::ExportAttestations {
             tenant,
@@ -3134,7 +3135,7 @@ async fn run(
             out,
             live,
         }) => {
-            let (commit, attestations) = if *live {
+            let (repository_id, commit, attestations) = if *live {
                 let commit_response = live_versioning_json(
                     config,
                     tenant,
@@ -3148,6 +3149,10 @@ async fn run(
                 let commit: VersionCommitInfo =
                     serde_json::from_value(commit_response["commit"].clone())
                         .context("parsing admin version commit")?;
+                let repository_id = commit_response["repository_id"]
+                    .as_str()
+                    .context("admin version commit response is missing repository_id")?
+                    .to_string();
                 let response = live_versioning_json(
                     config,
                     tenant,
@@ -3160,14 +3165,18 @@ async fn run(
                 .await?;
                 let attestations = serde_json::from_value(response["attestations"].clone())
                     .context("parsing admin version commit attestations")?;
-                (commit.id, attestations)
+                (repository_id, commit.id, attestations)
             } else {
                 let repository =
                     VersionRepository::open(control, object_store, tenant, volume).await?;
                 let result: anyhow::Result<_> = async {
                     let commit = repository.inspect_commit(reference).await?;
                     let attestations = repository.list_commit_attestations(&commit.id).await?;
-                    Ok((commit.id, attestations))
+                    Ok((
+                        repository.identity().id().to_string(),
+                        commit.id,
+                        attestations,
+                    ))
                 }
                 .await;
                 let close = repository.close().await;
@@ -3176,12 +3185,11 @@ async fn run(
                 result
             };
             for attestation in &attestations {
-                verify_version_attestation(tenant, volume, &commit, attestation)?;
+                verify_version_attestation(&repository_id, &commit, attestation)?;
             }
             let bundle = VersionAttestationBundle {
-                version: 1,
-                tenant: tenant.clone(),
-                volume: volume.clone(),
+                version: 2,
+                repository_id,
                 commit: commit.clone(),
                 attestations,
             };
@@ -5295,9 +5303,9 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[41; 32]);
         let public_key = signing_key.verifying_key().to_bytes();
         let commit = "ab".repeat(32);
+        let repository_id = "00000000-0000-4000-8000-000000000001";
         let payload = version_commit_attestation_payload(
-            "tenant-a",
-            "docs",
+            repository_id,
             &commit,
             "release-2026",
             &public_key,
@@ -5311,8 +5319,15 @@ mod tests {
             1_700_000_000,
         )
         .unwrap();
-        verify_version_attestation("tenant-a", "docs", &commit, &attestation).unwrap();
-        assert!(verify_version_attestation("tenant-b", "docs", &commit, &attestation).is_err());
+        verify_version_attestation(repository_id, &commit, &attestation).unwrap();
+        assert!(
+            verify_version_attestation(
+                "00000000-0000-4000-8000-000000000002",
+                &commit,
+                &attestation
+            )
+            .is_err()
+        );
 
         let forged = VersionCommitAttestation::new_ed25519(
             "release-2026",
@@ -5321,7 +5336,7 @@ mod tests {
             1_700_000_000,
         )
         .unwrap();
-        assert!(verify_version_attestation("tenant-a", "docs", &commit, &forged).is_err());
+        assert!(verify_version_attestation(repository_id, &commit, &forged).is_err());
 
         let directory = tempfile::tempdir().unwrap();
         let bundle_path = directory.path().join("bundle.json");
@@ -5330,9 +5345,8 @@ mod tests {
         write_attestation_bundle(
             &bundle_path,
             &VersionAttestationBundle {
-                version: 1,
-                tenant: "tenant-a".to_string(),
-                volume: "docs".to_string(),
+                version: 2,
+                repository_id: repository_id.to_string(),
                 commit,
                 attestations: vec![attestation],
             },
@@ -5343,9 +5357,8 @@ mod tests {
             write_attestation_bundle(
                 &bundle_path,
                 &VersionAttestationBundle {
-                    version: 1,
-                    tenant: "tenant-a".to_string(),
-                    volume: "docs".to_string(),
+                    version: 2,
+                    repository_id: repository_id.to_string(),
                     commit: "ab".repeat(32),
                     attestations: Vec::new(),
                 },

@@ -80,18 +80,19 @@ audit request ID. The live admin path derives committer and request ID from the
 server request while permitting a distinct claimed author; authenticated
 requests use their principal and permitted unauthenticated loopback requests
 use an explicit committer marker. Offline CLI commits require an explicit
-author and use it as committer.
-Detached Ed25519 attestations sign a canonical statement containing the
-repository identity, commit ID, key identity, public key, and timestamp. They
+author and use it as committer. Each lazily created version repository has an
+immutable logical UUID stored in its encrypted database. Tenant and volume
+names locate and authorize the local copy but are not the repository's portable
+identity. Detached Ed25519 attestations sign a canonical version-2 statement
+containing that UUID, commit ID, key identity, public key, and timestamp. They
 are immutable side records keyed by commit ID and key ID, so signatures do not
 create a circular dependency in the content-addressed commit. SlateFS verifies
 each signature before storage and during repository verification; private keys
 remain client-side. Attestations follow their commit through quota accounting
-and garbage collection. A versioned JSON bundle can carry the repository
-identity, canonical commit ID, and attestations outside SlateFS for standalone
+and garbage collection. A version-2 JSON bundle can carry the repository UUID,
+canonical commit ID, and attestations outside SlateFS for standalone
 verification against an out-of-band trusted public key. Additional named
-branch
-references can point to any existing commit, tag, or branch and can be used by
+branch references can point to any existing commit, tag, or branch and can be used by
 read, restore, diff, and history operations. Commits advance `main` by default
 or an existing named branch when selected explicitly. Publishing a commit and
 its branch reference is one SlateDB batch after the new immutable tree nodes

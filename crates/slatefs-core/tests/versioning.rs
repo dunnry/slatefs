@@ -13,8 +13,8 @@ use slatefs_core::store::{self, ObjectStore};
 use slatefs_core::versioning::{
     VersionBranchProtectionPolicy, VersionCommitAttestation, VersionCommitOrigin,
     VersionCommitProvenance, VersionMergeConflictStrategy, VersionPathChangeKind,
-    VersionReflogAction, VersionRepository, VersionRestoreActionKind, VersionRestoreMode,
-    VersionTrustedAttestationKey, VersionWorkingTreeChangeKind,
+    VersionReflogAction, VersionRepository, VersionRepositoryIdentity, VersionRestoreActionKind,
+    VersionRestoreMode, VersionTrustedAttestationKey, VersionWorkingTreeChangeKind,
     force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease, version_commit_attestation_payload,
 };
@@ -807,6 +807,9 @@ async fn detached_commit_attestations_are_optional_immutable_and_verified() {
     let repository = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
         .await
         .unwrap();
+    let repository_identity = repository.identity().clone();
+    let repository_id = repository_identity.id().to_string();
+    assert!(uuid::Uuid::parse_str(&repository_id).is_ok());
     let commit = repository
         .commit_file(
             live.as_ref(),
@@ -828,8 +831,7 @@ async fn detached_commit_attestations_are_optional_immutable_and_verified() {
     let public_key = signing_key.verifying_key().to_bytes();
     let created_at = 1_700_000_000;
     let payload = version_commit_attestation_payload(
-        "t",
-        "v",
+        &repository_id,
         &commit.id,
         "release-2026",
         &public_key,
@@ -863,8 +865,7 @@ async fn detached_commit_attestations_are_optional_immutable_and_verified() {
 
     let replacement_time = created_at + 1;
     let replacement_payload = version_commit_attestation_payload(
-        "t",
-        "v",
+        &repository_id,
         &commit.id,
         "release-2026",
         &public_key,
@@ -885,9 +886,13 @@ async fn detached_commit_attestations_are_optional_immutable_and_verified() {
         Err(Error::AlreadyExists { .. })
     ));
 
+    let wrong_repository_id = if repository_id == "00000000-0000-4000-8000-000000000001" {
+        "00000000-0000-4000-8000-000000000002"
+    } else {
+        "00000000-0000-4000-8000-000000000001"
+    };
     let wrong_payload = version_commit_attestation_payload(
-        "t",
-        "other-volume",
+        wrong_repository_id,
         &commit.id,
         "wrong-context",
         &public_key,
@@ -911,8 +916,7 @@ async fn detached_commit_attestations_are_optional_immutable_and_verified() {
     let security_signing_key = SigningKey::from_bytes(&[8; 32]);
     let security_public_key = security_signing_key.verifying_key().to_bytes();
     let security_payload = version_commit_attestation_payload(
-        "t",
-        "v",
+        &repository_id,
         &commit.id,
         "security-2026",
         &security_public_key,
@@ -1028,8 +1032,7 @@ async fn detached_commit_attestations_are_optional_immutable_and_verified() {
     ));
     let feature_time = created_at + 2;
     let feature_payload = version_commit_attestation_payload(
-        "t",
-        "v",
+        &repository_id,
         &feature.id,
         "release-2026",
         &public_key,
@@ -1077,8 +1080,7 @@ async fn detached_commit_attestations_are_optional_immutable_and_verified() {
     assert!(!pending_quorum.satisfied());
     let security_feature_time = feature_time + 1;
     let security_feature_payload = version_commit_attestation_payload(
-        "t",
-        "v",
+        &repository_id,
         &feature.id,
         "security-2026",
         &security_public_key,
@@ -1122,6 +1124,60 @@ async fn detached_commit_attestations_are_optional_immutable_and_verified() {
     assert_eq!(promoted.commit(), feature.id);
 
     repository.close().await.unwrap();
+    let reopened = VersionRepository::open_with_identity(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "v",
+        repository_identity.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reopened.identity().id(), repository_id);
+    reopened.close().await.unwrap();
+    volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "imported-copy",
+        common::create_opts(None, None),
+    )
+    .await
+    .unwrap();
+    control
+        .set_versioning_enabled("t", "imported-copy", true)
+        .await
+        .unwrap();
+    let imported = VersionRepository::open_with_identity(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "imported-copy",
+        repository_identity,
+    )
+    .await
+    .unwrap();
+    assert_eq!(imported.identity().id(), repository_id);
+    imported.close().await.unwrap();
+    let mismatched_identity = VersionRepositoryIdentity::from_parts(
+        wrong_repository_id,
+        repository.identity().created_at(),
+    )
+    .unwrap();
+    assert!(matches!(
+        VersionRepository::open_with_identity(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            mismatched_identity,
+        )
+        .await,
+        Err(Error::Invalid {
+            what: "version repository identity",
+            ..
+        })
+    ));
     live.shutdown().await.unwrap();
     control.close().await.unwrap();
 }

@@ -176,14 +176,16 @@ Ed25519 key pair with
 `versioning attestation-keygen --out <private.key> --public-out <public.key>`.
 `versioning attest <tenant> <volume>
 <commit-or-ref> --key-id <name> --key-file <private.key>` signs a canonical
-statement containing the tenant, volume, commit ID, key ID, algorithm, public
-key, and timestamp; the private key remains in the CLI process and never
-enters SlateFS. `versioning attestations ... --trusted-public-key <public.key>`
+statement containing the repository's stable logical UUID, commit ID, key ID,
+algorithm, public key, and timestamp; the private key remains in the CLI
+process and never enters SlateFS. Tenant and volume names are local placement
+coordinates and are not part of the signature.
+`versioning attestations ... --trusted-public-key <public.key>`
 independently verifies every returned signature against the resolved commit and
 requires at least one from that exact public key. Add `--live` to sign or
 inspect through `slatefsd`.
 `versioning export-attestations ... --out <bundle.json>` writes the resolved
-commit and its signatures as a portable bundle.
+repository UUID, commit, and its signatures as a portable version-2 bundle.
 `versioning verify-attestation-bundle --in <bundle.json> --trusted-public-key <public.key>`
 verifies it without loading a SlateFS config or contacting a repository or
 daemon.
@@ -344,7 +346,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/status` | Compare the live working tree with query `reference` (default `main`) and `path` (default `/`) without modifying either side. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore-preview` | Preview `create`, `replace`, and `delete` actions for required `commit` and `path`, with optional `mode=overlay|exact`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Commit history with optional `branch` (default `main`), `path`, `limit`, and exclusive `page_token`; returns `next_page_token`. |
-| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit-or-ref}` | Resolve a commit ID, tag, or branch and return the commit with its complete parent list. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit-or-ref}` | Resolve a commit ID, tag, or branch and return `repository_id` plus the commit with its complete parent list. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/diff` | Added, modified, and deleted paths between required `from` and `to` commit IDs or tags; supports `limit` and exclusive path `page_token`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/tags` | List immutable commit tags. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/tags` | Create a retention-pinning tag from `{"name":"...","commit":"..."}`. |

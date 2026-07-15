@@ -235,12 +235,13 @@ slatefs -c /etc/slatefs/slatefs.toml versioning verify <tenant> <volume> --live
 ```
 
 Attestation is optional and client-side: `slatefsd` receives the public key and
-signature, never `release.key`. The signed statement binds the tenant, volume,
-resolved commit ID, key ID, algorithm, public key, and timestamp. The
-`attestations --trusted-public-key` command independently verifies each
+signature, never `release.key`. The signed statement binds the stable logical
+repository UUID, resolved commit ID, key ID, algorithm, public key, and
+timestamp. Tenant and volume names remain local access and storage coordinates.
+The `attestations --trusted-public-key` command independently verifies each
 returned signature against the resolved commit and fails unless that exact
-public key signed it. The exported version-1 JSON bundle carries the tenant,
-volume, canonical commit ID, and detached attestations. Bundle verification is
+public key signed it. The exported version-2 JSON bundle carries the repository
+UUID, canonical commit ID, and detached attestations. Bundle verification is
 standalone: it does not load `/etc/slatefs/slatefs.toml` or contact SlateFS.
 
 To require a signer on a protected branch, first attest its current head, then
