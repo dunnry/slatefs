@@ -178,6 +178,14 @@ plan is applied to the target tree and published as one new single-parent
 commit, branch compare-and-swap, reflog entry, and optional idempotency record.
 Preview runs the same planner without writing. Neither operation reads from or
 writes to the live filesystem.
+Version garbage collection marks the complete retained commit, Prolly-node,
+and blob graph, then sweeps unreachable records in deterministic bounded
+batches. The default sweep budget is 10,000 objects and callers may select up
+to 1,000,000. Reports distinguish commits, attestations, nodes, blobs, and
+idempotency records and expose whether more candidates remain. Each non-empty
+batch is one SlateDB write and flush; later invocations repeat the mark phase
+against current refs before continuing, so branch or tag movement between
+batches cannot delete newly reachable data.
 Working-tree status scans one live subtree and the corresponding versioned
 metadata, then compares ownership, mode, kind, size, and bounded file or
 symlink contents. It ignores atime and mtime noise, performs no version-store

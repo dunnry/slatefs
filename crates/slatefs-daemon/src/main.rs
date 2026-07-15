@@ -1174,6 +1174,8 @@ struct VersionRetentionPatchRequest {
 struct VersionGcRequest {
     #[serde(default)]
     dry_run: bool,
+    #[serde(default)]
+    max_deletions: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4190,6 +4192,7 @@ async fn run_version_gc_response(
             retention.as_ref().and_then(|policy| policy.keep_last),
             retention.as_ref().and_then(|policy| policy.max_age_secs),
             body.dry_run,
+            body.max_deletions,
         )
         .await;
     let report = match report_result {
@@ -4209,6 +4212,14 @@ async fn run_version_gc_response(
             (
                 "reclaimed_bytes".to_string(),
                 AuditDetailValue::U64(report.reclaimed_bytes),
+            ),
+            (
+                "remaining_objects".to_string(),
+                AuditDetailValue::U64(report.remaining_objects),
+            ),
+            (
+                "complete".to_string(),
+                AuditDetailValue::Bool(report.complete),
             ),
         ],
     )
@@ -4230,7 +4241,11 @@ async fn run_version_gc_response(
                 "deleted_attestations": report.deleted_attestations,
                 "deleted_nodes": report.deleted_nodes,
                 "deleted_blobs": report.deleted_blobs,
+                "deleted_idempotency_records": report.deleted_idempotency_records,
                 "reclaimed_bytes": report.reclaimed_bytes,
+                "remaining_objects": report.remaining_objects,
+                "max_deletions": report.max_deletions,
+                "complete": report.complete,
                 "dry_run": report.dry_run,
             }
         }),
@@ -7046,7 +7061,12 @@ fn automatic_version_gc_audit_record(
         ("deleted_commits", report.deleted_commits),
         ("deleted_nodes", report.deleted_nodes),
         ("deleted_blobs", report.deleted_blobs),
+        (
+            "deleted_idempotency_records",
+            report.deleted_idempotency_records,
+        ),
         ("reclaimed_bytes", report.reclaimed_bytes),
+        ("remaining_objects", report.remaining_objects),
     ] {
         record
             .details
@@ -7055,6 +7075,10 @@ fn automatic_version_gc_audit_record(
     record
         .details
         .insert("automatic".to_string(), AuditDetailValue::Bool(true));
+    record.details.insert(
+        "complete".to_string(),
+        AuditDetailValue::Bool(report.complete),
+    );
     record
 }
 
@@ -7130,7 +7154,7 @@ async fn enforce_version_retention(
             }
         };
         let report = repository
-            .garbage_collect(policy.keep_last, policy.max_age_secs, false)
+            .garbage_collect(policy.keep_last, policy.max_age_secs, false, None)
             .await;
         let close = repository.close().await;
         let report = match (report, close) {
@@ -10156,7 +10180,7 @@ mod tests {
         assert!(verify["verify"]["nodes"].as_u64().unwrap() > 0);
         assert!(verify["verify"]["blobs"].as_u64().unwrap() > 0);
 
-        let gc_body = r#"{"dry_run":true}"#;
+        let gc_body = r#"{"dry_run":true,"max_deletions":1}"#;
         let gc_request = format!(
             "POST /admin/v1/tenants/t/volumes/v/versioning/gc HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             gc_body.len(),
@@ -10169,6 +10193,8 @@ mod tests {
         assert_eq!(gc["gc"]["retained_commits"], 3);
         assert_eq!(gc["gc"]["deleted_commits"], 0);
         assert_eq!(gc["gc"]["deleted_attestations"], 0);
+        assert_eq!(gc["gc"]["max_deletions"], 1);
+        assert_eq!(gc["gc"]["complete"], true);
         let delete_branch_response = admin_exchange(
             Arc::clone(&state),
             b"DELETE /admin/v1/tenants/t/volumes/v/versioning/branches/release HTTP/1.1\r\nHost: localhost\r\n\r\n",

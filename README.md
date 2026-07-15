@@ -318,8 +318,12 @@ lowering it immediately prunes older recovery entries and releases their GC
 roots, while raising it applies to future transitions. For an enabled volume
 served by `slatefsd`, the daemon applies count and age retention on its normal
 export-control poll; disabled, unserved, policyless, and never-committed
-volumes are untouched. `versioning gc` runs the same collection explicitly
-and `--dry-run` reports first; `versioning stats` reports logical usage.
+volumes are untouched. `versioning gc` runs the same collection explicitly in
+deterministic batches of at most 10,000 unreachable objects by default;
+`--max-deletions` may select 1 to 1,000,000. The report exposes
+`remaining_objects` and `complete`, so repeat until complete. `--dry-run`
+reports the next batch without deleting it, and `versioning stats` reports
+logical usage. Automatic retention processes one default-sized batch per poll.
 Tags and branch heads pin their commit and Prolly tree through both automatic
 and explicit GC until the reference is deleted. `show`, `restore`, and `diff`
 accept a commit ID, tag name, or branch name.
@@ -441,7 +445,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/verify` | Verify the reachable commit DAG, attestations, branch trust rules, Prolly nodes, and content blobs. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Current history retention and quota policy. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Set `keep_last`, `max_age_secs`, `max_bytes`, and/or positive `reflog_keep_last`, or `{"clear":true}`. Lowering the reflog limit prunes immediately. |
-| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/gc` | Apply retention, or report with `{"dry_run":true}`. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/gc` | Apply one bounded retention batch, or preview it with `{"dry_run":true,"max_deletions":10000}`. The response reports deleted objects by type, stale idempotency records, remaining objects, and whether collection is complete. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/lease` | Break an expired lease with its exact observed `owner` and `{"confirm":true}`. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/history` | Permanently purge history; requires `{"confirm":true}` and no protected branches. |
 | `GET` | `/admin/v1/nodes` | Daemon node inventory with `limit` and `page_token`. |

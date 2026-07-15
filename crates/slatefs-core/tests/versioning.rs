@@ -1149,7 +1149,10 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         repository.reflog("feature", 1).await.unwrap()[0].action(),
         VersionReflogAction::Recover
     );
-    let complete_dag_gc = repository.garbage_collect(None, None, true).await.unwrap();
+    let complete_dag_gc = repository
+        .garbage_collect(None, None, true, None)
+        .await
+        .unwrap();
     assert_eq!(complete_dag_gc.retained_commits, 7);
     assert_eq!(complete_dag_gc.deleted_commits, 0);
     assert_eq!(
@@ -2152,7 +2155,7 @@ async fn idempotent_commit_retries_return_the_original_commit() {
             .all(|entry| entry.action() == VersionReflogAction::Commit)
     );
     let gc = repository
-        .garbage_collect(Some(1), None, false)
+        .garbage_collect(Some(1), None, false, None)
         .await
         .unwrap();
     assert_eq!(gc.deleted_commits, 0);
@@ -2819,14 +2822,14 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
         Err(Error::Invalid { .. })
     ));
     let dry_run = repository
-        .garbage_collect(Some(1), None, true)
+        .garbage_collect(Some(1), None, true, None)
         .await
         .unwrap();
     assert_eq!(dry_run.deleted_commits, 0);
     assert_eq!(repository.history(None, 10).await.unwrap().len(), 3);
 
     let collected = repository
-        .garbage_collect(Some(1), None, false)
+        .garbage_collect(Some(1), None, false, None)
         .await
         .unwrap();
     assert_eq!(collected.retained_commits, 3);
@@ -2860,7 +2863,7 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
     assert_eq!(repository.delete_tag("milestone-1").await.unwrap(), tag);
     assert!(repository.list_tags().await.unwrap().is_empty());
     let still_branch_pinned = repository
-        .garbage_collect(Some(1), None, false)
+        .garbage_collect(Some(1), None, false, None)
         .await
         .unwrap();
     assert_eq!(still_branch_pinned.retained_commits, 3);
@@ -2872,7 +2875,7 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
         Err(Error::Invalid { .. })
     ));
     let unpinned = repository
-        .garbage_collect(Some(1), None, false)
+        .garbage_collect(Some(1), None, false, None)
         .await
         .unwrap();
     assert_eq!(unpinned.retained_commits, 3);
@@ -2916,7 +2919,7 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
         before_rejected_commit.commits
     );
     let recovered = quota_repository
-        .garbage_collect(Some(1), None, false)
+        .garbage_collect(Some(1), None, false, None)
         .await
         .unwrap();
     assert_eq!(recovered.deleted_commits, 0);
@@ -2998,11 +3001,36 @@ async fn configurable_reflog_retention_bounds_recovery_and_gc_roots() {
         .unwrap();
     assert_eq!(repository.prune_reflogs().await.unwrap(), 2);
     assert_eq!(repository.reflog("main", 1).await.unwrap().len(), 1);
-    let gc = repository
-        .garbage_collect(Some(1), None, false)
+    let preview = repository
+        .garbage_collect(Some(1), None, true, Some(1))
         .await
         .unwrap();
-    assert_eq!(gc.deleted_commits, 3);
+    assert!(!preview.complete);
+    assert!(preview.remaining_objects > 0);
+    assert_eq!(preview.max_deletions, 1);
+    let mut deleted_commits = 0;
+    let mut runs = 0;
+    loop {
+        let gc = repository
+            .garbage_collect(Some(1), None, false, Some(1))
+            .await
+            .unwrap();
+        let deleted = gc.deleted_commits
+            + gc.deleted_attestations
+            + gc.deleted_nodes
+            + gc.deleted_blobs
+            + gc.deleted_idempotency_records;
+        assert!(deleted <= 1);
+        deleted_commits += gc.deleted_commits;
+        runs += 1;
+        if gc.complete {
+            assert_eq!(gc.remaining_objects, 0);
+            break;
+        }
+        assert!(gc.remaining_objects > 0);
+    }
+    assert!(runs > 1);
+    assert_eq!(deleted_commits, 3);
 
     repository.close().await.unwrap();
     live.shutdown().await.unwrap();

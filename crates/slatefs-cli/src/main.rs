@@ -787,6 +787,9 @@ enum VersioningCmd {
         volume: String,
         #[arg(long)]
         dry_run: bool,
+        /// Maximum unreachable objects to delete in this run.
+        #[arg(long)]
+        max_deletions: Option<u32>,
         #[arg(long)]
         live: bool,
     },
@@ -5066,6 +5069,7 @@ async fn run(
             tenant,
             volume,
             dry_run,
+            max_deletions,
             live,
         }) => {
             if *live {
@@ -5076,7 +5080,10 @@ async fn run(
                     "POST",
                     "gc",
                     &[],
-                    Some(serde_json::json!({ "dry_run": dry_run })),
+                    Some(serde_json::json!({
+                        "dry_run": dry_run,
+                        "max_deletions": max_deletions,
+                    })),
                 )
                 .await?;
                 let report = &response["gc"];
@@ -5084,7 +5091,13 @@ async fn run(
                 println!("deleted_commits: {}", report["deleted_commits"]);
                 println!("deleted_nodes: {}", report["deleted_nodes"]);
                 println!("deleted_blobs: {}", report["deleted_blobs"]);
+                println!(
+                    "deleted_idempotency_records: {}",
+                    report["deleted_idempotency_records"]
+                );
                 println!("reclaimed_bytes: {}", report["reclaimed_bytes"]);
+                println!("remaining_objects: {}", report["remaining_objects"]);
+                println!("complete: {}", report["complete"]);
                 println!("dry_run: {}", report["dry_run"]);
                 return Ok(());
             }
@@ -5097,6 +5110,7 @@ async fn run(
                     policy.as_ref().and_then(|policy| policy.keep_last),
                     policy.as_ref().and_then(|policy| policy.max_age_secs),
                     *dry_run,
+                    *max_deletions,
                 )
                 .await;
             let close = repository.close().await;
@@ -5106,7 +5120,13 @@ async fn run(
             println!("deleted_commits: {}", report.deleted_commits);
             println!("deleted_nodes: {}", report.deleted_nodes);
             println!("deleted_blobs: {}", report.deleted_blobs);
+            println!(
+                "deleted_idempotency_records: {}",
+                report.deleted_idempotency_records
+            );
             println!("reclaimed_bytes: {}", report.reclaimed_bytes);
+            println!("remaining_objects: {}", report.remaining_objects);
+            println!("complete: {}", report.complete);
             println!("dry_run: {}", report.dry_run);
             if !report.dry_run {
                 append_cli_version_audit(
@@ -6619,6 +6639,8 @@ mod tests {
             "tenant-a",
             "docs",
             "--dry-run",
+            "--max-deletions",
+            "2500",
             "--live",
         ])
         .unwrap();
@@ -6626,6 +6648,7 @@ mod tests {
             cli.command,
             Command::Versioning(VersioningCmd::Gc {
                 dry_run: true,
+                max_deletions: Some(2500),
                 live: true,
                 ..
             })

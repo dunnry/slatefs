@@ -63,6 +63,10 @@ const SHA256_LEN: usize = 32;
 pub const DEFAULT_REFLOG_KEEP_LAST: u32 = 100;
 /// Maximum configurable per-branch recovery window.
 pub const MAX_REFLOG_KEEP_LAST: u32 = 100_000;
+/// Default object-deletion budget for one incremental GC run.
+pub const DEFAULT_GC_MAX_DELETIONS: u32 = 10_000;
+/// Maximum object-deletion budget accepted for one GC run.
+pub const MAX_GC_MAX_DELETIONS: u32 = 1_000_000;
 const MAINTENANCE_LEASE_VERSION: u8 = 1;
 const MAINTENANCE_LEASE_TTL_SECS: u64 = 120;
 const MAINTENANCE_LEASE_RENEW_SECS: u64 = 30;
@@ -2419,7 +2423,11 @@ pub struct VersionGcReport {
     pub deleted_attestations: u64,
     pub deleted_nodes: u64,
     pub deleted_blobs: u64,
+    pub deleted_idempotency_records: u64,
     pub reclaimed_bytes: u64,
+    pub remaining_objects: u64,
+    pub max_deletions: u32,
+    pub complete: bool,
     pub dry_run: bool,
 }
 
@@ -3725,7 +3733,15 @@ impl VersionRepository {
         keep_last: Option<u32>,
         max_age_secs: Option<u64>,
         dry_run: bool,
+        max_deletions: Option<u32>,
     ) -> Result<VersionGcReport> {
+        let max_deletions = max_deletions.unwrap_or(DEFAULT_GC_MAX_DELETIONS);
+        if max_deletions == 0 || max_deletions > MAX_GC_MAX_DELETIONS {
+            return Err(Error::invalid(
+                "version gc max deletions",
+                format!("must be between 1 and {MAX_GC_MAX_DELETIONS}"),
+            ));
+        }
         let now = crate::control::now_unix();
         let cutoff = max_age_secs.map(|age| now.saturating_sub(age));
         let mut next = self.store.get_head().await?.map(|head| head.commit_id);
@@ -3855,44 +3871,39 @@ impl VersionRepository {
 
         let mut report = VersionGcReport {
             retained_commits: retained.len() as u64,
+            max_deletions,
             dry_run,
             ..VersionGcReport::default()
         };
         let mut deletions = WriteBatch::new();
+        let mut selected = 0_u64;
         let mut iter = self.store.db.scan(..).await?;
         while let Some(entry) = iter.next().await? {
             let key = entry.key.as_ref();
-            let delete = if let Some(cid) = key.strip_prefix(NODE_PREFIX) {
+            let delete_kind = if let Some(cid) = key.strip_prefix(NODE_PREFIX) {
                 if live_nodes.contains(cid) {
-                    false
+                    None
                 } else {
-                    report.deleted_nodes += 1;
-                    true
+                    Some(0_u8)
                 }
             } else if let Some(cid) = key.strip_prefix(BLOB_PREFIX) {
                 if live_blobs.contains(cid) {
-                    false
+                    None
                 } else {
-                    report.deleted_blobs += 1;
-                    true
+                    Some(1)
                 }
             } else if let Some(id) = key.strip_prefix(COMMIT_PREFIX) {
                 if retained_ids.contains(id) {
-                    false
+                    None
                 } else {
-                    report.deleted_commits += 1;
-                    if !dry_run {
-                        deletions.put(pruned_commit_key_bytes(id), Vec::<u8>::new());
-                    }
-                    true
+                    Some(2)
                 }
             } else if key.starts_with(ATTESTATION_PREFIX) {
                 let (commit, _) = parse_attestation_key(key)?;
                 if retained_ids.contains(commit.as_slice()) {
-                    false
+                    None
                 } else {
-                    report.deleted_attestations += 1;
-                    true
+                    Some(3)
                 }
             } else if key.starts_with(IDEMPOTENCY_PREFIX) {
                 let record: VersionCommitIdempotencyRecord = decode_versioned(
@@ -3900,11 +3911,32 @@ impl VersionRepository {
                     &entry.value,
                     "version commit idempotency record",
                 )?;
-                !retained_ids.contains(record.commit_id.as_slice())
+                (!retained_ids.contains(record.commit_id.as_slice())).then_some(4)
             } else {
-                false
+                None
             };
-            if delete {
+            if let Some(delete_kind) = delete_kind {
+                if selected >= u64::from(max_deletions) {
+                    report.remaining_objects += 1;
+                    continue;
+                }
+                selected += 1;
+                match delete_kind {
+                    0 => report.deleted_nodes += 1,
+                    1 => report.deleted_blobs += 1,
+                    2 => {
+                        report.deleted_commits += 1;
+                        if !dry_run {
+                            let id = key
+                                .strip_prefix(COMMIT_PREFIX)
+                                .expect("commit deletion kind has commit prefix");
+                            deletions.put(pruned_commit_key_bytes(id), Vec::<u8>::new());
+                        }
+                    }
+                    3 => report.deleted_attestations += 1,
+                    4 => report.deleted_idempotency_records += 1,
+                    _ => unreachable!("unknown GC deletion kind"),
+                }
                 report.reclaimed_bytes = report
                     .reclaimed_bytes
                     .saturating_add((entry.key.len() + entry.value.len()) as u64);
@@ -3913,13 +3945,8 @@ impl VersionRepository {
                 }
             }
         }
-        if !dry_run
-            && (report.deleted_nodes
-                + report.deleted_blobs
-                + report.deleted_commits
-                + report.deleted_attestations
-                > 0)
-        {
+        report.complete = report.remaining_objects == 0;
+        if !dry_run && selected > 0 {
             self.store.db.write(deletions).await?;
             self.store.db.flush().await?;
             self.prolly.clear_cache();
