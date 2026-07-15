@@ -200,6 +200,7 @@ trusted-key list keeps signature enforcement disabled and requires a zero
 quorum. `versioning quorum-status <tenant> <volume> <protected-branch>
 <candidate>` resolves the candidate and reports the required count, matching
 trusted key IDs, and whether promotion is ready without moving either branch.
+Add `--check` to exit non-zero when the candidate is below quorum.
 
 `unprotect-branch --yes` removes that guard. `versioning reflog <branch>` lists
 the newest 100 head

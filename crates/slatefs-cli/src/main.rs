@@ -517,6 +517,9 @@ enum VersioningCmd {
         volume: String,
         branch: String,
         commit: String,
+        /// Exit non-zero when the candidate does not satisfy the branch quorum.
+        #[arg(long)]
+        check: bool,
         #[arg(long)]
         live: bool,
     },
@@ -3436,6 +3439,7 @@ async fn run(
             volume,
             branch,
             commit,
+            check,
             live,
         }) => {
             let quorum = if *live {
@@ -3462,6 +3466,13 @@ async fn run(
                 quorum
             };
             print_attestation_quorum(&quorum);
+            if *check && !quorum.satisfied() {
+                anyhow::bail!(
+                    "commit {} does not satisfy the attestation quorum for branch {}",
+                    quorum.commit(),
+                    quorum.branch()
+                );
+            }
         }
         Command::Versioning(VersioningCmd::ProtectBranch {
             tenant,
@@ -5198,6 +5209,7 @@ mod tests {
             "docs",
             "release",
             "candidate",
+            "--check",
             "--live",
         ])
         .unwrap();
@@ -5206,6 +5218,7 @@ mod tests {
             Command::Versioning(VersioningCmd::QuorumStatus {
                 branch,
                 commit,
+                check: true,
                 live: true,
                 ..
             }) if branch == "release" && commit == "candidate"

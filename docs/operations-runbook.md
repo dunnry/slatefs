@@ -256,7 +256,7 @@ slatefs -c /etc/slatefs/slatefs.toml versioning branch <tenant> <volume> candida
 slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path>... -m <message> --branch candidate --live
 slatefs -c /etc/slatefs/slatefs.toml versioning attest <tenant> <volume> candidate --key-id release-2026 --key-file release.key --live
 slatefs -c /etc/slatefs/slatefs.toml versioning attest <tenant> <volume> candidate --key-id security-2026 --key-file security.key --live
-slatefs -c /etc/slatefs/slatefs.toml versioning quorum-status <tenant> <volume> main candidate --live
+slatefs -c /etc/slatefs/slatefs.toml versioning quorum-status <tenant> <volume> main candidate --check --live
 slatefs -c /etc/slatefs/slatefs.toml versioning merge <tenant> <volume> candidate main --live
 ```
 
@@ -268,7 +268,8 @@ Changing the key set or quorum requires the current head to satisfy the new
 policy. Removing all trusted keys with a zero quorum disables signature
 enforcement, while `unprotect-branch` removes the entire destructive-ref guard.
 `quorum-status` is read-only and prints the canonical candidate commit, trusted
-and matching key IDs, required count, and final `satisfied` result.
+and matching key IDs, required count, and final `satisfied` result. `--check`
+also exits non-zero when the result is false, for use as a release gate.
 
 Merge conflicts fail without moving either branch by default. After reviewing
 `merge-preview`, use `--conflict-strategy ours` to keep each conflicting path
