@@ -536,7 +536,12 @@ impl VersionStore {
         Ok(protections)
     }
 
-    async fn set_branch_protected(&self, name: &str, protected: bool) -> Result<VersionRef> {
+    async fn set_branch_protected(
+        &self,
+        name: &str,
+        protected: bool,
+        allowed_committers: &[String],
+    ) -> Result<VersionRef> {
         let _guard = self.ref_lock.lock().await;
         let reference = self
             .get_branch(name)
@@ -547,6 +552,7 @@ impl VersionStore {
             let protection = VersionBranchProtection {
                 branch: name.to_string(),
                 protected_at: crate::control::now_unix(),
+                allowed_committers: allowed_committers.to_vec(),
             };
             self.db
                 .put_bytes(
@@ -569,6 +575,31 @@ impl VersionStore {
             ));
         }
         Ok(())
+    }
+
+    async fn authorize_branch_publisher(
+        &self,
+        name: &str,
+        provenance: &VersionCommitProvenance,
+    ) -> Result<()> {
+        let Some(protection) = self.branch_protection(name).await? else {
+            return Ok(());
+        };
+        if protection.allowed_committers.is_empty()
+            || protection
+                .allowed_committers
+                .iter()
+                .any(|committer| committer == provenance.committer())
+        {
+            return Ok(());
+        }
+        Err(Error::invalid(
+            "version branch authorization",
+            format!(
+                "committer {} is not allowed to publish to protected branch {name}",
+                provenance.committer()
+            ),
+        ))
     }
 
     async fn get_commit(&self, id: &[u8; 32]) -> Result<VersionCommit> {
@@ -631,6 +662,8 @@ impl VersionStore {
                     .unwrap_or_else(|| "empty".to_string())
             )));
         }
+        self.authorize_branch_publisher(branch, &commit.provenance)
+            .await?;
         if let Some((required_branch, required_commit)) = required_ref {
             let current = self.get_branch(required_branch).await?;
             if current.as_ref().map(|head| head.commit_id) != Some(required_commit) {
@@ -858,6 +891,7 @@ impl VersionStore {
         target: &str,
         expected_source: [u8; 32],
         expected_target: [u8; 32],
+        provenance: &VersionCommitProvenance,
     ) -> Result<VersionRef> {
         let _guard = self.ref_lock.lock().await;
         let source_ref = self
@@ -873,6 +907,7 @@ impl VersionStore {
                 "branch moved while preparing fast-forward merge".into(),
             ));
         }
+        self.authorize_branch_publisher(target, provenance).await?;
         let mut batch = WriteBatch::new();
         batch.put(
             branch_key(target),
@@ -1177,6 +1212,7 @@ struct VersionRef {
 struct VersionBranchProtection {
     branch: String,
     protected_at: u64,
+    allowed_committers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1285,6 +1321,7 @@ pub struct VersionBranchInfo {
     name: String,
     commit: String,
     protected: bool,
+    allowed_committers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1480,6 +1517,10 @@ impl VersionBranchInfo {
 
     pub fn protected(&self) -> bool {
         self.protected
+    }
+
+    pub fn allowed_committers(&self) -> &[String] {
+        &self.allowed_committers
     }
 }
 
@@ -2893,26 +2934,31 @@ impl VersionRepository {
             name: name.to_string(),
             commit: hex::encode(reference.commit_id),
             protected: false,
+            allowed_committers: Vec::new(),
         })
     }
 
     pub async fn list_branches(&self) -> Result<Vec<VersionBranchInfo>> {
-        let protected = self
+        let protections = self
             .store
             .list_branch_protections()
             .await?
             .into_iter()
-            .map(|protection| protection.branch)
-            .collect::<HashSet<_>>();
+            .map(|protection| (protection.branch, protection.allowed_committers))
+            .collect::<HashMap<_, _>>();
         Ok(self
             .store
             .list_branches()
             .await?
             .into_iter()
-            .map(|(name, reference)| VersionBranchInfo {
-                protected: protected.contains(&name),
-                name,
-                commit: hex::encode(reference.commit_id),
+            .map(|(name, reference)| {
+                let allowed_committers = protections.get(&name).cloned().unwrap_or_default();
+                VersionBranchInfo {
+                    protected: protections.contains_key(&name),
+                    name,
+                    commit: hex::encode(reference.commit_id),
+                    allowed_committers,
+                }
             })
             .collect())
     }
@@ -2924,13 +2970,23 @@ impl VersionRepository {
         &self,
         name: &str,
         protected: bool,
+        allowed_committers: &[String],
     ) -> Result<VersionBranchInfo> {
         validate_version_branch_name(name)?;
-        let reference = self.store.set_branch_protected(name, protected).await?;
+        let allowed_committers = if protected {
+            normalize_allowed_committers(allowed_committers)?
+        } else {
+            Vec::new()
+        };
+        let reference = self
+            .store
+            .set_branch_protected(name, protected, &allowed_committers)
+            .await?;
         Ok(VersionBranchInfo {
             name: name.to_string(),
             commit: hex::encode(reference.commit_id),
             protected,
+            allowed_committers,
         })
     }
 
@@ -2990,6 +3046,7 @@ impl VersionRepository {
             name: name.to_string(),
             commit: hex::encode(reference.commit_id),
             protected: false,
+            allowed_committers: Vec::new(),
         })
     }
 
@@ -3141,7 +3198,13 @@ impl VersionRepository {
         {
             let merged = self
                 .store
-                .fast_forward_branch(source, target, source_ref.commit_id, target_ref.commit_id)
+                .fast_forward_branch(
+                    source,
+                    target,
+                    source_ref.commit_id,
+                    target_ref.commit_id,
+                    &provenance,
+                )
                 .await?;
             return Ok(VersionMergeInfo {
                 source: source.to_string(),
@@ -4512,6 +4575,22 @@ fn validate_version_identity(what: &'static str, value: &str) -> Result<()> {
         return Err(Error::invalid(what, "must not contain control characters"));
     }
     Ok(())
+}
+
+fn normalize_allowed_committers(values: &[String]) -> Result<Vec<String>> {
+    if values.len() > 64 {
+        return Err(Error::invalid(
+            "version branch allowed committers",
+            "must contain at most 64 identities",
+        ));
+    }
+    let mut normalized = values.to_vec();
+    for value in &normalized {
+        validate_version_identity("version branch allowed committer", value)?;
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
 }
 
 fn validate_version_request_id(value: &str) -> Result<()> {

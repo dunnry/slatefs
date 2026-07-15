@@ -1032,6 +1032,13 @@ struct VersionBranchRecoverRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct VersionBranchProtectionRequest {
+    #[serde(default)]
+    allowed_committers: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VersionBranchMergeRequest {
     source: String,
     #[serde(default)]
@@ -1524,6 +1531,11 @@ fn core_error(error: slatefs_core::error::Error) -> AdminError {
         slatefs_core::error::Error::AlreadyExists { .. } => 409,
         slatefs_core::error::Error::Invalid { what, .. } if *what == "version branch operation" => {
             409
+        }
+        slatefs_core::error::Error::Invalid { what, .. }
+            if *what == "version branch authorization" =>
+        {
+            403
         }
         slatefs_core::error::Error::Invalid { .. } | slatefs_core::error::Error::Config(_) => 400,
         _ => 500,
@@ -2658,10 +2670,17 @@ async fn set_version_branch_protection_response(
     name: &str,
     protected: bool,
 ) -> Result<AdminHttpResponse, AdminError> {
+    let allowed_committers = if protected {
+        parse_json_body::<VersionBranchProtectionRequest>(request)?.allowed_committers
+    } else {
+        Vec::new()
+    };
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
     let (control, repository) = open_version_repository(state, tenant, volume).await?;
-    let result = repository.set_branch_protected(name, protected).await;
+    let result = repository
+        .set_branch_protected(name, protected, &allowed_committers)
+        .await;
     let audit = match &result {
         Ok(branch) => {
             append_version_audit(
@@ -7823,11 +7842,13 @@ mod tests {
         );
         let branches: Value = serde_json::from_str(response_body(&branches_response)).unwrap();
         assert_eq!(branches["branches"].as_array().unwrap().len(), 2);
-        let protect_response = admin_exchange(
-            Arc::clone(&state),
-            b"PUT /admin/v1/tenants/t/volumes/v/versioning/branches/release/protection HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
-        )
-        .await;
+        let protect_body = r#"{"allowed_committers":["other-committer"]}"#;
+        let protect_request = format!(
+            "PUT /admin/v1/tenants/t/volumes/v/versioning/branches/release/protection HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            protect_body.len(),
+            protect_body
+        );
+        let protect_response = admin_exchange(Arc::clone(&state), protect_request.as_bytes()).await;
         assert_eq!(
             response_status(&protect_response),
             200,
@@ -7835,6 +7856,10 @@ mod tests {
         );
         let protected: Value = serde_json::from_str(response_body(&protect_response)).unwrap();
         assert_eq!(protected["branch"]["protected"], true);
+        assert_eq!(
+            protected["branch"]["allowed_committers"],
+            json!(["other-committer"])
+        );
         let blocked_reset_body = r#"{"commit":"baseline"}"#;
         let blocked_reset_request = format!(
             "POST /admin/v1/tenants/t/volumes/v/versioning/branches/release/reset HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -7905,6 +7930,26 @@ mod tests {
             "POST /admin/v1/tenants/t/volumes/v/versioning/commits HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             branch_commit_body.len(),
             branch_commit_body
+        );
+        let denied_branch_commit =
+            admin_exchange(Arc::clone(&state), branch_commit_request.as_bytes()).await;
+        assert_eq!(
+            response_status(&denied_branch_commit),
+            403,
+            "{denied_branch_commit}"
+        );
+        let authorize_body = r#"{"allowed_committers":["admin:unauthenticated"]}"#;
+        let authorize_request = format!(
+            "PUT /admin/v1/tenants/t/volumes/v/versioning/branches/release/protection HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            authorize_body.len(),
+            authorize_body
+        );
+        let authorize_response =
+            admin_exchange(Arc::clone(&state), authorize_request.as_bytes()).await;
+        assert_eq!(
+            response_status(&authorize_response),
+            200,
+            "{authorize_response}"
         );
         let branch_commit_response =
             admin_exchange(Arc::clone(&state), branch_commit_request.as_bytes()).await;
@@ -8265,7 +8310,7 @@ mod tests {
             let expected = if action == AuditAction::VersionCommit {
                 3
             } else if action == AuditAction::Maintain {
-                11
+                12
             } else {
                 1
             };

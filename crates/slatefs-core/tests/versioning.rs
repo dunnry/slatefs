@@ -272,10 +272,11 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         VersionReflogAction::Recover
     );
     let protected = repository
-        .set_branch_protected("release", true)
+        .set_branch_protected("release", true, &["other-committer".into()])
         .await
         .unwrap();
     assert!(protected.protected());
+    assert_eq!(protected.allowed_committers(), &["other-committer"]);
     assert!(
         repository
             .list_branches()
@@ -286,6 +287,22 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
             .unwrap()
             .protected()
     );
+    assert!(matches!(
+        repository
+            .merge_branch(
+                "main",
+                "release",
+                VersionMergeConflictStrategy::Fail,
+                test_provenance(),
+            )
+            .await,
+        Err(Error::Invalid { .. })
+    ));
+    let protected = repository
+        .set_branch_protected("release", true, &["test-committer".into()])
+        .await
+        .unwrap();
+    assert_eq!(protected.allowed_committers(), &["test-committer"]);
     assert!(matches!(
         repository.reset_branch("release", "main").await,
         Err(Error::Invalid { .. })
@@ -311,7 +328,7 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         .unwrap();
     assert!(protected_fast_forward.fast_forward());
     let unprotected = repository
-        .set_branch_protected("release", false)
+        .set_branch_protected("release", false, &[])
         .await
         .unwrap();
     assert!(!unprotected.protected());

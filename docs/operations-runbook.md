@@ -210,7 +210,7 @@ slatefs -c /etc/slatefs/slatefs.toml versioning tags <tenant> <volume> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning untag <tenant> <volume> <name> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning branch <tenant> <volume> <name> <commit-or-ref> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning branches <tenant> <volume> --live
-slatefs -c /etc/slatefs/slatefs.toml versioning protect-branch <tenant> <volume> <name> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning protect-branch <tenant> <volume> <name> --allow-committer tenant:<tenant> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning unprotect-branch <tenant> <volume> <name> --yes --live
 slatefs -c /etc/slatefs/slatefs.toml versioning reflog <tenant> <volume> <name> --limit 100 --live
 slatefs -c /etc/slatefs/slatefs.toml versioning recover-branch <tenant> <volume> <name> <reflog-sequence> --yes --live
@@ -237,9 +237,12 @@ changes from both branches are still merged.
 
 Protect long-lived or release branches before exposing reset, deletion, or
 recovery workflows to operators. Protection does not block commits or merges;
-those operations preserve the protected head as an ancestor. Removing the
-guard requires `unprotect-branch --yes` and emits a durable maintenance audit
-record.
+those operations preserve the protected head as an ancestor. Repeat
+`--allow-committer` to restrict publication to exact server-derived committer
+identities such as `tenant:<tenant>`, `admin-token`, or a configured admin
+principal. Omitting it allows any committer. Unauthorized live publication
+returns HTTP `403`. Removing the guard requires `unprotect-branch --yes` and
+emits a durable maintenance audit record.
 
 Live commit and divergent-merge provenance records the authenticated admin or
 tenant principal as committer and the HTTP request ID for audit correlation.
@@ -248,6 +251,9 @@ instead. `--author` is optional on live requests and defaults to that committer
 identity. It names the content author when supplied but cannot replace the
 server-derived committer. Offline commit and divergent merge commands require
 `--author`; they record the claimed identity as both author and committer.
+Treat offline storage and KMS access as repository-administrator access: an
+offline operator can claim an allowed committer identity. Use the authenticated
+`--live` path when the allowlist must enforce customer identity.
 
 `restore-preview` prints a token after the plan. Pass it unchanged to
 `restore --token`; a `409` means the branch, plan, or live subtree changed and

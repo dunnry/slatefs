@@ -95,7 +95,11 @@ new reflog transition. A durable protection record can guard any existing
 branch, including `main`, against reset, deletion, and recovery. Protection is
 checked while holding the same ref lock as the mutation, so it cannot race a
 destructive move. Linear commits, fast-forwards, and merge commits remain
-available because they retain the protected head in their ancestry.
+available because they retain the protected head in their ancestry. Protection
+may also carry an exact committer allowlist. Publication authorization is
+checked under the ref lock against hash-bound commit provenance for ordinary
+and divergent commits, and against the merge request provenance before a
+fast-forward. An empty allowlist leaves publication unrestricted.
 Disabling versioning blocks repository operations
 without deleting its history. Volume deletion removes both the live and
 optional version-store prefixes.
