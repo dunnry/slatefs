@@ -23,9 +23,10 @@ use slatefs_core::versioning::{
     VersionBranchRecoveryInfo, VersionBranchResetInfo, VersionCommitAttestation, VersionCommitInfo,
     VersionCommitOrigin, VersionCommitProvenance, VersionMergeConflictStrategy, VersionMergeInfo,
     VersionMergePreview, VersionPathChangeKind, VersionReflogEntry, VersionRepository,
-    VersionRestoreActionKind, VersionRestoreApplyInfo, VersionRestoreMode, VersionRestorePreview,
-    VersionTagInfo, VersionTrustedAttestationKey, VersionWorkingTreeChangeKind,
-    VersionWorkingTreeStatus, force_break_expired_version_maintenance_lease, purge_version_history,
+    VersionRepositoryBundleReport, VersionRestoreActionKind, VersionRestoreApplyInfo,
+    VersionRestoreMode, VersionRestorePreview, VersionTagInfo, VersionTrustedAttestationKey,
+    VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
+    force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease, version_commit_attestation_payload,
 };
 use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
@@ -344,6 +345,29 @@ enum VersioningCmd {
     Policy {
         tenant: String,
         volume: String,
+        #[arg(long)]
+        live: bool,
+    },
+    /// Export the complete logical version repository to a portable binary bundle.
+    ExportRepository {
+        tenant: String,
+        volume: String,
+        /// New bundle file to create.
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        live: bool,
+    },
+    /// Import a portable repository bundle into an uninitialized version repository.
+    ImportRepository {
+        tenant: String,
+        volume: String,
+        /// Bundle file to import.
+        #[arg(long = "in")]
+        input: PathBuf,
+        /// Confirm creation of repository history in the destination volume.
+        #[arg(long)]
+        yes: bool,
         #[arg(long)]
         live: bool,
     },
@@ -1916,14 +1940,14 @@ fn admin_tls_client_config(config: &Config) -> anyhow::Result<Arc<ClientConfig>>
     Ok(Arc::new(client))
 }
 
-async fn exchange_admin_stream<S>(mut stream: S, request: &[u8]) -> anyhow::Result<String>
+async fn exchange_admin_stream<S>(mut stream: S, request: &[u8]) -> anyhow::Result<Vec<u8>>
 where
     S: tokio::io::AsyncRead + AsyncWrite + Unpin,
 {
     stream.write_all(request).await?;
     stream.shutdown().await?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
     Ok(response)
 }
 
@@ -1931,7 +1955,7 @@ async fn admin_http_exchange(
     config: &Config,
     listen: &str,
     request: &[u8],
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Vec<u8>> {
     let stream = TcpStream::connect(listen)
         .await
         .with_context(|| format!("connecting to slatefsd admin endpoint at {listen}"))?;
@@ -2001,17 +2025,20 @@ async fn live_versioning_json(
     );
     let response = admin_http_exchange(config, listen, request.as_bytes()).await?;
     let (head, body) = response
-        .split_once("\r\n\r\n")
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| (&response[..position], &response[position + 4..]))
         .ok_or_else(|| anyhow::anyhow!("malformed admin response"))?;
+    let head = std::str::from_utf8(head).context("admin response headers are not UTF-8")?;
     let status = head.lines().next().unwrap_or_default();
     if !status.starts_with("HTTP/1.1 200 ") && !status.starts_with("HTTP/1.1 201 ") {
-        let detail = serde_json::from_str::<serde_json::Value>(body)
+        let detail = serde_json::from_slice::<serde_json::Value>(body)
             .ok()
             .and_then(|body| body["error"]["message"].as_str().map(str::to_string))
-            .unwrap_or_else(|| body.trim().to_string());
+            .unwrap_or_else(|| String::from_utf8_lossy(body).trim().to_string());
         anyhow::bail!("admin versioning request failed: {detail}");
     }
-    serde_json::from_str(body).context("parsing admin versioning response")
+    serde_json::from_slice(body).context("parsing admin versioning response")
 }
 
 async fn post_live_versioning_json(
@@ -2022,6 +2049,46 @@ async fn post_live_versioning_json(
     body: serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
     live_versioning_json(config, tenant, volume, "POST", operation, &[], Some(body)).await
+}
+
+async fn live_versioning_bundle(
+    config: &Config,
+    tenant: &str,
+    volume: &str,
+    method: &str,
+    bundle: Option<&[u8]>,
+) -> anyhow::Result<Vec<u8>> {
+    let listen = config
+        .admin
+        .listen
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--live requires [admin].listen"))?;
+    let authorization = admin_bearer_token(config, tenant)?
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
+    let body = bundle.unwrap_or_default();
+    let mut request = format!(
+        "{method} /admin/v1/tenants/{tenant}/volumes/{volume}/versioning/bundle HTTP/1.1\r\nHost: {listen}\r\nContent-Type: application/vnd.slatefs.version-repository\r\n{authorization}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    let response = admin_http_exchange(config, listen, &request).await?;
+    let (head, body) = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| (&response[..position], &response[position + 4..]))
+        .ok_or_else(|| anyhow::anyhow!("malformed admin response"))?;
+    let head = std::str::from_utf8(head).context("admin response headers are not UTF-8")?;
+    let status = head.lines().next().unwrap_or_default();
+    if !status.starts_with("HTTP/1.1 200 ") && !status.starts_with("HTTP/1.1 201 ") {
+        let detail = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|body| body["error"]["message"].as_str().map(str::to_string))
+            .unwrap_or_else(|| String::from_utf8_lossy(body).trim().to_string());
+        anyhow::bail!("admin versioning request failed: {detail}");
+    }
+    Ok(body.to_vec())
 }
 
 #[tokio::main]
@@ -2192,6 +2259,40 @@ fn write_attestation_bundle(
     file.write_all(&json)?;
     file.write_all(b"\n")?;
     Ok(())
+}
+
+fn write_repository_bundle(path: &std::path::Path, bundle: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    if let Err(error) = file.write_all(bundle).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(error).with_context(|| format!("writing {}", path.display()));
+    }
+    Ok(())
+}
+
+fn print_repository_bundle_report(report: &VersionRepositoryBundleReport) {
+    println!("repository_id: {}", report.identity.id());
+    println!("repository_created_at: {}", report.identity.created_at());
+    println!("bundle_bytes: {}", report.bundle_bytes);
+    println!("logical_bytes: {}", report.logical_bytes);
+    println!("objects: {}", report.objects);
+    println!("commits: {}", report.commits);
+    println!("pruned_commits: {}", report.pruned_commits);
+    println!("attestations: {}", report.attestations);
+    println!("nodes: {}", report.nodes);
+    println!("blobs: {}", report.blobs);
+    println!("branches: {}", report.branches);
+    println!("tags: {}", report.tags);
+    println!("reflogs: {}", report.reflogs);
 }
 
 fn read_attestation_bundle(path: &std::path::Path) -> anyhow::Result<VersionAttestationBundle> {
@@ -2766,6 +2867,105 @@ async fn run(
                 }
                 None => println!("lease:       none"),
             }
+        }
+        Command::Versioning(VersioningCmd::ExportRepository {
+            tenant,
+            volume,
+            out,
+            live,
+        }) => {
+            let (bundle, report) = if *live {
+                let bundle = live_versioning_bundle(config, tenant, volume, "GET", None).await?;
+                let report = VersionRepository::inspect_bundle(&bundle)?;
+                (bundle, report)
+            } else {
+                let repository =
+                    VersionRepository::open(control, object_store, tenant, volume).await?;
+                let result = repository.export_bundle().await;
+                let close = repository.close().await;
+                let exported = result?;
+                close?;
+                exported
+            };
+            write_repository_bundle(out, &bundle)?;
+            if !*live {
+                append_cli_version_audit(
+                    control,
+                    AuditAction::VersionRepositoryExport,
+                    tenant,
+                    volume,
+                    [
+                        (
+                            "repository_id".to_string(),
+                            AuditDetailValue::String(report.identity.id().to_string()),
+                        ),
+                        (
+                            "bundle_bytes".to_string(),
+                            AuditDetailValue::U64(report.bundle_bytes),
+                        ),
+                    ],
+                )
+                .await?;
+            }
+            println!("wrote repository bundle to {}", out.display());
+            print_repository_bundle_report(&report);
+        }
+        Command::Versioning(VersioningCmd::ImportRepository {
+            tenant,
+            volume,
+            input,
+            yes,
+            live,
+        }) => {
+            if !yes {
+                anyhow::bail!("versioning import-repository requires --yes");
+            }
+            let bundle = std::fs::read(input)
+                .with_context(|| format!("reading repository bundle {}", input.display()))?;
+            let inspected = VersionRepository::inspect_bundle(&bundle)?;
+            let report = if *live {
+                let response =
+                    live_versioning_bundle(config, tenant, volume, "POST", Some(&bundle)).await?;
+                let response: serde_json::Value = serde_json::from_slice(&response)
+                    .context("parsing admin repository import response")?;
+                serde_json::from_value(response["repository_bundle"].clone())
+                    .context("parsing imported repository bundle report")?
+            } else {
+                let report = VersionRepository::import_bundle(
+                    control,
+                    object_store,
+                    tenant,
+                    volume,
+                    &bundle,
+                )
+                .await?;
+                append_cli_version_audit(
+                    control,
+                    AuditAction::VersionRepositoryImport,
+                    tenant,
+                    volume,
+                    [
+                        (
+                            "repository_id".to_string(),
+                            AuditDetailValue::String(report.identity.id().to_string()),
+                        ),
+                        (
+                            "bundle_bytes".to_string(),
+                            AuditDetailValue::U64(report.bundle_bytes),
+                        ),
+                    ],
+                )
+                .await?;
+                report
+            };
+            if report != inspected {
+                anyhow::bail!("imported repository report does not match the source bundle");
+            }
+            println!(
+                "imported repository bundle from {} into {tenant}/{volume}",
+                input.display()
+            );
+            print_repository_bundle_report(&report);
         }
         Command::Versioning(VersioningCmd::Status {
             tenant,
@@ -4993,6 +5193,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_versioning_bundle_transport_preserves_binary_bytes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let expected_request_body = vec![0, 0xff, 1, 2, 3, 0x80];
+        let expected_response_body = vec![b'S', b'L', 0, 0xff, 0x80, 4, 5];
+        let response_body = expected_response_body.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.slatefs.version-repository\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        response_body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(&response_body).await.unwrap();
+            request
+        });
+        let config = Config::parse(&format!(
+            r#"
+                [object_store]
+                url = "memory:///"
+
+                [kms]
+                provider = "static"
+                key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+                [admin]
+                listen = "{listen}"
+
+                [admin.tenant_tokens]
+                tenant-a = "tenant-secret"
+            "#
+        ))
+        .unwrap();
+        let response = live_versioning_bundle(
+            &config,
+            "tenant-a",
+            "docs",
+            "POST",
+            Some(&expected_request_body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response, expected_response_body);
+        let request = server.await.unwrap();
+        let separator = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        let head = std::str::from_utf8(&request[..separator]).unwrap();
+        assert!(head.contains("Authorization: Bearer tenant-secret\r\n"));
+        assert_eq!(&request[separator + 4..], expected_request_body);
+    }
+
+    #[tokio::test]
     async fn live_versioning_client_supports_custom_ca_tls() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
         let (ca_path, cert_path, key_path) = generate_admin_server_certificate(directory.path())?;
@@ -5070,6 +5331,56 @@ mod tests {
         assert_eq!(parse_size_bytes("2m").unwrap(), 2 * 1024 * 1024);
         assert_eq!(parse_size_bytes("100G").unwrap(), 100 * 1024 * 1024 * 1024);
         assert_eq!(parse_size_bytes("1T").unwrap(), 1024_u64.pow(4));
+    }
+
+    #[test]
+    fn parses_repository_bundle_commands() {
+        let export = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "export-repository",
+            "tenant-a",
+            "docs",
+            "--out",
+            "docs.slatevcs",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            export.command,
+            Command::Versioning(VersioningCmd::ExportRepository {
+                tenant,
+                volume,
+                out,
+                live: true,
+            }) if tenant == "tenant-a"
+                && volume == "docs"
+                && out == std::path::Path::new("docs.slatevcs")
+        ));
+
+        let import = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "import-repository",
+            "tenant-a",
+            "restored",
+            "--in",
+            "docs.slatevcs",
+            "--yes",
+        ])
+        .unwrap();
+        assert!(matches!(
+            import.command,
+            Command::Versioning(VersioningCmd::ImportRepository {
+                tenant,
+                volume,
+                input,
+                yes: true,
+                live: false,
+            }) if tenant == "tenant-a"
+                && volume == "restored"
+                && input == std::path::Path::new("docs.slatevcs")
+        ));
     }
 
     #[test]

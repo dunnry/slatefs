@@ -91,9 +91,14 @@ each signature before storage and during repository verification; private keys
 remain client-side. Attestations follow their commit through quota accounting
 and garbage collection. A version-2 JSON bundle can carry the repository UUID,
 canonical commit ID, and attestations outside SlateFS for standalone
-verification against an out-of-band trusted public key. Additional named
-branch references can point to any existing commit, tag, or branch and can be used by
-read, restore, diff, and history operations. Commits advance `main` by default
+verification against an out-of-band trusted public key. A separate version-1
+binary repository bundle carries the complete logical object graph and stable
+identity across volumes. Import validates that graph before an atomic SlateDB
+batch re-encrypts it with the empty destination volume's key. Placement-local
+policy, leases, retention settings, and retry state stay behind. Additional
+named branch references can point to any existing commit, tag, or branch and
+can be used by read, restore, diff, and history operations. Commits advance
+`main` by default
 or an existing named branch when selected explicitly. Publishing a commit and
 its branch reference is one SlateDB batch after the new immutable tree nodes
 and blobs have been written. The same batch records a per-branch reflog entry

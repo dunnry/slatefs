@@ -190,6 +190,22 @@ repository UUID, commit, and its signatures as a portable version-2 bundle.
 verifies it without loading a SlateFS config or contacting a repository or
 daemon.
 
+Complete repositories are portable independently of attestation-only bundles.
+The export-repository command writes a checksummed .slatevcs binary bundle
+containing the repository identity, commits, attestations, Prolly nodes,
+content blobs, branches, tags, reflogs, and pruned-parent markers. The
+import-repository command, with explicit --yes confirmation, validates every
+hash, signature, and reference before one atomic import into an uninitialized,
+versioning-enabled destination repository. Enabling versioning alone does not
+initialize the repository. The destination retains the source
+repository UUID while SlateDB re-encrypts the logical records with the
+destination volume's key. Retention settings, branch protection, leases, and
+retry-idempotency records are local operational state and do not travel. Both
+commands support --live; the daemon transports the native binary media type
+without base64 conversion. Live imports are limited to a 512 MiB request body;
+larger repositories can use the offline commands while the involved volumes
+are quiesced.
+
 A protected branch can additionally trust one or more exact signer keys with
 repeatable `--trust-attestation-key <key-id>=<public.key>`. Enabling that rule
 requires the branch's current head to satisfy the configured signature quorum.
@@ -343,6 +359,8 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshot-retention` | Set nullable `keep_last` and/or `max_age_secs`, or `{"clear":true}`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Opt-in state, retention policy, and current or last repository lease. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Enable or disable with `{"enabled":true|false}`; disabling retains history. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/bundle` | Export the complete checksummed repository as `application/vnd.slatefs.version-repository`. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/bundle` | Import a native bundle body into an uninitialized repository; the admin request-body limit is 512 MiB. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/status` | Compare the live working tree with query `reference` (default `main`) and `path` (default `/`) without modifying either side. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore-preview` | Preview `create`, `replace`, and `delete` actions for required `commit` and `path`, with optional `mode=overlay|exact`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Commit history with optional `branch` (default `main`), `path`, `limit`, and exclusive `page_token`; returns `next_page_token`. |

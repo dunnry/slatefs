@@ -58,6 +58,21 @@ DEK. SlateDB compresses blocks
 first, then the SlateFS block transformer AEAD-seals the compressed bytes, and
 SlateDB checksums the transformed bytes.
 
+## Portable Version Repository Bundle
+
+The external .slatevcs format is a logical transfer format, not a copy of the
+encrypted object-store prefix. Its binary envelope is the eight-byte SLATEVCS
+magic, one-byte format version, big-endian 64-bit payload length, postcard
+payload, and a 32-byte SHA-256 payload checksum. Format version 1 carries the
+stable repository identity and a strictly ordered list of key/value records.
+
+Portable records are commits, detached attestations, Prolly nodes, content
+blobs, branches, tags, reflogs, and pruned-parent markers. Import recomputes
+content hashes, verifies attestations against the repository identity, checks
+all graph and reference targets, and then writes one SlateDB batch. Volume
+encryption, retention policy, branch protection, maintenance leases, and
+idempotency retry records are destination-local and are not represented.
+
 ## Key Hierarchy
 
 All keys are 32-byte secrets. Key wrap blobs use AES-256-GCM with the context

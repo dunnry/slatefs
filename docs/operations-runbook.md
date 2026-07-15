@@ -224,6 +224,9 @@ slatefs -c /etc/slatefs/slatefs.toml versioning attest <tenant> <volume> <commit
 slatefs -c /etc/slatefs/slatefs.toml versioning attestations <tenant> <volume> <commit-or-ref> --trusted-public-key release.pub --live
 slatefs -c /etc/slatefs/slatefs.toml versioning export-attestations <tenant> <volume> <commit-or-ref> --out release-attestations.json --live
 slatefs versioning verify-attestation-bundle --in release-attestations.json --trusted-public-key release.pub
+slatefs -c /etc/slatefs/slatefs.toml versioning export-repository <tenant> <volume> --out repository.slatevcs --live
+slatefs -c /etc/slatefs/slatefs.toml versioning enable <tenant> <empty-destination-volume> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning import-repository <tenant> <empty-destination-volume> --in repository.slatevcs --yes --live
 slatefs -c /etc/slatefs/slatefs.toml versioning merge <tenant> <volume> <source> <target> --author <content-author> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning merge <tenant> <volume> <source> <target> --conflict-strategy ours --live
 slatefs -c /etc/slatefs/slatefs.toml versioning merge-preview <tenant> <volume> <source> <target> --live
@@ -243,6 +246,15 @@ returned signature against the resolved commit and fails unless that exact
 public key signed it. The exported version-2 JSON bundle carries the repository
 UUID, canonical commit ID, and detached attestations. Bundle verification is
 standalone: it does not load `/etc/slatefs/slatefs.toml` or contact SlateFS.
+
+Repository import requires an uninitialized version repository and preserves
+the source repository UUID. Enabling versioning alone does not initialize it.
+The destination volume may use a different DEK; the
+logical bundle is validated before SlateDB encrypts one atomic destination
+batch. Branch protection, retention configuration, maintenance leases, and
+idempotency retry records are deliberately not imported. The live admin
+transport accepts bundles up to 512 MiB. For larger bundles, quiesce the source
+and destination volumes and omit the live flag.
 
 To require a signer on a protected branch, first attest its current head, then
 configure the trust anchor. One trusted signature is required by default. This

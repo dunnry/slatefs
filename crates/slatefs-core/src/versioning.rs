@@ -2746,6 +2746,11 @@ impl VersionRepository {
         &self.identity
     }
 
+    /// Validate a portable repository bundle without opening a volume.
+    pub fn inspect_bundle(bundle: &[u8]) -> Result<VersionRepositoryBundleReport> {
+        decode_repository_bundle(bundle).map(|(_, report)| report)
+    }
+
     /// Export every durable logical object in this repository. The returned
     /// bundle is independent of the source volume's encryption key and can be
     /// imported into a differently encrypted destination volume.
@@ -2771,8 +2776,8 @@ impl VersionRepository {
         Ok((bundle, report))
     }
 
-    /// Import a complete logical repository into an empty, versioning-enabled
-    /// destination volume. All records are validated before one atomic batch
+    /// Import a complete logical repository into an uninitialized,
+    /// versioning-enabled destination volume. All records are validated before one atomic batch
     /// makes them visible, and SlateDB encrypts that batch with the destination
     /// volume's key.
     pub async fn import_bundle(
@@ -5820,8 +5825,10 @@ fn decode_repository_bundle(
             "payload checksum does not match",
         ));
     }
-    let payload: VersionRepositoryBundlePayload = postcard::from_bytes(payload_bytes)?;
-    let mut report = validate_repository_bundle_payload(&payload)?;
+    let payload: VersionRepositoryBundlePayload = postcard::from_bytes(payload_bytes)
+        .map_err(|error| Error::invalid("version repository bundle", error.to_string()))?;
+    let mut report = validate_repository_bundle_payload(&payload)
+        .map_err(|error| Error::invalid("version repository bundle", error.to_string()))?;
     report.bundle_bytes = bundle.len() as u64;
     Ok((payload, report))
 }

@@ -827,16 +827,18 @@ where
     write_http_response_with_headers(stream, status, content_type, &[], body).await
 }
 
-async fn write_http_response_with_headers<W>(
+async fn write_http_response_with_headers<W, B>(
     stream: &mut W,
     status: &str,
     content_type: &str,
     headers: &[(&str, String)],
-    body: String,
+    body: B,
 ) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
+    B: AsRef<[u8]>,
 {
+    let body = body.as_ref();
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len(),
@@ -847,7 +849,8 @@ where
             .write_all(format!("{name}: {value}\r\n").as_bytes())
             .await?;
     }
-    stream.write_all(format!("\r\n{body}").as_bytes()).await?;
+    stream.write_all(b"\r\n").await?;
+    stream.write_all(body).await?;
     stream.shutdown().await
 }
 
@@ -915,6 +918,9 @@ const DEFAULT_PAGE_LIMIT: usize = 100;
 const MAX_PAGE_LIMIT: usize = 1_000;
 const DEFAULT_VERSION_CONTENT_BYTES: u64 = 1024 * 1024;
 const MAX_VERSION_CONTENT_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_ADMIN_HEADER_BYTES: usize = 64 * 1024;
+const MAX_ADMIN_REQUEST_BODY_BYTES: usize = 512 * 1024 * 1024;
+const VERSION_REPOSITORY_BUNDLE_CONTENT_TYPE: &str = "application/vnd.slatefs.version-repository";
 const SLATEDB_VERSION: &str = "0.14.1";
 static RUSTLS_PROVIDER: Once = Once::new();
 
@@ -951,13 +957,13 @@ struct AdminHttpRequest {
     peer: Option<SocketAddr>,
     cert_principal: Option<String>,
     authenticated_principal: Option<String>,
-    body: String,
+    body: Vec<u8>,
 }
 
 struct AdminHttpResponse {
     status: u16,
     content_type: &'static str,
-    body: String,
+    body: Vec<u8>,
     headers: Vec<(&'static str, String)>,
 }
 
@@ -1409,7 +1415,7 @@ impl AdminHttpResponse {
         Self {
             status,
             content_type: "text/plain; charset=utf-8",
-            body: body.into(),
+            body: body.into().into_bytes(),
             headers: Vec::new(),
         }
     }
@@ -1423,7 +1429,7 @@ impl AdminHttpResponse {
         Self {
             status,
             content_type: "application/json",
-            body,
+            body: body.into_bytes(),
             headers: Vec::new(),
         }
     }
@@ -1437,6 +1443,15 @@ impl AdminHttpResponse {
         Self {
             status,
             content_type: "application/json",
+            body: body.into_bytes(),
+            headers: Vec::new(),
+        }
+    }
+
+    fn binary(status: u16, content_type: &'static str, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            content_type,
             body,
             headers: Vec::new(),
         }
@@ -1520,6 +1535,8 @@ fn status_line(status: u16) -> &'static str {
         404 => "404 Not Found",
         405 => "405 Method Not Allowed",
         409 => "409 Conflict",
+        413 => "413 Content Too Large",
+        431 => "431 Request Header Fields Too Large",
         500 => "500 Internal Server Error",
         503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",
@@ -1564,7 +1581,12 @@ fn core_error(error: slatefs_core::error::Error) -> AdminError {
         slatefs_core::error::Error::NotFound { .. } => 404,
         slatefs_core::error::Error::AlreadyExists { .. } => 409,
         slatefs_core::error::Error::Invalid { what, .. }
-            if matches!(*what, "version branch operation" | "version history purge") =>
+            if matches!(
+                *what,
+                "version branch operation"
+                    | "version history purge"
+                    | "version repository bundle import"
+            ) =>
         {
             409
         }
@@ -1882,21 +1904,43 @@ async fn read_admin_request<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut buf = [0u8; 16 * 1024];
-    let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
-    let n = match read {
-        Ok(result) => result.map_err(|error| AdminError {
-            status: 400,
-            message: format!("read failed: {error}"),
-        })?,
-        Err(_) => return Ok(None),
+    let mut request = Vec::new();
+    let header_end = loop {
+        if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            if position + 4 > MAX_ADMIN_HEADER_BYTES {
+                return Err(AdminError {
+                    status: 431,
+                    message: "request headers are too large".to_string(),
+                });
+            }
+            break position + 4;
+        }
+        if request.len() >= MAX_ADMIN_HEADER_BYTES {
+            return Err(AdminError {
+                status: 431,
+                message: "request headers are too large".to_string(),
+            });
+        }
+        let mut chunk = [0u8; 16 * 1024];
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk)).await;
+        let n = match read {
+            Ok(result) => result.map_err(|error| AdminError {
+                status: 400,
+                message: format!("read failed: {error}"),
+            })?,
+            Err(_) if request.is_empty() => return Ok(None),
+            Err(_) => return Err(bad_request("request headers timed out")),
+        };
+        if n == 0 {
+            if request.is_empty() {
+                return Ok(None);
+            }
+            return Err(bad_request("request headers are truncated"));
+        }
+        request.extend_from_slice(&chunk[..n]);
     };
-    if n == 0 {
-        return Ok(None);
-    }
-
-    let request = String::from_utf8_lossy(&buf[..n]);
-    let (head, body) = request.split_once("\r\n\r\n").unwrap_or((&request, ""));
+    let head = std::str::from_utf8(&request[..header_end - 4])
+        .map_err(|_| bad_request("request headers are not UTF-8"))?;
     let mut lines = head.lines();
     let request_line = lines
         .next()
@@ -1920,6 +1964,47 @@ where
             headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
         }
     }
+    let content_length = headers
+        .get("content-length")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| bad_request("invalid Content-Length"))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    if content_length > MAX_ADMIN_REQUEST_BODY_BYTES {
+        return Err(AdminError {
+            status: 413,
+            message: format!(
+                "request body exceeds the {MAX_ADMIN_REQUEST_BODY_BYTES}-byte admin limit"
+            ),
+        });
+    }
+    let received_body = request.len() - header_end;
+    if received_body > content_length {
+        return Err(bad_request("request body exceeds Content-Length"));
+    }
+    while request.len() - header_end < content_length {
+        let remaining = content_length - (request.len() - header_end);
+        let mut chunk = [0u8; 16 * 1024];
+        let read_len = remaining.min(chunk.len());
+        let read =
+            tokio::time::timeout(Duration::from_secs(30), stream.read(&mut chunk[..read_len]))
+                .await;
+        let n = match read {
+            Ok(result) => result.map_err(|error| AdminError {
+                status: 400,
+                message: format!("read failed: {error}"),
+            })?,
+            Err(_) => return Err(bad_request("request body timed out")),
+        };
+        if n == 0 {
+            return Err(bad_request("request body is truncated"));
+        }
+        request.extend_from_slice(&chunk[..n]);
+    }
+    let body = request.split_off(header_end);
 
     let (path, raw_query) = target.split_once('?').unwrap_or((target.as_str(), ""));
     let request_id = request_id_from_headers(&headers).unwrap_or_else(generated_request_id);
@@ -1933,7 +2018,7 @@ where
         peer,
         cert_principal: None,
         authenticated_principal: None,
-        body: body.to_string(),
+        body,
     }))
 }
 
@@ -2482,6 +2567,112 @@ async fn patch_versioning_response(
                 "updated_at": policy.updated_at,
             }
         }),
+    ))
+}
+
+async fn export_version_repository_bundle_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository.export_bundle().await;
+    let (bundle, report) = match result {
+        Ok(exported) => exported,
+        Err(error) => {
+            return finish_version_repository(control, repository, Err(error)).await;
+        }
+    };
+    let audit = append_version_audit(
+        &control,
+        request,
+        AuditAction::VersionRepositoryExport,
+        tenant,
+        volume,
+        [
+            (
+                "repository_id".to_string(),
+                AuditDetailValue::String(report.identity.id().to_string()),
+            ),
+            (
+                "bundle_bytes".to_string(),
+                AuditDetailValue::U64(report.bundle_bytes),
+            ),
+            ("objects".to_string(), AuditDetailValue::U64(report.objects)),
+        ],
+    )
+    .await;
+    let repository_close = repository.close().await;
+    let control_close = control.close().await;
+    audit?;
+    repository_close.map_err(core_error)?;
+    control_close.map_err(core_error)?;
+    state
+        .export_metrics
+        .version_operation(tenant, volume, "repository-export");
+    Ok(AdminHttpResponse::binary(
+        200,
+        VERSION_REPOSITORY_BUNDLE_CONTENT_TYPE,
+        bundle,
+    ))
+}
+
+async fn import_version_repository_bundle_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    if request.body.is_empty() {
+        return Err(bad_request("repository bundle body is empty"));
+    }
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let control = state.control_writer().await?;
+    let result = VersionRepository::import_bundle(
+        &control,
+        Arc::clone(&state.object_store),
+        tenant,
+        volume,
+        &request.body,
+    )
+    .await;
+    let report = match result {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = control.close().await;
+            return Err(core_error(error));
+        }
+    };
+    append_version_audit(
+        &control,
+        request,
+        AuditAction::VersionRepositoryImport,
+        tenant,
+        volume,
+        [
+            (
+                "repository_id".to_string(),
+                AuditDetailValue::String(report.identity.id().to_string()),
+            ),
+            (
+                "bundle_bytes".to_string(),
+                AuditDetailValue::U64(report.bundle_bytes),
+            ),
+            ("objects".to_string(), AuditDetailValue::U64(report.objects)),
+        ],
+    )
+    .await?;
+    control.close().await.map_err(core_error)?;
+    state
+        .export_metrics
+        .version_operation(tenant, volume, "repository-import");
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "repository_bundle": report }),
     ))
 }
 
@@ -3886,10 +4077,10 @@ fn export_create_json(record: &ExportRecord) -> Value {
 fn parse_json_body<T: for<'de> Deserialize<'de>>(
     request: &AdminHttpRequest,
 ) -> Result<T, AdminError> {
-    if request.body.trim().is_empty() {
+    if request.body.iter().all(u8::is_ascii_whitespace) {
         return Err(bad_request("request body must be JSON"));
     }
-    serde_json::from_str(&request.body)
+    serde_json::from_slice(&request.body)
         .map_err(|error| bad_request(format!("invalid JSON: {error}")))
 }
 
@@ -4937,6 +5128,32 @@ async fn route_admin_request(
                 "versioning",
             ],
         ) => patch_versioning_response(state, request, tenant, volume).await,
+        (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "bundle",
+            ],
+        ) => export_version_repository_bundle_response(state, request, tenant, volume).await,
+        (
+            "POST",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "bundle",
+            ],
+        ) => import_version_repository_bundle_response(state, request, tenant, volume).await,
         (
             "GET",
             [
@@ -7772,7 +7989,7 @@ mod tests {
         })
     }
 
-    async fn admin_exchange(state: Arc<AdminState>, request: &[u8]) -> String {
+    async fn admin_exchange_bytes(state: Arc<AdminState>, request: &[u8]) -> Vec<u8> {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -7786,7 +8003,11 @@ mod tests {
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         server.await.unwrap();
-        String::from_utf8(response).unwrap()
+        response
+    }
+
+    async fn admin_exchange(state: Arc<AdminState>, request: &[u8]) -> String {
+        String::from_utf8(admin_exchange_bytes(state, request).await).unwrap()
     }
 
     fn response_status(response: &str) -> u16 {
@@ -8270,6 +8491,159 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_exports_and_imports_native_repository_bundles() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([92; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        let source_record = slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "source",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "destination",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        control
+            .set_versioning_enabled("t", "source", true)
+            .await
+            .unwrap();
+        control
+            .set_versioning_enabled("t", "destination", true)
+            .await
+            .unwrap();
+        let source_dek = control.unwrap_volume_dek(&source_record).await.unwrap();
+        let source = Volume::open(&source_record, source_dek, Arc::clone(&object_store))
+            .await
+            .unwrap();
+        let creds = Credentials::root();
+        let file = source
+            .create(&creds, ROOT_INO, b"portable.bin", 0o644, true)
+            .await
+            .unwrap();
+        let mut state_word = 0x9e37_79b9_u32;
+        let contents = (0..256 * 1024)
+            .map(|_| {
+                state_word ^= state_word << 13;
+                state_word ^= state_word >> 17;
+                state_word ^= state_word << 5;
+                state_word as u8
+            })
+            .collect::<Vec<_>>();
+        source.write(&creds, file.ino, 0, &contents).await.unwrap();
+        let repository =
+            VersionRepository::open(&control, Arc::clone(&object_store), "t", "source")
+                .await
+                .unwrap();
+        let commit = repository
+            .commit_file(
+                source.as_ref(),
+                "/portable.bin",
+                "portable history".to_string(),
+                test_commit_provenance(),
+            )
+            .await
+            .unwrap();
+        repository.close().await.unwrap();
+        source.shutdown().await.unwrap();
+        control.close().await.unwrap();
+
+        let state = available_admin_state(
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            HashMap::new(),
+            None,
+        )
+        .await;
+        let exported = admin_exchange_bytes(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/source/versioning/bundle HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: bundle-export\r\n\r\n",
+        )
+        .await;
+        let separator = exported
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        let head = std::str::from_utf8(&exported[..separator]).unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+        assert!(
+            head.contains("Content-Type: application/vnd.slatefs.version-repository"),
+            "{head}"
+        );
+        let bundle = &exported[separator + 4..];
+        assert!(
+            bundle.len() > 16 * 1024,
+            "expected a multi-read bundle, found {} bytes",
+            bundle.len()
+        );
+        let report = VersionRepository::inspect_bundle(bundle).unwrap();
+        assert_eq!(report.commits, 1);
+
+        let mut import_request = format!(
+            "POST /admin/v1/tenants/t/volumes/destination/versioning/bundle HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: bundle-import\r\nContent-Type: application/vnd.slatefs.version-repository\r\nContent-Length: {}\r\n\r\n",
+            bundle.len()
+        )
+        .into_bytes();
+        import_request.extend_from_slice(bundle);
+        let imported = admin_exchange(Arc::clone(&state), &import_request).await;
+        assert_eq!(response_status(&imported), 200, "{imported}");
+        let imported: Value = serde_json::from_str(response_body(&imported)).unwrap();
+        assert_eq!(
+            imported["repository_bundle"]["identity"]["id"],
+            report.identity.id()
+        );
+        assert_eq!(imported["repository_bundle"]["bundle_bytes"], bundle.len());
+
+        let verify_control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        let destination = VersionRepository::open(
+            &verify_control,
+            Arc::clone(&object_store),
+            "t",
+            "destination",
+        )
+        .await
+        .unwrap();
+        assert_eq!(destination.identity(), &report.identity);
+        assert_eq!(
+            destination
+                .read_file(&commit.id, "/portable.bin")
+                .await
+                .unwrap()
+                .as_ref(),
+            contents
+        );
+        destination.close().await.unwrap();
+        for action in [
+            AuditAction::VersionRepositoryExport,
+            AuditAction::VersionRepositoryImport,
+        ] {
+            let (records, _) = verify_control
+                .list_audit(AuditQuery {
+                    action: Some(action),
+                    ..AuditQuery::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(records.len(), 1);
+        }
+        verify_control.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn admin_versioning_commit_and_restore_use_live_writer() {
         let object_store = store::resolve_root("memory:///").unwrap();
         let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([91; 32])));
@@ -8548,7 +8922,7 @@ mod tests {
             peer: None,
             cert_principal: None,
             authenticated_principal: Some("other-manager".to_string()),
-            body: String::new(),
+            body: Vec::new(),
         };
         let denied_policy = match set_version_branch_protection_response(
             &state,
@@ -12032,7 +12406,7 @@ mod tests {
         .await;
         let patch = admin_exchange(
             Arc::clone(&state),
-            b"PATCH /admin/v1/tenants/t/volumes/v/snapshot-retention HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 42\r\n\r\n{\"keep_last\":2,\"max_age_secs\":3600}",
+            b"PATCH /admin/v1/tenants/t/volumes/v/snapshot-retention HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 35\r\n\r\n{\"keep_last\":2,\"max_age_secs\":3600}",
         )
         .await;
         assert_eq!(response_status(&patch), 200, "{patch}");
