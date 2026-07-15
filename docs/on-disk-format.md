@@ -126,6 +126,7 @@ the live VFS request path. Its logical key prefixes are:
 | `pc/<sha256-commit-id>` | 2 | `VersionCommit`, including hash-bound provenance |
 | `pi/<sha256-idempotency-key>` | 1 | commit ID and branch-aware canonical request fingerprint |
 | `pr/heads/<name>` | 1 | mutable branch `VersionRef`; `main` is the default commit head |
+| `pr/protected/<name>` | 1 | durable destructive-ref protection for an existing branch |
 | `pr/logs/<name>/<sequence>` | 1 | bounded branch-head transition record; the newest 100 per name are retained |
 | `pr/tags/<name>` | 1 | immutable named commit reference and creation time |
 
@@ -144,6 +145,9 @@ garbage collection removes it when that commit is pruned. Version repository
 tags keep their referenced commit and tree reachable through garbage
 collection. Version repository history is retained when the policy is disabled
 and removed with the volume.
+Branch protection records name their branch and creation time. Verification
+rejects a record whose payload does not match its key or whose branch no longer
+exists.
 
 `version-leases/<tenant>/<volume>` is a version-1 postcard record containing
 `tenant`, `volume`, an ephemeral owner UUID, operation name, acquisition time,

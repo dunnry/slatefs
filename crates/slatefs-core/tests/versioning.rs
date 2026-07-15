@@ -271,6 +271,54 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         repository.reflog("release", 1).await.unwrap()[0].action(),
         VersionReflogAction::Recover
     );
+    let protected = repository
+        .set_branch_protected("release", true)
+        .await
+        .unwrap();
+    assert!(protected.protected());
+    assert!(
+        repository
+            .list_branches()
+            .await
+            .unwrap()
+            .iter()
+            .find(|branch| branch.name() == "release")
+            .unwrap()
+            .protected()
+    );
+    assert!(matches!(
+        repository.reset_branch("release", "main").await,
+        Err(Error::Invalid { .. })
+    ));
+    assert!(matches!(
+        repository.delete_branch("release").await,
+        Err(Error::Invalid { .. })
+    ));
+    assert!(matches!(
+        repository
+            .recover_branch("release", release_reflog[0].sequence())
+            .await,
+        Err(Error::Invalid { .. })
+    ));
+    let protected_fast_forward = repository
+        .merge_branch(
+            "main",
+            "release",
+            VersionMergeConflictStrategy::Fail,
+            test_provenance(),
+        )
+        .await
+        .unwrap();
+    assert!(protected_fast_forward.fast_forward());
+    let unprotected = repository
+        .set_branch_protected("release", false)
+        .await
+        .unwrap();
+    assert!(!unprotected.protected());
+    assert_eq!(
+        repository.delete_branch("release").await.unwrap().name(),
+        "release"
+    );
     repository
         .create_branch("feature", &first.id)
         .await

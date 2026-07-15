@@ -157,7 +157,10 @@ immutable names for important commits. `versioning branch`, `branches`, and
 `delete-branch` manage durable branch references; a branch name can be used
 where a commit or tag is accepted. `commit --branch <name>` advances an
 existing branch instead of `main`, and `log --branch <name>` follows that
-branch's history. `versioning reflog <branch>` lists the newest 100 head
+branch's history. `protect-branch` durably blocks reset, deletion, and reflog
+recovery while continuing to allow ordinary commits and merges;
+`unprotect-branch --yes` removes that guard. `versioning reflog <branch>` lists
+the newest 100 head
 transitions even after branch deletion. Every create, commit, fast-forward,
 merge, reset, and delete records its ref change atomically; retained reflog
 heads are GC roots, so this recovery window takes precedence over stricter
@@ -301,6 +304,8 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | List branch heads, including `main`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/reflog` | List up to 100 retained head transitions, newest first, including deleted branches; optional `limit`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | Create a branch from `{"name":"...","commit":"commit-or-ref"}`. |
+| `PUT` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/protection` | Protect a branch from reset, deletion, and reflog recovery; commits and merges remain allowed. |
+| `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/protection` | Remove destructive-ref protection from a branch. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}` | Delete a non-main branch without deleting its commit immediately. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/reset` | Compare-and-swap an existing branch, including `main`, to `{"commit":"commit-or-ref"}`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/recover` | Restore the head preceding a retained reflog entry from `{"sequence":42}`, recreating a deleted branch when needed. |

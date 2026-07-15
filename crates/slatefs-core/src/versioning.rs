@@ -36,12 +36,14 @@ const IDEMPOTENCY_PREFIX: &[u8] = b"pi/";
 const PRUNED_COMMIT_PREFIX: &[u8] = b"pp/";
 const BRANCH_PREFIX: &[u8] = b"pr/heads/";
 const HEAD_KEY: &[u8] = b"pr/heads/main";
+const BRANCH_PROTECTION_PREFIX: &[u8] = b"pr/protected/";
 const REFLOG_PREFIX: &[u8] = b"pr/logs/";
 const TAG_PREFIX: &[u8] = b"pr/tags/";
 const ENTRY_META_VERSION: u8 = 1;
 const COMMIT_VERSION: u8 = 2;
 const IDEMPOTENCY_VERSION: u8 = 1;
 const REF_VERSION: u8 = 1;
+const BRANCH_PROTECTION_VERSION: u8 = 1;
 const REFLOG_VERSION: u8 = 1;
 const TAG_VERSION: u8 = 1;
 const REFLOG_RETAIN_PER_BRANCH: usize = 100;
@@ -493,6 +495,82 @@ impl VersionStore {
         Ok(branches)
     }
 
+    async fn branch_protection(&self, name: &str) -> Result<Option<VersionBranchProtection>> {
+        self.get_raw(&branch_protection_key(name))
+            .await
+            .map_err(version_store_error)?
+            .map(|bytes| {
+                decode_versioned(
+                    BRANCH_PROTECTION_VERSION,
+                    &bytes,
+                    "version branch protection",
+                )
+            })
+            .transpose()
+    }
+
+    async fn list_branch_protections(&self) -> Result<Vec<VersionBranchProtection>> {
+        let mut iter = self.db.scan_prefix(BRANCH_PROTECTION_PREFIX, ..).await?;
+        let mut protections = Vec::new();
+        while let Some(entry) = iter.next().await? {
+            let name = std::str::from_utf8(
+                entry
+                    .key
+                    .strip_prefix(BRANCH_PROTECTION_PREFIX)
+                    .unwrap_or_default(),
+            )
+            .map_err(|_| Error::Versioning("protected version branch name is not UTF-8".into()))?;
+            let protection: VersionBranchProtection = decode_versioned(
+                BRANCH_PROTECTION_VERSION,
+                &entry.value,
+                "version branch protection",
+            )?;
+            if protection.branch != name {
+                return Err(Error::Versioning(format!(
+                    "version branch protection {name} does not match its key"
+                )));
+            }
+            protections.push(protection);
+        }
+        protections.sort_by(|left, right| left.branch.cmp(&right.branch));
+        Ok(protections)
+    }
+
+    async fn set_branch_protected(&self, name: &str, protected: bool) -> Result<VersionRef> {
+        let _guard = self.ref_lock.lock().await;
+        let reference = self
+            .get_branch(name)
+            .await?
+            .ok_or_else(|| Error::not_found("version branch", name))?;
+        let key = branch_protection_key(name);
+        if protected {
+            let protection = VersionBranchProtection {
+                branch: name.to_string(),
+                protected_at: crate::control::now_unix(),
+            };
+            self.db
+                .put_bytes(
+                    key.into(),
+                    encode_versioned(BRANCH_PROTECTION_VERSION, &protection)?.into(),
+                )
+                .await?;
+        } else {
+            self.db.delete(key).await?;
+        }
+        self.db.flush().await?;
+        Ok(reference)
+    }
+
+    async fn reject_protected_branch(&self, name: &str, operation: &str) -> Result<()> {
+        if self.branch_protection(name).await?.is_some() {
+            return Err(Error::invalid(
+                "version branch operation",
+                format!("cannot {operation} protected branch {name}; unprotect it first"),
+            ));
+        }
+        Ok(())
+    }
+
     async fn get_commit(&self, id: &[u8; 32]) -> Result<VersionCommit> {
         self.try_get_commit(id)
             .await?
@@ -698,6 +776,9 @@ impl VersionStore {
         if self.try_get_tag(name).await?.is_some() {
             return Err(Error::already_exists("version tag", name));
         }
+        if self.branch_protection(name).await?.is_some() {
+            return Err(Error::already_exists("version branch protection", name));
+        }
         let mut batch = WriteBatch::new();
         batch.put(key, encode_versioned(REF_VERSION, reference)?);
         self.append_reflog(
@@ -715,6 +796,7 @@ impl VersionStore {
 
     async fn delete_branch(&self, name: &str) -> Result<VersionRef> {
         let _guard = self.ref_lock.lock().await;
+        self.reject_protected_branch(name, "delete").await?;
         let key = branch_key(name);
         let reference = self
             .get_ref(&key)
@@ -742,6 +824,7 @@ impl VersionStore {
         reference: &VersionRef,
     ) -> Result<()> {
         let _guard = self.ref_lock.lock().await;
+        self.reject_protected_branch(name, "reset").await?;
         let key = branch_key(name);
         let current = self
             .get_ref(&key)
@@ -848,6 +931,7 @@ impl VersionStore {
         sequence: u64,
     ) -> Result<(Option<VersionRef>, VersionRef)> {
         let _guard = self.ref_lock.lock().await;
+        self.reject_protected_branch(name, "recover").await?;
         let record: VersionReflogRecord = self
             .get_raw(&reflog_key(name, sequence))
             .await
@@ -1090,6 +1174,12 @@ struct VersionRef {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct VersionBranchProtection {
+    branch: String,
+    protected_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct VersionReflogRecord {
     sequence: u64,
     branch: String,
@@ -1194,6 +1284,7 @@ pub struct VersionTagInfo {
 pub struct VersionBranchInfo {
     name: String,
     commit: String,
+    protected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1385,6 +1476,10 @@ impl VersionBranchInfo {
 
     pub fn commit(&self) -> &str {
         &self.commit
+    }
+
+    pub fn protected(&self) -> bool {
+        self.protected
     }
 }
 
@@ -2001,7 +2096,20 @@ impl VersionRepository {
     /// blob. Unreachable objects are intentionally left to garbage collection.
     pub async fn verify(&self) -> Result<VersionVerifyReport> {
         let mut pending = Vec::new();
-        for (name, branch) in self.store.list_branches().await? {
+        let branches = self.store.list_branches().await?;
+        let branch_names = branches
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<HashSet<_>>();
+        for protection in self.store.list_branch_protections().await? {
+            if !branch_names.contains(protection.branch.as_str()) {
+                return Err(Error::Versioning(format!(
+                    "version branch protection {} references a missing branch",
+                    protection.branch
+                )));
+            }
+        }
+        for (name, branch) in branches {
             let commit = self
                 .store
                 .get_commit(&branch.commit_id)
@@ -2784,20 +2892,46 @@ impl VersionRepository {
         Ok(VersionBranchInfo {
             name: name.to_string(),
             commit: hex::encode(reference.commit_id),
+            protected: false,
         })
     }
 
     pub async fn list_branches(&self) -> Result<Vec<VersionBranchInfo>> {
+        let protected = self
+            .store
+            .list_branch_protections()
+            .await?
+            .into_iter()
+            .map(|protection| protection.branch)
+            .collect::<HashSet<_>>();
         Ok(self
             .store
             .list_branches()
             .await?
             .into_iter()
             .map(|(name, reference)| VersionBranchInfo {
+                protected: protected.contains(&name),
                 name,
                 commit: hex::encode(reference.commit_id),
             })
             .collect())
+    }
+
+    /// Enable or disable destructive-ref protection for an existing branch.
+    /// Protected branches still accept commits and merges, but cannot be
+    /// reset, deleted, or moved through reflog recovery.
+    pub async fn set_branch_protected(
+        &self,
+        name: &str,
+        protected: bool,
+    ) -> Result<VersionBranchInfo> {
+        validate_version_branch_name(name)?;
+        let reference = self.store.set_branch_protected(name, protected).await?;
+        Ok(VersionBranchInfo {
+            name: name.to_string(),
+            commit: hex::encode(reference.commit_id),
+            protected,
+        })
     }
 
     /// List the newest retained head transitions for a branch. Reflogs remain
@@ -2855,6 +2989,7 @@ impl VersionRepository {
         Ok(VersionBranchInfo {
             name: name.to_string(),
             commit: hex::encode(reference.commit_id),
+            protected: false,
         })
     }
 
@@ -4263,6 +4398,10 @@ fn tag_key(name: &str) -> Vec<u8> {
 
 fn branch_key(name: &str) -> Vec<u8> {
     prefixed_key(BRANCH_PREFIX, name.as_bytes())
+}
+
+fn branch_protection_key(name: &str) -> Vec<u8> {
+    prefixed_key(BRANCH_PROTECTION_PREFIX, name.as_bytes())
 }
 
 fn reflog_branch_prefix(name: &str) -> Vec<u8> {

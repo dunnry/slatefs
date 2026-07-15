@@ -91,7 +91,11 @@ for every create, commit, fast-forward, merge, reset, or delete. Reflogs retain
 the newest 100 transitions per branch name and remain readable after deletion.
 Recovery names one retained sequence and atomically restores its preceding
 head, recreating a deleted branch when necessary, then records that move as a
-new reflog transition.
+new reflog transition. A durable protection record can guard any existing
+branch, including `main`, against reset, deletion, and recovery. Protection is
+checked while holding the same ref lock as the mutation, so it cannot race a
+destructive move. Linear commits, fast-forwards, and merge commits remain
+available because they retain the protected head in their ancestry.
 Disabling versioning blocks repository operations
 without deleting its history. Volume deletion removes both the live and
 optional version-store prefixes.

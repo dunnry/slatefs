@@ -1522,6 +1522,9 @@ fn core_error(error: slatefs_core::error::Error) -> AdminError {
     let status = match &error {
         slatefs_core::error::Error::NotFound { .. } => 404,
         slatefs_core::error::Error::AlreadyExists { .. } => 409,
+        slatefs_core::error::Error::Invalid { what, .. } if *what == "version branch operation" => {
+            409
+        }
         slatefs_core::error::Error::Invalid { .. } | slatefs_core::error::Error::Config(_) => 400,
         _ => 500,
     };
@@ -2645,6 +2648,57 @@ async fn create_version_branch_response(
     repository_close.map_err(core_error)?;
     control_close.map_err(core_error)?;
     Ok(AdminHttpResponse::json(201, json!({ "branch": branch })))
+}
+
+async fn set_version_branch_protection_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+    name: &str,
+    protected: bool,
+) -> Result<AdminHttpResponse, AdminError> {
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository.set_branch_protected(name, protected).await;
+    let audit = match &result {
+        Ok(branch) => {
+            append_version_audit(
+                &control,
+                request,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String(
+                            if protected {
+                                "version-branch-protect"
+                            } else {
+                                "version-branch-unprotect"
+                            }
+                            .to_string(),
+                        ),
+                    ),
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(branch.name().to_string()),
+                    ),
+                ],
+            )
+            .await
+        }
+        Err(_) => Ok(()),
+    };
+    let repository_close = repository.close().await;
+    let control_close = control.close().await;
+    let branch = result.map_err(core_error)?;
+    audit?;
+    repository_close.map_err(core_error)?;
+    control_close.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(200, json!({ "branch": branch })))
 }
 
 async fn delete_version_branch_response(
@@ -4488,6 +4542,41 @@ async fn route_admin_request(
                 "branches",
             ],
         ) => create_version_branch_response(state, request, tenant, volume).await,
+        (
+            "PUT",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "branches",
+                name,
+                "protection",
+            ],
+        ) => {
+            set_version_branch_protection_response(state, request, tenant, volume, name, true).await
+        }
+        (
+            "DELETE",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "branches",
+                name,
+                "protection",
+            ],
+        ) => {
+            set_version_branch_protection_response(state, request, tenant, volume, name, false)
+                .await
+        }
         (
             "DELETE",
             [
@@ -7734,6 +7823,33 @@ mod tests {
         );
         let branches: Value = serde_json::from_str(response_body(&branches_response)).unwrap();
         assert_eq!(branches["branches"].as_array().unwrap().len(), 2);
+        let protect_response = admin_exchange(
+            Arc::clone(&state),
+            b"PUT /admin/v1/tenants/t/volumes/v/versioning/branches/release/protection HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            response_status(&protect_response),
+            200,
+            "{protect_response}"
+        );
+        let protected: Value = serde_json::from_str(response_body(&protect_response)).unwrap();
+        assert_eq!(protected["branch"]["protected"], true);
+        let blocked_reset_body = r#"{"commit":"baseline"}"#;
+        let blocked_reset_request = format!(
+            "POST /admin/v1/tenants/t/volumes/v/versioning/branches/release/reset HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            blocked_reset_body.len(),
+            blocked_reset_body
+        );
+        let blocked_reset =
+            admin_exchange(Arc::clone(&state), blocked_reset_request.as_bytes()).await;
+        assert_eq!(response_status(&blocked_reset), 409, "{blocked_reset}");
+        let blocked_delete = admin_exchange(
+            Arc::clone(&state),
+            b"DELETE /admin/v1/tenants/t/volumes/v/versioning/branches/release HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&blocked_delete), 409, "{blocked_delete}");
         let merge_preview = admin_exchange(
             Arc::clone(&state),
             b"GET /admin/v1/tenants/t/volumes/v/versioning/branches/release/merge?source=main HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -7829,6 +7945,18 @@ mod tests {
             branch_history["commits"][0]["id"],
             branch_commit["commit"]["id"]
         );
+        let unprotect_response = admin_exchange(
+            Arc::clone(&state),
+            b"DELETE /admin/v1/tenants/t/volumes/v/versioning/branches/release/protection HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            response_status(&unprotect_response),
+            200,
+            "{unprotect_response}"
+        );
+        let unprotected: Value = serde_json::from_str(response_body(&unprotect_response)).unwrap();
+        assert_eq!(unprotected["branch"]["protected"], false);
         let reset_body = r#"{"commit":"baseline"}"#;
         let reset_request = format!(
             "POST /admin/v1/tenants/t/volumes/v/versioning/branches/release/reset HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -8137,7 +8265,7 @@ mod tests {
             let expected = if action == AuditAction::VersionCommit {
                 3
             } else if action == AuditAction::Maintain {
-                9
+                11
             } else {
                 1
             };

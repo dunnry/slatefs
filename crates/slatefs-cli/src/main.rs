@@ -448,6 +448,24 @@ enum VersioningCmd {
         #[arg(long)]
         live: bool,
     },
+    /// Protect a branch from reset, deletion, and reflog recovery.
+    ProtectBranch {
+        tenant: String,
+        volume: String,
+        name: String,
+        #[arg(long)]
+        live: bool,
+    },
+    /// Remove destructive-ref protection from a branch.
+    UnprotectBranch {
+        tenant: String,
+        volume: String,
+        name: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        live: bool,
+    },
     /// List retained branch-head transitions, including deleted branch history.
     Reflog {
         tenant: String,
@@ -1210,7 +1228,12 @@ fn print_version_tag(tag: &VersionTagInfo) {
 }
 
 fn print_version_branch(branch: &VersionBranchInfo) {
-    println!("{}\t{}", branch.name(), branch.commit());
+    println!(
+        "{}\t{}\tprotected={}",
+        branch.name(),
+        branch.commit(),
+        branch.protected()
+    );
 }
 
 fn print_version_branch_reset(reset: &VersionBranchResetInfo) {
@@ -2838,6 +2861,92 @@ async fn run(
                 print_version_branch(&branch);
             }
             repository_close?;
+        }
+        Command::Versioning(VersioningCmd::ProtectBranch {
+            tenant,
+            volume,
+            name,
+            live,
+        }) => {
+            if *live {
+                let endpoint = format!("branches/{name}/protection");
+                let response =
+                    live_versioning_json(config, tenant, volume, "PUT", &endpoint, &[], None)
+                        .await?;
+                let branch: VersionBranchInfo = serde_json::from_value(response["branch"].clone())
+                    .context("parsing protected admin version branch")?;
+                print_version_branch(&branch);
+                return Ok(());
+            }
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let result = repository.set_branch_protected(name, true).await;
+            let repository_close = repository.close().await;
+            let branch = result?;
+            repository_close?;
+            append_cli_version_audit(
+                control,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-branch-protect".to_string()),
+                    ),
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(branch.name().to_string()),
+                    ),
+                ],
+            )
+            .await?;
+            print_version_branch(&branch);
+        }
+        Command::Versioning(VersioningCmd::UnprotectBranch {
+            tenant,
+            volume,
+            name,
+            yes,
+            live,
+        }) => {
+            if !yes {
+                anyhow::bail!(
+                    "unprotecting version branch {name} requires --yes; destructive ref operations will become available"
+                );
+            }
+            if *live {
+                let endpoint = format!("branches/{name}/protection");
+                let response =
+                    live_versioning_json(config, tenant, volume, "DELETE", &endpoint, &[], None)
+                        .await?;
+                let branch: VersionBranchInfo = serde_json::from_value(response["branch"].clone())
+                    .context("parsing unprotected admin version branch")?;
+                print_version_branch(&branch);
+                return Ok(());
+            }
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let result = repository.set_branch_protected(name, false).await;
+            let repository_close = repository.close().await;
+            let branch = result?;
+            repository_close?;
+            append_cli_version_audit(
+                control,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-branch-unprotect".to_string()),
+                    ),
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(branch.name().to_string()),
+                    ),
+                ],
+            )
+            .await?;
+            print_version_branch(&branch);
         }
         Command::Versioning(VersioningCmd::Reflog {
             tenant,
@@ -4587,6 +4696,46 @@ mod tests {
                 live: true,
                 ..
             }) if name == "release" && commit == "baseline"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "protect-branch",
+            "tenant-a",
+            "docs",
+            "release",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::ProtectBranch {
+                name,
+                live: true,
+                ..
+            }) if name == "release"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "unprotect-branch",
+            "tenant-a",
+            "docs",
+            "release",
+            "--yes",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::UnprotectBranch {
+                name,
+                yes: true,
+                live: true,
+                ..
+            }) if name == "release"
         ));
 
         let cli = Cli::try_parse_from([

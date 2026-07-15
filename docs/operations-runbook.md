@@ -210,6 +210,8 @@ slatefs -c /etc/slatefs/slatefs.toml versioning tags <tenant> <volume> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning untag <tenant> <volume> <name> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning branch <tenant> <volume> <name> <commit-or-ref> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning branches <tenant> <volume> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning protect-branch <tenant> <volume> <name> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning unprotect-branch <tenant> <volume> <name> --yes --live
 slatefs -c /etc/slatefs/slatefs.toml versioning reflog <tenant> <volume> <name> --limit 100 --live
 slatefs -c /etc/slatefs/slatefs.toml versioning recover-branch <tenant> <volume> <name> <reflog-sequence> --yes --live
 slatefs -c /etc/slatefs/slatefs.toml versioning delete-branch <tenant> <volume> <name> --live
@@ -232,6 +234,12 @@ Merge conflicts fail without moving either branch by default. After reviewing
 from the target or `--conflict-strategy theirs` to keep it from the source.
 Resolution is applied to the complete logical path, while non-conflicting
 changes from both branches are still merged.
+
+Protect long-lived or release branches before exposing reset, deletion, or
+recovery workflows to operators. Protection does not block commits or merges;
+those operations preserve the protected head as an ancestor. Removing the
+guard requires `unprotect-branch --yes` and emits a durable maintenance audit
+record.
 
 Live commit and divergent-merge provenance records the authenticated admin or
 tenant principal as committer and the HTTP request ID for audit correlation.
