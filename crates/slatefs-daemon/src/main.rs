@@ -161,6 +161,7 @@ struct ExportMetrics {
     snapshot_retention_deleted: Arc<Mutex<HashMap<VolumeId, u64>>>,
     version_operations: Arc<Mutex<HashMap<(VolumeId, String), u64>>>,
     version_operation_denials: Arc<Mutex<HashMap<(VolumeId, String), u64>>>,
+    version_sync_bytes: Arc<Mutex<HashMap<(VolumeId, String), u64>>>,
     tls_reloads: Arc<Mutex<HashMap<String, u64>>>,
     tls_reload_failures: Arc<Mutex<HashMap<String, u64>>>,
     tls_expiry: Arc<Mutex<HashMap<String, i64>>>,
@@ -228,6 +229,16 @@ impl ExportMetrics {
         *denials
             .entry((VolumeId::from_parts(tenant, volume), operation.to_string()))
             .or_insert(0) += 1;
+    }
+
+    fn version_sync_bytes(&self, tenant: &str, volume: &str, direction: &str, bytes: u64) {
+        let mut transfers = self
+            .version_sync_bytes
+            .lock()
+            .expect("version sync metrics poisoned");
+        *transfers
+            .entry((VolumeId::from_parts(tenant, volume), direction.to_string()))
+            .or_insert(0) += bytes;
     }
 
     fn register_tls_surface(&self, surface: &str, expiry_timestamp_seconds: i64) {
@@ -346,6 +357,22 @@ impl ExportMetrics {
                     ("tenant", volume_id.tenant.as_str()),
                     ("volume", volume_id.volume.as_str()),
                     ("operation", operation.as_str()),
+                ],
+                *value as f64,
+            ));
+        }
+        for ((volume_id, direction), value) in self
+            .version_sync_bytes
+            .lock()
+            .expect("version sync metrics poisoned")
+            .iter()
+        {
+            samples.push(PrometheusSample::new(
+                "slatefs_version_sync_bytes_total",
+                [
+                    ("tenant", volume_id.tenant.as_str()),
+                    ("volume", volume_id.volume.as_str()),
+                    ("direction", direction.as_str()),
                 ],
                 *value as f64,
             ));
@@ -921,6 +948,7 @@ const MAX_VERSION_CONTENT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ADMIN_HEADER_BYTES: usize = 64 * 1024;
 const MAX_ADMIN_REQUEST_BODY_BYTES: usize = 512 * 1024 * 1024;
 const VERSION_REPOSITORY_BUNDLE_CONTENT_TYPE: &str = "application/vnd.slatefs.version-repository";
+const VERSION_REPOSITORY_SYNC_CONTENT_TYPE: &str = "application/vnd.slatefs.version-sync";
 const SLATEDB_VERSION: &str = "0.14.1";
 static RUSTLS_PROVIDER: Once = Once::new();
 
@@ -1036,6 +1064,13 @@ struct VersionRestoreRequest {
     #[serde(default)]
     mode: VersionRestoreMode,
     token: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionSyncExportRequest {
+    #[serde(default)]
+    have: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1586,6 +1621,11 @@ fn core_error(error: slatefs_core::error::Error) -> AdminError {
                 "version branch operation"
                     | "version history purge"
                     | "version repository bundle import"
+                    | "version repository sync compare-and-swap"
+                    | "version repository sync fast-forward"
+                    | "version repository sync force"
+                    | "version repository sync identity"
+                    | "version repository sync object"
             ) =>
         {
             409
@@ -2674,6 +2714,205 @@ async fn import_version_repository_bundle_response(
         200,
         json!({ "repository_bundle": report }),
     ))
+}
+
+async fn get_version_sync_state_response(
+    state: &AdminState,
+    tenant: &str,
+    volume: &str,
+    branch: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let control = state.control_writer().await?;
+    let repository =
+        VersionRepository::open_existing(&control, Arc::clone(&state.object_store), tenant, volume)
+            .await
+            .map_err(core_error)?;
+    let sync = if let Some(repository) = repository {
+        let result = repository.sync_state(branch).await;
+        let repository_close = repository.close().await;
+        let sync = result.map_err(core_error)?;
+        repository_close.map_err(core_error)?;
+        Some(sync)
+    } else {
+        None
+    };
+    control.close().await.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(200, json!({ "sync": sync })))
+}
+
+async fn export_version_sync_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+    branch: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let body: VersionSyncExportRequest = parse_json_body(request)?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository
+        .export_sync_bundle(branch, body.have.as_deref())
+        .await;
+    let (bundle, report) = match result {
+        Ok(exported) => exported,
+        Err(error) => {
+            return finish_version_repository(control, repository, Err(error)).await;
+        }
+    };
+    let audit = append_version_audit(
+        &control,
+        request,
+        AuditAction::VersionSyncExport,
+        tenant,
+        volume,
+        [
+            (
+                "repository_id".to_string(),
+                AuditDetailValue::String(report.identity.id().to_string()),
+            ),
+            (
+                "branch".to_string(),
+                AuditDetailValue::String(report.branch.clone()),
+            ),
+            (
+                "target".to_string(),
+                AuditDetailValue::String(report.target.clone()),
+            ),
+            (
+                "bundle_bytes".to_string(),
+                AuditDetailValue::U64(report.bundle_bytes),
+            ),
+            ("objects".to_string(), AuditDetailValue::U64(report.objects)),
+        ],
+    )
+    .await;
+    let repository_close = repository.close().await;
+    let control_close = control.close().await;
+    audit?;
+    repository_close.map_err(core_error)?;
+    control_close.map_err(core_error)?;
+    state
+        .export_metrics
+        .version_operation(tenant, volume, "sync-export");
+    state
+        .export_metrics
+        .version_sync_bytes(tenant, volume, "sent", report.bundle_bytes);
+    let mut response = AdminHttpResponse::binary(200, VERSION_REPOSITORY_SYNC_CONTENT_TYPE, bundle);
+    response.headers.extend([
+        ("X-SlateFS-Repository-Id", report.identity.id().to_string()),
+        ("X-SlateFS-Sync-Target", report.target),
+        ("X-SlateFS-Sync-Objects", report.objects.to_string()),
+    ]);
+    Ok(response)
+}
+
+async fn apply_version_sync_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+    branch: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    if request.body.is_empty() {
+        return Err(bad_request("version sync body is empty"));
+    }
+    let force = query_bool(&request.query, "force", false);
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let control = state.control_writer().await?;
+    let result = VersionRepository::apply_sync_bundle(
+        &control,
+        Arc::clone(&state.object_store),
+        tenant,
+        volume,
+        branch,
+        &request.body,
+        force,
+    )
+    .await;
+    let report = match result {
+        Ok(report) => report,
+        Err(error) => {
+            let message = error.to_string();
+            let response_error = core_error(error);
+            let outcome = if matches!(response_error.status, 403 | 409) {
+                AuditOutcome::Denied
+            } else {
+                AuditOutcome::Failed {
+                    reason: message.clone(),
+                }
+            };
+            let _ = append_version_audit_with_outcome(
+                &control,
+                request,
+                AuditAction::VersionSyncApply,
+                tenant,
+                volume,
+                outcome,
+                [
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(branch.to_string()),
+                    ),
+                    ("force".to_string(), AuditDetailValue::Bool(force)),
+                    ("reason".to_string(), AuditDetailValue::String(message)),
+                ],
+            )
+            .await;
+            let _ = control.close().await;
+            state
+                .export_metrics
+                .version_operation_denied(tenant, volume, "sync-apply");
+            return Err(response_error);
+        }
+    };
+    append_version_audit(
+        &control,
+        request,
+        AuditAction::VersionSyncApply,
+        tenant,
+        volume,
+        [
+            (
+                "repository_id".to_string(),
+                AuditDetailValue::String(report.identity.id().to_string()),
+            ),
+            (
+                "branch".to_string(),
+                AuditDetailValue::String(report.branch.clone()),
+            ),
+            (
+                "previous".to_string(),
+                report
+                    .previous
+                    .clone()
+                    .map(AuditDetailValue::String)
+                    .unwrap_or(AuditDetailValue::Null),
+            ),
+            (
+                "target".to_string(),
+                AuditDetailValue::String(report.target.clone()),
+            ),
+            ("forced".to_string(), AuditDetailValue::Bool(report.forced)),
+            (
+                "bundle_bytes".to_string(),
+                AuditDetailValue::U64(report.bundle_bytes),
+            ),
+            ("objects".to_string(), AuditDetailValue::U64(report.objects)),
+        ],
+    )
+    .await?;
+    control.close().await.map_err(core_error)?;
+    state
+        .export_metrics
+        .version_operation(tenant, volume, "sync-apply");
+    state
+        .export_metrics
+        .version_sync_bytes(tenant, volume, "received", report.bundle_bytes);
+    Ok(AdminHttpResponse::json(200, json!({ "sync": report })))
 }
 
 async fn list_version_commits_response(
@@ -5154,6 +5393,51 @@ async fn route_admin_request(
                 "bundle",
             ],
         ) => import_version_repository_bundle_response(state, request, tenant, volume).await,
+        (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "sync",
+                "branches",
+                branch,
+            ],
+        ) => get_version_sync_state_response(state, tenant, volume, branch).await,
+        (
+            "POST",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "sync",
+                "branches",
+                branch,
+            ],
+        ) => export_version_sync_response(state, request, tenant, volume, branch).await,
+        (
+            "PUT",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "sync",
+                "branches",
+                branch,
+            ],
+        ) => apply_version_sync_response(state, request, tenant, volume, branch).await,
         (
             "GET",
             [
@@ -8641,6 +8925,207 @@ mod tests {
             assert_eq!(records.len(), 1);
         }
         verify_control.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_negotiates_and_applies_native_version_sync() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([93; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        let source_record = slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "source",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "destination",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        for volume in ["source", "destination"] {
+            control
+                .set_versioning_enabled("t", volume, true)
+                .await
+                .unwrap();
+        }
+        let source_dek = control.unwrap_volume_dek(&source_record).await.unwrap();
+        let source = Volume::open(&source_record, source_dek, Arc::clone(&object_store))
+            .await
+            .unwrap();
+        let creds = Credentials::root();
+        let file = source
+            .create(&creds, ROOT_INO, b"sync.txt", 0o644, true)
+            .await
+            .unwrap();
+        source
+            .write(&creds, file.ino, 0, b"native sync")
+            .await
+            .unwrap();
+        let repository =
+            VersionRepository::open(&control, Arc::clone(&object_store), "t", "source")
+                .await
+                .unwrap();
+        let commit = repository
+            .commit_file(
+                source.as_ref(),
+                "/sync.txt",
+                "sync transport".into(),
+                test_commit_provenance(),
+            )
+            .await
+            .unwrap();
+        let repository_id = repository.identity().id().to_string();
+        repository.close().await.unwrap();
+        source.shutdown().await.unwrap();
+        control.close().await.unwrap();
+
+        let state = available_admin_state(
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            HashMap::new(),
+            None,
+        )
+        .await;
+        let destination_state = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/destination/versioning/sync/branches/main HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            response_status(&destination_state),
+            200,
+            "{destination_state}"
+        );
+        let destination_state: Value =
+            serde_json::from_str(response_body(&destination_state)).unwrap();
+        assert!(destination_state["sync"].is_null());
+
+        let source_state = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/source/versioning/sync/branches/main HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        let source_state: Value = serde_json::from_str(response_body(&source_state)).unwrap();
+        assert_eq!(source_state["sync"]["identity"]["id"], repository_id);
+        assert_eq!(source_state["sync"]["head"], commit.id);
+
+        let export_body = br#"{}"#;
+        let export_request = format!(
+            "POST /admin/v1/tenants/t/volumes/source/versioning/sync/branches/main HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: sync-export\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            export_body.len(),
+            std::str::from_utf8(export_body).unwrap()
+        );
+        let exported = admin_exchange_bytes(Arc::clone(&state), export_request.as_bytes()).await;
+        let separator = exported
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        let head = std::str::from_utf8(&exported[..separator]).unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+        assert!(
+            head.contains("Content-Type: application/vnd.slatefs.version-sync"),
+            "{head}"
+        );
+        assert!(head.contains(&format!("X-SlateFS-Repository-Id: {repository_id}")));
+        assert!(head.contains(&format!("X-SlateFS-Sync-Target: {}", commit.id)));
+        let pack = &exported[separator + 4..];
+        assert!(pack.starts_with(b"SLATESYN"));
+
+        let mut wrong_branch_request = format!(
+            "PUT /admin/v1/tenants/t/volumes/destination/versioning/sync/branches/other HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/vnd.slatefs.version-sync\r\nContent-Length: {}\r\n\r\n",
+            pack.len()
+        )
+        .into_bytes();
+        wrong_branch_request.extend_from_slice(pack);
+        let wrong_branch = admin_exchange(Arc::clone(&state), &wrong_branch_request).await;
+        assert_eq!(response_status(&wrong_branch), 400, "{wrong_branch}");
+
+        let mut apply_request = format!(
+            "PUT /admin/v1/tenants/t/volumes/destination/versioning/sync/branches/main HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: sync-apply\r\nContent-Type: application/vnd.slatefs.version-sync\r\nContent-Length: {}\r\n\r\n",
+            pack.len()
+        )
+        .into_bytes();
+        apply_request.extend_from_slice(pack);
+        let applied = admin_exchange(Arc::clone(&state), &apply_request).await;
+        assert_eq!(response_status(&applied), 200, "{applied}");
+        let applied: Value = serde_json::from_str(response_body(&applied)).unwrap();
+        assert_eq!(applied["sync"]["target"], commit.id);
+        assert_eq!(applied["sync"]["branch"], "main");
+        assert_eq!(applied["sync"]["forced"], false);
+
+        let verify_control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        let destination = VersionRepository::open(
+            &verify_control,
+            Arc::clone(&object_store),
+            "t",
+            "destination",
+        )
+        .await
+        .unwrap();
+        assert_eq!(destination.identity().id(), repository_id);
+        assert_eq!(
+            destination
+                .read_file(&commit.id, "/sync.txt")
+                .await
+                .unwrap()
+                .as_ref(),
+            b"native sync"
+        );
+        destination.close().await.unwrap();
+        let (exports, _) = verify_control
+            .list_audit(AuditQuery {
+                action: Some(AuditAction::VersionSyncExport),
+                ..AuditQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports[0].outcome, AuditOutcome::Success);
+        let (applies, _) = verify_control
+            .list_audit(AuditQuery {
+                action: Some(AuditAction::VersionSyncApply),
+                ..AuditQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(applies.len(), 2);
+        assert!(
+            applies
+                .iter()
+                .any(|record| record.outcome == AuditOutcome::Success)
+        );
+        assert!(
+            applies
+                .iter()
+                .any(|record| matches!(record.outcome, AuditOutcome::Failed { .. }))
+        );
+        verify_control.close().await.unwrap();
+        let metrics = render_daemon_metrics_with_exports(&[], &state.export_metrics);
+        assert!(metrics.contains(
+            "slatefs_version_operations_total{tenant=\"t\",volume=\"source\",operation=\"sync-export\"} 1"
+        ));
+        assert!(metrics.contains(
+            "slatefs_version_operations_total{tenant=\"t\",volume=\"destination\",operation=\"sync-apply\"} 1"
+        ));
+        assert!(metrics.contains(
+            "slatefs_version_sync_bytes_total{tenant=\"t\",volume=\"source\",direction=\"sent\"}"
+        ));
+        assert!(metrics.contains(
+            "slatefs_version_sync_bytes_total{tenant=\"t\",volume=\"destination\",direction=\"received\"}"
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

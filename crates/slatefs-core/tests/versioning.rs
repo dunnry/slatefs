@@ -1353,6 +1353,7 @@ async fn native_sync_is_incremental_atomic_and_force_protected() {
         Arc::clone(&object_store),
         "t",
         "destination",
+        "main",
         &initial_pack,
         false,
     )
@@ -1386,6 +1387,7 @@ async fn native_sync_is_incremental_atomic_and_force_protected() {
         Arc::clone(&object_store),
         "t",
         "destination",
+        "main",
         &incremental_pack,
         false,
     )
@@ -1461,6 +1463,7 @@ async fn native_sync_is_incremental_atomic_and_force_protected() {
             Arc::clone(&object_store),
             "t",
             "destination",
+            "main",
             &divergent_pack,
             false,
         )
@@ -1485,6 +1488,7 @@ async fn native_sync_is_incremental_atomic_and_force_protected() {
             Arc::clone(&object_store),
             "t",
             "destination",
+            "main",
             &divergent_pack,
             true,
         )
@@ -1508,6 +1512,7 @@ async fn native_sync_is_incremental_atomic_and_force_protected() {
         Arc::clone(&object_store),
         "t",
         "destination",
+        "main",
         &divergent_pack,
         true,
     )
@@ -1521,6 +1526,7 @@ async fn native_sync_is_incremental_atomic_and_force_protected() {
             Arc::clone(&object_store),
             "t",
             "destination",
+            "main",
             &divergent_pack,
             true,
         )

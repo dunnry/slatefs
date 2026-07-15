@@ -3004,10 +3004,21 @@ impl VersionRepository {
         object_store: Arc<dyn ObjectStore>,
         tenant: &str,
         volume: &str,
+        branch: &str,
         bundle: &[u8],
         force: bool,
     ) -> Result<VersionRepositorySyncReport> {
         let payload = decode_repository_sync_bundle(bundle)?;
+        validate_version_branch_name(branch)?;
+        if payload.branch != branch {
+            return Err(Error::invalid(
+                "version repository sync branch",
+                format!(
+                    "sync pack branch {} does not match requested branch {branch}",
+                    payload.branch
+                ),
+            ));
+        }
         if payload.expected.is_none() {
             validate_sync_objects_as_repository(&payload)?;
         }
