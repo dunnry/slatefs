@@ -4187,6 +4187,7 @@ dependencies = [
  "hex",
  "rcgen",
  "rustls-pemfile",
+ "serde",
  "serde_json",
  "slatefs-core",
  "tempfile",

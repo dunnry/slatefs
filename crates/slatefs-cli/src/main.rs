@@ -8,6 +8,7 @@ use anyhow::Context;
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use serde::{Deserialize, Serialize};
 use slatefs_core::config::{ClientAddrRule, Config};
 use slatefs_core::control::{
     AuditAction, AuditActor, AuditDetailValue, AuditOutcome, AuditPlane, AuditRecord, AuditScope,
@@ -37,6 +38,16 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use zeroize::Zeroizing;
 
 static RUSTLS_PROVIDER: Once = Once::new();
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionAttestationBundle {
+    version: u8,
+    tenant: String,
+    volume: String,
+    commit: String,
+    attestations: Vec<VersionCommitAttestation>,
+}
 
 #[derive(Parser)]
 #[command(name = "slatefs", version, about = "SlateFS management CLI")]
@@ -428,6 +439,23 @@ enum VersioningCmd {
         trusted_public_key: Option<PathBuf>,
         #[arg(long)]
         live: bool,
+    },
+    /// Export a portable JSON bundle of a commit and its signatures.
+    ExportAttestations {
+        tenant: String,
+        volume: String,
+        reference: String,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        live: bool,
+    },
+    /// Verify a portable attestation bundle without opening SlateFS.
+    VerifyAttestationBundle {
+        #[arg(long = "in")]
+        input: PathBuf,
+        #[arg(long)]
+        trusted_public_key: PathBuf,
     },
     /// Compare two commits and list changed paths.
     Diff {
@@ -1982,6 +2010,13 @@ async fn main() -> anyhow::Result<()> {
     {
         return version_attestation_keygen(out, public_out);
     }
+    if let Command::Versioning(VersioningCmd::VerifyAttestationBundle {
+        input,
+        trusted_public_key,
+    }) = &cli.command
+    {
+        return verify_attestation_bundle_file(input, trusted_public_key);
+    }
 
     let config = Config::load(&cli.config)
         .with_context(|| format!("loading config from {}", cli.config.display()))?;
@@ -2108,6 +2143,60 @@ fn read_hex_key<const N: usize>(path: &std::path::Path, what: &str) -> anyhow::R
     })
 }
 
+fn write_attestation_bundle(
+    path: &std::path::Path,
+    bundle: &VersionAttestationBundle,
+) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    let json = serde_json::to_vec_pretty(bundle)?;
+    file.write_all(&json)?;
+    file.write_all(b"\n")?;
+    Ok(())
+}
+
+fn read_attestation_bundle(path: &std::path::Path) -> anyhow::Result<VersionAttestationBundle> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening attestation bundle {}", path.display()))?;
+    let bundle: VersionAttestationBundle = serde_json::from_reader(file)
+        .with_context(|| format!("parsing attestation bundle {}", path.display()))?;
+    if bundle.version != 1 {
+        anyhow::bail!(
+            "attestation bundle {} has unsupported version {}",
+            path.display(),
+            bundle.version
+        );
+    }
+    Ok(bundle)
+}
+
+fn verify_attestation_bundle_file(
+    input: &std::path::Path,
+    trusted_public_key: &std::path::Path,
+) -> anyhow::Result<()> {
+    let bundle = read_attestation_bundle(input)?;
+    let trusted = read_hex_key::<32>(trusted_public_key, "trusted Ed25519 public key")?;
+    print_version_attestations(
+        &bundle.tenant,
+        &bundle.volume,
+        &bundle.commit,
+        &bundle.attestations,
+        Some(trusted),
+    )?;
+    println!("bundle: verified");
+    println!("tenant: {}", bundle.tenant);
+    println!("volume: {}", bundle.volume);
+    println!("commit: {}", bundle.commit);
+    Ok(())
+}
+
 fn parse_trusted_attestation_key(value: &str) -> Result<VersionTrustedAttestationKey, String> {
     let (key_id, path) = value
         .split_once('=')
@@ -2222,6 +2311,9 @@ async fn run(
     match command {
         Command::Keygen { .. } => unreachable!("handled before control-plane open"),
         Command::Versioning(VersioningCmd::AttestationKeygen { .. }) => {
+            unreachable!("handled before control-plane open")
+        }
+        Command::Versioning(VersioningCmd::VerifyAttestationBundle { .. }) => {
             unreachable!("handled before control-plane open")
         }
         Command::Key(KeyCmd::RotateKek { tenant }) => {
@@ -3001,6 +3093,69 @@ async fn run(
             let (commit, attestations) = result?;
             close?;
             print_version_attestations(tenant, volume, &commit, &attestations, trusted)?;
+        }
+        Command::Versioning(VersioningCmd::ExportAttestations {
+            tenant,
+            volume,
+            reference,
+            out,
+            live,
+        }) => {
+            let (commit, attestations) = if *live {
+                let commit_response = live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    "GET",
+                    &format!("commits/{reference}"),
+                    &[],
+                    None,
+                )
+                .await?;
+                let commit: VersionCommitInfo =
+                    serde_json::from_value(commit_response["commit"].clone())
+                        .context("parsing admin version commit")?;
+                let response = live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    "GET",
+                    &format!("commits/{}/attestations", commit.id),
+                    &[],
+                    None,
+                )
+                .await?;
+                let attestations = serde_json::from_value(response["attestations"].clone())
+                    .context("parsing admin version commit attestations")?;
+                (commit.id, attestations)
+            } else {
+                let repository =
+                    VersionRepository::open(control, object_store, tenant, volume).await?;
+                let result: anyhow::Result<_> = async {
+                    let commit = repository.inspect_commit(reference).await?;
+                    let attestations = repository.list_commit_attestations(&commit.id).await?;
+                    Ok((commit.id, attestations))
+                }
+                .await;
+                let close = repository.close().await;
+                let result = result?;
+                close?;
+                result
+            };
+            for attestation in &attestations {
+                verify_version_attestation(tenant, volume, &commit, attestation)?;
+            }
+            let bundle = VersionAttestationBundle {
+                version: 1,
+                tenant: tenant.clone(),
+                volume: volume.clone(),
+                commit: commit.clone(),
+                attestations,
+            };
+            write_attestation_bundle(out, &bundle)?;
+            println!("wrote attestation bundle to {}", out.display());
+            println!("commit: {commit}");
+            println!("attestations: {}", bundle.attestations.len());
         }
         Command::Versioning(VersioningCmd::Diff {
             tenant,
@@ -4963,6 +5118,38 @@ mod tests {
             }) if trusted_attestation_keys.len() == 1
                 && trusted_attestation_keys[0].key_id() == "release-2026"
         ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "export-attestations",
+            "tenant-a",
+            "docs",
+            "main",
+            "--out",
+            "/tmp/main-attestations.json",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::ExportAttestations { live: true, .. })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "verify-attestation-bundle",
+            "--in",
+            "/tmp/main-attestations.json",
+            "--trusted-public-key",
+            public_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::VerifyAttestationBundle { .. })
+        ));
     }
 
     #[test]
@@ -5030,6 +5217,36 @@ mod tests {
         )
         .unwrap();
         assert!(verify_version_attestation("tenant-a", "docs", &commit, &forged).is_err());
+
+        let directory = tempfile::tempdir().unwrap();
+        let bundle_path = directory.path().join("bundle.json");
+        let public_path = directory.path().join("release.pub");
+        std::fs::write(&public_path, format!("{}\n", hex::encode(public_key))).unwrap();
+        write_attestation_bundle(
+            &bundle_path,
+            &VersionAttestationBundle {
+                version: 1,
+                tenant: "tenant-a".to_string(),
+                volume: "docs".to_string(),
+                commit,
+                attestations: vec![attestation],
+            },
+        )
+        .unwrap();
+        verify_attestation_bundle_file(&bundle_path, &public_path).unwrap();
+        assert!(
+            write_attestation_bundle(
+                &bundle_path,
+                &VersionAttestationBundle {
+                    version: 1,
+                    tenant: "tenant-a".to_string(),
+                    volume: "docs".to_string(),
+                    commit: "ab".repeat(32),
+                    attestations: Vec::new(),
+                },
+            )
+            .is_err()
+        );
     }
 
     #[test]
