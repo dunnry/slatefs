@@ -13,9 +13,9 @@ use slatefs_core::store::{self, ObjectStore};
 use slatefs_core::versioning::{
     VersionCommitAttestation, VersionCommitOrigin, VersionCommitProvenance,
     VersionMergeConflictStrategy, VersionPathChangeKind, VersionReflogAction, VersionRepository,
-    VersionRestoreActionKind, VersionRestoreMode, VersionWorkingTreeChangeKind,
-    force_break_expired_version_maintenance_lease, purge_version_history,
-    try_get_version_maintenance_lease, version_commit_attestation_payload,
+    VersionRestoreActionKind, VersionRestoreMode, VersionTrustedAttestationKey,
+    VersionWorkingTreeChangeKind, force_break_expired_version_maintenance_lease,
+    purge_version_history, try_get_version_maintenance_lease, version_commit_attestation_payload,
 };
 use slatefs_core::vfs::{Credentials, Vfs};
 use slatefs_core::volume::{self, Volume};
@@ -278,6 +278,7 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
             true,
             &["other-committer".into()],
             &["test-manager".into()],
+            &[],
         )
         .await
         .unwrap();
@@ -312,6 +313,7 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
                 true,
                 &["test-committer".into()],
                 &["test-manager".into()],
+                &[],
                 "other-manager",
             )
             .await,
@@ -319,7 +321,7 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
     ));
     assert!(matches!(
         repository
-            .set_branch_protected_as("release", false, &[], &[], "other-manager")
+            .set_branch_protected_as("release", false, &[], &[], &[], "other-manager")
             .await,
         Err(Error::Invalid { .. })
     ));
@@ -329,6 +331,7 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
             true,
             &["test-committer".into()],
             &["test-manager".into()],
+            &[],
             "test-manager",
         )
         .await
@@ -370,7 +373,7 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         .await
         .unwrap();
     let unprotected = repository
-        .set_branch_protected_as("release", false, &[], &[], "test-manager")
+        .set_branch_protected_as("release", false, &[], &[], &[], "test-manager")
         .await
         .unwrap();
     assert!(!unprotected.protected());
@@ -899,6 +902,126 @@ async fn detached_commit_attestations_are_optional_immutable_and_verified() {
             .await,
         Err(Error::Invalid { .. })
     ));
+
+    let trusted_key = VersionTrustedAttestationKey::new_ed25519(
+        "release-2026",
+        signing_key.verifying_key().to_bytes(),
+    )
+    .unwrap();
+    repository
+        .create_branch("release", &commit.id)
+        .await
+        .unwrap();
+    let protected = repository
+        .set_branch_protected(
+            "release",
+            true,
+            &[],
+            &[],
+            std::slice::from_ref(&trusted_key),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        protected.trusted_attestation_keys(),
+        std::slice::from_ref(&trusted_key)
+    );
+
+    repository
+        .create_branch("feature", &commit.id)
+        .await
+        .unwrap();
+    live.write(&creds, file.ino, 0, b"new signed contents")
+        .await
+        .unwrap();
+    assert!(matches!(
+        repository
+            .commit_paths_on_branch(
+                live.as_ref(),
+                "release",
+                &["/signed.txt".to_string()],
+                "unsigned direct publication".to_string(),
+                test_provenance(),
+            )
+            .await,
+        Err(Error::Invalid {
+            what: "version branch attestation authorization",
+            ..
+        })
+    ));
+    let feature = repository
+        .commit_paths_on_branch(
+            live.as_ref(),
+            "feature",
+            &["/signed.txt".to_string()],
+            "candidate release".to_string(),
+            test_provenance(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        repository
+            .set_branch_protected(
+                "feature",
+                true,
+                &[],
+                &[],
+                std::slice::from_ref(&trusted_key),
+            )
+            .await,
+        Err(Error::Invalid {
+            what: "version branch protection",
+            ..
+        })
+    ));
+    assert!(matches!(
+        repository
+            .merge_branch(
+                "feature",
+                "release",
+                VersionMergeConflictStrategy::Fail,
+                test_provenance(),
+            )
+            .await,
+        Err(Error::Invalid {
+            what: "version branch attestation authorization",
+            ..
+        })
+    ));
+    let feature_time = created_at + 2;
+    let feature_payload = version_commit_attestation_payload(
+        "t",
+        "v",
+        &feature.id,
+        "release-2026",
+        &public_key,
+        feature_time,
+    )
+    .unwrap();
+    repository
+        .add_commit_attestation(
+            &feature.id,
+            VersionCommitAttestation::new_ed25519(
+                "release-2026",
+                public_key,
+                signing_key.sign(&feature_payload).to_bytes(),
+                feature_time,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let promoted = repository
+        .merge_branch(
+            "feature",
+            "release",
+            VersionMergeConflictStrategy::Fail,
+            test_provenance(),
+        )
+        .await
+        .unwrap();
+    assert!(promoted.fast_forward());
+    assert_eq!(promoted.commit(), feature.id);
 
     repository.close().await.unwrap();
     live.shutdown().await.unwrap();

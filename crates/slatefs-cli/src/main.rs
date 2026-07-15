@@ -3185,7 +3185,7 @@ async fn run(
             }
             let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
             let result = repository
-                .set_branch_protected(name, true, allowed_committers, allowed_managers)
+                .set_branch_protected(name, true, allowed_committers, allowed_managers, &[])
                 .await;
             let repository_close = repository.close().await;
             let branch = result?;
@@ -3232,7 +3232,9 @@ async fn run(
                 return Ok(());
             }
             let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
-            let result = repository.set_branch_protected(name, false, &[], &[]).await;
+            let result = repository
+                .set_branch_protected(name, false, &[], &[], &[])
+                .await;
             let repository_close = repository.close().await;
             let branch = result?;
             repository_close?;

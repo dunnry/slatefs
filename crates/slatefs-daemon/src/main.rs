@@ -1566,7 +1566,9 @@ fn core_error(error: slatefs_core::error::Error) -> AdminError {
         slatefs_core::error::Error::Invalid { what, .. }
             if matches!(
                 *what,
-                "version branch authorization" | "version branch policy authorization"
+                "version branch authorization"
+                    | "version branch attestation authorization"
+                    | "version branch policy authorization"
             ) =>
         {
             403
@@ -1595,7 +1597,10 @@ fn is_version_publication_authorization_error(error: &slatefs_core::error::Error
     matches!(
         error,
         slatefs_core::error::Error::Invalid { what, .. }
-            if *what == "version branch authorization"
+            if matches!(
+                *what,
+                "version branch authorization" | "version branch attestation authorization"
+            )
     )
 }
 
@@ -2861,6 +2866,7 @@ async fn set_version_branch_protection_response(
             protected,
             &allowed_committers,
             &allowed_managers,
+            &[],
             &admin_committer(request),
         )
         .await;
