@@ -18,10 +18,11 @@ use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{
     VersionBranchInfo, VersionBranchRecoveryInfo, VersionBranchResetInfo, VersionCommitInfo,
-    VersionMergeConflictStrategy, VersionMergeInfo, VersionMergePreview, VersionPathChangeKind,
-    VersionReflogEntry, VersionRepository, VersionRestoreActionKind, VersionRestoreApplyInfo,
-    VersionRestoreMode, VersionRestorePreview, VersionTagInfo, VersionWorkingTreeChangeKind,
-    VersionWorkingTreeStatus, force_break_expired_version_maintenance_lease, purge_version_history,
+    VersionCommitOrigin, VersionCommitProvenance, VersionMergeConflictStrategy, VersionMergeInfo,
+    VersionMergePreview, VersionPathChangeKind, VersionReflogEntry, VersionRepository,
+    VersionRestoreActionKind, VersionRestoreApplyInfo, VersionRestoreMode, VersionRestorePreview,
+    VersionTagInfo, VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
+    force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease,
 };
 use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
@@ -355,7 +356,10 @@ enum VersioningCmd {
         paths: Vec<String>,
         #[arg(short, long)]
         message: String,
-        /// Retry key; reuse only for the same canonical paths and message.
+        /// Claimed content author. Required for offline commits; live commits default to the authenticated principal.
+        #[arg(long)]
+        author: Option<String>,
+        /// Retry key; reuse only for the same branch, canonical paths, message, author, and committer.
         #[arg(long)]
         idempotency_key: Option<String>,
         /// Branch to advance.
@@ -490,6 +494,9 @@ enum VersioningCmd {
         volume: String,
         source: String,
         target: String,
+        /// Claimed merge author. Required for offline merges.
+        #[arg(long)]
+        author: Option<String>,
         /// Resolve conflicts by failing, keeping target paths, or keeping source paths.
         #[arg(long, default_value = "fail", value_parser = parse_version_merge_conflict_strategy)]
         conflict_strategy: VersionMergeConflictStrategy,
@@ -1117,6 +1124,10 @@ fn print_version_commit(commit: &VersionCommitInfo) {
         }
     );
     println!("created {}", commit.created_at);
+    println!("author {}", commit.provenance.author());
+    println!("committer {}", commit.provenance.committer());
+    println!("origin {}", commit.provenance.origin().as_str());
+    println!("request {}", commit.provenance.request_id());
     println!("paths {}", commit.paths.join(","));
     println!("message {}", commit.message);
 }
@@ -1354,6 +1365,25 @@ async fn append_cli_version_audit(
     volume: &str,
     details: impl IntoIterator<Item = (String, AuditDetailValue)>,
 ) -> anyhow::Result<()> {
+    append_cli_version_audit_with_request_id(
+        control,
+        action,
+        tenant,
+        volume,
+        format!("cli-versioning-{}", uuid::Uuid::new_v4()),
+        details,
+    )
+    .await
+}
+
+async fn append_cli_version_audit_with_request_id(
+    control: &ControlPlane,
+    action: AuditAction,
+    tenant: &str,
+    volume: &str,
+    request_id: String,
+    details: impl IntoIterator<Item = (String, AuditDetailValue)>,
+) -> anyhow::Result<()> {
     let mut record = AuditRecord::new(
         AuditActor {
             plane: AuditPlane::Cli,
@@ -1367,12 +1397,27 @@ async fn append_cli_version_audit(
             volume: Some(volume.to_string()),
             node: None,
         },
-        format!("cli-versioning-{}", uuid::Uuid::new_v4()),
+        request_id,
         AuditOutcome::Success,
     );
     record.details.extend(details);
     control.append_audit_record(record).await?;
     Ok(())
+}
+
+fn offline_commit_provenance(
+    author: Option<&String>,
+    request_id: String,
+) -> anyhow::Result<VersionCommitProvenance> {
+    let author =
+        author.ok_or_else(|| anyhow::anyhow!("offline version commits require --author"))?;
+    VersionCommitProvenance::new(
+        VersionCommitOrigin::Cli,
+        author.clone(),
+        author.clone(),
+        request_id,
+    )
+    .map_err(anyhow::Error::from)
 }
 
 fn print_snapshot_retention(tenant: &str, volume: &str, policy: Option<&SnapshotRetentionPolicy>) {
@@ -2376,6 +2421,7 @@ async fn run(
             volume: volume_name,
             paths,
             message,
+            author,
             idempotency_key,
             branch,
             live,
@@ -2389,17 +2435,15 @@ async fn run(
                     serde_json::json!({
                         "paths": paths,
                         "message": message,
+                        "author": author,
                         "idempotency_key": idempotency_key,
                         "branch": branch,
                     }),
                 )
                 .await?;
-                println!(
-                    "commit {}",
-                    response["commit"]["id"]
-                        .as_str()
-                        .ok_or_else(|| anyhow::anyhow!("admin response omitted commit id"))?
-                );
+                let commit: VersionCommitInfo = serde_json::from_value(response["commit"].clone())
+                    .context("parsing admin version commit")?;
+                print_version_commit(&commit);
                 if response["replayed"].as_bool().unwrap_or(false) {
                     println!("replayed true");
                 }
@@ -2411,6 +2455,8 @@ async fn run(
             let record = control.get_mountable_volume(tenant, volume_name).await?;
             let dek = control.unwrap_volume_dek(&record).await?;
             let live = volume::Volume::open(&record, dek, Arc::clone(&object_store)).await?;
+            let request_id = format!("cli-versioning-{}", uuid::Uuid::new_v4());
+            let provenance = offline_commit_provenance(author.as_ref(), request_id.clone())?;
             let commit = match idempotency_key.as_deref() {
                 Some(key) => repository
                     .commit_volume_paths_on_branch_idempotent(
@@ -2418,6 +2464,7 @@ async fn run(
                         branch,
                         paths,
                         message.clone(),
+                        provenance,
                         key,
                     )
                     .await
@@ -2426,7 +2473,13 @@ async fn run(
                         (result.into_commit(), replayed)
                     }),
                 None => repository
-                    .commit_volume_paths_on_branch(live.as_ref(), branch, paths, message.clone())
+                    .commit_volume_paths_on_branch(
+                        live.as_ref(),
+                        branch,
+                        paths,
+                        message.clone(),
+                        provenance,
+                    )
                     .await
                     .map(|commit| (commit, false)),
             };
@@ -2435,11 +2488,12 @@ async fn run(
             let (commit, replayed) = commit?;
             live_close?;
             repository_close?;
-            append_cli_version_audit(
+            append_cli_version_audit_with_request_id(
                 control,
                 AuditAction::VersionCommit,
                 tenant,
                 volume_name,
+                request_id,
                 [
                     (
                         "commit".to_string(),
@@ -2449,6 +2503,14 @@ async fn run(
                     (
                         "branch".to_string(),
                         AuditDetailValue::String(branch.clone()),
+                    ),
+                    (
+                        "author".to_string(),
+                        AuditDetailValue::String(commit.provenance.author().to_string()),
+                    ),
+                    (
+                        "committer".to_string(),
+                        AuditDetailValue::String(commit.provenance.committer().to_string()),
                     ),
                 ],
             )
@@ -2983,6 +3045,7 @@ async fn run(
             volume,
             source,
             target,
+            author,
             conflict_strategy,
             live,
         }) => {
@@ -2996,6 +3059,7 @@ async fn run(
                     serde_json::json!({
                         "source": source,
                         "conflict_strategy": conflict_strategy,
+                        "author": author,
                     }),
                 )
                 .await?;
@@ -3005,17 +3069,20 @@ async fn run(
                 return Ok(());
             }
             let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let request_id = format!("cli-versioning-{}", uuid::Uuid::new_v4());
+            let provenance = offline_commit_provenance(author.as_ref(), request_id.clone())?;
             let result = repository
-                .merge_branch(source, target, *conflict_strategy)
+                .merge_branch(source, target, *conflict_strategy, provenance)
                 .await;
             let repository_close = repository.close().await;
             let merge = result?;
             repository_close?;
-            append_cli_version_audit(
+            append_cli_version_audit_with_request_id(
                 control,
                 AuditAction::Maintain,
                 tenant,
                 volume,
+                request_id,
                 [
                     (
                         "maintenance".to_string(),
@@ -4421,6 +4488,8 @@ mod tests {
             "retry-1",
             "--branch",
             "draft",
+            "--author",
+            "alice",
             "--live",
         ])
         .unwrap();
@@ -4429,9 +4498,10 @@ mod tests {
             Command::Versioning(VersioningCmd::Commit {
                 idempotency_key: Some(key),
                 branch,
+                author: Some(author),
                 live: true,
                 ..
-            }) if key == "retry-1" && branch == "draft"
+            }) if key == "retry-1" && branch == "draft" && author == "alice"
         ));
 
         let cli = Cli::try_parse_from([
@@ -4616,6 +4686,8 @@ mod tests {
             "main",
             "--conflict-strategy",
             "theirs",
+            "--author",
+            "alice",
             "--live",
         ])
         .unwrap();
@@ -4624,10 +4696,11 @@ mod tests {
             Command::Versioning(VersioningCmd::Merge {
                 source,
                 target,
+                author: Some(author),
                 conflict_strategy: VersionMergeConflictStrategy::Theirs,
                 live: true,
                 ..
-            }) if source == "draft" && target == "main"
+            }) if source == "draft" && target == "main" && author == "alice"
         ));
 
         let cli = Cli::try_parse_from([

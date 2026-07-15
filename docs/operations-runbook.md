@@ -198,7 +198,7 @@ For opt-in file history on a currently served filesystem volume, route commit
 and restore through that daemon's configured admin listener:
 
 ```sh
-slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path>... -m <message> --idempotency-key <retry-key> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path>... -m <message> --author <content-author> --idempotency-key <retry-key> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning restore <tenant> <volume> <commit> <path> --mode overlay --token <preview-token> --yes --live
 slatefs -c /etc/slatefs/slatefs.toml versioning log <tenant> <volume> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning status <tenant> <volume> /projects --reference main --live
@@ -214,10 +214,10 @@ slatefs -c /etc/slatefs/slatefs.toml versioning reflog <tenant> <volume> <name> 
 slatefs -c /etc/slatefs/slatefs.toml versioning recover-branch <tenant> <volume> <name> <reflog-sequence> --yes --live
 slatefs -c /etc/slatefs/slatefs.toml versioning delete-branch <tenant> <volume> <name> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning reset-branch <tenant> <volume> <name> <commit-or-ref> --yes --live
-slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path>... -m <message> --branch <name> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path>... -m <message> --author <content-author> --branch <name> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning log <tenant> <volume> --branch <name> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning inspect <tenant> <volume> <commit-or-ref> --live
-slatefs -c /etc/slatefs/slatefs.toml versioning merge <tenant> <volume> <source> <target> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning merge <tenant> <volume> <source> <target> --author <content-author> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning merge <tenant> <volume> <source> <target> --conflict-strategy ours --live
 slatefs -c /etc/slatefs/slatefs.toml versioning merge-preview <tenant> <volume> <source> <target> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning show <tenant> <volume> <commit> <path> --out restored.bin --live
@@ -232,6 +232,14 @@ Merge conflicts fail without moving either branch by default. After reviewing
 from the target or `--conflict-strategy theirs` to keep it from the source.
 Resolution is applied to the complete logical path, while non-conflicting
 changes from both branches are still merged.
+
+Live commit and divergent-merge provenance records the authenticated admin or
+tenant principal as committer and the HTTP request ID for audit correlation.
+An allowed unauthenticated loopback request records `admin:unauthenticated`
+instead. `--author` is optional on live requests and defaults to that committer
+identity. It names the content author when supplied but cannot replace the
+server-derived committer. Offline commit and divergent merge commands require
+`--author`; they record the claimed identity as both author and committer.
 
 `restore-preview` prints a token after the plan. Pass it unchanged to
 `restore --token`; a `409` means the branch, plan, or live subtree changed and

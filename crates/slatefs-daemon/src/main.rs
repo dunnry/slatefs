@@ -40,8 +40,9 @@ use slatefs_core::rate::{RateLimiter, RateLimits};
 use slatefs_core::snapshot::SnapshotVolume;
 use slatefs_core::store;
 use slatefs_core::versioning::{
-    VersionMaintenanceLeaseInfo, VersionMergeConflictStrategy, VersionRepository,
-    VersionRestoreMode, force_break_expired_version_maintenance_lease, purge_version_history,
+    VersionCommitOrigin, VersionCommitProvenance, VersionMaintenanceLeaseInfo,
+    VersionMergeConflictStrategy, VersionRepository, VersionRestoreMode,
+    force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease,
 };
 use slatefs_core::vfs::Vfs;
@@ -963,22 +964,33 @@ struct VersionCommitRequest {
     idempotency_key: Option<String>,
     #[serde(default)]
     branch: Option<String>,
+    #[serde(default)]
+    author: Option<String>,
+}
+
+struct NormalizedVersionCommitRequest {
+    paths: Vec<String>,
+    message: String,
+    idempotency_key: Option<String>,
+    branch: String,
+    author: Option<String>,
 }
 
 impl VersionCommitRequest {
-    fn into_paths(mut self) -> Result<(Vec<String>, String, Option<String>, String), AdminError> {
+    fn normalize(mut self) -> Result<NormalizedVersionCommitRequest, AdminError> {
         if let Some(path) = self.path {
             self.paths.push(path);
         }
         if self.paths.is_empty() {
             return Err(bad_request("provide path or paths"));
         }
-        Ok((
-            self.paths,
-            self.message,
-            self.idempotency_key,
-            self.branch.unwrap_or_else(|| "main".to_string()),
-        ))
+        Ok(NormalizedVersionCommitRequest {
+            paths: self.paths,
+            message: self.message,
+            idempotency_key: self.idempotency_key,
+            branch: self.branch.unwrap_or_else(|| "main".to_string()),
+            author: self.author,
+        })
     }
 }
 
@@ -1024,6 +1036,8 @@ struct VersionBranchMergeRequest {
     source: String,
     #[serde(default)]
     conflict_strategy: VersionMergeConflictStrategy,
+    #[serde(default)]
+    author: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1968,7 +1982,14 @@ async fn commit_live_version_response(
     volume: &str,
 ) -> Result<AdminHttpResponse, AdminError> {
     let body: VersionCommitRequest = parse_json_body(request)?;
-    let (paths, message, idempotency_key, branch) = body.into_paths()?;
+    let NormalizedVersionCommitRequest {
+        paths,
+        message,
+        idempotency_key,
+        branch,
+        author,
+    } = body.normalize()?;
+    let provenance = admin_commit_provenance(request, author)?;
     let target = live_filesystem_target(state, tenant, volume)?;
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
@@ -1995,6 +2016,7 @@ async fn commit_live_version_response(
                 &branch,
                 &paths,
                 message,
+                provenance,
                 key,
             )
             .await
@@ -2003,7 +2025,7 @@ async fn commit_live_version_response(
                 (result.into_commit(), replayed)
             }),
         None => repository
-            .commit_volume_paths_on_branch(target.as_ref(), &branch, &paths, message)
+            .commit_volume_paths_on_branch(target.as_ref(), &branch, &paths, message, provenance)
             .await
             .map(|commit| (commit, false)),
     };
@@ -2019,6 +2041,14 @@ async fn commit_live_version_response(
                     (
                         "commit".to_string(),
                         AuditDetailValue::String(commit.id.clone()),
+                    ),
+                    (
+                        "author".to_string(),
+                        AuditDetailValue::String(commit.provenance.author().to_string()),
+                    ),
+                    (
+                        "committer".to_string(),
+                        AuditDetailValue::String(commit.provenance.committer().to_string()),
                     ),
                     (
                         "paths".to_string(),
@@ -2062,6 +2092,7 @@ async fn commit_live_version_response(
                 "created_at": commit.created_at,
                 "message": commit.message,
                 "paths": commit.paths,
+                "provenance": commit.provenance,
             },
             "replayed": replayed,
             "branch": branch,
@@ -2364,6 +2395,7 @@ async fn list_version_commits_response(
                 "created_at": commit.created_at,
                 "message": commit.message,
                 "paths": commit.paths,
+                "provenance": commit.provenance,
             })
         })
         .collect::<Vec<_>>();
@@ -2777,11 +2809,12 @@ async fn merge_version_branch_response(
     target: &str,
 ) -> Result<AdminHttpResponse, AdminError> {
     let body: VersionBranchMergeRequest = parse_json_body(request)?;
+    let provenance = admin_commit_provenance(request, body.author.clone())?;
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
     let (control, repository) = open_version_repository(state, tenant, volume).await?;
     let result = repository
-        .merge_branch(&body.source, target, body.conflict_strategy)
+        .merge_branch(&body.source, target, body.conflict_strategy, provenance)
         .await;
     let audit = match &result {
         Ok(merge) => {
@@ -3437,6 +3470,23 @@ fn admin_actor(request: &AdminHttpRequest) -> AuditActor {
         source_ip: request.peer.map(|addr| addr.ip().to_string()),
         client_agent: request.headers.get("user-agent").cloned(),
     }
+}
+
+fn admin_commit_provenance(
+    request: &AdminHttpRequest,
+    author: Option<String>,
+) -> Result<VersionCommitProvenance, AdminError> {
+    let committer = request
+        .authenticated_principal
+        .clone()
+        .unwrap_or_else(|| "admin:unauthenticated".to_string());
+    VersionCommitProvenance::new(
+        VersionCommitOrigin::Admin,
+        author.unwrap_or_else(|| committer.clone()),
+        committer,
+        request.request_id.clone(),
+    )
+    .map_err(core_error)
 }
 
 async fn append_version_audit(
@@ -6900,6 +6950,16 @@ mod tests {
     type TestResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
     const ADMIN_TOKEN: &str = "secret-admin-token";
 
+    fn test_commit_provenance() -> VersionCommitProvenance {
+        VersionCommitProvenance::new(
+            VersionCommitOrigin::Api,
+            "test-author",
+            "test-committer",
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn conflicting_version_merge_maps_to_conflict() {
         let error = version_merge_error(slatefs_core::error::Error::Versioning(
@@ -7576,10 +7636,9 @@ mod tests {
         targets.insert(VolumeId::from_parts("t", "v"), Arc::clone(&volume));
         let state =
             available_admin_state(Arc::clone(&object_store), Arc::clone(&kms), targets, None).await;
-        let commit_body =
-            r#"{"path":"/notes.txt","message":"live commit","idempotency_key":"retry-live-1"}"#;
+        let commit_body = r#"{"path":"/notes.txt","message":"live commit","author":"Alice","idempotency_key":"retry-live-1"}"#;
         let commit_request = format!(
-            "POST /admin/v1/tenants/t/volumes/v/versioning/commits HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            "POST /admin/v1/tenants/t/volumes/v/versioning/commits HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nX-Request-Id: version-commit-1\r\nContent-Length: {}\r\n\r\n{}",
             commit_body.len(),
             commit_body
         );
@@ -7588,11 +7647,25 @@ mod tests {
         let commit_response: Value = serde_json::from_str(response_body(&commit_response)).unwrap();
         let commit_id = commit_response["commit"]["id"].as_str().unwrap();
         assert_eq!(commit_response["replayed"], false);
+        assert_eq!(commit_response["commit"]["provenance"]["origin"], "admin");
+        assert_eq!(commit_response["commit"]["provenance"]["author"], "Alice");
+        assert_eq!(
+            commit_response["commit"]["provenance"]["committer"],
+            "admin:unauthenticated"
+        );
+        assert_eq!(
+            commit_response["commit"]["provenance"]["request_id"],
+            "version-commit-1"
+        );
         let replay_response = admin_exchange(Arc::clone(&state), commit_request.as_bytes()).await;
         assert_eq!(response_status(&replay_response), 201, "{replay_response}");
         let replay: Value = serde_json::from_str(response_body(&replay_response)).unwrap();
         assert_eq!(replay["commit"]["id"], commit_id);
         assert_eq!(replay["replayed"], true);
+        assert_eq!(
+            replay["commit"]["provenance"]["request_id"],
+            "version-commit-1"
+        );
         let conflict_body =
             r#"{"path":"/notes.txt","message":"other request","idempotency_key":"retry-live-1"}"#;
         let conflict_request = format!(
@@ -7737,6 +7810,7 @@ mod tests {
         let inspected: Value = serde_json::from_str(response_body(&inspected)).unwrap();
         assert_eq!(inspected["commit"]["id"], branch_commit["commit"]["id"]);
         assert_eq!(inspected["commit"]["parents"][0], commit_id);
+        assert_eq!(inspected["commit"]["provenance"]["origin"], "admin");
         assert_ne!(branch_commit["commit"]["id"], commit_id);
         let branch_history_response = admin_exchange(
             Arc::clone(&state),
@@ -7811,6 +7885,7 @@ mod tests {
         );
         let history: Value = serde_json::from_str(response_body(&history_response)).unwrap();
         assert_eq!(history["commits"][0]["id"], commit_id);
+        assert_eq!(history["commits"][0]["provenance"]["author"], "Alice");
         assert!(history["next_page_token"].is_null());
 
         let content_request = format!(
@@ -10227,12 +10302,22 @@ mod tests {
             .await
             .unwrap();
         repository
-            .commit_volume_paths(volume.as_ref(), &["/notes.txt".into()], "first".into())
+            .commit_volume_paths(
+                volume.as_ref(),
+                &["/notes.txt".into()],
+                "first".into(),
+                test_commit_provenance(),
+            )
             .await
             .unwrap();
         volume.write(&creds, file.ino, 0, b"two").await.unwrap();
         repository
-            .commit_volume_paths(volume.as_ref(), &["/notes.txt".into()], "second".into())
+            .commit_volume_paths(
+                volume.as_ref(),
+                &["/notes.txt".into()],
+                "second".into(),
+                test_commit_provenance(),
+            )
             .await
             .unwrap();
         repository.close().await.unwrap();

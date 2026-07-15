@@ -74,7 +74,14 @@ block transformer. Normal VFS, NFS, and 9P operations do not open or update it.
 
 Each commit applies file metadata and content-chunk references to an immutable
 Prolly tree. Chunks are content-addressed blobs, commit IDs are SHA-256 hashes,
-and `heads/main` points to the current commit. Additional named branch
+and `heads/main` points to the current commit. The hash also covers commit
+provenance: content author, publishing committer, publication origin, and the
+audit request ID. The live admin path derives committer and request ID from the
+server request while permitting a distinct claimed author; authenticated
+requests use their principal and permitted unauthenticated loopback requests
+use an explicit committer marker. Offline CLI commits require an explicit
+author and use it as committer.
+Additional named branch
 references can point to any existing commit, tag, or branch and can be used by
 read, restore, diff, and history operations. Commits advance `main` by default
 or an existing named branch when selected explicitly. Publishing a commit and

@@ -39,7 +39,7 @@ const HEAD_KEY: &[u8] = b"pr/heads/main";
 const REFLOG_PREFIX: &[u8] = b"pr/logs/";
 const TAG_PREFIX: &[u8] = b"pr/tags/";
 const ENTRY_META_VERSION: u8 = 1;
-const COMMIT_VERSION: u8 = 1;
+const COMMIT_VERSION: u8 = 2;
 const IDEMPOTENCY_VERSION: u8 = 1;
 const REF_VERSION: u8 = 1;
 const REFLOG_VERSION: u8 = 1;
@@ -1052,6 +1052,7 @@ struct VersionCommit {
     created_at: u64,
     message: String,
     paths: Vec<String>,
+    provenance: VersionCommitProvenance,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1061,6 +1062,15 @@ struct VersionCommitBody {
     created_at: u64,
     message: String,
     paths: Vec<String>,
+    provenance: VersionCommitProvenance,
+}
+
+struct VersionCommitOperation<'a> {
+    branch: &'a str,
+    paths: &'a [String],
+    message: String,
+    provenance: VersionCommitProvenance,
+    idempotency_key: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -1069,6 +1079,8 @@ struct VersionCommitRequestFingerprint<'a> {
     branch: &'a str,
     message: &'a str,
     paths: &'a [String],
+    author: &'a str,
+    committer: &'a str,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1101,6 +1113,72 @@ pub struct VersionCommitInfo {
     pub created_at: u64,
     pub message: String,
     pub paths: Vec<String>,
+    pub provenance: VersionCommitProvenance,
+}
+
+/// Where a version commit was published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VersionCommitOrigin {
+    Cli,
+    Admin,
+    Api,
+}
+
+impl VersionCommitOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Admin => "admin",
+            Self::Api => "api",
+        }
+    }
+}
+
+/// Identity and audit correlation hashed into an immutable version commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionCommitProvenance {
+    origin: VersionCommitOrigin,
+    author: String,
+    committer: String,
+    request_id: String,
+}
+
+impl VersionCommitProvenance {
+    pub fn new(
+        origin: VersionCommitOrigin,
+        author: impl Into<String>,
+        committer: impl Into<String>,
+        request_id: impl Into<String>,
+    ) -> Result<Self> {
+        let provenance = Self {
+            origin,
+            author: author.into(),
+            committer: committer.into(),
+            request_id: request_id.into(),
+        };
+        validate_version_identity("version commit author", &provenance.author)?;
+        validate_version_identity("version commit committer", &provenance.committer)?;
+        validate_version_request_id(&provenance.request_id)?;
+        Ok(provenance)
+    }
+
+    pub fn origin(&self) -> VersionCommitOrigin {
+        self.origin
+    }
+
+    pub fn author(&self) -> &str {
+        &self.author
+    }
+
+    pub fn committer(&self) -> &str {
+        &self.committer
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1703,6 +1781,7 @@ impl From<VersionCommit> for VersionCommitInfo {
             created_at: commit.created_at,
             message: commit.message,
             paths: commit.paths,
+            provenance: commit.provenance,
         }
     }
 }
@@ -1979,6 +2058,7 @@ impl VersionRepository {
                 created_at: commit.created_at,
                 message: commit.message.clone(),
                 paths: commit.paths.clone(),
+                provenance: commit.provenance.clone(),
             };
             let expected: [u8; 32] = Sha256::digest(postcard::to_allocvec(&body)?).into();
             if expected != commit.id || commit.id != id {
@@ -2221,8 +2301,10 @@ impl VersionRepository {
         live: &dyn Vfs,
         path: &str,
         message: String,
+        provenance: VersionCommitProvenance,
     ) -> Result<VersionCommitInfo> {
-        self.commit_paths(live, &[path.to_string()], message).await
+        self.commit_paths(live, &[path.to_string()], message, provenance)
+            .await
     }
 
     /// Commit multiple selected paths as one immutable tree update. Directory
@@ -2233,9 +2315,20 @@ impl VersionRepository {
         live: &dyn Vfs,
         paths: &[String],
         message: String,
+        provenance: VersionCommitProvenance,
     ) -> Result<VersionCommitInfo> {
         Ok(self
-            .commit_paths_inner(live, None, "main", paths, message, None)
+            .commit_paths_inner(
+                live,
+                None,
+                VersionCommitOperation {
+                    branch: "main",
+                    paths,
+                    message,
+                    provenance,
+                    idempotency_key: None,
+                },
+            )
             .await?
             .into_commit())
     }
@@ -2247,25 +2340,48 @@ impl VersionRepository {
         branch: &str,
         paths: &[String],
         message: String,
+        provenance: VersionCommitProvenance,
     ) -> Result<VersionCommitInfo> {
         Ok(self
-            .commit_paths_inner(live, None, branch, paths, message, None)
+            .commit_paths_inner(
+                live,
+                None,
+                VersionCommitOperation {
+                    branch,
+                    paths,
+                    message,
+                    provenance,
+                    idempotency_key: None,
+                },
+            )
             .await?
             .into_commit())
     }
 
     /// Commit selected paths with a caller-supplied retry key. Reusing the key
-    /// with the same canonical paths and message returns the original commit;
-    /// reusing it for a different request is rejected.
+    /// with the same branch, canonical paths, message, author, and committer
+    /// returns the original commit; reusing it for a different request is
+    /// rejected.
     pub async fn commit_paths_idempotent(
         &self,
         live: &dyn Vfs,
         paths: &[String],
         message: String,
+        provenance: VersionCommitProvenance,
         idempotency_key: &str,
     ) -> Result<VersionCommitResult> {
-        self.commit_paths_inner(live, None, "main", paths, message, Some(idempotency_key))
-            .await
+        self.commit_paths_inner(
+            live,
+            None,
+            VersionCommitOperation {
+                branch: "main",
+                paths,
+                message,
+                provenance,
+                idempotency_key: Some(idempotency_key),
+            },
+        )
+        .await
     }
 
     /// Commit selected paths to an existing named branch with a retry key.
@@ -2275,10 +2391,21 @@ impl VersionRepository {
         branch: &str,
         paths: &[String],
         message: String,
+        provenance: VersionCommitProvenance,
         idempotency_key: &str,
     ) -> Result<VersionCommitResult> {
-        self.commit_paths_inner(live, None, branch, paths, message, Some(idempotency_key))
-            .await
+        self.commit_paths_inner(
+            live,
+            None,
+            VersionCommitOperation {
+                branch,
+                paths,
+                message,
+                provenance,
+                idempotency_key: Some(idempotency_key),
+            },
+        )
+        .await
     }
 
     /// Commit from a live SlateFS volume while validating its writer lease
@@ -2288,10 +2415,21 @@ impl VersionRepository {
         live: &Volume,
         paths: &[String],
         message: String,
+        provenance: VersionCommitProvenance,
     ) -> Result<VersionCommitInfo> {
         live.validate_writer_lease().await?;
         Ok(self
-            .commit_paths_inner(live, Some(live), "main", paths, message, None)
+            .commit_paths_inner(
+                live,
+                Some(live),
+                VersionCommitOperation {
+                    branch: "main",
+                    paths,
+                    message,
+                    provenance,
+                    idempotency_key: None,
+                },
+            )
             .await?
             .into_commit())
     }
@@ -2303,10 +2441,21 @@ impl VersionRepository {
         branch: &str,
         paths: &[String],
         message: String,
+        provenance: VersionCommitProvenance,
     ) -> Result<VersionCommitInfo> {
         live.validate_writer_lease().await?;
         Ok(self
-            .commit_paths_inner(live, Some(live), branch, paths, message, None)
+            .commit_paths_inner(
+                live,
+                Some(live),
+                VersionCommitOperation {
+                    branch,
+                    paths,
+                    message,
+                    provenance,
+                    idempotency_key: None,
+                },
+            )
             .await?
             .into_commit())
     }
@@ -2318,16 +2467,20 @@ impl VersionRepository {
         live: &Volume,
         paths: &[String],
         message: String,
+        provenance: VersionCommitProvenance,
         idempotency_key: &str,
     ) -> Result<VersionCommitResult> {
         live.validate_writer_lease().await?;
         self.commit_paths_inner(
             live,
             Some(live),
-            "main",
-            paths,
-            message,
-            Some(idempotency_key),
+            VersionCommitOperation {
+                branch: "main",
+                paths,
+                message,
+                provenance,
+                idempotency_key: Some(idempotency_key),
+            },
         )
         .await
     }
@@ -2339,16 +2492,20 @@ impl VersionRepository {
         branch: &str,
         paths: &[String],
         message: String,
+        provenance: VersionCommitProvenance,
         idempotency_key: &str,
     ) -> Result<VersionCommitResult> {
         live.validate_writer_lease().await?;
         self.commit_paths_inner(
             live,
             Some(live),
-            branch,
-            paths,
-            message,
-            Some(idempotency_key),
+            VersionCommitOperation {
+                branch,
+                paths,
+                message,
+                provenance,
+                idempotency_key: Some(idempotency_key),
+            },
         )
         .await
     }
@@ -2357,15 +2514,21 @@ impl VersionRepository {
         &self,
         live: &dyn Vfs,
         writer_guard: Option<&Volume>,
-        branch: &str,
-        paths: &[String],
-        message: String,
-        idempotency_key: Option<&str>,
+        operation: VersionCommitOperation<'_>,
     ) -> Result<VersionCommitResult> {
+        let VersionCommitOperation {
+            branch,
+            paths,
+            message,
+            provenance,
+            idempotency_key,
+        } = operation;
         validate_version_branch_name(branch)?;
         let canonical = canonicalize_path_set(paths)?;
         let idempotency = idempotency_key
-            .map(|key| version_commit_idempotency_intent(key, branch, &canonical, &message))
+            .map(|key| {
+                version_commit_idempotency_intent(key, branch, &canonical, &message, &provenance)
+            })
             .transpose()?;
         let head = self.store.get_branch(branch).await?;
         if branch != "main" && head.is_none() {
@@ -2431,6 +2594,7 @@ impl VersionRepository {
             created_at: crate::control::now_unix(),
             message,
             paths: canonical,
+            provenance,
         };
         let body_bytes = postcard::to_allocvec(&body)?;
         let id: [u8; 32] = Sha256::digest(&body_bytes).into();
@@ -2441,6 +2605,7 @@ impl VersionRepository {
             created_at: body.created_at,
             message: body.message,
             paths: body.paths,
+            provenance: body.provenance,
         };
         let encoded = encode_versioned(COMMIT_VERSION, &commit)?;
         if let Some(writer_guard) = writer_guard {
@@ -2801,6 +2966,7 @@ impl VersionRepository {
         source: &str,
         target: &str,
         strategy: VersionMergeConflictStrategy,
+        provenance: VersionCommitProvenance,
     ) -> Result<VersionMergeInfo> {
         validate_version_branch_name(source)?;
         validate_version_branch_name(target)?;
@@ -2884,6 +3050,7 @@ impl VersionRepository {
                 .into_iter()
                 .map(|change| change.path().to_string())
                 .collect(),
+            provenance,
         };
         let id: [u8; 32] = Sha256::digest(postcard::to_allocvec(&body)?).into();
         let commit = VersionCommit {
@@ -2893,6 +3060,7 @@ impl VersionRepository {
             created_at: body.created_at,
             message: body.message,
             paths: body.paths,
+            provenance: body.provenance,
         };
         let encoded = encode_versioned(COMMIT_VERSION, &commit)?;
         self.store
@@ -4168,6 +4336,7 @@ fn version_commit_idempotency_intent(
     branch: &str,
     canonical_paths: &[String],
     message: &str,
+    provenance: &VersionCommitProvenance,
 ) -> Result<VersionCommitIdempotencyIntent> {
     if key.is_empty() {
         return Err(Error::invalid(
@@ -4182,16 +4351,44 @@ fn version_commit_idempotency_intent(
         ));
     }
     let request = VersionCommitRequestFingerprint {
-        version: 1,
+        version: 2,
         branch,
         message,
         paths: canonical_paths,
+        author: provenance.author(),
+        committer: provenance.committer(),
     };
     let request_fingerprint = Sha256::digest(postcard::to_allocvec(&request)?).into();
     Ok(VersionCommitIdempotencyIntent {
         key_hash: Sha256::digest(key.as_bytes()).into(),
         request_fingerprint,
     })
+}
+
+fn validate_version_identity(what: &'static str, value: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 256 {
+        return Err(Error::invalid(what, "must contain 1 to 256 UTF-8 bytes"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(Error::invalid(what, "must not contain control characters"));
+    }
+    Ok(())
+}
+
+fn validate_version_request_id(value: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 128 || !value.is_ascii() {
+        return Err(Error::invalid(
+            "version commit request id",
+            "must contain 1 to 128 ASCII characters",
+        ));
+    }
+    if value.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(Error::invalid(
+            "version commit request id",
+            "must not contain control characters",
+        ));
+    }
+    Ok(())
 }
 
 fn encode_versioned<T: Serialize>(version: u8, value: &T) -> Result<Vec<u8>> {
@@ -4346,6 +4543,41 @@ mod tests {
         assert_eq!(canonical_path("a//b").unwrap(), "/a/b");
         assert!(canonical_path("/").is_err());
         assert!(canonical_path("a/../b").is_err());
+    }
+
+    #[test]
+    fn version_commit_provenance_rejects_ambiguous_identity_fields() {
+        assert!(
+            VersionCommitProvenance::new(VersionCommitOrigin::Api, "", "committer", "request")
+                .is_err()
+        );
+        assert!(
+            VersionCommitProvenance::new(
+                VersionCommitOrigin::Api,
+                "author\nforged",
+                "committer",
+                "request",
+            )
+            .is_err()
+        );
+        assert!(
+            VersionCommitProvenance::new(
+                VersionCommitOrigin::Api,
+                "author",
+                "committer",
+                "non-ascii-é",
+            )
+            .is_err()
+        );
+        assert!(
+            VersionCommitProvenance::new(
+                VersionCommitOrigin::Api,
+                "author",
+                "committer",
+                "request\rforged",
+            )
+            .is_err()
+        );
     }
 
     #[test]

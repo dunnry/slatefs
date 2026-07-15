@@ -123,7 +123,7 @@ the live VFS request path. Its logical key prefixes are:
 |---|---:|---|
 | `pn/<prolly-node-key>` | Prolly | immutable Prolly node bytes |
 | `pb/<content-id>` | Prolly | content-addressed file chunk blob |
-| `pc/<sha256-commit-id>` | 1 | `VersionCommit` |
+| `pc/<sha256-commit-id>` | 2 | `VersionCommit`, including hash-bound provenance |
 | `pi/<sha256-idempotency-key>` | 1 | commit ID and branch-aware canonical request fingerprint |
 | `pr/heads/<name>` | 1 | mutable branch `VersionRef`; `main` is the default commit head |
 | `pr/logs/<name>/<sequence>` | 1 | bounded branch-head transition record; the newest 100 per name are retained |
@@ -135,7 +135,10 @@ prefixes its structured values with `u8 format_version` and postcard-encodes
 the payload. Entry metadata version 1 distinguishes regular files,
 directories, and symlinks.
 A commit records zero, one, or two parents, its root manifest, creation time,
-message, and selected paths. Two parents identify a three-way merge commit.
+message, selected paths, and provenance containing origin, author, committer,
+and request ID. All fields are covered by the commit ID. Two parents identify
+a three-way merge commit. Version 2 is the initial deployed contract; SlateFS
+does not migrate the earlier development-only version-1 record shape.
 An idempotency record is written atomically with its commit and head;
 garbage collection removes it when that commit is pruned. Version repository
 tags keep their referenced commit and tree reachable through garbage

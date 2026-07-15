@@ -143,7 +143,14 @@ the affected volume object-store prefixes.
 every volume and is never part of the normal NFS/9P read or write path. Enable
 it explicitly with `slatefs versioning enable <tenant> <volume>`, then create
 versions of selected regular files with `slatefs versioning commit` and its
-tenant, volume, path, and `-m <message>` arguments. `versioning log`,
+tenant, volume, path, and `-m <message>` arguments. Each immutable commit also
+hashes its content author, publishing committer, origin, and request ID. Live
+commits default the author to the server-derived committer identity;
+authenticated requests use their principal and permitted unauthenticated
+loopback requests use an explicit marker. `--author` may name a different
+content author.
+Offline commits require `--author` and record that claimed identity as both
+author and committer. `versioning log`,
 `versioning diff`, `versioning show`, and `versioning restore` inspect, compare,
 and recover those commits. `versioning tag`, `tags`, and `untag` manage
 immutable names for important commits. `versioning branch`, `branches`, and
@@ -297,9 +304,9 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}` | Delete a non-main branch without deleting its commit immediately. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/reset` | Compare-and-swap an existing branch, including `main`, to `{"commit":"commit-or-ref"}`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/recover` | Restore the head preceding a retained reflog entry from `{"sequence":42}`, recreating a deleted branch when needed. |
-| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{target}/merge` | Fast-forward or three-way merge a target from `{"source":"...","conflict_strategy":"fail|ours|theirs"}`; the strategy defaults to `fail`, whose conflicts return `409`. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{target}/merge` | Fast-forward or three-way merge a target from `{"source":"...","conflict_strategy":"fail|ours|theirs","author":"..."}`; strategy defaults to `fail`, author defaults to the server-derived committer, and conflicts return `409`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{target}/merge?source=` | Preview ancestry and logical-path conflicts without moving either branch. |
-| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"...","idempotency_key":"...","branch":"main"}`; retry key and branch are optional and singular `path` remains accepted. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"...","author":"...","idempotency_key":"...","branch":"main"}`; author, retry key, and branch are optional and singular `path` remains accepted. The response includes hash-bound `provenance`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit-or-tag}/content?path=&offset=&length=` | Read a bounded file or symlink range as base64 JSON; defaults to 1 MiB and rejects ranges over 4 MiB. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore` | Apply a current preview through the live writer from `{"commit":"...","path":"...","mode":"overlay|exact","token":"..."}`; stale tokens return `409`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/stats` | Logical history bytes, nodes, blobs, and commits. |
@@ -314,10 +321,10 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 Every admin response includes `X-Request-Id`; callers may provide it or the
 daemon generates a UUID. v1 errors use `{"error":{"code","message","request_id"}}`.
 Version commit callers can separately provide an `idempotency_key` of up to
-256 UTF-8 bytes. Repeating the same key with the same canonical paths and
-message returns the original commit with `"replayed":true`; using it for a
-different request returns HTTP 409. Retry records are retained and collected
-with their commits.
+256 UTF-8 bytes. Repeating the same key with the same branch, canonical paths,
+message, author, and committer returns the original commit and its original
+request ID with `"replayed":true`; using it for a different request returns
+HTTP 409. Retry records are retained and collected with their commits.
 Unauthenticated loopback remains the default. To bind the admin listener
 outside loopback, configure `[admin].token = "..."`, `token_file = "..."`, or
 mTLS cert auth. Per-customer bearer tokens may be configured in

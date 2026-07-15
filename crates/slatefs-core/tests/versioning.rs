@@ -10,13 +10,24 @@ use slatefs_core::error::Error;
 use slatefs_core::meta::inode::ROOT_INO;
 use slatefs_core::store::{self, ObjectStore};
 use slatefs_core::versioning::{
-    VersionMergeConflictStrategy, VersionPathChangeKind, VersionReflogAction, VersionRepository,
-    VersionRestoreActionKind, VersionRestoreMode, VersionWorkingTreeChangeKind,
+    VersionCommitOrigin, VersionCommitProvenance, VersionMergeConflictStrategy,
+    VersionPathChangeKind, VersionReflogAction, VersionRepository, VersionRestoreActionKind,
+    VersionRestoreMode, VersionWorkingTreeChangeKind,
     force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease,
 };
 use slatefs_core::vfs::{Credentials, Vfs};
 use slatefs_core::volume::{self, Volume};
+
+fn test_provenance() -> VersionCommitProvenance {
+    VersionCommitProvenance::new(
+        VersionCommitOrigin::Api,
+        "test-author",
+        "test-committer",
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .unwrap()
+}
 
 #[tokio::test]
 async fn versioning_is_opt_in_and_restores_committed_files() {
@@ -90,17 +101,31 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         .await
         .unwrap();
     let first = repository
-        .commit_file(live.as_ref(), "/notes.txt", "initial notes".to_string())
+        .commit_file(
+            live.as_ref(),
+            "/notes.txt",
+            "initial notes".to_string(),
+            test_provenance(),
+        )
         .await
         .unwrap();
     assert_eq!(first.paths, vec!["/notes.txt"]);
+    assert_eq!(first.provenance.origin(), VersionCommitOrigin::Api);
+    assert_eq!(first.provenance.author(), "test-author");
+    assert_eq!(first.provenance.committer(), "test-committer");
+    assert!(!first.provenance.request_id().is_empty());
 
     let second_contents = b"second version\n";
     live.write(&creds, file.ino, 0, second_contents)
         .await
         .unwrap();
     let second = repository
-        .commit_file(live.as_ref(), "notes.txt", "update notes".to_string())
+        .commit_file(
+            live.as_ref(),
+            "notes.txt",
+            "update notes".to_string(),
+            test_provenance(),
+        )
         .await
         .unwrap();
     assert!(
@@ -137,6 +162,7 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
             "draft",
             &["/notes.txt".into(), "/draft.txt".into()],
             "draft update".into(),
+            test_provenance(),
             "draft-retry",
         )
         .await
@@ -149,6 +175,7 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
             "draft",
             &["/notes.txt".into(), "/draft.txt".into()],
             "draft update".into(),
+            test_provenance(),
             "draft-retry",
         )
         .await
@@ -198,14 +225,24 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
     assert_eq!(fast_forward_preview.behind(), 0);
     assert_eq!(fast_forward_preview.merge_base(), first.id);
     let merged = repository
-        .merge_branch("main", "release", VersionMergeConflictStrategy::Fail)
+        .merge_branch(
+            "main",
+            "release",
+            VersionMergeConflictStrategy::Fail,
+            test_provenance(),
+        )
         .await
         .unwrap();
     assert!(merged.fast_forward());
     assert!(!merged.already_up_to_date());
     assert_eq!(merged.commit(), second.id);
     let unchanged = repository
-        .merge_branch("main", "release", VersionMergeConflictStrategy::Fail)
+        .merge_branch(
+            "main",
+            "release",
+            VersionMergeConflictStrategy::Fail,
+            test_provenance(),
+        )
         .await
         .unwrap();
     assert!(!unchanged.fast_forward());
@@ -251,6 +288,7 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
             "feature",
             &["/feature.txt".into()],
             "add feature file".into(),
+            test_provenance(),
         )
         .await
         .unwrap();
@@ -265,7 +303,12 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
     assert_eq!(three_way_preview.behind(), 1);
     assert_eq!(three_way_preview.merge_base(), first.id);
     let three_way = repository
-        .merge_branch("feature", "main", VersionMergeConflictStrategy::Fail)
+        .merge_branch(
+            "feature",
+            "main",
+            VersionMergeConflictStrategy::Fail,
+            test_provenance(),
+        )
         .await
         .unwrap();
     assert!(!three_way.fast_forward());
@@ -279,6 +322,12 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         merged_history[0].parents,
         vec![second.id.clone(), feature_commit.id.clone()]
     );
+    assert_eq!(
+        merged_history[0].provenance.origin(),
+        VersionCommitOrigin::Api
+    );
+    assert_eq!(merged_history[0].provenance.author(), "test-author");
+    assert_eq!(merged_history[0].provenance.committer(), "test-committer");
     assert_eq!(
         repository
             .read_file("main", "/feature.txt")
@@ -302,7 +351,12 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
     assert!(!conflict_preview.can_merge());
     assert_eq!(conflict_preview.conflicts(), &["/notes.txt".to_string()]);
     let conflict = repository
-        .merge_branch("draft", "main", VersionMergeConflictStrategy::Fail)
+        .merge_branch(
+            "draft",
+            "main",
+            VersionMergeConflictStrategy::Fail,
+            test_provenance(),
+        )
         .await
         .unwrap_err();
     assert!(conflict.to_string().contains("merge conflict"));
@@ -328,7 +382,12 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         .await
         .unwrap();
     let ours = repository
-        .merge_branch("draft", "main", VersionMergeConflictStrategy::Ours)
+        .merge_branch(
+            "draft",
+            "main",
+            VersionMergeConflictStrategy::Ours,
+            test_provenance(),
+        )
         .await
         .unwrap();
     assert_eq!(ours.strategy(), VersionMergeConflictStrategy::Ours);
@@ -361,6 +420,7 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
             "draft",
             "theirs-target",
             VersionMergeConflictStrategy::Theirs,
+            test_provenance(),
         )
         .await
         .unwrap();
@@ -638,6 +698,13 @@ async fn idempotent_commit_retries_return_the_original_commit() {
             live.as_ref(),
             &["notes.txt".into(), "/notes.txt".into()],
             "save notes".into(),
+            VersionCommitProvenance::new(
+                VersionCommitOrigin::Api,
+                "test-author",
+                "test-committer",
+                "request-first",
+            )
+            .unwrap(),
             "retry-1",
         )
         .await
@@ -653,12 +720,14 @@ async fn idempotent_commit_retries_return_the_original_commit() {
             live.as_ref(),
             &["/notes.txt".into()],
             "save notes".into(),
+            test_provenance(),
             "retry-1",
         )
         .await
         .unwrap();
     assert!(replay.replayed());
     assert_eq!(replay.commit().id, first_id);
+    assert_eq!(replay.commit().provenance.request_id(), "request-first");
     assert_eq!(repository.history(None, 10).await.unwrap().len(), 1);
     assert_eq!(
         repository
@@ -669,11 +738,30 @@ async fn idempotent_commit_retries_return_the_original_commit() {
         b"first contents"
     );
 
+    let changed_author = repository
+        .commit_volume_paths_idempotent(
+            live.as_ref(),
+            &["/notes.txt".into()],
+            "save notes".into(),
+            VersionCommitProvenance::new(
+                VersionCommitOrigin::Api,
+                "other-author",
+                "test-committer",
+                "request-author-conflict",
+            )
+            .unwrap(),
+            "retry-1",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(changed_author, Error::AlreadyExists { .. }));
+
     let conflict = repository
         .commit_volume_paths_idempotent(
             live.as_ref(),
             &["/notes.txt".into()],
             "different request".into(),
+            test_provenance(),
             "retry-1",
         )
         .await
@@ -684,6 +772,7 @@ async fn idempotent_commit_retries_return_the_original_commit() {
             live.as_ref(),
             &["/notes.txt".into()],
             "save notes".into(),
+            test_provenance(),
             "",
         )
         .await
@@ -704,6 +793,7 @@ async fn idempotent_commit_retries_return_the_original_commit() {
                     live.as_ref(),
                     &["/notes.txt".into()],
                     "save changed notes".into(),
+                    test_provenance(),
                     "retry-concurrent",
                 )
                 .await
@@ -733,6 +823,7 @@ async fn idempotent_commit_retries_return_the_original_commit() {
             live.as_ref(),
             &["/notes.txt".into()],
             "save notes".into(),
+            test_provenance(),
             "retry-1",
         )
         .await
@@ -869,7 +960,12 @@ async fn range_reads_and_restore_stream_across_chunks() {
         .await
         .unwrap();
     let commit = repository
-        .commit_file(live.as_ref(), "/large.bin", "large file".into())
+        .commit_file(
+            live.as_ref(),
+            "/large.bin",
+            "large file".into(),
+            test_provenance(),
+        )
         .await
         .unwrap();
     let offset = common::TEST_CHUNK as u64 - 13;
@@ -974,6 +1070,7 @@ async fn fenced_live_writer_cannot_publish_a_version_commit() {
             stale.as_ref(),
             &["/primary.txt".into()],
             "stale primary".into(),
+            test_provenance(),
         )
         .await
         .unwrap_err();
@@ -986,6 +1083,7 @@ async fn fenced_live_writer_cannot_publish_a_version_commit() {
             replacement.as_ref(),
             &["/primary.txt".into()],
             "replacement primary".into(),
+            test_provenance(),
         )
         .await
         .unwrap();
@@ -1049,7 +1147,12 @@ async fn concurrent_commits_preserve_a_linear_complete_history() {
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
             let result = repository
-                .commit_volume_paths(live.as_ref(), &[path.to_string()], message.to_string())
+                .commit_volume_paths(
+                    live.as_ref(),
+                    &[path.to_string()],
+                    message.to_string(),
+                    test_provenance(),
+                )
                 .await;
             (path.to_string(), message.to_string(), result)
         }));
@@ -1064,7 +1167,12 @@ async fn concurrent_commits_preserve_a_linear_complete_history() {
                 "unexpected concurrent commit failure: {error}"
             );
             repository
-                .commit_volume_paths(live.as_ref(), &[path], format!("retry {message}"))
+                .commit_volume_paths(
+                    live.as_ref(),
+                    &[path],
+                    format!("retry {message}"),
+                    test_provenance(),
+                )
                 .await
                 .unwrap();
         }
@@ -1162,7 +1270,12 @@ async fn commits_directories_symlinks_renames_and_deletions_atomically() {
         .await
         .unwrap();
     let initial = repository
-        .commit_paths(live.as_ref(), &["/docs".into()], "capture docs".into())
+        .commit_paths(
+            live.as_ref(),
+            &["/docs".into()],
+            "capture docs".into(),
+            test_provenance(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1191,6 +1304,7 @@ async fn commits_directories_symlinks_renames_and_deletions_atomically() {
                 "/docs/renamed.txt".into(),
             ],
             "rename and delete".into(),
+            test_provenance(),
         )
         .await
         .unwrap();
@@ -1315,7 +1429,12 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
         .unwrap();
         commits.push(
             repository
-                .commit_file(live.as_ref(), "/history.txt", format!("version {index}"))
+                .commit_file(
+                    live.as_ref(),
+                    "/history.txt",
+                    format!("version {index}"),
+                    test_provenance(),
+                )
                 .await
                 .unwrap(),
         );
@@ -1441,7 +1560,12 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
     live.write(&creds, file.ino, 0, b"quota").await.unwrap();
     assert!(
         quota_repository
-            .commit_file(live.as_ref(), "/history.txt", "over quota".into())
+            .commit_file(
+                live.as_ref(),
+                "/history.txt",
+                "over quota".into(),
+                test_provenance(),
+            )
             .await
             .unwrap_err()
             .to_string()
