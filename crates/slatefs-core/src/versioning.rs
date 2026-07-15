@@ -1194,6 +1194,70 @@ impl VersionPathChange {
     }
 }
 
+/// How a live filesystem path differs from a versioned tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VersionWorkingTreeChangeKind {
+    /// The path exists only in the live filesystem.
+    Added,
+    /// The path exists in both trees but its metadata or contents differ.
+    Modified,
+    /// The path exists only in the versioned tree.
+    Deleted,
+    /// The live and versioned paths have different filesystem kinds.
+    TypeChanged,
+}
+
+/// One live-versus-versioned path comparison result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionWorkingTreeChange {
+    path: String,
+    change: VersionWorkingTreeChangeKind,
+}
+
+impl VersionWorkingTreeChange {
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn change(&self) -> VersionWorkingTreeChangeKind {
+        self.change
+    }
+}
+
+/// Read-only status of a live subtree relative to a commit, tag, or branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionWorkingTreeStatus {
+    reference: String,
+    commit: String,
+    root: String,
+    changes: Vec<VersionWorkingTreeChange>,
+}
+
+impl VersionWorkingTreeStatus {
+    pub fn reference(&self) -> &str {
+        &self.reference
+    }
+
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
+
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    pub fn changes(&self) -> &[VersionWorkingTreeChange] {
+        &self.changes
+    }
+
+    pub fn is_clean(&self) -> bool {
+        self.changes.is_empty()
+    }
+}
+
 impl From<VersionCommit> for VersionCommitInfo {
     fn from(commit: VersionCommit) -> Self {
         Self {
@@ -2503,6 +2567,144 @@ impl VersionRepository {
         Ok(self.resolve_commit(reference).await?.into())
     }
 
+    /// Compare a live filesystem subtree with a commit, tag, or branch without
+    /// modifying either side. The root path `/` compares every live path with
+    /// every path tracked by the referenced tree.
+    pub async fn working_tree_status(
+        &self,
+        live: &dyn Vfs,
+        reference: &str,
+        root: &str,
+    ) -> Result<VersionWorkingTreeStatus> {
+        let commit = self.resolve_commit(reference).await?;
+        let commit_id = commit_id_string(&commit.id);
+        let root = canonical_status_root(root)?;
+        let tree = commit.tree.to_tree();
+        let mut versioned = BTreeMap::new();
+        let mut range = self
+            .prolly
+            .prefix(&tree, b"m/")
+            .await
+            .map_err(prolly_error)?;
+        while let Some(entry) = range.next().await {
+            let (key, value) = entry.map_err(prolly_error)?;
+            let path = std::str::from_utf8(key.strip_prefix(b"m/").unwrap_or_default())
+                .map_err(|_| Error::Versioning("version tree contains a non-UTF-8 path".into()))?;
+            if path_is_within(path, &root) {
+                versioned.insert(path.to_string(), decode_version_entry(&value)?);
+            }
+        }
+        let live_entries = scan_live_subtree(live, &root).await?;
+        let paths = versioned
+            .keys()
+            .chain(live_entries.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut changes = Vec::new();
+        for path in paths {
+            let change = match (versioned.get(&path), live_entries.get(&path)) {
+                (None, Some(_)) => Some(VersionWorkingTreeChangeKind::Added),
+                (Some(_), None) => Some(VersionWorkingTreeChangeKind::Deleted),
+                (Some(entry), Some(attr)) if !version_entry_kind_matches(entry, attr.kind) => {
+                    Some(VersionWorkingTreeChangeKind::TypeChanged)
+                }
+                (Some(entry), Some(attr)) => {
+                    if self
+                        .version_entry_matches_live(live, &tree, &path, entry, attr)
+                        .await?
+                    {
+                        None
+                    } else {
+                        Some(VersionWorkingTreeChangeKind::Modified)
+                    }
+                }
+                (None, None) => None,
+            };
+            if let Some(change) = change {
+                changes.push(VersionWorkingTreeChange { path, change });
+            }
+        }
+        Ok(VersionWorkingTreeStatus {
+            reference: reference.to_string(),
+            commit: commit_id,
+            root,
+            changes,
+        })
+    }
+
+    async fn version_entry_matches_live(
+        &self,
+        live: &dyn Vfs,
+        tree: &Tree,
+        path: &str,
+        entry: &VersionEntry,
+        attr: &FileAttr,
+    ) -> Result<bool> {
+        if entry.mode != attr.mode
+            || entry.uid != attr.uid
+            || entry.gid != attr.gid
+            || entry.size != attr.size
+        {
+            return Ok(false);
+        }
+        let creds = Credentials::root();
+        match &entry.data {
+            VersionEntryData::Directory => Ok(true),
+            VersionEntryData::Symlink { target } => {
+                Ok(live.readlink(&creds, attr.ino).await.map_err(fs_error)? == *target)
+            }
+            VersionEntryData::File { chunk_count } => {
+                let expected_chunks = entry.size.div_ceil(self.chunk_size);
+                if expected_chunks != u64::from(*chunk_count) {
+                    return Err(Error::Versioning(format!(
+                        "versioned chunk count for {path} does not match its recorded size"
+                    )));
+                }
+                for index in 0..*chunk_count {
+                    let encoded = self
+                        .prolly
+                        .get(tree, &file_chunk_key(path, index))
+                        .await
+                        .map_err(prolly_error)?
+                        .ok_or_else(|| {
+                            Error::Versioning(format!("missing chunk {index} for {path}"))
+                        })?;
+                    let reference = ValueRef::from_stored_bytes(&encoded).map_err(prolly_error)?;
+                    let ValueRef::Blob(reference) = reference else {
+                        return Err(Error::Versioning(format!(
+                            "chunk {index} for {path} is not a blob reference"
+                        )));
+                    };
+                    let expected = self
+                        .store
+                        .get_blob(&reference)
+                        .await
+                        .map_err(version_store_error)?
+                        .ok_or_else(|| {
+                            Error::Versioning(format!("missing blob for chunk {index} of {path}"))
+                        })?;
+                    let len = u32::try_from(expected.len()).map_err(|_| {
+                        Error::Versioning(format!("chunk {index} for {path} is too large"))
+                    })?;
+                    let actual = live
+                        .read_with_atime_policy(
+                            &creds,
+                            attr.ino,
+                            u64::from(index) * self.chunk_size,
+                            len,
+                            AtimeMode::Noatime,
+                        )
+                        .await
+                        .map_err(fs_error)?;
+                    if actual.as_ref() != expected {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+
     /// Return newest-first history for a named branch.
     pub async fn history_on_branch(
         &self,
@@ -2959,6 +3161,64 @@ async fn resolve_path_optional(vfs: &dyn Vfs, canonical: &str) -> Result<Option<
     Ok(Some(current))
 }
 
+async fn scan_live_subtree(vfs: &dyn Vfs, root: &str) -> Result<BTreeMap<String, FileAttr>> {
+    let Some(root_attr) = resolve_path_optional(vfs, root).await? else {
+        return Ok(BTreeMap::new());
+    };
+    let creds = Credentials::root();
+    let mut entries = BTreeMap::new();
+    let mut pending = vec![(root.to_string(), root_attr)];
+    while let Some((path, attr)) = pending.pop() {
+        if path != "/" {
+            entries.insert(path.clone(), attr.clone());
+        }
+        if attr.kind != FileKind::Dir {
+            continue;
+        }
+        let mut cookie = 0;
+        loop {
+            let page = vfs
+                .readdir(&creds, attr.ino, cookie, 1024)
+                .await
+                .map_err(fs_error)?;
+            if page.entries.is_empty() && !page.eof {
+                return Err(Error::Versioning(format!(
+                    "directory scan for {path} did not advance"
+                )));
+            }
+            for child in page.entries {
+                cookie = child.cookie;
+                let name = std::str::from_utf8(&child.name).map_err(|_| {
+                    Error::invalid(
+                        "working tree path",
+                        format!("{path} contains a non-UTF-8 name"),
+                    )
+                })?;
+                let child_path = if path == "/" {
+                    format!("/{name}")
+                } else {
+                    format!("{path}/{name}")
+                };
+                let child_attr = vfs.getattr(&creds, child.ino).await.map_err(fs_error)?;
+                pending.push((child_path, child_attr));
+            }
+            if page.eof {
+                break;
+            }
+        }
+    }
+    Ok(entries)
+}
+
+fn version_entry_kind_matches(entry: &VersionEntry, kind: FileKind) -> bool {
+    matches!(
+        (&entry.data, kind),
+        (VersionEntryData::File { .. }, FileKind::File)
+            | (VersionEntryData::Directory, FileKind::Dir)
+            | (VersionEntryData::Symlink { .. }, FileKind::Symlink)
+    )
+}
+
 async fn resolve_parent(vfs: &dyn Vfs, canonical: &str) -> Result<(u64, Vec<u8>)> {
     let components = path_components(canonical);
     let (name, parents) = components
@@ -3005,6 +3265,14 @@ fn canonical_path(path: &str) -> Result<String> {
     Ok(format!("/{}", components.join("/")))
 }
 
+fn canonical_status_root(path: &str) -> Result<String> {
+    if path.split('/').all(str::is_empty) {
+        Ok("/".to_string())
+    } else {
+        canonical_path(path)
+    }
+}
+
 fn canonicalize_path_set(paths: &[String]) -> Result<Vec<String>> {
     if paths.is_empty() {
         return Err(Error::invalid(
@@ -3029,7 +3297,8 @@ fn canonicalize_path_set(paths: &[String]) -> Result<Vec<String>> {
 }
 
 fn path_is_within(path: &str, root: &str) -> bool {
-    path == root
+    root == "/"
+        || path == root
         || path
             .strip_prefix(root)
             .is_some_and(|suffix| suffix.starts_with('/'))
@@ -3084,7 +3353,9 @@ fn mutation_from_diff(diff: Diff) -> Mutation {
 }
 
 fn path_components(path: &str) -> Vec<&str> {
-    path.trim_start_matches('/').split('/').collect()
+    path.split('/')
+        .filter(|component| !component.is_empty())
+        .collect()
 }
 
 fn file_meta_key(path: &str) -> Vec<u8> {

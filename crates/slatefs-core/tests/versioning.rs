@@ -11,8 +11,8 @@ use slatefs_core::meta::inode::ROOT_INO;
 use slatefs_core::store::{self, ObjectStore};
 use slatefs_core::versioning::{
     VersionMergeConflictStrategy, VersionPathChangeKind, VersionRepository,
-    force_break_expired_version_maintenance_lease, purge_version_history,
-    try_get_version_maintenance_lease,
+    VersionWorkingTreeChangeKind, force_break_expired_version_maintenance_lease,
+    purge_version_history, try_get_version_maintenance_lease,
 };
 use slatefs_core::vfs::{Credentials, Vfs};
 use slatefs_core::volume::{self, Volume};
@@ -102,6 +102,13 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         .commit_file(live.as_ref(), "notes.txt", "update notes".to_string())
         .await
         .unwrap();
+    assert!(
+        repository
+            .working_tree_status(live.as_ref(), "main", "/notes.txt")
+            .await
+            .unwrap()
+            .is_clean()
+    );
     assert_eq!(second.parents, vec![first.id.clone()]);
     let diff = repository
         .diff_commits(&first.id, &second.id)
@@ -369,6 +376,58 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         inspected.parents,
         vec![three_way.commit().to_string(), branch_commit.id.clone()]
     );
+    let status = repository
+        .working_tree_status(live.as_ref(), "draft", "/")
+        .await
+        .unwrap();
+    assert_eq!(status.commit(), branch_commit.id);
+    assert_eq!(status.root(), "/");
+    assert_eq!(status.changes().len(), 1);
+    assert_eq!(status.changes()[0].path(), "/feature.txt");
+    assert_eq!(
+        status.changes()[0].change(),
+        VersionWorkingTreeChangeKind::Added
+    );
+    live.write(&creds, file.ino, 0, b"working change\n")
+        .await
+        .unwrap();
+    let status = repository
+        .working_tree_status(live.as_ref(), "draft", "/notes.txt")
+        .await
+        .unwrap();
+    assert_eq!(
+        status.changes()[0].change(),
+        VersionWorkingTreeChangeKind::Modified
+    );
+    repository
+        .restore_file(live.as_ref(), "draft", "/notes.txt")
+        .await
+        .unwrap();
+    live.unlink(&creds, ROOT_INO, b"draft.txt").await.unwrap();
+    let status = repository
+        .working_tree_status(live.as_ref(), "draft", "/draft.txt")
+        .await
+        .unwrap();
+    assert_eq!(
+        status.changes()[0].change(),
+        VersionWorkingTreeChangeKind::Deleted
+    );
+    live.mkdir(&creds, ROOT_INO, b"draft.txt", 0o750)
+        .await
+        .unwrap();
+    let status = repository
+        .working_tree_status(live.as_ref(), "draft", "/draft.txt")
+        .await
+        .unwrap();
+    assert_eq!(
+        status.changes()[0].change(),
+        VersionWorkingTreeChangeKind::TypeChanged
+    );
+    live.rmdir(&creds, ROOT_INO, b"draft.txt").await.unwrap();
+    repository
+        .restore_file(live.as_ref(), "draft", "/draft.txt")
+        .await
+        .unwrap();
     let verified = repository.verify().await.unwrap();
     assert_eq!(verified.commits, 7);
     assert!(verified.nodes > 0);

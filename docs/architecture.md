@@ -101,6 +101,13 @@ applying mutations and folds metadata/chunk conflicts into logical file paths.
 Commit inspection resolves an ID, tag, or branch to its immutable commit and
 exposes the complete parent list so merge ancestry remains directly navigable
 even though ordinary log pagination follows first parents.
+Working-tree status scans one live subtree and the corresponding versioned
+metadata, then compares ownership, mode, kind, size, and bounded file or
+symlink contents. It ignores atime and mtime noise, performs no version-store
+writes, and reports added, modified, deleted, and type-changed paths in stable
+path order. A live scan validates the daemon writer lease before and after the
+comparison, but concurrent client writes may still make any status result
+immediately stale.
 An unbounded GC retains the full reachable DAG; bounded retention evaluates
 first-parent history per branch and may prune older secondary ancestry.
 

@@ -163,6 +163,10 @@ non-conflicting changes from both branches.
 fast-forward state, and every conflicting logical path without writing.
 `versioning inspect <commit-or-ref>` resolves a commit ID, tag, or branch and
 shows the complete parent list, including both parents of a merge commit.
+`versioning status [path] --reference <commit-or-ref>` compares the live
+working tree with versioned metadata and bounded file contents, reporting
+added, modified, deleted, and type-changed paths without writing either side.
+`versioning policy` reports opt-in and repository-lease state.
 Show and restore stream versioned data in bounded chunks rather than loading a
 complete large file into memory.
 `versioning disable` stops all version operations but retains existing history;
@@ -266,6 +270,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/snapshot-retention` | Set nullable `keep_last` and/or `max_age_secs`, or `{"clear":true}`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Opt-in state, retention policy, and current or last repository lease. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Enable or disable with `{"enabled":true|false}`; disabling retains history. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/status` | Compare the live working tree with query `reference` (default `main`) and `path` (default `/`) without modifying either side. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Commit history with optional `branch` (default `main`), `path`, `limit`, and exclusive `page_token`; returns `next_page_token`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit-or-ref}` | Resolve a commit ID, tag, or branch and return the commit with its complete parent list. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/diff` | Added, modified, and deleted paths between required `from` and `to` commit IDs or tags; supports `limit` and exclusive path `page_token`. |

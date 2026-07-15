@@ -201,6 +201,8 @@ and restore through that daemon's configured admin listener:
 slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path>... -m <message> --idempotency-key <retry-key> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning restore <tenant> <volume> <commit> <path> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning log <tenant> <volume> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning status <tenant> <volume> /projects --reference main --live
+slatefs -c /etc/slatefs/slatefs.toml versioning policy <tenant> <volume> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning diff <tenant> <volume> <from-commit> <to-commit> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning tag <tenant> <volume> <name> <commit> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning tags <tenant> <volume> --live
@@ -272,7 +274,7 @@ API content reads are paged with `offset` and `length` (1 MiB default, 4 MiB
 maximum) and return `total_size`, `eof`, and `next_offset`. Show, restore, and
 diff accept either a commit ID or an immutable tag name.
 
-`versioning status <tenant> <volume> [--live]` also reports the current or most
+`versioning policy <tenant> <volume> [--live]` also reports the current or most
 recent repository lease, including owner UUID, operation, expiry, and whether
 it is expired. Use this before diagnosing a `409` conflict or removing an
 orphaned local lease.

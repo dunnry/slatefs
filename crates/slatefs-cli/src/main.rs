@@ -19,7 +19,8 @@ use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{
     VersionBranchInfo, VersionBranchResetInfo, VersionCommitInfo, VersionMergeConflictStrategy,
     VersionMergeInfo, VersionMergePreview, VersionPathChangeKind, VersionRepository,
-    VersionTagInfo, force_break_expired_version_maintenance_lease, purge_version_history,
+    VersionTagInfo, VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
+    force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease,
 };
 use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
@@ -324,10 +325,23 @@ enum VersioningCmd {
         #[arg(long)]
         live: bool,
     },
-    /// Show whether versioning is enabled. This does not open a version store.
+    /// Show versioning policy and repository lease state.
+    Policy {
+        tenant: String,
+        volume: String,
+        #[arg(long)]
+        live: bool,
+    },
+    /// Compare a live subtree with a commit, tag, or branch.
     Status {
         tenant: String,
         volume: String,
+        /// Subtree to compare; defaults to all live and versioned paths.
+        #[arg(default_value = "/")]
+        path: String,
+        /// Commit, tag, or branch to compare against.
+        #[arg(long, default_value = "main")]
+        reference: String,
         #[arg(long)]
         live: bool,
     },
@@ -532,7 +546,7 @@ enum VersioningCmd {
     Unlock {
         tenant: String,
         volume: String,
-        /// Exact owner UUID reported by `versioning status`.
+        /// Exact owner UUID reported by `versioning policy`.
         #[arg(long)]
         owner: String,
         #[arg(long)]
@@ -1064,6 +1078,31 @@ fn version_change_label(change: VersionPathChangeKind) -> &'static str {
         VersionPathChangeKind::Modified => "modified",
         VersionPathChangeKind::Deleted => "deleted",
         _ => "unknown",
+    }
+}
+
+fn working_tree_change_label(change: VersionWorkingTreeChangeKind) -> &'static str {
+    match change {
+        VersionWorkingTreeChangeKind::Added => "added",
+        VersionWorkingTreeChangeKind::Modified => "modified",
+        VersionWorkingTreeChangeKind::Deleted => "deleted",
+        VersionWorkingTreeChangeKind::TypeChanged => "type-changed",
+    }
+}
+
+fn print_working_tree_status(status: &VersionWorkingTreeStatus) {
+    println!("reference {}\t{}", status.reference(), status.commit());
+    println!("root {}", status.root());
+    if status.is_clean() {
+        println!("clean");
+        return;
+    }
+    for change in status.changes() {
+        println!(
+            "{}\t{}",
+            working_tree_change_label(change.change()),
+            change.path()
+        );
     }
 }
 
@@ -2115,7 +2154,7 @@ async fn run(
                 policy.tenant, policy.volume
             );
         }
-        Command::Versioning(VersioningCmd::Status {
+        Command::Versioning(VersioningCmd::Policy {
             tenant,
             volume,
             live,
@@ -2185,6 +2224,47 @@ async fn run(
                 }
                 None => println!("lease:       none"),
             }
+        }
+        Command::Versioning(VersioningCmd::Status {
+            tenant,
+            volume: volume_name,
+            path,
+            reference,
+            live,
+        }) => {
+            if *live {
+                let query = vec![("reference", reference.clone()), ("path", path.clone())];
+                let response = live_versioning_json(
+                    config,
+                    tenant,
+                    volume_name,
+                    "GET",
+                    "status",
+                    &query,
+                    None,
+                )
+                .await?;
+                let status: VersionWorkingTreeStatus =
+                    serde_json::from_value(response["status"].clone())
+                        .context("parsing admin working tree status")?;
+                print_working_tree_status(&status);
+                return Ok(());
+            }
+            let repository =
+                VersionRepository::open(control, Arc::clone(&object_store), tenant, volume_name)
+                    .await?;
+            let record = control.get_mountable_volume(tenant, volume_name).await?;
+            let dek = control.unwrap_volume_dek(&record).await?;
+            let live = volume::Volume::open(&record, dek, Arc::clone(&object_store)).await?;
+            let result = repository
+                .working_tree_status(live.as_ref(), reference, path)
+                .await;
+            let live_close = live.shutdown().await;
+            let repository_close = repository.close().await;
+            let status = result?;
+            live_close?;
+            repository_close?;
+            print_working_tree_status(&status);
         }
         Command::Versioning(VersioningCmd::Commit {
             tenant,
@@ -3939,6 +4019,42 @@ mod tests {
 
     #[test]
     fn parses_live_versioning_lifecycle_flags() {
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "policy",
+            "tenant-a",
+            "docs",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::Policy { live: true, .. })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "status",
+            "tenant-a",
+            "docs",
+            "/projects",
+            "--reference",
+            "draft",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::Status {
+                path,
+                reference,
+                live: true,
+                ..
+            }) if path == "/projects" && reference == "draft"
+        ));
+
         let cli = Cli::try_parse_from([
             "slatefs",
             "versioning",

@@ -2184,6 +2184,39 @@ async fn get_versioning_response(
     ))
 }
 
+async fn get_working_tree_status_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let reference = request
+        .query
+        .get("reference")
+        .map(String::as_str)
+        .unwrap_or("main");
+    let path = request.query.get("path").map(String::as_str).unwrap_or("/");
+    let target = live_filesystem_target(state, tenant, volume)?;
+    target
+        .validate_writer_lease()
+        .await
+        .map_err(|error| live_version_error(&target, tenant, volume, error))?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository
+        .working_tree_status(target.as_ref(), reference, path)
+        .await;
+    let writer_validation = target.validate_writer_lease().await;
+    let repository_close = repository.close().await;
+    let control_close = control.close().await;
+    let status = result.map_err(|error| live_version_error(&target, tenant, volume, error))?;
+    writer_validation.map_err(|error| live_version_error(&target, tenant, volume, error))?;
+    repository_close.map_err(core_error)?;
+    control_close.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(200, json!({ "status": status })))
+}
+
 async fn patch_versioning_response(
     state: &AdminState,
     request: &AdminHttpRequest,
@@ -4129,6 +4162,19 @@ async fn route_admin_request(
                 "versioning",
             ],
         ) => patch_versioning_response(state, request, tenant, volume).await,
+        (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "status",
+            ],
+        ) => get_working_tree_status_response(state, request, tenant, volume).await,
         (
             "GET",
             [
@@ -7370,6 +7416,15 @@ mod tests {
         let diff: Value = serde_json::from_str(response_body(&diff_response)).unwrap();
         assert_eq!(diff["changes"], serde_json::json!([]));
         assert!(diff["next_page_token"].is_null());
+        let status_response = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning/status?reference=main&path=/notes.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&status_response), 200, "{status_response}");
+        let status: Value = serde_json::from_str(response_body(&status_response)).unwrap();
+        assert_eq!(status["status"]["commit"], commit_id);
+        assert_eq!(status["status"]["changes"], json!([]));
         let tag_body = format!(r#"{{"name":"baseline","commit":"{commit_id}"}}"#);
         let tag_request = format!(
             "POST /admin/v1/tenants/t/volumes/v/versioning/tags HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -7438,6 +7493,15 @@ mod tests {
             .write(&creds, file.ino, 0, b"branch update")
             .await
             .unwrap();
+        let status_response = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning/status?reference=main&path=/notes.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&status_response), 200, "{status_response}");
+        let status: Value = serde_json::from_str(response_body(&status_response)).unwrap();
+        assert_eq!(status["status"]["changes"][0]["path"], "/notes.txt");
+        assert_eq!(status["status"]["changes"][0]["change"], "modified");
         let branch_commit_body =
             r#"{"path":"/notes.txt","message":"release update","branch":"release"}"#;
         let branch_commit_request = format!(
