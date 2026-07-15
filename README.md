@@ -158,7 +158,7 @@ immutable names for important commits. `versioning branch`, `branches`, and
 where a commit or tag is accepted. `commit --branch <name>` advances an
 existing branch instead of `main`, and `log --branch <name>` follows that
 branch's history. `protect-branch` durably blocks reset, deletion, and reflog
-recovery while continuing to allow ordinary commits and merges;
+recovery;
 repeatable `--allow-committer <identity>` arguments can restrict those
 publications to exact committer identities. An empty allowlist permits any
 committer. Repeatable `--allow-manager <identity>` arguments independently
@@ -168,7 +168,28 @@ durably audited with both identity lists. Denied protected-branch commits and
 merges also record their server-derived author/committer and target metadata,
 and rejected reset, delete, recovery, and protected-history purge attempts are
 recorded as denied maintenance actions. Audits never contain messages, file
-contents, or bearer tokens.
+contents, signatures, or bearer tokens.
+
+Commit attestations are a second, independently opt-in layer. Generate an
+Ed25519 key pair with
+`versioning attestation-keygen --out <private.key> --public-out <public.key>`.
+`versioning attest <tenant> <volume>
+<commit-or-ref> --key-id <name> --key-file <private.key>` signs a canonical
+statement containing the tenant, volume, commit ID, key ID, algorithm, public
+key, and timestamp; the private key remains in the CLI process and never
+enters SlateFS. `versioning attestations ... --trusted-public-key <public.key>`
+independently verifies every returned signature against the resolved commit and
+requires at least one from that exact public key. Add `--live` to sign or
+inspect through `slatefsd`.
+
+A protected branch can additionally trust one or more exact signer keys with
+repeatable `--trust-attestation-key <key-id>=<public.key>`. Enabling that rule
+requires the branch's current head to be signed already. New work is committed
+on an unprotected candidate branch, attested, and then fast-forwarded into the
+protected branch. Unsigned direct commits, unsigned fast-forwards, and newly
+created unsigned merge commits are rejected. An empty trusted-key list keeps
+signature enforcement disabled.
+
 `unprotect-branch --yes` removes that guard. `versioning reflog <branch>` lists
 the newest 100 head
 transitions even after branch deletion. Every create, commit, fast-forward,
@@ -225,12 +246,14 @@ and `--dry-run` reports first; `versioning stats` reports logical usage.
 Tags and branch heads pin their commit and Prolly tree through both automatic
 and explicit GC until the reference is deleted. `show`, `restore`, and `diff`
 accept a commit ID, tag name, or branch name.
-`versioning verify` checks the reachable commit DAG and reads every
-referenced Prolly node and content blob.
+`versioning verify` checks the reachable commit DAG, every detached
+attestation and protected-branch trust rule, and every referenced Prolly node
+and content blob.
 `versioning purge --yes` permanently removes the physical history prefix while
 leaving versioning enabled for a fresh next commit. Protected branches block
-purge until their guards are explicitly removed. Commit, restore, retention,
-GC, and purge actions emit durable audit records, and live daemon operations
+purge until their guards are explicitly removed. Commit, attestation, restore,
+retention, GC, and purge actions emit durable audit records, and live daemon
+operations
 increment `slatefs_version_operations_total{tenant,volume,operation}`. An
 automatic collection uses the `gc-auto` operation label. Protected-operation
 rejections increment
@@ -317,7 +340,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | List branch heads, including `main`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/reflog` | List up to 100 retained head transitions, newest first, including deleted branches; optional `limit`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | Create a branch from `{"name":"...","commit":"commit-or-ref"}`. |
-| `PUT` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/protection` | Protect a branch from reset, deletion, and reflog recovery with `{"allowed_committers":["tenant:acme"],"allowed_managers":["admin-token"]}`; empty lists leave publication or policy management unrestricted. |
+| `PUT` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/protection` | Protect a branch with optional `allowed_committers`, `allowed_managers`, and `trusted_attestation_keys` objects containing `key_id`, `algorithm`, and `public_key`; a non-empty trusted-key list requires signed publication. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/protection` | Remove destructive-ref protection from a branch. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}` | Delete a non-main branch without deleting its commit immediately. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/reset` | Compare-and-swap an existing branch, including `main`, to `{"commit":"commit-or-ref"}`. |
@@ -325,10 +348,12 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{target}/merge` | Fast-forward or three-way merge a target from `{"source":"...","conflict_strategy":"fail|ours|theirs","author":"..."}`; strategy defaults to `fail`, author defaults to the server-derived committer, and conflicts return `409`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{target}/merge?source=` | Preview ancestry and logical-path conflicts without moving either branch. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"...","author":"...","idempotency_key":"...","branch":"main"}`; author, retry key, and branch are optional and singular `path` remains accepted. The response includes hash-bound `provenance`. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit-or-ref}/attestations` | Verify and immutably attach a detached Ed25519 attestation. Reposting the identical record is idempotent. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit-or-ref}/attestations` | List detached commit attestations ordered by key ID. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit-or-tag}/content?path=&offset=&length=` | Read a bounded file or symlink range as base64 JSON; defaults to 1 MiB and rejects ranges over 4 MiB. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore` | Apply a current preview through the live writer from `{"commit":"...","path":"...","mode":"overlay|exact","token":"..."}`; stale tokens return `409`. |
-| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/stats` | Logical history bytes, nodes, blobs, and commits. |
-| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/verify` | Verify the reachable commit DAG, Prolly nodes, and content blobs. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/stats` | Logical history bytes, nodes, blobs, commits, and attestations. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/verify` | Verify the reachable commit DAG, attestations, branch trust rules, Prolly nodes, and content blobs. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Current history retention and quota policy. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Set `keep_last`, `max_age_secs`, and/or `max_bytes`, or `{"clear":true}`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/gc` | Apply retention, or report with `{"dry_run":true}`. |

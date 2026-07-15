@@ -81,7 +81,13 @@ server request while permitting a distinct claimed author; authenticated
 requests use their principal and permitted unauthenticated loopback requests
 use an explicit committer marker. Offline CLI commits require an explicit
 author and use it as committer.
-Additional named branch
+Detached Ed25519 attestations sign a canonical statement containing the
+repository identity, commit ID, key identity, public key, and timestamp. They
+are immutable side records keyed by commit ID and key ID, so signatures do not
+create a circular dependency in the content-addressed commit. SlateFS verifies
+each signature before storage and during repository verification; private keys
+remain client-side. Attestations follow their commit through quota accounting
+and garbage collection. Additional named branch
 references can point to any existing commit, tag, or branch and can be used by
 read, restore, diff, and history operations. Commits advance `main` by default
 or an existing named branch when selected explicitly. Publishing a commit and
@@ -99,12 +105,18 @@ available because they retain the protected head in their ancestry. Protection
 may also carry an exact committer allowlist. Publication authorization is
 checked under the ref lock against hash-bound commit provenance for ordinary
 and divergent commits, and against the merge request provenance before a
-fast-forward. A separate exact manager allowlist controls live changes to the
-protection record itself, with authorization checked under the same ref lock
-against the existing policy. Empty publisher or manager allowlists leave that
+fast-forward. Protection may also contain exact trusted `(key ID, algorithm,
+public key)` tuples. Enabling signer enforcement requires the existing head to
+have a matching valid attestation. Subsequent publications check the candidate
+commit under the ref lock; this permits pre-attested fast-forwards and rejects
+direct unsigned commits, unsigned fast-forwards, and unsigned merge commits.
+A separate exact manager allowlist controls live changes to the protection
+record itself, with authorization checked under the same ref lock against the
+existing policy. Empty publisher, manager, or trusted-key lists leave that
 operation unrestricted. Offline repository access is the administrative
 recovery boundary. The live control plane durably audits successful and denied
-policy changes with the requested identity lists and server-derived actor; it
+policy changes with the requested identity and trusted-key ID lists and
+server-derived actor; it
 also audits publication denials with branch, path or merge metadata, author,
 and committer. Protected reset, delete, reflog recovery, and history-purge
 denials are audited with their requested target metadata. Audit records do not

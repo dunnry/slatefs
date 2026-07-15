@@ -1,6 +1,6 @@
 # SlateFS Security Review
 
-Date: 2026-06-13
+Date: 2026-07-14
 
 Scope: current pre-GA SlateFS codebase, including the control plane, encrypted
 volume format, NFSv3 and 9P frontends, metrics/alerts, and operational docs.
@@ -18,7 +18,8 @@ or behavior changes are preferred until a GA contract exists.
 | Control/volume isolation | One SlateDB per volume; per-volume DEK and cache namespace. | `store::volume_db_path`; `VolumeCaches` |
 | NFS handle integrity | File handles include `{fsid, ino, generation}` and HMAC verification rejects forged or foreign handles. | `slatefs-nfs/src/fh.rs` tests |
 | 9P transport protection | 9P listeners can be rustls-wrapped with `p9_tls_cert`/`p9_tls_key`; source allowlists run before TLS handshakes. | `p9_tls_end_to_end`; config validation tests |
-| Daemon admin surface | Optional admin listener is config-validated to loopback and currently exposes live-writer snapshot creation only. | `admin_listener_must_be_loopback`; `admin_snapshot_endpoint_creates_live_checkpoint` |
+| Daemon admin surface | Optional admin listener is config-validated for loopback or authenticated TLS/bearer operation; tenant credentials are scoped to their tenant. | Admin auth and tenant-isolation integration tests. |
+| Version commit authenticity | Optional detached Ed25519 attestations bind repository identity, commit ID, key ID, public key, and timestamp. Protected branches may require an exact trusted key before fast-forward publication; private keys remain client-side. | `detached_commit_attestations_are_optional_immutable_and_verified`; live admin versioning integration test. |
 | Single-writer safety | SlateDB fencing marks stale volumes dead and drops daemon exports. | `fenced_writer_marks_volume_dead`; failover drill |
 | Quota and deletion safety | Quota counters are committed with mutations; tenant/volume delete drops wrapped keys before deleting prefixes. | `quota` tests; control-plane delete paths |
 | Operator visibility | Prometheus rules cover fenced volumes, degraded writable volumes, missing scrapes, block decode failures, and denied protected-version operations; Grafana surfaces core liveness and storage signals. | `monitoring/` |
@@ -30,7 +31,7 @@ or behavior changes are preferred until a GA contract exists.
 | SR-1 | Medium | Plaintext 9P exports remain available for Linux kernel v9fs and still carry tenant bearer tokens in-band. A token holder is the tenant boundary and may assert any uid inside that tenant's 9P connection. | Use rustls-wrapped 9P for TLS-capable clients/sidecars. Keep plaintext kernel v9fs exports behind tenant network isolation or an external TLS tunnel. |
 | SR-2 | Medium | NFSv3 AUTH_SYS identities are unauthenticated uid/gid assertions. | Accepted by DD-10. Use per-export source allowlists, squash policy, and network isolation. |
 | SR-3 | Low | Xattr names are plaintext key suffixes and can appear in SST first/last-key metadata. Xattr values are encrypted. | Documented v1 exception. Future hardening can SIV-encrypt xattr names like filenames. |
-| SR-4 | Low | Object-store rollback/history replay is out of scope; SlateDB fencing protects live single-writer integrity, not malicious bucket rollback. | Documented out of scope. Use bucket versioning, object lock, audit logs, and cloud IAM controls in production. |
+| SR-4 | Low | Object-store rollback/history replay is out of scope; SlateDB fencing and commit attestations protect integrity/authenticity of observed state but cannot detect replay of an older internally valid repository snapshot. | Use bucket versioning, object lock, external audit-log retention, and cloud IAM controls in production. |
 | SR-5 | Low | `slatefs_block_decode_failures_total` covers served writable volumes and snapshot exports. Control-plane decode failures still fail closed and log, but are not counted by that per-volume metric. | Accept for current Phase 6 alerting. Revisit when control-plane metrics targets are added. |
 
 ## Verification Run

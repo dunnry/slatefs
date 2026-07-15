@@ -219,6 +219,9 @@ slatefs -c /etc/slatefs/slatefs.toml versioning reset-branch <tenant> <volume> <
 slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path>... -m <message> --author <content-author> --branch <name> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning log <tenant> <volume> --branch <name> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning inspect <tenant> <volume> <commit-or-ref> --live
+slatefs versioning attestation-keygen --out release.key --public-out release.pub
+slatefs -c /etc/slatefs/slatefs.toml versioning attest <tenant> <volume> <commit-or-ref> --key-id release-2026 --key-file release.key --live
+slatefs -c /etc/slatefs/slatefs.toml versioning attestations <tenant> <volume> <commit-or-ref> --trusted-public-key release.pub --live
 slatefs -c /etc/slatefs/slatefs.toml versioning merge <tenant> <volume> <source> <target> --author <content-author> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning merge <tenant> <volume> <source> <target> --conflict-strategy ours --live
 slatefs -c /etc/slatefs/slatefs.toml versioning merge-preview <tenant> <volume> <source> <target> --live
@@ -228,6 +231,31 @@ slatefs -c /etc/slatefs/slatefs.toml versioning gc <tenant> <volume> --dry-run -
 slatefs -c /etc/slatefs/slatefs.toml versioning stats <tenant> <volume> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning verify <tenant> <volume> --live
 ```
+
+Attestation is optional and client-side: `slatefsd` receives the public key and
+signature, never `release.key`. The signed statement binds the tenant, volume,
+resolved commit ID, key ID, algorithm, public key, and timestamp. The
+`attestations --trusted-public-key` command independently verifies each
+returned signature against the resolved commit and fails unless that exact
+public key signed it.
+
+To require a signer on a protected branch, first attest its current head, then
+configure the trust anchor:
+
+```sh
+slatefs -c /etc/slatefs/slatefs.toml versioning protect-branch <tenant> <volume> main --trust-attestation-key release-2026=release.pub --allow-manager <admin-principal> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning branch <tenant> <volume> candidate main --live
+slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path>... -m <message> --branch candidate --live
+slatefs -c /etc/slatefs/slatefs.toml versioning attest <tenant> <volume> candidate --key-id release-2026 --key-file release.key --live
+slatefs -c /etc/slatefs/slatefs.toml versioning merge <tenant> <volume> candidate main --live
+```
+
+The final merge must be a fast-forward from the still-current protected head.
+Direct commits and unsigned candidates are rejected. A divergent merge would
+create a new, unsigned merge commit and is therefore rejected; create a fresh
+candidate from the new protected head instead. Removing all trusted keys by
+updating protection disables signature enforcement, while `unprotect-branch`
+removes the entire destructive-ref guard.
 
 Merge conflicts fail without moving either branch by default. After reviewing
 `merge-preview`, use `--conflict-strategy ours` to keep each conflicting path
