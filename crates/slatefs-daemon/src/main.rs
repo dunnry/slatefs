@@ -1067,6 +1067,8 @@ struct VersionBranchProtectionRequest {
     allowed_managers: Vec<String>,
     #[serde(default)]
     trusted_attestation_keys: Vec<VersionTrustedAttestationKey>,
+    #[serde(default)]
+    required_attestations: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2887,16 +2889,20 @@ async fn set_version_branch_protection_response(
     name: &str,
     protected: bool,
 ) -> Result<AdminHttpResponse, AdminError> {
-    let (allowed_committers, allowed_managers, trusted_attestation_keys) = if protected {
-        let policy = parse_json_body::<VersionBranchProtectionRequest>(request)?;
-        (
-            policy.allowed_committers,
-            policy.allowed_managers,
-            policy.trusted_attestation_keys,
-        )
-    } else {
-        (Vec::new(), Vec::new(), Vec::new())
-    };
+    let (allowed_committers, allowed_managers, trusted_attestation_keys, required_attestations) =
+        if protected {
+            let policy = parse_json_body::<VersionBranchProtectionRequest>(request)?;
+            (
+                policy.allowed_committers,
+                policy.allowed_managers,
+                policy.trusted_attestation_keys,
+                policy.required_attestations,
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Some(0))
+        };
+    let required_attestations =
+        required_attestations.unwrap_or(u32::from(!trusted_attestation_keys.is_empty()));
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
     let (control, repository) = open_version_repository(state, tenant, volume).await?;
@@ -2904,11 +2910,7 @@ async fn set_version_branch_protection_response(
         &allowed_committers,
         &allowed_managers,
         &trusted_attestation_keys,
-        if trusted_attestation_keys.is_empty() {
-            0
-        } else {
-            1
-        },
+        required_attestations,
     )
     .map_err(core_error)?;
     let result = repository
@@ -2929,6 +2931,7 @@ async fn set_version_branch_protection_response(
                     branch.allowed_committers(),
                     branch.allowed_managers(),
                     branch.trusted_attestation_keys(),
+                    branch.required_attestations(),
                 ),
             )
             .await
@@ -2952,6 +2955,7 @@ async fn set_version_branch_protection_response(
                     &allowed_committers,
                     &allowed_managers,
                     &trusted_attestation_keys,
+                    required_attestations,
                 ),
             )
             .await
@@ -4022,6 +4026,7 @@ fn version_branch_policy_audit_details(
     allowed_committers: &[String],
     allowed_managers: &[String],
     trusted_attestation_keys: &[VersionTrustedAttestationKey],
+    required_attestations: u32,
 ) -> Vec<(String, AuditDetailValue)> {
     let identities = |values: &[String]| {
         AuditDetailValue::Array(
@@ -4062,6 +4067,10 @@ fn version_branch_policy_audit_details(
                     .map(|key| AuditDetailValue::String(key.key_id().to_string()))
                     .collect(),
             ),
+        ),
+        (
+            "required_attestations".to_string(),
+            AuditDetailValue::U64(u64::from(required_attestations)),
         ),
     ]
 }
@@ -8435,6 +8444,7 @@ mod tests {
                 "algorithm": "ed25519",
                 "public_key": public_key,
             }],
+            "required_attestations": 1,
         })
         .to_string();
         let protect_request = format!(
@@ -8462,6 +8472,7 @@ mod tests {
             protected["branch"]["trusted_attestation_keys"][0]["key_id"],
             "release-2026"
         );
+        assert_eq!(protected["branch"]["required_attestations"], 1);
         let denied_policy_request = AdminHttpRequest {
             method: "DELETE".to_string(),
             path: "/admin/v1/tenants/t/volumes/v/versioning/branches/release/protection"
@@ -9141,6 +9152,10 @@ mod tests {
                     Some(&AuditDetailValue::Array(vec![AuditDetailValue::String(
                         "release-2026".to_string()
                     )]))
+                );
+                assert_eq!(
+                    protected.details.get("required_attestations"),
+                    Some(&AuditDetailValue::U64(1))
                 );
                 let denied = records
                     .iter()

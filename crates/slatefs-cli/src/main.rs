@@ -525,6 +525,9 @@ enum VersioningCmd {
         /// Trusted signer as KEY_ID=PUBLIC_KEY_FILE; repeatable. Non-empty requires signed publication.
         #[arg(long = "trust-attestation-key", value_parser = parse_trusted_attestation_key)]
         trusted_attestation_keys: Vec<VersionTrustedAttestationKey>,
+        /// Number of distinct trusted signatures required for publication. Defaults to 1 when keys are configured.
+        #[arg(long = "require-attestations")]
+        required_attestations: Option<u32>,
         #[arg(long)]
         live: bool,
     },
@@ -1321,6 +1324,9 @@ fn print_version_branch(branch: &VersionBranchInfo) {
             key.key_id(),
             hex::encode(key.public_key())
         );
+    }
+    if branch.protected() {
+        println!("required_attestations {}", branch.required_attestations());
     }
 }
 
@@ -3408,8 +3414,11 @@ async fn run(
             allowed_committers,
             allowed_managers,
             trusted_attestation_keys,
+            required_attestations,
             live,
         }) => {
+            let required_attestations =
+                required_attestations.unwrap_or(u32::from(!trusted_attestation_keys.is_empty()));
             if *live {
                 let endpoint = format!("branches/{name}/protection");
                 let response = live_versioning_json(
@@ -3423,6 +3432,7 @@ async fn run(
                         "allowed_committers": allowed_committers,
                         "allowed_managers": allowed_managers,
                         "trusted_attestation_keys": trusted_attestation_keys,
+                        "required_attestations": required_attestations,
                     })),
                 )
                 .await?;
@@ -3436,11 +3446,7 @@ async fn run(
                 allowed_committers,
                 allowed_managers,
                 trusted_attestation_keys,
-                if trusted_attestation_keys.is_empty() {
-                    0
-                } else {
-                    1
-                },
+                required_attestations,
             )?;
             let result = repository.set_branch_protected(name, true, &policy).await;
             let repository_close = repository.close().await;
@@ -3469,6 +3475,10 @@ async fn run(
                                 .map(|key| AuditDetailValue::String(key.key_id().to_string()))
                                 .collect(),
                         ),
+                    ),
+                    (
+                        "required_attestations".to_string(),
+                        AuditDetailValue::U64(u64::from(branch.required_attestations())),
                     ),
                 ],
             )
@@ -5110,12 +5120,15 @@ mod tests {
             "release",
             "--trust-attestation-key",
             trusted.as_str(),
+            "--require-attestations",
+            "1",
         ])
         .unwrap();
         assert!(matches!(
             cli.command,
             Command::Versioning(VersioningCmd::ProtectBranch {
                 trusted_attestation_keys,
+                required_attestations: Some(1),
                 ..
             }) if trusted_attestation_keys.len() == 1
                 && trusted_attestation_keys[0].key_id() == "release-2026"
