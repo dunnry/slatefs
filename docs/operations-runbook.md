@@ -199,7 +199,7 @@ and restore through that daemon's configured admin listener:
 
 ```sh
 slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path>... -m <message> --idempotency-key <retry-key> --live
-slatefs -c /etc/slatefs/slatefs.toml versioning restore <tenant> <volume> <commit> <path> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning restore <tenant> <volume> <commit> <path> --mode overlay --token <preview-token> --yes --live
 slatefs -c /etc/slatefs/slatefs.toml versioning log <tenant> <volume> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning status <tenant> <volume> /projects --reference main --live
 slatefs -c /etc/slatefs/slatefs.toml versioning restore-preview <tenant> <volume> main /projects --mode exact --live
@@ -230,6 +230,12 @@ Merge conflicts fail without moving either branch by default. After reviewing
 from the target or `--conflict-strategy theirs` to keep it from the source.
 Resolution is applied to the complete logical path, while non-conflicting
 changes from both branches are still merged.
+
+`restore-preview` prints a token after the plan. Pass it unchanged to
+`restore --token`; a `409` means the branch, plan, or live subtree changed and
+the preview must be regenerated. Exact mode deletes live-only paths and
+therefore requires `--yes`. Multi-path restore is not globally atomic, so
+schedule exact subtree restores during a client write quiescence window.
 
 The CLI supplies the matching `[admin.tenant_tokens]` credential when present,
 otherwise `admin.token` or `admin.token_file`, as a bearer token. Tenant tokens

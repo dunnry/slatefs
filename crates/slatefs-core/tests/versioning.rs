@@ -444,6 +444,44 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         exact.actions()[0].action(),
         VersionRestoreActionKind::Delete
     );
+    live.write(&creds, feature_file.ino, 0, b"changed after preview")
+        .await
+        .unwrap();
+    let stale = repository
+        .apply_restore(
+            live.as_ref(),
+            "draft",
+            "/",
+            VersionRestoreMode::Exact,
+            exact.token(),
+        )
+        .await
+        .unwrap_err();
+    assert!(stale.to_string().contains("restore preview is stale"));
+    let exact = repository
+        .preview_restore(live.as_ref(), "draft", "/", VersionRestoreMode::Exact)
+        .await
+        .unwrap();
+    let applied = repository
+        .apply_restore(
+            live.as_ref(),
+            "draft",
+            "/",
+            VersionRestoreMode::Exact,
+            exact.token(),
+        )
+        .await
+        .unwrap();
+    assert!(!applied.atomic());
+    assert_eq!(applied.actions(), exact.actions());
+    assert!(live.lookup(&creds, ROOT_INO, b"feature.txt").await.is_err());
+    assert!(
+        repository
+            .working_tree_status(live.as_ref(), "draft", "/")
+            .await
+            .unwrap()
+            .is_clean()
+    );
     let verified = repository.verify().await.unwrap();
     assert_eq!(verified.commits, 7);
     assert!(verified.nodes > 0);

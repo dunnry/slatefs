@@ -110,9 +110,13 @@ comparison, but concurrent client writes may still make any status result
 immediately stale.
 Restore preview maps the same status into filesystem actions. Overlay mode
 plans creates and replacements while preserving live-only paths. Exact mode
-also plans deletion of live-only paths. Preview is read-only and does not yet
-act as an apply token; destructive exact restore remains a separate future
-operation.
+also plans deletion of live-only paths. Its token binds the immutable commit,
+canonical root, mode, actions, and a bounded SHA-256 fingerprint of live
+metadata and contents. Apply recomputes the plan and rejects a stale token
+before mutation. Deletes run deepest-first and file replacements use temporary
+entries plus rename. The version-operation lock serializes applies, but NFS/9P
+clients are not frozen and the VFS has no multi-path transaction, so a subtree
+restore is explicitly not globally atomic.
 An unbounded GC retains the full reachable DAG; bounded retention evaluates
 first-parent history per branch and may prune older secondary ancestry.
 

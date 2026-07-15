@@ -19,8 +19,8 @@ use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{
     VersionBranchInfo, VersionBranchResetInfo, VersionCommitInfo, VersionMergeConflictStrategy,
     VersionMergeInfo, VersionMergePreview, VersionPathChangeKind, VersionRepository,
-    VersionRestoreActionKind, VersionRestoreMode, VersionRestorePreview, VersionTagInfo,
-    VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
+    VersionRestoreActionKind, VersionRestoreApplyInfo, VersionRestoreMode, VersionRestorePreview,
+    VersionTagInfo, VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
     force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease,
 };
@@ -512,6 +512,14 @@ enum VersioningCmd {
         volume: String,
         commit: String,
         path: String,
+        #[arg(long, default_value = "overlay", value_parser = parse_version_restore_mode)]
+        mode: VersionRestoreMode,
+        /// Token returned by `restore-preview` for the same commit, path, and mode.
+        #[arg(long)]
+        token: String,
+        /// Confirm the potentially destructive restore.
+        #[arg(long)]
+        yes: bool,
         /// Ask the serving slatefsd admin endpoint to use its active writer.
         #[arg(long)]
         live: bool,
@@ -1138,6 +1146,7 @@ fn print_restore_preview(preview: &VersionRestorePreview) {
     println!("reference {}\t{}", preview.reference(), preview.commit());
     println!("root {}", preview.root());
     println!("mode {}", preview.mode().as_str());
+    println!("token {}", preview.token());
     if preview.is_clean() {
         println!("clean");
         return;
@@ -1149,6 +1158,14 @@ fn print_restore_preview(preview: &VersionRestorePreview) {
             action.path()
         );
     }
+}
+
+fn print_restore_apply(applied: &VersionRestoreApplyInfo) {
+    println!("restored {} from {}", applied.root(), applied.commit());
+    println!("reference {}", applied.reference());
+    println!("mode {}", applied.mode().as_str());
+    println!("actions {}", applied.actions().len());
+    println!("atomic {}", applied.atomic());
 }
 
 fn print_version_tag(tag: &VersionTagInfo) {
@@ -3020,18 +3037,32 @@ async fn run(
             volume: volume_name,
             commit,
             path,
+            mode,
+            token,
+            yes,
             live,
         }) => {
+            if !yes {
+                anyhow::bail!("applying a restore requires --yes");
+            }
             if *live {
-                post_live_versioning_json(
+                let response = post_live_versioning_json(
                     config,
                     tenant,
                     volume_name,
                     "restore",
-                    serde_json::json!({ "commit": commit, "path": path }),
+                    serde_json::json!({
+                        "commit": commit,
+                        "path": path,
+                        "mode": mode,
+                        "token": token,
+                    }),
                 )
                 .await?;
-                println!("restored {path} from {commit}");
+                let applied: VersionRestoreApplyInfo =
+                    serde_json::from_value(response["restored"].clone())
+                        .context("parsing applied restore")?;
+                print_restore_apply(&applied);
                 return Ok(());
             }
             let repository =
@@ -3040,10 +3071,12 @@ async fn run(
             let record = control.get_mountable_volume(tenant, volume_name).await?;
             let dek = control.unwrap_volume_dek(&record).await?;
             let live = volume::Volume::open(&record, dek, Arc::clone(&object_store)).await?;
-            let restore = repository.restore_file(live.as_ref(), commit, path).await;
+            let restore = repository
+                .apply_restore(live.as_ref(), commit, path, *mode, token)
+                .await;
             let live_close = live.shutdown().await;
             let repository_close = repository.close().await;
-            restore?;
+            let applied = restore?;
             live_close?;
             repository_close?;
             append_cli_version_audit(
@@ -3057,7 +3090,7 @@ async fn run(
                 )],
             )
             .await?;
-            println!("restored {path} from {commit}");
+            print_restore_apply(&applied);
         }
         Command::Versioning(VersioningCmd::Retention {
             tenant,
@@ -4166,6 +4199,33 @@ mod tests {
                 live: true,
                 ..
             })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "restore",
+            "tenant-a",
+            "docs",
+            "baseline",
+            "/projects",
+            "--mode",
+            "exact",
+            "--token",
+            "preview-token",
+            "--yes",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::Restore {
+                mode: VersionRestoreMode::Exact,
+                token,
+                yes: true,
+                live: true,
+                ..
+            }) if token == "preview-token"
         ));
 
         let cli = Cli::try_parse_from([

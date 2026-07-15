@@ -168,8 +168,11 @@ working tree with versioned metadata and bounded file contents, reporting
 added, modified, deleted, and type-changed paths without writing either side.
 `versioning restore-preview <commit-or-ref> <path> --mode overlay|exact`
 translates that comparison into create, replace, and delete actions. Overlay
-preserves live-only paths; exact reports the deletions needed for an exact
-match but does not apply them.
+preserves live-only paths; exact includes the deletions needed for an exact
+match. The preview returns a token binding the resolved commit, plan, and live
+subtree fingerprint. `versioning restore` requires that token and `--yes`, and
+rejects stale plans before mutation. File replacements are staged atomically;
+multi-path restores are serialized but not globally atomic.
 `versioning policy` reports opt-in and repository-lease state.
 Show and restore stream versioned data in bounded chunks rather than loading a
 complete large file into memory.
@@ -290,7 +293,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{target}/merge?source=` | Preview ancestry and logical-path conflicts without moving either branch. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"...","idempotency_key":"...","branch":"main"}`; retry key and branch are optional and singular `path` remains accepted. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit-or-tag}/content?path=&offset=&length=` | Read a bounded file or symlink range as base64 JSON; defaults to 1 MiB and rejects ranges over 4 MiB. |
-| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore` | Atomically restore one file through the live writer from a commit ID or tag in `{"commit":"...","path":"..."}`. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore` | Apply a current preview through the live writer from `{"commit":"...","path":"...","mode":"overlay|exact","token":"..."}`; stale tokens return `409`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/stats` | Logical history bytes, nodes, blobs, and commits. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/verify` | Verify the reachable commit DAG, Prolly nodes, and content blobs. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Current history retention and quota policy. |

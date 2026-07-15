@@ -987,6 +987,9 @@ impl VersionCommitRequest {
 struct VersionRestoreRequest {
     commit: String,
     path: String,
+    #[serde(default)]
+    mode: VersionRestoreMode,
+    token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1510,6 +1513,17 @@ fn core_error(error: slatefs_core::error::Error) -> AdminError {
 
 fn version_merge_error(error: slatefs_core::error::Error) -> AdminError {
     if matches!(&error, slatefs_core::error::Error::Versioning(message) if message.contains("merge conflict"))
+    {
+        return AdminError {
+            status: 409,
+            message: error.to_string(),
+        };
+    }
+    core_error(error)
+}
+
+fn version_restore_error(error: slatefs_core::error::Error) -> AdminError {
+    if matches!(&error, slatefs_core::error::Error::Versioning(message) if message.contains("restore preview is stale"))
     {
         return AdminError {
             status: 409,
@@ -2076,9 +2090,15 @@ async fn restore_live_version_response(
         };
 
     let restore = repository
-        .restore_file(target.as_ref(), &body.commit, &body.path)
+        .apply_restore(
+            target.as_ref(),
+            &body.commit,
+            &body.path,
+            body.mode,
+            &body.token,
+        )
         .await;
-    let audit = if restore.is_ok() {
+    let audit = if let Ok(applied) = &restore {
         append_version_audit(
             &control,
             request,
@@ -2094,6 +2114,14 @@ async fn restore_live_version_response(
                     "path".to_string(),
                     AuditDetailValue::String(body.path.clone()),
                 ),
+                (
+                    "mode".to_string(),
+                    AuditDetailValue::String(body.mode.as_str().to_string()),
+                ),
+                (
+                    "actions".to_string(),
+                    AuditDetailValue::U64(applied.actions().len() as u64),
+                ),
             ],
         )
         .await
@@ -2102,7 +2130,13 @@ async fn restore_live_version_response(
     };
     let repository_close = repository.close().await;
     let control_close = control.close().await;
-    restore.map_err(|error| live_version_error(&target, tenant, volume, error))?;
+    let applied = restore.map_err(|error| {
+        if target.is_dead() {
+            live_version_error(&target, tenant, volume, error)
+        } else {
+            version_restore_error(error)
+        }
+    })?;
     audit?;
     repository_close.map_err(core_error)?;
     control_close.map_err(core_error)?;
@@ -2110,15 +2144,7 @@ async fn restore_live_version_response(
         .export_metrics
         .version_operation(tenant, volume, "restore");
 
-    Ok(AdminHttpResponse::json(
-        200,
-        json!({
-            "restored": {
-                "commit": body.commit,
-                "path": body.path,
-            }
-        }),
-    ))
+    Ok(AdminHttpResponse::json(200, json!({ "restored": applied })))
 }
 
 fn version_retention_json(policy: Option<&VersioningRetentionPolicy>) -> Value {
@@ -6775,6 +6801,14 @@ mod tests {
         assert_eq!(error.status, 409);
     }
 
+    #[test]
+    fn stale_restore_preview_maps_to_conflict() {
+        let error = version_restore_error(slatefs_core::error::Error::Versioning(
+            "restore preview is stale; generate a new preview before applying".into(),
+        ));
+        assert_eq!(error.status, 409);
+    }
+
     fn create_opts() -> slatefs_core::volume::CreateVolumeOptions {
         slatefs_core::volume::CreateVolumeOptions {
             cipher: Cipher::Aes256Gcm,
@@ -7818,7 +7852,20 @@ mod tests {
             .write(&creds, file.ino, 0, b"changed data!")
             .await
             .unwrap();
-        let restore_body = format!(r#"{{"commit":"{commit_id}","path":"/notes.txt"}}"#);
+        let preview_request = format!(
+            "GET /admin/v1/tenants/t/volumes/v/versioning/restore-preview?commit={commit_id}&path=/notes.txt&mode=overlay HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        let preview_response = admin_exchange(Arc::clone(&state), preview_request.as_bytes()).await;
+        assert_eq!(
+            response_status(&preview_response),
+            200,
+            "{preview_response}"
+        );
+        let preview: Value = serde_json::from_str(response_body(&preview_response)).unwrap();
+        let restore_body = format!(
+            r#"{{"commit":"{commit_id}","path":"/notes.txt","mode":"overlay","token":"{}"}}"#,
+            preview["preview"]["token"].as_str().unwrap()
+        );
         let restore_request = format!(
             "POST /admin/v1/tenants/t/volumes/v/versioning/restore HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             restore_body.len(),

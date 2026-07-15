@@ -1313,6 +1313,7 @@ pub struct VersionRestorePreview {
     commit: String,
     root: String,
     mode: VersionRestoreMode,
+    token: String,
     actions: Vec<VersionRestoreAction>,
 }
 
@@ -1333,6 +1334,10 @@ impl VersionRestorePreview {
         self.mode
     }
 
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
     pub fn actions(&self) -> &[VersionRestoreAction] {
         &self.actions
     }
@@ -1340,6 +1345,59 @@ impl VersionRestorePreview {
     pub fn is_clean(&self) -> bool {
         self.actions.is_empty()
     }
+}
+
+/// Result of applying a token-guarded restore plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionRestoreApplyInfo {
+    reference: String,
+    commit: String,
+    root: String,
+    mode: VersionRestoreMode,
+    token: String,
+    actions: Vec<VersionRestoreAction>,
+    atomic: bool,
+}
+
+impl VersionRestoreApplyInfo {
+    pub fn reference(&self) -> &str {
+        &self.reference
+    }
+
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
+
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    pub fn mode(&self) -> VersionRestoreMode {
+        self.mode
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub fn actions(&self) -> &[VersionRestoreAction] {
+        &self.actions
+    }
+
+    pub fn atomic(&self) -> bool {
+        self.atomic
+    }
+}
+
+#[derive(Serialize)]
+struct VersionRestorePlanFingerprint<'a> {
+    version: u8,
+    commit: &'a str,
+    root: &'a str,
+    mode: VersionRestoreMode,
+    live_fingerprint: [u8; 32],
+    actions: &'a [VersionRestoreAction],
 }
 
 impl From<VersionCommit> for VersionCommitInfo {
@@ -2746,13 +2804,94 @@ impl VersionRepository {
                     action,
                 })
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let live_fingerprint = live_subtree_fingerprint(live, &status.root).await?;
+        let token = hex::encode(Sha256::digest(postcard::to_allocvec(
+            &VersionRestorePlanFingerprint {
+                version: 1,
+                commit: &status.commit,
+                root: &status.root,
+                mode,
+                live_fingerprint,
+                actions: &actions,
+            },
+        )?));
         Ok(VersionRestorePreview {
             reference: status.reference,
             commit: status.commit,
             root: status.root,
             mode,
+            token,
             actions,
+        })
+    }
+
+    /// Recompute and apply a restore preview only when its token still matches
+    /// the current live subtree. Individual file replacements are staged and
+    /// atomic, but a multi-path restore is not globally atomic.
+    pub async fn apply_restore(
+        &self,
+        live: &dyn Vfs,
+        reference: &str,
+        root: &str,
+        mode: VersionRestoreMode,
+        token: &str,
+    ) -> Result<VersionRestoreApplyInfo> {
+        let preview = self.preview_restore(live, reference, root, mode).await?;
+        if preview.token != token {
+            return Err(Error::Versioning(
+                "restore preview is stale; generate a new preview before applying".into(),
+            ));
+        }
+        let status = self
+            .working_tree_status(live, &preview.commit, &preview.root)
+            .await?;
+        let mut removals = preview
+            .actions
+            .iter()
+            .filter(|action| action.action == VersionRestoreActionKind::Delete)
+            .map(|action| action.path.clone())
+            .chain(
+                status
+                    .changes
+                    .iter()
+                    .filter(|change| change.change == VersionWorkingTreeChangeKind::TypeChanged)
+                    .map(|change| change.path.clone()),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        removals.sort_by(|left, right| {
+            path_components(right)
+                .len()
+                .cmp(&path_components(left).len())
+                .then_with(|| right.cmp(left))
+        });
+        for path in removals {
+            remove_live_subtree(live, &path).await?;
+        }
+        let restore_candidates = preview
+            .actions
+            .iter()
+            .filter(|action| action.action != VersionRestoreActionKind::Delete)
+            .map(|action| action.path.clone())
+            .collect::<Vec<_>>();
+        let restore_paths = if restore_candidates.is_empty() {
+            Vec::new()
+        } else {
+            canonicalize_path_set(&restore_candidates)?
+        };
+        for path in restore_paths {
+            self.restore_file(live, &preview.commit, &path).await?;
+        }
+        Ok(VersionRestoreApplyInfo {
+            reference: preview.reference,
+            commit: preview.commit,
+            root: preview.root,
+            mode: preview.mode,
+            token: preview.token,
+            actions: preview.actions,
+            atomic: false,
         })
     }
 
@@ -3332,6 +3471,83 @@ async fn scan_live_subtree(vfs: &dyn Vfs, root: &str) -> Result<BTreeMap<String,
         }
     }
     Ok(entries)
+}
+
+async fn live_subtree_fingerprint(vfs: &dyn Vfs, root: &str) -> Result<[u8; 32]> {
+    let entries = scan_live_subtree(vfs, root).await?;
+    let creds = Credentials::root();
+    let mut hash = Sha256::new();
+    hash.update([1]);
+    for (path, attr) in entries {
+        hash.update((path.len() as u64).to_be_bytes());
+        hash.update(path.as_bytes());
+        hash.update([file_kind_fingerprint(attr.kind)]);
+        hash.update(attr.mode.to_be_bytes());
+        hash.update(attr.uid.to_be_bytes());
+        hash.update(attr.gid.to_be_bytes());
+        hash.update(attr.size.to_be_bytes());
+        match attr.kind {
+            FileKind::File => {
+                let mut offset = 0;
+                while offset < attr.size {
+                    let len = (attr.size - offset)
+                        .min(vfs.chunk_size())
+                        .min(u32::MAX as u64) as u32;
+                    let bytes = vfs
+                        .read_with_atime_policy(&creds, attr.ino, offset, len, AtimeMode::Noatime)
+                        .await
+                        .map_err(fs_error)?;
+                    if bytes.is_empty() {
+                        return Err(Error::Versioning(format!(
+                            "live contents for {path} did not advance while fingerprinting"
+                        )));
+                    }
+                    hash.update(&bytes);
+                    offset = offset.saturating_add(bytes.len() as u64);
+                }
+            }
+            FileKind::Symlink => {
+                hash.update(vfs.readlink(&creds, attr.ino).await.map_err(fs_error)?);
+            }
+            _ => {}
+        }
+    }
+    Ok(hash.finalize().into())
+}
+
+fn file_kind_fingerprint(kind: FileKind) -> u8 {
+    match kind {
+        FileKind::File => 1,
+        FileKind::Dir => 2,
+        FileKind::Symlink => 3,
+        FileKind::Fifo => 4,
+        FileKind::Socket => 5,
+        FileKind::CharDev => 6,
+        FileKind::BlockDev => 7,
+    }
+}
+
+async fn remove_live_subtree(vfs: &dyn Vfs, root: &str) -> Result<()> {
+    let mut entries = scan_live_subtree(vfs, root)
+        .await?
+        .into_iter()
+        .collect::<Vec<_>>();
+    entries.sort_by(|(left, _), (right, _)| {
+        path_components(right)
+            .len()
+            .cmp(&path_components(left).len())
+            .then_with(|| right.cmp(left))
+    });
+    let creds = Credentials::root();
+    for (path, attr) in entries {
+        let (parent, name) = resolve_parent(vfs, &path).await?;
+        if attr.kind == FileKind::Dir {
+            vfs.rmdir(&creds, parent, &name).await.map_err(fs_error)?;
+        } else {
+            vfs.unlink(&creds, parent, &name).await.map_err(fs_error)?;
+        }
+    }
+    Ok(())
 }
 
 fn version_entry_kind_matches(entry: &VersionEntry, kind: FileKind) -> bool {
