@@ -21,7 +21,7 @@ or behavior changes are preferred until a GA contract exists.
 | Daemon admin surface | Optional admin listener is config-validated to loopback and currently exposes live-writer snapshot creation only. | `admin_listener_must_be_loopback`; `admin_snapshot_endpoint_creates_live_checkpoint` |
 | Single-writer safety | SlateDB fencing marks stale volumes dead and drops daemon exports. | `fenced_writer_marks_volume_dead`; failover drill |
 | Quota and deletion safety | Quota counters are committed with mutations; tenant/volume delete drops wrapped keys before deleting prefixes. | `quota` tests; control-plane delete paths |
-| Operator visibility | Prometheus rules cover fenced volumes, degraded writable volumes, missing scrapes, and block decode failures; Grafana dashboard surfaces liveness, degraded state, storage errors, and decode failures. | `monitoring/` |
+| Operator visibility | Prometheus rules cover fenced volumes, degraded writable volumes, missing scrapes, block decode failures, and denied protected-version operations; Grafana surfaces core liveness and storage signals. | `monitoring/` |
 
 ## Open Findings
 

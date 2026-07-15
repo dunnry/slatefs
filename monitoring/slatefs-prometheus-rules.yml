@@ -91,6 +91,15 @@ groups:
           summary: "SlateFS tenant rate-limit rejections for {{ $labels.tenant }}"
           description: "The daemon returned EAGAIN because a tenant ops/bytes token bucket was exhausted."
 
+      - alert: SlateFSProtectedVersionOperationDenied
+        expr: sum by (tenant, volume, operation) (increase(slatefs_version_operation_denials_total[5m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SlateFS protected version operation denied on {{ $labels.tenant }}/{{ $labels.volume }}"
+          description: "A protected {{ $labels.operation }} operation was rejected. Correlate the tenant, volume, operation, and request ID with the durable admin audit log."
+
       - alert: SlateFSNBDAttachRejections
         expr: sum by (tenant, volume, reason) (increase(slatefs_nbd_attach_rejected_total[5m])) > 0
         for: 0m
