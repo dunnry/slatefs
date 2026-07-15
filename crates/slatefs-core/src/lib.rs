@@ -20,6 +20,7 @@ pub mod quota;
 pub mod rate;
 pub mod snapshot;
 pub mod store;
+pub mod version_snapshot;
 pub mod versioning;
 pub mod vfs;
 pub mod volume;

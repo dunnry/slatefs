@@ -16,6 +16,7 @@ use prolly::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use slatedb::bytes::Bytes as SlateBytes;
+use slatedb::config::{CheckpointOptions, CheckpointScope};
 use slatedb::object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
 use slatedb::{Db, Settings, WriteBatch};
 use tokio::sync::{Mutex, watch};
@@ -1407,21 +1408,29 @@ impl AsyncBlobStore for VersionStore {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-enum VersionEntryData {
+pub(crate) enum VersionEntryData {
     File { chunk_count: u32 },
     Directory,
     Symlink { target: Vec<u8> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct VersionEntry {
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    size: u64,
-    atime: Timespec,
-    mtime: Timespec,
-    data: VersionEntryData,
+pub(crate) struct VersionEntry {
+    pub(crate) mode: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) size: u64,
+    pub(crate) atime: Timespec,
+    pub(crate) mtime: Timespec,
+    pub(crate) data: VersionEntryData,
+}
+
+pub(crate) struct VersionHistoricalExportPlan {
+    pub(crate) checkpoint: uuid::Uuid,
+    pub(crate) commit: String,
+    pub(crate) tree: RootManifest,
+    pub(crate) created_at: u64,
+    pub(crate) entries: BTreeMap<String, VersionEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5204,6 +5213,53 @@ impl VersionRepository {
         Ok(self.read_file_range(commit, path, 0, u64::MAX).await?.data)
     }
 
+    pub(crate) async fn prepare_historical_export(
+        &self,
+        reference: &str,
+    ) -> Result<VersionHistoricalExportPlan> {
+        let commit = self.resolve_commit(reference).await?;
+        let tree = commit.tree.to_tree();
+        let mut entries = BTreeMap::new();
+        let mut range = self
+            .prolly
+            .prefix(&tree, b"m/")
+            .await
+            .map_err(prolly_error)?;
+        while let Some(entry) = range.next().await {
+            let (key, value) = entry.map_err(prolly_error)?;
+            let path = std::str::from_utf8(key.strip_prefix(b"m/").unwrap_or_default())
+                .map_err(|_| Error::Versioning("version tree contains a non-UTF-8 path".into()))?;
+            entries.insert(path.to_string(), decode_version_entry(&value)?);
+        }
+        if entries.is_empty() {
+            return Err(Error::invalid(
+                "version historical export",
+                format!(
+                    "commit {} contains no versioned paths",
+                    hex::encode(commit.id)
+                ),
+            ));
+        }
+        let checkpoint = self
+            .store
+            .db
+            .create_checkpoint(
+                CheckpointScope::All,
+                &CheckpointOptions {
+                    name: Some(format!("slatefs-version-export-{}", hex::encode(commit.id))),
+                    ..CheckpointOptions::default()
+                },
+            )
+            .await?;
+        Ok(VersionHistoricalExportPlan {
+            checkpoint: checkpoint.id,
+            commit: hex::encode(commit.id),
+            tree: commit.tree,
+            created_at: commit.created_at,
+            entries,
+        })
+    }
+
     /// Read a bounded byte range without materializing the complete versioned
     /// file. The returned range is clipped to EOF.
     pub async fn read_file_range(
@@ -5807,7 +5863,7 @@ fn file_meta_key(path: &str) -> Vec<u8> {
     key
 }
 
-fn file_chunk_key(path: &str, index: u32) -> Vec<u8> {
+pub(crate) fn file_chunk_key(path: &str, index: u32) -> Vec<u8> {
     let mut key = Vec::with_capacity(path.len() + 8);
     key.extend_from_slice(b"c/");
     key.extend_from_slice(path.as_bytes());

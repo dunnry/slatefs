@@ -10,6 +10,7 @@ use slatefs_core::control::ControlPlane;
 use slatefs_core::error::Error;
 use slatefs_core::meta::inode::ROOT_INO;
 use slatefs_core::store::{self, ObjectStore};
+use slatefs_core::version_snapshot::VersionHistoricalVolume;
 use slatefs_core::versioning::{
     VersionBranchProtectionPolicy, VersionCommitAttestation, VersionCommitOrigin,
     VersionCommitProvenance, VersionMergeConflictStrategy, VersionPathChangeKind,
@@ -18,7 +19,7 @@ use slatefs_core::versioning::{
     force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease, version_commit_attestation_payload,
 };
-use slatefs_core::vfs::{Credentials, Vfs};
+use slatefs_core::vfs::{Credentials, FsError, Vfs};
 use slatefs_core::volume::{self, Volume};
 
 fn test_provenance() -> VersionCommitProvenance {
@@ -29,6 +30,156 @@ fn test_provenance() -> VersionCommitProvenance {
         uuid::Uuid::new_v4().to_string(),
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn historical_version_volume_is_immutable_and_synthesizes_ancestors() {
+    let object_store: Arc<dyn ObjectStore> = store::resolve_root("memory:///").unwrap();
+    let control = ControlPlane::open(Arc::clone(&object_store), common::test_kms())
+        .await
+        .unwrap();
+    control.create_tenant("t", None).await.unwrap();
+    let record = volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "v",
+        common::create_opts(None, None),
+    )
+    .await
+    .unwrap();
+    control
+        .set_versioning_enabled("t", "v", true)
+        .await
+        .unwrap();
+
+    let dek = control.unwrap_volume_dek(&record).await.unwrap();
+    let live = Volume::open(&record, dek, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let creds = Credentials::root();
+    let docs = live.mkdir(&creds, ROOT_INO, b"docs", 0o750).await.unwrap();
+    let note = live
+        .create(&creds, docs.ino, b"note.txt", 0o640, true)
+        .await
+        .unwrap();
+    live.write(&creds, note.ino, 0, b"historical contents")
+        .await
+        .unwrap();
+    live.symlink(&creds, docs.ino, b"latest", b"note.txt")
+        .await
+        .unwrap();
+
+    let repository = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap();
+    let first = repository
+        .commit_paths(
+            live.as_ref(),
+            &["/docs/note.txt".into(), "/docs/latest".into()],
+            "historical export source".into(),
+            test_provenance(),
+        )
+        .await
+        .unwrap();
+    repository
+        .create_tag("historical-test", &first.id)
+        .await
+        .unwrap();
+    repository.close().await.unwrap();
+
+    let historical = VersionHistoricalVolume::open(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "v",
+        "historical-test",
+    )
+    .await
+    .unwrap();
+    assert_eq!(historical.commit(), first.id);
+    assert!(historical.read_only());
+    assert_ne!(historical.fsid(), live.fsid());
+
+    let historical_docs = historical.lookup(&creds, ROOT_INO, b"docs").await.unwrap();
+    assert_eq!(
+        historical_docs.mode, 0o555,
+        "missing ancestor is synthesized"
+    );
+    let page = historical
+        .readdir(&creds, historical_docs.ino, 0, 16)
+        .await
+        .unwrap();
+    assert!(page.eof);
+    assert_eq!(
+        page.entries
+            .iter()
+            .map(|entry| entry.name.as_slice())
+            .collect::<Vec<_>>(),
+        vec![b"latest".as_slice(), b"note.txt".as_slice()]
+    );
+    let historical_note = historical
+        .lookup(&creds, historical_docs.ino, b"note.txt")
+        .await
+        .unwrap();
+    assert_eq!(
+        historical
+            .read(&creds, historical_note.ino, 3, 10)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"torical co"
+    );
+    let historical_link = historical
+        .lookup(&creds, historical_docs.ino, b"latest")
+        .await
+        .unwrap();
+    assert_eq!(
+        historical
+            .readlink(&creds, historical_link.ino)
+            .await
+            .unwrap(),
+        b"note.txt"
+    );
+    assert_eq!(
+        historical
+            .create(&creds, historical_docs.ino, b"nope", 0o644, true)
+            .await
+            .unwrap_err(),
+        FsError::ReadOnly
+    );
+
+    // The checkpoint-backed view releases the repository lease and remains
+    // pinned while the live repository advances.
+    live.write(&creds, note.ino, 0, b"current contents   ")
+        .await
+        .unwrap();
+    let repository = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap();
+    let current = repository
+        .commit_file(
+            live.as_ref(),
+            "/docs/note.txt",
+            "advance live history".into(),
+            test_provenance(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(current.id, first.id);
+    assert_eq!(
+        historical
+            .read(&creds, historical_note.ino, 0, 64)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"historical contents"
+    );
+
+    repository.close().await.unwrap();
+    historical.shutdown().await.unwrap();
+    live.shutdown().await.unwrap();
+    control.close().await.unwrap();
 }
 
 #[tokio::test]
