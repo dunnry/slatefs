@@ -2818,6 +2818,25 @@ async fn list_version_branches_response(
     ))
 }
 
+async fn get_version_attestation_quorum_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+    branch: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let commit = request
+        .query
+        .get("commit")
+        .ok_or_else(|| bad_request("commit query parameter is required"))?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository.attestation_quorum(branch, commit).await;
+    let quorum = finish_version_repository(control, repository, result).await?;
+    Ok(AdminHttpResponse::json(200, json!({ "quorum": quorum })))
+}
+
 async fn list_version_reflog_response(
     state: &AdminState,
     request: &AdminHttpRequest,
@@ -5126,6 +5145,21 @@ async fn route_admin_request(
                 "recover",
             ],
         ) => recover_version_branch_response(state, request, tenant, volume, name).await,
+        (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "branches",
+                branch,
+                "attestation-quorum",
+            ],
+        ) => get_version_attestation_quorum_response(state, request, tenant, volume, branch).await,
         (
             "GET",
             [
@@ -8473,6 +8507,21 @@ mod tests {
             "release-2026"
         );
         assert_eq!(protected["branch"]["required_attestations"], 1);
+        let quorum_response = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning/branches/release/attestation-quorum?commit=release HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&quorum_response), 200, "{quorum_response}");
+        let quorum: Value = serde_json::from_str(response_body(&quorum_response)).unwrap();
+        assert_eq!(quorum["quorum"]["branch"], "release");
+        assert_eq!(quorum["quorum"]["commit"], commit_id);
+        assert_eq!(quorum["quorum"]["required_attestations"], 1);
+        assert_eq!(
+            quorum["quorum"]["matching_key_ids"],
+            json!(["release-2026"])
+        );
+        assert_eq!(quorum["quorum"]["satisfied"], true);
         let denied_policy_request = AdminHttpRequest {
             method: "DELETE".to_string(),
             path: "/admin/v1/tenants/t/volumes/v/versioning/branches/release/protection"

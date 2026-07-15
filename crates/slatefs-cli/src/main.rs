@@ -19,13 +19,13 @@ use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{
-    VersionBranchInfo, VersionBranchProtectionPolicy, VersionBranchRecoveryInfo,
-    VersionBranchResetInfo, VersionCommitAttestation, VersionCommitInfo, VersionCommitOrigin,
-    VersionCommitProvenance, VersionMergeConflictStrategy, VersionMergeInfo, VersionMergePreview,
-    VersionPathChangeKind, VersionReflogEntry, VersionRepository, VersionRestoreActionKind,
-    VersionRestoreApplyInfo, VersionRestoreMode, VersionRestorePreview, VersionTagInfo,
-    VersionTrustedAttestationKey, VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
-    force_break_expired_version_maintenance_lease, purge_version_history,
+    VersionAttestationQuorumInfo, VersionBranchInfo, VersionBranchProtectionPolicy,
+    VersionBranchRecoveryInfo, VersionBranchResetInfo, VersionCommitAttestation, VersionCommitInfo,
+    VersionCommitOrigin, VersionCommitProvenance, VersionMergeConflictStrategy, VersionMergeInfo,
+    VersionMergePreview, VersionPathChangeKind, VersionReflogEntry, VersionRepository,
+    VersionRestoreActionKind, VersionRestoreApplyInfo, VersionRestoreMode, VersionRestorePreview,
+    VersionTagInfo, VersionTrustedAttestationKey, VersionWorkingTreeChangeKind,
+    VersionWorkingTreeStatus, force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease, version_commit_attestation_payload,
 };
 use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
@@ -508,6 +508,15 @@ enum VersioningCmd {
     Branches {
         tenant: String,
         volume: String,
+        #[arg(long)]
+        live: bool,
+    },
+    /// Check whether a commit has enough trusted signatures for a branch.
+    QuorumStatus {
+        tenant: String,
+        volume: String,
+        branch: String,
+        commit: String,
         #[arg(long)]
         live: bool,
     },
@@ -1327,6 +1336,21 @@ fn print_version_branch(branch: &VersionBranchInfo) {
     }
     if branch.protected() {
         println!("required_attestations {}", branch.required_attestations());
+    }
+}
+
+fn print_attestation_quorum(quorum: &VersionAttestationQuorumInfo) {
+    println!("branch {}", quorum.branch());
+    println!("commit {}", quorum.commit());
+    println!("protected {}", quorum.protected());
+    println!("required_attestations {}", quorum.required_attestations());
+    println!("matching_attestations {}", quorum.matching_key_ids().len());
+    println!("satisfied {}", quorum.satisfied());
+    for key_id in quorum.trusted_key_ids() {
+        println!("trusted_key {key_id}");
+    }
+    for key_id in quorum.matching_key_ids() {
+        println!("matching_key {key_id}");
     }
 }
 
@@ -3407,6 +3431,38 @@ async fn run(
             }
             repository_close?;
         }
+        Command::Versioning(VersioningCmd::QuorumStatus {
+            tenant,
+            volume,
+            branch,
+            commit,
+            live,
+        }) => {
+            let quorum = if *live {
+                let endpoint = format!("branches/{branch}/attestation-quorum");
+                let response = live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    "GET",
+                    &endpoint,
+                    &[("commit", commit.clone())],
+                    None,
+                )
+                .await?;
+                serde_json::from_value(response["quorum"].clone())
+                    .context("parsing admin version attestation quorum")?
+            } else {
+                let repository =
+                    VersionRepository::open(control, object_store, tenant, volume).await?;
+                let result = repository.attestation_quorum(branch, commit).await;
+                let repository_close = repository.close().await;
+                let quorum = result?;
+                repository_close?;
+                quorum
+            };
+            print_attestation_quorum(&quorum);
+        }
         Command::Versioning(VersioningCmd::ProtectBranch {
             tenant,
             volume,
@@ -5132,6 +5188,27 @@ mod tests {
                 ..
             }) if trusted_attestation_keys.len() == 1
                 && trusted_attestation_keys[0].key_id() == "release-2026"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "quorum-status",
+            "tenant-a",
+            "docs",
+            "release",
+            "candidate",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::QuorumStatus {
+                branch,
+                commit,
+                live: true,
+                ..
+            }) if branch == "release" && commit == "candidate"
         ));
 
         let cli = Cli::try_parse_from([
