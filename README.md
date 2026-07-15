@@ -154,7 +154,9 @@ branch's history. `versioning reflog <branch>` lists the newest 100 head
 transitions even after branch deletion. Every create, commit, fast-forward,
 merge, reset, and delete records its ref change atomically; retained reflog
 heads are GC roots, so this recovery window takes precedence over stricter
-count or age retention. `reset-branch <name> <commit-or-ref> --yes` deliberately
+count or age retention. `recover-branch <name> <reflog-sequence> --yes`
+atomically restores the head that preceded that exact transition, recreating a
+deleted branch when necessary. `reset-branch <name> <commit-or-ref> --yes` deliberately
 moves any existing branch, including `main`, without rewriting commits or file
 data; the previous head remains recoverable while its reflog entry is retained.
 `versioning merge <source> <target>` fast-forwards when possible or creates an
@@ -294,6 +296,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | Create a branch from `{"name":"...","commit":"commit-or-ref"}`. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}` | Delete a non-main branch without deleting its commit immediately. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/reset` | Compare-and-swap an existing branch, including `main`, to `{"commit":"commit-or-ref"}`. |
+| `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/recover` | Restore the head preceding a retained reflog entry from `{"sequence":42}`, recreating a deleted branch when needed. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{target}/merge` | Fast-forward or three-way merge a target from `{"source":"...","conflict_strategy":"fail|ours|theirs"}`; the strategy defaults to `fail`, whose conflicts return `409`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{target}/merge?source=` | Preview ancestry and logical-path conflicts without moving either branch. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Atomically commit selected paths through the live writer from `{"paths":["..."],"message":"...","idempotency_key":"...","branch":"main"}`; retry key and branch are optional and singular `path` remains accepted. |

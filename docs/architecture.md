@@ -82,6 +82,9 @@ its branch reference is one SlateDB batch after the new immutable tree nodes
 and blobs have been written. The same batch records a per-branch reflog entry
 for every create, commit, fast-forward, merge, reset, or delete. Reflogs retain
 the newest 100 transitions per branch name and remain readable after deletion.
+Recovery names one retained sequence and atomically restores its preceding
+head, recreating a deleted branch when necessary, then records that move as a
+new reflog transition.
 Disabling versioning blocks repository operations
 without deleting its history. Volume deletion removes both the live and
 optional version-store prefixes.

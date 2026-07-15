@@ -211,6 +211,7 @@ slatefs -c /etc/slatefs/slatefs.toml versioning untag <tenant> <volume> <name> -
 slatefs -c /etc/slatefs/slatefs.toml versioning branch <tenant> <volume> <name> <commit-or-ref> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning branches <tenant> <volume> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning reflog <tenant> <volume> <name> --limit 100 --live
+slatefs -c /etc/slatefs/slatefs.toml versioning recover-branch <tenant> <volume> <name> <reflog-sequence> --yes --live
 slatefs -c /etc/slatefs/slatefs.toml versioning delete-branch <tenant> <volume> <name> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning reset-branch <tenant> <volume> <name> <commit-or-ref> --yes --live
 slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path>... -m <message> --branch <name> --live

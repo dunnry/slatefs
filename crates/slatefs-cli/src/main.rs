@@ -17,11 +17,11 @@ use slatefs_core::crypto::kms::{self, LocalAgeKms};
 use slatefs_core::meta::superblock::VolumeKind;
 use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{
-    VersionBranchInfo, VersionBranchResetInfo, VersionCommitInfo, VersionMergeConflictStrategy,
-    VersionMergeInfo, VersionMergePreview, VersionPathChangeKind, VersionReflogEntry,
-    VersionRepository, VersionRestoreActionKind, VersionRestoreApplyInfo, VersionRestoreMode,
-    VersionRestorePreview, VersionTagInfo, VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
-    force_break_expired_version_maintenance_lease, purge_version_history,
+    VersionBranchInfo, VersionBranchRecoveryInfo, VersionBranchResetInfo, VersionCommitInfo,
+    VersionMergeConflictStrategy, VersionMergeInfo, VersionMergePreview, VersionPathChangeKind,
+    VersionReflogEntry, VersionRepository, VersionRestoreActionKind, VersionRestoreApplyInfo,
+    VersionRestoreMode, VersionRestorePreview, VersionTagInfo, VersionWorkingTreeChangeKind,
+    VersionWorkingTreeStatus, force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease,
 };
 use slatefs_core::volume::{self, CreateBlockVolumeOptions, CreateVolumeOptions};
@@ -451,6 +451,17 @@ enum VersioningCmd {
         branch: String,
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        #[arg(long)]
+        live: bool,
+    },
+    /// Restore the branch head that preceded one retained reflog entry.
+    RecoverBranch {
+        tenant: String,
+        volume: String,
+        name: String,
+        sequence: u64,
+        #[arg(long)]
+        yes: bool,
         #[arg(long)]
         live: bool,
     },
@@ -1202,12 +1213,23 @@ fn print_version_branch_reset(reset: &VersionBranchResetInfo) {
 
 fn print_version_reflog_entry(entry: &VersionReflogEntry) {
     println!(
-        "{}\t{}\t{}\t{} -> {}",
+        "{}\t{}\t{}\t{}\t{} -> {}",
+        entry.sequence(),
         entry.created_at(),
         entry.action().as_str(),
         entry.branch(),
         entry.previous().unwrap_or("-"),
         entry.commit().unwrap_or("-")
+    );
+}
+
+fn print_version_branch_recovery(recovery: &VersionBranchRecoveryInfo) {
+    println!(
+        "{}\treflog={}\t{} -> {}",
+        recovery.name(),
+        recovery.sequence(),
+        recovery.previous().unwrap_or("deleted"),
+        recovery.commit()
     );
 }
 
@@ -2789,6 +2811,67 @@ async fn run(
                 print_version_reflog_entry(&entry);
             }
             repository_close?;
+        }
+        Command::Versioning(VersioningCmd::RecoverBranch {
+            tenant,
+            volume,
+            name,
+            sequence,
+            yes,
+            live,
+        }) => {
+            if !yes {
+                anyhow::bail!(
+                    "recovering version branch {name} requires --yes; this moves or recreates the branch"
+                );
+            }
+            if *live {
+                let endpoint = format!("branches/{name}/recover");
+                let response = post_live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    &endpoint,
+                    serde_json::json!({ "sequence": sequence }),
+                )
+                .await?;
+                let recovery: VersionBranchRecoveryInfo =
+                    serde_json::from_value(response["recovery"].clone())
+                        .context("parsing recovered admin version branch")?;
+                print_version_branch_recovery(&recovery);
+                return Ok(());
+            }
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let result = repository.recover_branch(name, *sequence).await;
+            let repository_close = repository.close().await;
+            let recovery = result?;
+            repository_close?;
+            append_cli_version_audit(
+                control,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-branch-recover".to_string()),
+                    ),
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(recovery.name().to_string()),
+                    ),
+                    (
+                        "reflog_sequence".to_string(),
+                        AuditDetailValue::U64(recovery.sequence()),
+                    ),
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(recovery.commit().to_string()),
+                    ),
+                ],
+            )
+            .await?;
+            print_version_branch_recovery(&recovery);
         }
         Command::Versioning(VersioningCmd::DeleteBranch {
             tenant,
@@ -4456,6 +4539,29 @@ mod tests {
                 live: true,
                 ..
             }) if branch == "release"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "recover-branch",
+            "tenant-a",
+            "docs",
+            "release",
+            "42",
+            "--yes",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::RecoverBranch {
+                name,
+                sequence: 42,
+                yes: true,
+                live: true,
+                ..
+            }) if name == "release"
         ));
 
         let cli = Cli::try_parse_from([

@@ -224,6 +224,16 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
     assert_eq!(release_reflog[1].action(), VersionReflogAction::Reset);
     assert_eq!(release_reflog[2].action(), VersionReflogAction::FastForward);
     assert_eq!(release_reflog[3].action(), VersionReflogAction::Create);
+    let recovered = repository
+        .recover_branch("release", release_reflog[0].sequence())
+        .await
+        .unwrap();
+    assert_eq!(recovered.previous(), Some(second.id.as_str()));
+    assert_eq!(recovered.commit(), first.id);
+    assert_eq!(
+        repository.reflog("release", 1).await.unwrap()[0].action(),
+        VersionReflogAction::Recover
+    );
     repository
         .create_branch("feature", &first.id)
         .await
@@ -502,6 +512,16 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         Some(feature_commit.id.as_str())
     );
     assert_eq!(feature_reflog[0].commit(), None);
+    let recovered = repository
+        .recover_branch("feature", feature_reflog[0].sequence())
+        .await
+        .unwrap();
+    assert_eq!(recovered.previous(), None);
+    assert_eq!(recovered.commit(), feature_commit.id);
+    assert_eq!(
+        repository.reflog("feature", 1).await.unwrap()[0].action(),
+        VersionReflogAction::Recover
+    );
     let complete_dag_gc = repository.garbage_collect(None, None, true).await.unwrap();
     assert_eq!(complete_dag_gc.retained_commits, 7);
     assert_eq!(complete_dag_gc.deleted_commits, 0);

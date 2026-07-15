@@ -1014,6 +1014,12 @@ struct VersionBranchResetRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct VersionBranchRecoverRequest {
+    sequence: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VersionBranchMergeRequest {
     source: String,
     #[serde(default)]
@@ -2706,6 +2712,61 @@ async fn reset_version_branch_response(
     repository_close.map_err(core_error)?;
     control_close.map_err(core_error)?;
     Ok(AdminHttpResponse::json(200, json!({ "reset": reset })))
+}
+
+async fn recover_version_branch_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+    name: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let body: VersionBranchRecoverRequest = parse_json_body(request)?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository.recover_branch(name, body.sequence).await;
+    let audit = match &result {
+        Ok(recovery) => {
+            append_version_audit(
+                &control,
+                request,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-branch-recover".to_string()),
+                    ),
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(recovery.name().to_string()),
+                    ),
+                    (
+                        "reflog_sequence".to_string(),
+                        AuditDetailValue::U64(recovery.sequence()),
+                    ),
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(recovery.commit().to_string()),
+                    ),
+                ],
+            )
+            .await
+        }
+        Err(_) => Ok(()),
+    };
+    let repository_close = repository.close().await;
+    let control_close = control.close().await;
+    let recovery = result.map_err(core_error)?;
+    audit?;
+    repository_close.map_err(core_error)?;
+    control_close.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "recovery": recovery }),
+    ))
 }
 
 async fn merge_version_branch_response(
@@ -4406,6 +4467,21 @@ async fn route_admin_request(
                 "reset",
             ],
         ) => reset_version_branch_response(state, request, tenant, volume, name).await,
+        (
+            "POST",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "branches",
+                name,
+                "recover",
+            ],
+        ) => recover_version_branch_response(state, request, tenant, volume, name).await,
         (
             "GET",
             [
@@ -7891,6 +7967,25 @@ mod tests {
         assert!(entries[0]["commit"].is_null());
         assert_eq!(entries[1]["action"], "reset");
         assert_eq!(entries[2]["action"], "reset");
+        let recover_body = format!(r#"{{"sequence":{}}}"#, entries[0]["sequence"]);
+        let recover_request = format!(
+            "POST /admin/v1/tenants/t/volumes/v/versioning/branches/release/recover HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            recover_body.len(),
+            recover_body
+        );
+        let recover_response = admin_exchange(Arc::clone(&state), recover_request.as_bytes()).await;
+        assert_eq!(
+            response_status(&recover_response),
+            200,
+            "{recover_response}"
+        );
+        let recovery: Value = serde_json::from_str(response_body(&recover_response)).unwrap();
+        assert_eq!(recovery["recovery"]["name"], "release");
+        assert!(recovery["recovery"]["previous"].is_null());
+        assert_eq!(
+            recovery["recovery"]["commit"],
+            branch_commit["commit"]["id"]
+        );
 
         volume
             .write(&creds, file.ino, 0, b"changed data!")
@@ -7967,7 +8062,7 @@ mod tests {
             let expected = if action == AuditAction::VersionCommit {
                 3
             } else if action == AuditAction::Maintain {
-                8
+                9
             } else {
                 1
             };

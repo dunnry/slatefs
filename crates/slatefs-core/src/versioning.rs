@@ -842,6 +842,66 @@ impl VersionStore {
         Ok(ids)
     }
 
+    async fn recover_branch(
+        &self,
+        name: &str,
+        sequence: u64,
+    ) -> Result<(Option<VersionRef>, VersionRef)> {
+        let _guard = self.ref_lock.lock().await;
+        let record: VersionReflogRecord = self
+            .get_raw(&reflog_key(name, sequence))
+            .await
+            .map_err(version_store_error)?
+            .map(|bytes| decode_versioned(REFLOG_VERSION, &bytes, "version branch reflog"))
+            .transpose()?
+            .ok_or_else(|| {
+                Error::not_found("version branch reflog entry", format!("{name}/{sequence}"))
+            })?;
+        if record.branch != name || record.sequence != sequence {
+            return Err(Error::Versioning(format!(
+                "version branch reflog entry {name}/{sequence} does not match its key"
+            )));
+        }
+        let target_id = record.previous.ok_or_else(|| {
+            Error::invalid(
+                "version branch recovery",
+                format!("reflog entry {sequence} has no preceding head"),
+            )
+        })?;
+        let commit = self.get_commit(&target_id).await?;
+        let target = VersionRef {
+            commit_id: target_id,
+            tree: commit.tree,
+        };
+        let key = branch_key(name);
+        let current = self.get_ref(&key).await?;
+        if current
+            .as_ref()
+            .is_some_and(|current| current.commit_id == target_id)
+        {
+            return Err(Error::invalid(
+                "version branch recovery",
+                format!("branch {name} already points to {}", hex::encode(target_id)),
+            ));
+        }
+        if current.is_none() && self.try_get_tag(name).await?.is_some() {
+            return Err(Error::already_exists("version tag", name));
+        }
+        let mut batch = WriteBatch::new();
+        batch.put(key, encode_versioned(REF_VERSION, &target)?);
+        self.append_reflog(
+            &mut batch,
+            name,
+            current.as_ref().map(|current| current.commit_id),
+            Some(target.commit_id),
+            VersionReflogAction::Recover,
+        )
+        .await?;
+        self.db.write(batch).await?;
+        self.db.flush().await?;
+        Ok((current, target))
+    }
+
     async fn append_reflog(
         &self,
         batch: &mut WriteBatch,
@@ -1066,6 +1126,15 @@ pub struct VersionBranchResetInfo {
     commit: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionBranchRecoveryInfo {
+    name: String,
+    sequence: u64,
+    previous: Option<String>,
+    commit: String,
+}
+
 /// The operation that changed a version branch head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1076,6 +1145,7 @@ pub enum VersionReflogAction {
     Merge,
     Reset,
     Delete,
+    Recover,
 }
 
 impl VersionReflogAction {
@@ -1087,6 +1157,7 @@ impl VersionReflogAction {
             Self::Merge => "merge",
             Self::Reset => "reset",
             Self::Delete => "delete",
+            Self::Recover => "recover",
         }
     }
 }
@@ -1095,6 +1166,7 @@ impl VersionReflogAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct VersionReflogEntry {
+    sequence: u64,
     branch: String,
     previous: Option<String>,
     commit: Option<String>,
@@ -1252,7 +1324,29 @@ impl VersionBranchResetInfo {
     }
 }
 
+impl VersionBranchRecoveryInfo {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn previous(&self) -> Option<&str> {
+        self.previous.as_deref()
+    }
+
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
+}
+
 impl VersionReflogEntry {
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
     pub fn branch(&self) -> &str {
         &self.branch
     }
@@ -1277,6 +1371,7 @@ impl VersionReflogEntry {
 impl From<VersionReflogRecord> for VersionReflogEntry {
     fn from(record: VersionReflogRecord) -> Self {
         Self {
+            sequence: record.sequence,
             branch: record.branch,
             previous: record.previous.map(hex::encode),
             commit: record.commit.map(hex::encode),
@@ -2558,6 +2653,29 @@ impl VersionRepository {
             .take(limit)
             .map(VersionReflogEntry::from)
             .collect())
+    }
+
+    /// Restore the head that immediately preceded one retained reflog entry.
+    /// This recreates a deleted branch or moves an existing branch atomically.
+    pub async fn recover_branch(
+        &self,
+        name: &str,
+        sequence: u64,
+    ) -> Result<VersionBranchRecoveryInfo> {
+        validate_version_branch_name(name)?;
+        if sequence == 0 {
+            return Err(Error::invalid(
+                "version branch reflog sequence",
+                "must be greater than zero",
+            ));
+        }
+        let (previous, recovered) = self.store.recover_branch(name, sequence).await?;
+        Ok(VersionBranchRecoveryInfo {
+            name: name.to_string(),
+            sequence,
+            previous: previous.map(|reference| hex::encode(reference.commit_id)),
+            commit: hex::encode(recovered.commit_id),
+        })
     }
 
     pub async fn delete_branch(&self, name: &str) -> Result<VersionBranchInfo> {
