@@ -402,6 +402,9 @@ enum VersioningCmd {
         /// New file that will receive the 32-byte private key with mode 0600.
         #[arg(long)]
         out: PathBuf,
+        /// New file that will receive the 32-byte public key.
+        #[arg(long)]
+        public_out: PathBuf,
     },
     /// Sign a commit with a client-side Ed25519 key and attach the signature.
     Attest {
@@ -1975,8 +1978,9 @@ async fn main() -> anyhow::Result<()> {
     if let Command::Keygen { out } = &cli.command {
         return keygen(out.as_deref());
     }
-    if let Command::Versioning(VersioningCmd::AttestationKeygen { out }) = &cli.command {
-        return version_attestation_keygen(out);
+    if let Command::Versioning(VersioningCmd::AttestationKeygen { out, public_out }) = &cli.command
+    {
+        return version_attestation_keygen(out, public_out);
     }
 
     let config = Config::load(&cli.config)
@@ -2019,7 +2023,10 @@ fn keygen(out: Option<&std::path::Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn version_attestation_keygen(path: &std::path::Path) -> anyhow::Result<()> {
+fn version_attestation_keygen(
+    private_path: &std::path::Path,
+    public_path: &std::path::Path,
+) -> anyhow::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -2031,15 +2038,29 @@ fn version_attestation_keygen(path: &std::path::Path) -> anyhow::Result<()> {
         hex::encode(public_key),
         hex::encode(secret.expose_secret())
     ));
-    let mut file = std::fs::OpenOptions::new()
+    let mut private_file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)
-        .with_context(|| format!("creating {}", path.display()))?;
-    file.write_all(contents.as_bytes())?;
-    println!("wrote Ed25519 private key to {}", path.display());
-    println!("public_key: {}", hex::encode(public_key));
+        .open(private_path)
+        .with_context(|| format!("creating {}", private_path.display()))?;
+    let public_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(public_path);
+    let mut public_file = match public_file {
+        Ok(file) => file,
+        Err(error) => {
+            drop(private_file);
+            let _ = std::fs::remove_file(private_path);
+            return Err(error).with_context(|| format!("creating {}", public_path.display()));
+        }
+    };
+    private_file.write_all(contents.as_bytes())?;
+    public_file.write_all(format!("{}\n", hex::encode(public_key)).as_bytes())?;
+    println!("wrote Ed25519 private key to {}", private_path.display());
+    println!("wrote Ed25519 public key to {}", public_path.display());
     Ok(())
 }
 
@@ -4815,6 +4836,8 @@ mod tests {
             "attestation-keygen",
             "--out",
             "/tmp/release.key",
+            "--public-out",
+            "/tmp/release.pub",
         ])
         .unwrap();
         assert!(matches!(
@@ -4893,19 +4916,36 @@ mod tests {
     }
 
     #[test]
-    fn version_attestation_keygen_creates_a_private_file() {
+    fn version_attestation_keygen_creates_private_and_public_files() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("release.key");
-        version_attestation_keygen(&path).unwrap();
-        let private_key = read_ed25519_signing_key(&path).unwrap();
+        let private_path = directory.path().join("release.key");
+        let public_path = directory.path().join("release.pub");
+        version_attestation_keygen(&private_path, &public_path).unwrap();
+        let private_key = read_ed25519_signing_key(&private_path).unwrap();
         assert_ne!(private_key.to_bytes(), [0; 32]);
         assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(&private_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o600
         );
-        assert!(version_attestation_keygen(&path).is_err());
+        assert_eq!(
+            read_hex_key::<32>(&public_path, "Ed25519 public key").unwrap(),
+            private_key.verifying_key().to_bytes()
+        );
+        assert_eq!(
+            std::fs::metadata(&public_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        assert!(version_attestation_keygen(&private_path, &public_path).is_err());
     }
 
     #[test]
