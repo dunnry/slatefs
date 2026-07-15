@@ -5089,6 +5089,7 @@ async fn run(
                         tenant: tenant.clone(),
                         volume: volume.clone(),
                         snapshot: snapshot.clone(),
+                        version: None,
                         listen: listen.clone(),
                         allowed_clients: allowed_clients.clone(),
                         protocol: *protocol,

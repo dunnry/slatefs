@@ -39,6 +39,7 @@ use slatefs_core::metrics::{AggregatingRecorder, PrometheusSample, render_promet
 use slatefs_core::rate::{RateLimiter, RateLimits};
 use slatefs_core::snapshot::SnapshotVolume;
 use slatefs_core::store;
+use slatefs_core::version_snapshot::VersionHistoricalVolume;
 use slatefs_core::versioning::{
     VersionBranchProtectionPolicy, VersionCommitAttestation, VersionCommitOrigin,
     VersionCommitProvenance, VersionMaintenanceLeaseInfo, VersionMergeConflictStrategy,
@@ -446,6 +447,7 @@ struct BackendKey {
     tenant: String,
     volume: String,
     snapshot: Option<String>,
+    version: Option<String>,
 }
 
 impl BackendKey {
@@ -454,6 +456,7 @@ impl BackendKey {
             tenant: export.tenant.clone(),
             volume: export.volume.clone(),
             snapshot: export.snapshot.clone(),
+            version: export.version.clone(),
         }
     }
 
@@ -465,6 +468,7 @@ impl BackendKey {
 enum OpenVolume {
     FsWritable(Arc<Volume>),
     FsSnapshot(Arc<SnapshotVolume>),
+    FsVersion(Arc<VersionHistoricalVolume>),
     BlockWritable(Arc<BlockVolume>),
     BlockSnapshot(Arc<SnapshotBlockVolume>),
 }
@@ -480,6 +484,10 @@ impl OpenVolume {
                 let snapshot: Arc<dyn Vfs> = snapshot.clone();
                 Some(snapshot)
             }
+            Self::FsVersion(version) => {
+                let version: Arc<dyn Vfs> = version.clone();
+                Some(version)
+            }
             Self::BlockWritable(_) | Self::BlockSnapshot(_) => None,
         }
     }
@@ -494,21 +502,27 @@ impl OpenVolume {
                 let snapshot: Arc<dyn BlockDev> = snapshot.clone();
                 Some(snapshot)
             }
-            Self::FsWritable(_) | Self::FsSnapshot(_) => None,
+            Self::FsWritable(_) | Self::FsSnapshot(_) | Self::FsVersion(_) => None,
         }
     }
 
     fn writable(&self) -> Option<&Arc<Volume>> {
         match self {
             Self::FsWritable(volume) => Some(volume),
-            Self::FsSnapshot(_) | Self::BlockWritable(_) | Self::BlockSnapshot(_) => None,
+            Self::FsSnapshot(_)
+            | Self::FsVersion(_)
+            | Self::BlockWritable(_)
+            | Self::BlockSnapshot(_) => None,
         }
     }
 
     fn block_writable(&self) -> Option<&Arc<BlockVolume>> {
         match self {
             Self::BlockWritable(volume) => Some(volume),
-            Self::FsWritable(_) | Self::FsSnapshot(_) | Self::BlockSnapshot(_) => None,
+            Self::FsWritable(_)
+            | Self::FsSnapshot(_)
+            | Self::FsVersion(_)
+            | Self::BlockSnapshot(_) => None,
         }
     }
 }
@@ -1195,6 +1209,7 @@ impl ExportCreateRequest {
                 tenant: self.tenant,
                 volume: self.volume,
                 snapshot: self.snapshot.0,
+                version: None,
                 listen: self.listen,
                 allowed_clients: self.allowed_clients,
                 protocol: self.protocol,
@@ -4275,6 +4290,7 @@ fn export_config_json(id: &str, source: &str, export: &ExportConfig, enabled: bo
         "tenant": export.tenant,
         "volume": export.volume,
         "snapshot": export.snapshot,
+        "version": export.version,
         "protocol": export.protocol,
         "listen": export.listen,
         "allowed_clients": export
@@ -7369,7 +7385,7 @@ impl ExportManager {
         let clone_parent_prefixes = clone_parent_prefixes_from_reader(reader, &record).await?;
         let backend: OpenBackend = match record.kind {
             VolumeKind::Filesystem => {
-                self.open_filesystem_backend(export, &record, dek, clone_parent_prefixes)
+                self.open_filesystem_backend(reader, export, &record, dek, clone_parent_prefixes)
                     .await?
             }
             VolumeKind::Block { .. } => {
@@ -7384,12 +7400,33 @@ impl ExportManager {
 
     async fn open_filesystem_backend(
         &self,
+        reader: &ControlReader,
         export: &ExportConfig,
         record: &VolumeRecord,
         dek: slatefs_core::crypto::Secret32,
         clone_parent_prefixes: Vec<String>,
     ) -> anyhow::Result<OpenBackend> {
-        if let Some(snapshot) = &export.snapshot {
+        if let Some(commit) = &export.version {
+            let version = VersionHistoricalVolume::open_readonly(
+                reader,
+                Arc::clone(&self.object_store),
+                &export.tenant,
+                &export.volume,
+                commit,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "opening historical version {commit} for {}/{}",
+                    export.tenant, export.volume
+                )
+            })?;
+            Ok(OpenBackend {
+                volume: OpenVolume::FsVersion(version),
+                nbd_shutdowns: Arc::new(Mutex::new(Vec::new())),
+                ref_count: 0,
+            })
+        } else if let Some(snapshot) = &export.snapshot {
             let snapshot_volume = SnapshotVolume::open(
                 record,
                 dek,
@@ -7726,6 +7763,16 @@ impl ExportManager {
                     );
                 }
             }
+            OpenVolume::FsVersion(version) => {
+                if let Err(error) = version.shutdown().await {
+                    tracing::error!(
+                        tenant = backend_key.tenant,
+                        volume = backend_key.volume,
+                        version = backend_key.version.as_deref().unwrap_or("-"),
+                        "historical version shutdown: {error}"
+                    );
+                }
+            }
             OpenVolume::BlockWritable(volume) => {
                 if backend_key.snapshot.is_none() {
                     self.admin_targets
@@ -7776,6 +7823,7 @@ impl ExportManager {
                 ..
             } => {
                 backend_key.snapshot.is_some()
+                    || backend_key.version.is_some()
                     || tenant != &backend_key.tenant
                     || volume_name != &backend_key.volume
             }
@@ -7795,6 +7843,7 @@ impl ExportManager {
                 ..
             } => {
                 backend_key.snapshot.is_some()
+                    || backend_key.version.is_some()
                     || tenant != &backend_key.tenant
                     || volume_name != &backend_key.volume
             }
@@ -11201,6 +11250,7 @@ mod tests {
             tenant: "t".to_string(),
             volume: "v".to_string(),
             snapshot: None,
+            version: None,
             listen: "127.0.0.1:12049".to_string(),
             allowed_clients: Vec::new(),
             protocol: ExportProtocol::Nfs,
@@ -11407,6 +11457,7 @@ mod tests {
                 tenant: "t".to_string(),
                 volume: "v".to_string(),
                 snapshot: None,
+                version: None,
                 listen: listen.to_string(),
                 allowed_clients: Vec::new(),
                 protocol: ExportProtocol::Nfs,
@@ -11434,6 +11485,7 @@ mod tests {
                 tenant: "t".to_string(),
                 volume: "b".to_string(),
                 snapshot: None,
+                version: None,
                 listen: listen.to_string(),
                 allowed_clients: Vec::new(),
                 protocol: ExportProtocol::Nbd,
@@ -11466,6 +11518,7 @@ mod tests {
                 tenant: "t".to_string(),
                 volume: "v".to_string(),
                 snapshot: None,
+                version: None,
                 listen: listen.to_string(),
                 allowed_clients: Vec::new(),
                 protocol: ExportProtocol::P9,
@@ -11545,6 +11598,118 @@ mod tests {
         manager.reconcile(&reader).await.unwrap();
         assert_eq!(metrics.active_total(), 0);
         manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn export_manager_starts_and_releases_historical_version_exports() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([46; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        let record = slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        control
+            .set_versioning_enabled("t", "v", true)
+            .await
+            .unwrap();
+        let dek = control.unwrap_volume_dek(&record).await.unwrap();
+        let live = Volume::open(&record, dek, Arc::clone(&object_store))
+            .await
+            .unwrap();
+        let creds = Credentials::root();
+        let file = live
+            .create(&creds, ROOT_INO, b"history.txt", 0o644, true)
+            .await
+            .unwrap();
+        live.write(&creds, file.ino, 0, b"managed history")
+            .await
+            .unwrap();
+        let repository = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
+            .await
+            .unwrap();
+        let commit = repository
+            .commit_file(
+                live.as_ref(),
+                "/history.txt",
+                "managed history".into(),
+                test_commit_provenance(),
+            )
+            .await
+            .unwrap();
+        repository.close().await.unwrap();
+        live.shutdown().await.unwrap();
+
+        let fh_key = control.server_fh_key().await.unwrap();
+        let mut export = nfs_export("history", "127.0.0.1:0");
+        export.version = Some(commit.id.clone());
+        control.create_export(export).await.unwrap();
+        control.close().await.unwrap();
+
+        let config = test_config(Vec::new());
+        let metrics = ExportMetrics::default();
+        let mut manager = ExportManager::new(
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            fh_key,
+            &config,
+            config_export_records(&config.exports),
+            metrics.clone(),
+            ExportManagerTargets {
+                metrics: Arc::new(Mutex::new(Vec::new())),
+                admin: Arc::new(Mutex::new(HashMap::new())),
+                admin_blocks: Arc::new(Mutex::new(HashMap::new())),
+            },
+        );
+        let reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        manager.reconcile(&reader).await.unwrap();
+        assert_eq!(metrics.active_total(), 1);
+        let key = BackendKey {
+            tenant: "t".into(),
+            volume: "v".into(),
+            snapshot: None,
+            version: Some(commit.id.clone()),
+        };
+        let historical = manager
+            .open_backends
+            .get(&key)
+            .and_then(|backend| backend.volume.vfs())
+            .expect("historical filesystem backend");
+        assert!(historical.read_only());
+        let attr = historical
+            .lookup(&creds, ROOT_INO, b"history.txt")
+            .await
+            .unwrap();
+        assert_eq!(
+            historical
+                .read(&creds, attr.ino, 0, 64)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"managed history"
+        );
+
+        let control = ControlPlane::open(Arc::clone(&object_store), kms)
+            .await
+            .unwrap();
+        control.disable_export("history").await.unwrap();
+        control.close().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        manager.reconcile(&reader).await.unwrap();
+        assert_eq!(metrics.active_total(), 0);
+        assert!(!manager.open_backends.contains_key(&key));
+        manager.shutdown().await;
+        reader.close().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -11809,6 +11974,7 @@ mod tests {
                 tenant: "t".to_string(),
                 volume: "v".to_string(),
                 snapshot: None,
+                version: None,
             })
             .and_then(OpenBackend::writable)
             .cloned()
@@ -11956,6 +12122,7 @@ mod tests {
                     tenant: "t".to_string(),
                     volume: "v".to_string(),
                     snapshot: None,
+                    version: None,
                 })
                 .and_then(OpenBackend::writable)
                 .cloned()
@@ -12124,6 +12291,7 @@ mod tests {
                     tenant: "t".to_string(),
                     volume: "v".to_string(),
                     snapshot: None,
+                    version: None,
                 })
                 .and_then(OpenBackend::writable)
                 .cloned()

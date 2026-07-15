@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use ed25519_dalek::{Signer, SigningKey};
 use futures::TryStreamExt;
-use slatefs_core::control::ControlPlane;
+use slatefs_core::control::{ControlPlane, ControlReader};
 use slatefs_core::error::Error;
 use slatefs_core::meta::inode::ROOT_INO;
 use slatefs_core::store::{self, ObjectStore};
@@ -88,8 +88,11 @@ async fn historical_version_volume_is_immutable_and_synthesizes_ancestors() {
         .unwrap();
     repository.close().await.unwrap();
 
-    let historical = VersionHistoricalVolume::open(
-        &control,
+    let reader = ControlReader::open(Arc::clone(&object_store), common::test_kms())
+        .await
+        .unwrap();
+    let historical = VersionHistoricalVolume::open_readonly(
+        &reader,
         Arc::clone(&object_store),
         "t",
         "v",
@@ -178,6 +181,7 @@ async fn historical_version_volume_is_immutable_and_synthesizes_ancestors() {
 
     repository.close().await.unwrap();
     historical.shutdown().await.unwrap();
+    reader.close().await.unwrap();
     live.shutdown().await.unwrap();
     control.close().await.unwrap();
 }

@@ -31,7 +31,7 @@ const TENANT_RECORD_VERSION: u8 = 1;
 const VOLUME_RECORD_VERSION: u8 = 1;
 const DAEMON_NODE_RECORD_VERSION: u8 = 1;
 const VOLUME_PLACEMENT_RECORD_VERSION: u8 = 1;
-const EXPORT_RECORD_VERSION: u8 = 1;
+const EXPORT_RECORD_VERSION: u8 = 2;
 const AUDIT_RECORD_VERSION: u8 = 1;
 const SNAPSHOT_RETENTION_RECORD_VERSION: u8 = 1;
 const VERSIONING_POLICY_RECORD_VERSION: u8 = 1;
@@ -283,6 +283,8 @@ pub struct ExportRecord {
     pub tenant: String,
     pub volume: String,
     pub snapshot: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
     pub protocol: ExportProtocol,
     pub listen: String,
     pub allowed_clients: Vec<ClientAddrRule>,
@@ -320,6 +322,7 @@ impl ExportRecord {
             tenant: config.tenant,
             volume: config.volume,
             snapshot: config.snapshot,
+            version: config.version,
             protocol: config.protocol,
             listen: config.listen,
             allowed_clients: config.allowed_clients,
@@ -342,13 +345,16 @@ impl ExportRecord {
     }
 
     pub fn normalize(&mut self) {
-        if self.snapshot.is_some() {
+        if let Some(commit) = &mut self.version {
+            commit.make_ascii_lowercase();
+        }
+        if self.snapshot.is_some() || self.version.is_some() {
             self.read_only = true;
         }
     }
 
     pub fn effective_read_only(&self) -> bool {
-        self.read_only || self.snapshot.is_some()
+        self.read_only || self.snapshot.is_some() || self.version.is_some()
     }
 
     pub fn to_config(&self) -> ExportConfig {
@@ -356,6 +362,7 @@ impl ExportRecord {
             tenant: self.tenant.clone(),
             volume: self.volume.clone(),
             snapshot: self.snapshot.clone(),
+            version: self.version.clone(),
             listen: self.listen.clone(),
             allowed_clients: self.allowed_clients.clone(),
             protocol: self.protocol,
@@ -372,58 +379,6 @@ impl ExportRecord {
             anon_uid: self.anon_uid,
             anon_gid: self.anon_gid,
         }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ExportRecordV1 {
-    id: String,
-    tenant: String,
-    volume: String,
-    snapshot: Option<String>,
-    protocol: ExportProtocol,
-    listen: String,
-    allowed_clients: Vec<ClientAddrRule>,
-    squash: SquashMode,
-    atime: AtimeMode,
-    anon_uid: u32,
-    anon_gid: u32,
-    p9_token: Option<String>,
-    p9_tls_cert: Option<std::path::PathBuf>,
-    p9_tls_key: Option<std::path::PathBuf>,
-    enabled: bool,
-    created_at: u64,
-    updated_at: u64,
-}
-
-impl From<ExportRecordV1> for ExportRecord {
-    fn from(value: ExportRecordV1) -> Self {
-        let mut record = ExportRecord {
-            id: value.id,
-            tenant: value.tenant,
-            volume: value.volume,
-            snapshot: value.snapshot,
-            protocol: value.protocol,
-            listen: value.listen,
-            allowed_clients: value.allowed_clients,
-            read_only: false,
-            sync: NbdSyncMode::Default,
-            nbd_tls_cert: None,
-            nbd_tls_key: None,
-            nbd_tls_client_ca: None,
-            squash: value.squash,
-            atime: value.atime,
-            anon_uid: value.anon_uid,
-            anon_gid: value.anon_gid,
-            p9_token: value.p9_token,
-            p9_tls_cert: value.p9_tls_cert,
-            p9_tls_key: value.p9_tls_key,
-            enabled: value.enabled,
-            created_at: value.created_at,
-            updated_at: value.updated_at,
-        };
-        record.normalize();
-        record
     }
 }
 
@@ -2662,6 +2617,12 @@ fn validate_export_record_fields(record: &ExportRecord) -> Result<()> {
             "snapshot id must not be empty",
         ));
     }
+    if record.version.as_deref().is_some_and(str::is_empty) {
+        return Err(Error::invalid(
+            "export version",
+            "version commit id must not be empty",
+        ));
+    }
     if record.listen.trim().is_empty() {
         return Err(Error::invalid(
             "export listen",
@@ -2747,16 +2708,11 @@ fn decode_volume_placement_record(bytes: &[u8]) -> Result<VolumePlacementRecord>
 
 fn decode_export_record(bytes: &[u8]) -> Result<ExportRecord> {
     match bytes.split_first() {
-        Some((&EXPORT_RECORD_VERSION, rest)) => match postcard::from_bytes(rest) {
-            Ok(mut record) => {
-                ExportRecord::normalize(&mut record);
-                Ok(record)
-            }
-            Err(new_error) => match postcard::from_bytes::<ExportRecordV1>(rest) {
-                Ok(legacy) => Ok(legacy.into()),
-                Err(_) => Err(new_error.into()),
-            },
-        },
+        Some((&EXPORT_RECORD_VERSION, rest)) => {
+            let mut record = postcard::from_bytes(rest)?;
+            ExportRecord::normalize(&mut record);
+            Ok(record)
+        }
         Some((&version, _)) => Err(Error::invalid(
             "record",
             format!("format version {version}, expected {EXPORT_RECORD_VERSION}"),
@@ -2924,34 +2880,6 @@ mod tests {
         assert_eq!(decoded.name, legacy.name);
     }
 
-    #[test]
-    fn legacy_export_record_decodes_with_nbd_defaults() {
-        let legacy = ExportRecordV1 {
-            id: "exp".to_string(),
-            tenant: "t".to_string(),
-            volume: "v".to_string(),
-            snapshot: Some("snap".to_string()),
-            protocol: ExportProtocol::Nfs,
-            listen: "127.0.0.1:12049".to_string(),
-            allowed_clients: Vec::new(),
-            squash: SquashMode::AllSquash,
-            atime: AtimeMode::Relatime,
-            anon_uid: 65534,
-            anon_gid: 65534,
-            p9_token: None,
-            p9_tls_cert: None,
-            p9_tls_key: None,
-            enabled: true,
-            created_at: 1,
-            updated_at: 2,
-        };
-        let bytes = encode_versioned(EXPORT_RECORD_VERSION, &legacy).unwrap();
-        let decoded = decode_export_record(&bytes).unwrap();
-        assert!(decoded.read_only);
-        assert_eq!(decoded.sync, NbdSyncMode::Default);
-        assert!(decoded.effective_read_only());
-    }
-
     #[tokio::test]
     async fn export_volume_kind_mismatch_is_rejected() {
         let object_store = store::resolve_root("memory:///").unwrap();
@@ -3000,6 +2928,7 @@ mod tests {
                 tenant: "t".to_string(),
                 volume: "fs".to_string(),
                 snapshot: None,
+                version: None,
                 listen: "127.0.0.1:12090".to_string(),
                 allowed_clients: Vec::new(),
                 protocol: ExportProtocol::Nbd,
@@ -3026,6 +2955,7 @@ mod tests {
                 tenant: "t".to_string(),
                 volume: "blk".to_string(),
                 snapshot: None,
+                version: None,
                 listen: "127.0.0.1:12091".to_string(),
                 allowed_clients: Vec::new(),
                 protocol: ExportProtocol::Nfs,

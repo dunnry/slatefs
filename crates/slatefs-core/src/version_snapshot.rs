@@ -14,7 +14,8 @@ use slatedb::DbReader;
 use slatedb::admin::AdminBuilder;
 use slatedb::object_store::ObjectStore;
 
-use crate::control::ControlPlane;
+use crate::control::{ControlPlane, ControlReader, VolumeRecord};
+use crate::crypto::Secret32;
 use crate::crypto::transformer::SlateBlockTransformer;
 use crate::error::{Error, Result};
 use crate::locks::{LockRange, RangeLock, RangeLockTable};
@@ -181,6 +182,63 @@ impl VersionHistoricalVolume {
                 .ok_or_else(|| {
                     Error::not_found("version repository", format!("{tenant}/{volume}"))
                 })?;
+        Self::open_repository(
+            record,
+            dek,
+            object_store,
+            tenant,
+            volume,
+            reference,
+            repository,
+        )
+        .await
+    }
+
+    /// Read-only-control-plane variant used by the daemon export reconciler.
+    pub async fn open_readonly(
+        control: &ControlReader,
+        object_store: Arc<dyn ObjectStore>,
+        tenant: &str,
+        volume: &str,
+        reference: &str,
+    ) -> Result<Arc<Self>> {
+        let record = control.get_mountable_volume(tenant, volume).await?;
+        if !matches!(record.kind, VolumeKind::Filesystem) {
+            return Err(Error::invalid(
+                "version historical export",
+                "only filesystem volumes have version history",
+            ));
+        }
+        let dek = control.unwrap_volume_dek(&record).await?;
+        let repository = VersionRepository::open_existing_readonly(
+            control,
+            Arc::clone(&object_store),
+            tenant,
+            volume,
+        )
+        .await?
+        .ok_or_else(|| Error::not_found("version repository", format!("{tenant}/{volume}")))?;
+        Self::open_repository(
+            record,
+            dek,
+            object_store,
+            tenant,
+            volume,
+            reference,
+            repository,
+        )
+        .await
+    }
+
+    async fn open_repository(
+        record: VolumeRecord,
+        dek: Secret32,
+        object_store: Arc<dyn ObjectStore>,
+        tenant: &str,
+        volume: &str,
+        reference: &str,
+        repository: VersionRepository,
+    ) -> Result<Arc<Self>> {
         let prepared = repository.prepare_historical_export(reference).await;
         let close = repository.close().await;
         let plan = prepared?;

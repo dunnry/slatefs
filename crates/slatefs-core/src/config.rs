@@ -252,6 +252,10 @@ pub struct ExportConfig {
     /// Unset means serve the live writable volume.
     #[serde(default)]
     pub snapshot: Option<String>,
+    /// Exact version commit id to serve as a read-only historical filesystem.
+    /// Mutually exclusive with `snapshot` and unavailable to block exports.
+    #[serde(default)]
+    pub version: Option<String>,
     /// `ip:port` for this export's listener, e.g. `127.0.0.1:12049`.
     pub listen: String,
     /// Source IPs/CIDRs allowed to connect to this export. Empty means allow
@@ -262,8 +266,8 @@ pub struct ExportConfig {
     /// Wire protocol for this export (one listener per export, DD-10).
     #[serde(default)]
     pub protocol: ExportProtocol,
-    /// NBD only: expose the block device as read-only. Snapshot exports are
-    /// always read-only regardless of this field.
+    /// NBD only: expose the block device as read-only. Snapshot and historical
+    /// version exports are always read-only regardless of this field.
     #[serde(default)]
     pub read_only: bool,
     /// NBD only: write durability mode. `strict` forces every write and
@@ -312,13 +316,16 @@ pub struct ExportConfig {
 
 impl ExportConfig {
     pub fn normalize(&mut self) {
-        if self.snapshot.is_some() {
+        if let Some(commit) = &mut self.version {
+            commit.make_ascii_lowercase();
+        }
+        if self.snapshot.is_some() || self.version.is_some() {
             self.read_only = true;
         }
     }
 
     pub fn effective_read_only(&self) -> bool {
-        self.read_only || self.snapshot.is_some()
+        self.read_only || self.snapshot.is_some() || self.version.is_some()
     }
 }
 
@@ -743,6 +750,26 @@ pub fn validate_export_config(export: &ExportConfig) -> Result<()> {
     let has_nbd_tls_key = export.nbd_tls_key.is_some();
     let has_nbd_tls_client_ca = export.nbd_tls_client_ca.is_some();
     let has_p9_token = export.p9_token.is_some();
+    if export.snapshot.is_some() && export.version.is_some() {
+        return Err(Error::Config(format!(
+            "export {}/{} cannot set both snapshot and version",
+            export.tenant, export.volume
+        )));
+    }
+    if let Some(commit) = &export.version
+        && (commit.len() != 64 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(Error::Config(format!(
+            "export {}/{} version must be an exact 64-character commit id",
+            export.tenant, export.volume
+        )));
+    }
+    if export.version.is_some() && export.protocol == ExportProtocol::Nbd {
+        return Err(Error::Config(format!(
+            "export {}/{} cannot serve version history over nbd",
+            export.tenant, export.volume
+        )));
+    }
     if has_p9_tls_cert != has_p9_tls_key {
         return Err(Error::Config(format!(
             "export {}/{} must set both p9_tls_cert and p9_tls_key, or neither",
@@ -801,7 +828,7 @@ pub fn validate_export_config(export: &ExportConfig) -> Result<()> {
                     export.tenant, export.volume
                 )));
             }
-            if export.read_only && export.snapshot.is_none() {
+            if export.read_only && export.snapshot.is_none() && export.version.is_none() {
                 return Err(Error::Config(format!(
                     "export {}/{} sets read_only on a live filesystem export",
                     export.tenant, export.volume
@@ -813,6 +840,12 @@ pub fn validate_export_config(export: &ExportConfig) -> Result<()> {
 }
 
 pub fn validate_export_volume_kind(export: &ExportConfig, kind: VolumeKind) -> Result<()> {
+    if export.version.is_some() && kind != VolumeKind::Filesystem {
+        return Err(Error::Config(format!(
+            "historical version export {}/{} requires a filesystem volume and nfs or p9",
+            export.tenant, export.volume
+        )));
+    }
     match (export.protocol, kind) {
         (ExportProtocol::Nbd, VolumeKind::Block { .. }) => Ok(()),
         (ExportProtocol::Nbd, VolumeKind::Filesystem) => Err(Error::Config(format!(
@@ -927,6 +960,49 @@ mod tests {
         assert!(!config.exports[0].read_only);
         assert!(config.exports[1].read_only);
         assert!(config.exports[1].effective_read_only());
+    }
+
+    #[test]
+    fn historical_version_export_is_exact_read_only_and_exclusive() {
+        let commit = "A".repeat(64);
+        let raw = format!(
+            r#"
+                [object_store]
+                url = "memory:///"
+
+                [kms]
+                provider = "static"
+                key_hex = "0101010101010101010101010101010101010101010101010101010101010101"
+
+                [[exports]]
+                tenant = "t"
+                volume = "v"
+                version = "{commit}"
+                listen = "127.0.0.1:12049"
+            "#
+        );
+        let config = Config::parse(&raw).unwrap();
+        let expected = "a".repeat(64);
+        assert_eq!(
+            config.exports[0].version.as_deref(),
+            Some(expected.as_str())
+        );
+        assert!(config.exports[0].effective_read_only());
+
+        let both = raw.replace(
+            &format!("version = \"{commit}\""),
+            &format!("version = \"{commit}\"\nsnapshot = \"checkpoint\""),
+        );
+        assert!(Config::parse(&both).is_err());
+
+        let symbolic = raw.replace(&commit, "main");
+        assert!(Config::parse(&symbolic).is_err());
+
+        let nbd = raw.replace(
+            "listen = \"127.0.0.1:12049\"",
+            "listen = \"127.0.0.1:12049\"\nprotocol = \"nbd\"",
+        );
+        assert!(Config::parse(&nbd).is_err());
     }
 
     #[test]

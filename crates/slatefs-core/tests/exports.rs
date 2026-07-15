@@ -30,6 +30,7 @@ async fn export_crud_round_trips() {
             tenant: "t".to_string(),
             volume: "v".to_string(),
             snapshot: None,
+            version: None,
             listen: "127.0.0.1:12049".to_string(),
             allowed_clients: vec!["127.0.0.1".parse().unwrap()],
             protocol: ExportProtocol::Nfs,
@@ -69,6 +70,14 @@ async fn export_crud_round_trips() {
     let removed = control.remove_export("exp1").await.unwrap();
     assert_eq!(removed.id, "exp1");
     assert!(control.try_get_export("exp1").await.unwrap().is_none());
+
+    let mut historical = removed;
+    historical.id = "history".into();
+    historical.version = Some("A".repeat(64));
+    historical.read_only = false;
+    let historical = control.create_export(historical).await.unwrap();
+    assert_eq!(historical.version, Some("a".repeat(64)));
+    assert!(historical.effective_read_only());
     control.close().await.unwrap();
 }
 
@@ -95,6 +104,7 @@ async fn export_validation_rejects_bad_records() {
             tenant: "t".to_string(),
             volume: "v".to_string(),
             snapshot: None,
+            version: None,
             listen: "127.0.0.1:12049".to_string(),
             allowed_clients: Vec::new(),
             protocol: ExportProtocol::Nfs,
