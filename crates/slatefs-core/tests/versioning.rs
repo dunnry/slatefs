@@ -357,6 +357,17 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         .await
         .unwrap();
     assert!(protected_fast_forward.fast_forward());
+    repository.close().await.unwrap();
+    assert!(matches!(
+        purge_version_history(&control, Arc::clone(&object_store), "t", "v").await,
+        Err(Error::Invalid {
+            what: "version history purge",
+            ..
+        })
+    ));
+    let repository = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap();
     let unprotected = repository
         .set_branch_protected_as("release", false, &[], &[], "test-manager")
         .await

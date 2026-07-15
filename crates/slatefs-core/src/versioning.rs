@@ -1969,8 +1969,10 @@ pub async fn purge_version_history(
     tenant: &str,
     volume: &str,
 ) -> Result<usize> {
-    control.get_volume(tenant, volume).await?;
-    delete_version_history_objects(object_store, tenant, volume).await
+    let record = control.get_mountable_volume(tenant, volume).await?;
+    let dek = control.unwrap_volume_dek(&record).await?;
+    delete_version_history_objects_with_policy(object_store, tenant, volume, Some((record, dek)))
+        .await
 }
 
 pub(crate) async fn delete_version_history_objects(
@@ -1978,15 +1980,69 @@ pub(crate) async fn delete_version_history_objects(
     tenant: &str,
     volume: &str,
 ) -> Result<usize> {
+    delete_version_history_objects_with_policy(object_store, tenant, volume, None).await
+}
+
+async fn delete_version_history_objects_with_policy(
+    object_store: Arc<dyn ObjectStore>,
+    tenant: &str,
+    volume: &str,
+    protected_volume: Option<(VolumeRecord, crate::crypto::Secret32)>,
+) -> Result<usize> {
     let maintenance =
         VersionMaintenanceGuard::acquire(Arc::clone(&object_store), tenant, volume, "purge")
             .await?;
-    let result =
-        store::delete_prefix(&object_store, &store::version_db_prefix(tenant, volume)).await;
+    let result = async {
+        if let Some((record, dek)) = protected_volume
+            && store::prefix_exists(&object_store, &store::version_db_prefix(tenant, volume))
+                .await?
+        {
+            let db = open_version_db(&record, dek, Arc::clone(&object_store)).await?;
+            let version_store = VersionStore::new(db);
+            let protections = version_store.list_branch_protections().await;
+            let db_close = version_store.db.close().await.map_err(Error::from);
+            let protections = protections?;
+            db_close?;
+            if !protections.is_empty() {
+                let branches = protections
+                    .into_iter()
+                    .map(|protection| protection.branch)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(Error::invalid(
+                    "version history purge",
+                    format!(
+                        "protected branches block history purge: {branches}; unprotect them first"
+                    ),
+                ));
+            }
+        }
+        store::delete_prefix(&object_store, &store::version_db_prefix(tenant, volume)).await
+    }
+    .await;
     let close = maintenance.close().await;
     let deleted = result?;
     close?;
     Ok(deleted)
+}
+
+async fn open_version_db(
+    record: &VolumeRecord,
+    dek: crate::crypto::Secret32,
+    object_store: Arc<dyn ObjectStore>,
+) -> Result<Db> {
+    Db::builder(
+        store::version_db_path(&record.tenant, &record.name),
+        object_store,
+    )
+    .with_settings(Settings {
+        compression_codec: record.compression.to_slatedb(),
+        ..Settings::default()
+    })
+    .with_block_transformer(Arc::new(SlateBlockTransformer::new(record.cipher, dek)))
+    .build()
+    .await
+    .map_err(Error::from)
 }
 
 impl VersionRepository {
@@ -2109,22 +2165,12 @@ impl VersionRepository {
                 "file versioning is available only for filesystem volumes",
             ));
         }
-        let db = Db::builder(
-            store::version_db_path(&record.tenant, &record.name),
-            object_store,
-        )
-        .with_settings(Settings {
-            compression_codec: record.compression.to_slatedb(),
-            ..Settings::default()
-        })
-        .with_block_transformer(Arc::new(SlateBlockTransformer::new(record.cipher, dek)))
-        .build()
-        .await;
+        let db = open_version_db(record, dek, object_store).await;
         let db = match db {
             Ok(db) => db,
             Err(error) => {
                 let _ = maintenance.close().await;
-                return Err(error.into());
+                return Err(error);
             }
         };
         let store = VersionStore::new(db);

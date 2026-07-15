@@ -224,7 +224,8 @@ accept a commit ID, tag name, or branch name.
 `versioning verify` checks the reachable commit DAG and reads every
 referenced Prolly node and content blob.
 `versioning purge --yes` permanently removes the physical history prefix while
-leaving versioning enabled for a fresh next commit. Commit, restore, retention,
+leaving versioning enabled for a fresh next commit. Protected branches block
+purge until their guards are explicitly removed. Commit, restore, retention,
 GC, and purge actions emit durable audit records, and live daemon operations
 increment `slatefs_version_operations_total{tenant,volume,operation}`. An
 automatic collection uses the `gc-auto` operation label.
@@ -326,7 +327,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Set `keep_last`, `max_age_secs`, and/or `max_bytes`, or `{"clear":true}`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/gc` | Apply retention, or report with `{"dry_run":true}`. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/lease` | Break an expired lease with its exact observed `owner` and `{"confirm":true}`. |
-| `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/history` | Permanently purge history; requires `{"confirm":true}`. |
+| `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/history` | Permanently purge history; requires `{"confirm":true}` and no protected branches. |
 | `GET` | `/admin/v1/nodes` | Daemon node inventory with `limit` and `page_token`. |
 
 Every admin response includes `X-Request-Id`; callers may provide it or the

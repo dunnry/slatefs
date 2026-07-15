@@ -184,7 +184,9 @@ tags, named branch heads, and commits named by retained reflog entries add their
 referenced commit and tree to the GC reachability roots. The 100-transition
 recovery window therefore takes precedence over lower count or age limits. A
 physical purge deletes the separate version database prefix under the same
-lease.
+lease. While holding that lease, purge opens existing history and rejects the
+deletion if any branch protection record remains; whole-volume deletion is the
+explicit administrative exception.
 
 ## Request Path
 

@@ -1531,7 +1531,9 @@ fn core_error(error: slatefs_core::error::Error) -> AdminError {
     let status = match &error {
         slatefs_core::error::Error::NotFound { .. } => 404,
         slatefs_core::error::Error::AlreadyExists { .. } => 409,
-        slatefs_core::error::Error::Invalid { what, .. } if *what == "version branch operation" => {
+        slatefs_core::error::Error::Invalid { what, .. }
+            if matches!(*what, "version branch operation" | "version history purge") =>
+        {
             409
         }
         slatefs_core::error::Error::Invalid { what, .. }
@@ -8115,6 +8117,15 @@ mod tests {
             branch_history["commits"][0]["id"],
             branch_commit["commit"]["id"]
         );
+        let blocked_purge_body = r#"{"confirm":true}"#;
+        let blocked_purge_request = format!(
+            "DELETE /admin/v1/tenants/t/volumes/v/versioning/history HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            blocked_purge_body.len(),
+            blocked_purge_body
+        );
+        let blocked_purge =
+            admin_exchange(Arc::clone(&state), blocked_purge_request.as_bytes()).await;
+        assert_eq!(response_status(&blocked_purge), 409, "{blocked_purge}");
         let unprotect_response = admin_exchange(
             Arc::clone(&state),
             b"DELETE /admin/v1/tenants/t/volumes/v/versioning/branches/release/protection HTTP/1.1\r\nHost: localhost\r\n\r\n",

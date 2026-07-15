@@ -328,7 +328,9 @@ matching commits rather than merely scanning 100 unfiltered commits.
 `versioning purge <tenant> <volume> --yes` is irreversible. SlateFS acquires
 the same deployment-wide per-volume lease used by repository reads, commits,
 verification, and GC, so a concurrent operation returns a conflict instead of
-racing the deletion. Disabling alone retains history and is not a purge. For a
+racing the deletion. Any protected branch also returns a conflict; review and
+explicitly unprotect every guarded branch before purging. Disabling alone
+retains history and is not a purge. For a
 served volume, continue to use `--live`; the lease coordinates version history,
 not direct access to the live filesystem writer.
 
