@@ -1664,6 +1664,16 @@ struct VersionCommitRequestFingerprint<'a> {
     committer: &'a str,
 }
 
+#[derive(Serialize)]
+struct VersionCherryPickRequestFingerprint<'a> {
+    version: u8,
+    source: [u8; 32],
+    target: &'a str,
+    mainline: Option<u32>,
+    author: &'a str,
+    committer: &'a str,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VersionRef {
     commit_id: [u8; 32],
@@ -1830,6 +1840,7 @@ pub enum VersionReflogAction {
     Commit,
     FastForward,
     Merge,
+    CherryPick,
     Reset,
     Delete,
     Recover,
@@ -1843,6 +1854,7 @@ impl VersionReflogAction {
             Self::Commit => "commit",
             Self::FastForward => "fast-forward",
             Self::Merge => "merge",
+            Self::CherryPick => "cherry-pick",
             Self::Reset => "reset",
             Self::Delete => "delete",
             Self::Recover => "recover",
@@ -1912,6 +1924,36 @@ pub struct VersionMergePreview {
     conflicts: Vec<String>,
 }
 
+/// Read-only evaluation of applying one commit delta to a target branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionCherryPickPreview {
+    source: String,
+    target: String,
+    target_head: Option<String>,
+    parent: Option<String>,
+    mainline: Option<u32>,
+    paths: Vec<String>,
+    conflicts: Vec<String>,
+    already_applied: bool,
+}
+
+/// Result of atomically applying one commit delta to a target branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionCherryPickInfo {
+    source: String,
+    target: String,
+    previous: Option<String>,
+    commit: String,
+    parent: Option<String>,
+    mainline: Option<u32>,
+    paths: Vec<String>,
+    applied: bool,
+    replayed: bool,
+    already_applied: bool,
+}
+
 impl VersionMergePreview {
     pub fn source(&self) -> &str {
         &self.source
@@ -1961,6 +2003,94 @@ impl VersionMergePreview {
 struct ThreeWayMergePlan {
     mutations: Vec<Mutation>,
     conflicts: Vec<String>,
+}
+
+struct CherryPickPlan {
+    mutations: Vec<Mutation>,
+    source_paths: Vec<String>,
+    applied_paths: Vec<String>,
+    conflicts: Vec<String>,
+    already_applied: bool,
+}
+
+impl VersionCherryPickPreview {
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    pub fn target_head(&self) -> Option<&str> {
+        self.target_head.as_deref()
+    }
+
+    pub fn parent(&self) -> Option<&str> {
+        self.parent.as_deref()
+    }
+
+    pub fn mainline(&self) -> Option<u32> {
+        self.mainline
+    }
+
+    pub fn paths(&self) -> &[String] {
+        &self.paths
+    }
+
+    pub fn conflicts(&self) -> &[String] {
+        &self.conflicts
+    }
+
+    pub fn already_applied(&self) -> bool {
+        self.already_applied
+    }
+
+    pub fn can_apply(&self) -> bool {
+        self.conflicts.is_empty()
+    }
+}
+
+impl VersionCherryPickInfo {
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    pub fn previous(&self) -> Option<&str> {
+        self.previous.as_deref()
+    }
+
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
+
+    pub fn parent(&self) -> Option<&str> {
+        self.parent.as_deref()
+    }
+
+    pub fn mainline(&self) -> Option<u32> {
+        self.mainline
+    }
+
+    pub fn paths(&self) -> &[String] {
+        &self.paths
+    }
+
+    pub fn applied(&self) -> bool {
+        self.applied
+    }
+
+    pub fn replayed(&self) -> bool {
+        self.replayed
+    }
+
+    pub fn already_applied(&self) -> bool {
+        self.already_applied
+    }
 }
 
 impl VersionMergeInfo {
@@ -4644,6 +4774,317 @@ impl VersionRepository {
         })
     }
 
+    /// Preview applying the selected commit's delta to `target`. Ordinary
+    /// commits use their sole parent; merge commits require a one-based
+    /// `mainline` parent. No branch or Prolly node is modified.
+    pub async fn preview_cherry_pick(
+        &self,
+        source: &str,
+        target: &str,
+        mainline: Option<u32>,
+    ) -> Result<VersionCherryPickPreview> {
+        validate_version_branch_name(target)?;
+        let source = self.resolve_commit(source).await?;
+        let target_ref = self.store.get_branch(target).await?;
+        if target != "main" && target_ref.is_none() {
+            return Err(Error::not_found("version branch", target));
+        }
+        let (parent, base) = self.cherry_pick_base(&source, mainline).await?;
+        let target_tree = target_ref
+            .as_ref()
+            .map(|reference| reference.tree.to_tree())
+            .unwrap_or_else(|| self.prolly.create());
+        let plan = self
+            .cherry_pick_plan(&base, &target_tree, &source.tree.to_tree())
+            .await?;
+        Ok(VersionCherryPickPreview {
+            source: hex::encode(source.id),
+            target: target.to_string(),
+            target_head: target_ref.map(|reference| hex::encode(reference.commit_id)),
+            parent: parent.map(hex::encode),
+            mainline,
+            paths: plan.source_paths,
+            conflicts: plan.conflicts,
+            already_applied: plan.already_applied,
+        })
+    }
+
+    /// Atomically apply one commit delta to `target` and publish a new
+    /// single-parent commit. Conflicts abort without moving the branch.
+    /// Repeating the same idempotency key and request returns the first result.
+    pub async fn cherry_pick(
+        &self,
+        source: &str,
+        target: &str,
+        mainline: Option<u32>,
+        provenance: VersionCommitProvenance,
+        idempotency_key: Option<&str>,
+    ) -> Result<VersionCherryPickInfo> {
+        validate_version_branch_name(target)?;
+        let source = self.resolve_commit(source).await?;
+        let source_id = hex::encode(source.id);
+        let (source_parent, base) = self.cherry_pick_base(&source, mainline).await?;
+        let idempotency = idempotency_key
+            .map(|key| {
+                version_cherry_pick_idempotency_intent(
+                    key,
+                    source.id,
+                    target,
+                    mainline,
+                    &provenance,
+                )
+            })
+            .transpose()?;
+        let target_ref = self.store.get_branch(target).await?;
+        if target != "main" && target_ref.is_none() {
+            return Err(Error::not_found("version branch", target));
+        }
+        if let Some(intent) = idempotency
+            && let Some(commit) = self.store.resolve_idempotency(intent).await?
+        {
+            return Ok(VersionCherryPickInfo {
+                source: source_id,
+                target: target.to_string(),
+                previous: commit.parents.first().copied().map(hex::encode),
+                commit: hex::encode(commit.id),
+                parent: source_parent.map(hex::encode),
+                mainline,
+                paths: commit.paths,
+                applied: true,
+                replayed: true,
+                already_applied: false,
+            });
+        }
+        let target_tree = target_ref
+            .as_ref()
+            .map(|reference| reference.tree.to_tree())
+            .unwrap_or_else(|| self.prolly.create());
+        let plan = self
+            .cherry_pick_plan(&base, &target_tree, &source.tree.to_tree())
+            .await?;
+        if let Some(path) = plan.conflicts.first() {
+            return Err(Error::Versioning(format!(
+                "cherry-pick conflict applying {} to {target} at {path}",
+                source_id
+            )));
+        }
+        if plan.mutations.is_empty() {
+            let target_ref = target_ref.ok_or_else(|| {
+                Error::Versioning("empty target cannot already contain a cherry-pick".into())
+            })?;
+            return Ok(VersionCherryPickInfo {
+                source: source_id,
+                target: target.to_string(),
+                previous: Some(hex::encode(target_ref.commit_id)),
+                commit: hex::encode(target_ref.commit_id),
+                parent: source_parent.map(hex::encode),
+                mainline,
+                paths: Vec::new(),
+                applied: false,
+                replayed: false,
+                already_applied: plan.already_applied,
+            });
+        }
+        let tree = self
+            .prolly
+            .batch(&target_tree, plan.mutations)
+            .await
+            .map_err(prolly_error)?;
+        let previous = target_ref.as_ref().map(|reference| reference.commit_id);
+        let body = VersionCommitBody {
+            parents: previous.into_iter().collect(),
+            tree: RootManifest::from_tree(&tree),
+            created_at: crate::control::now_unix(),
+            message: format!(
+                "Cherry-pick {} onto {target}: {}",
+                &source_id[..12],
+                source.message
+            ),
+            paths: plan.applied_paths,
+            provenance,
+        };
+        let id: [u8; 32] = Sha256::digest(postcard::to_allocvec(&body)?).into();
+        let commit = VersionCommit {
+            id,
+            parents: body.parents,
+            tree: body.tree,
+            created_at: body.created_at,
+            message: body.message,
+            paths: body.paths,
+            provenance: body.provenance,
+        };
+        let encoded = encode_versioned(COMMIT_VERSION, &commit)?;
+        let outcome = self
+            .store
+            .publish_commit(VersionPublishRequest {
+                branch: target,
+                expected: previous,
+                required_ref: None,
+                commit: &commit,
+                encoded_commit: encoded,
+                idempotency,
+                max_bytes: self.max_bytes,
+                reflog_action: VersionReflogAction::CherryPick,
+            })
+            .await?;
+        let (commit, replayed) = match outcome {
+            VersionPublishOutcome::Published => (commit, false),
+            VersionPublishOutcome::Replayed(commit) => (*commit, true),
+        };
+        Ok(VersionCherryPickInfo {
+            source: source_id,
+            target: target.to_string(),
+            previous: commit.parents.first().copied().map(hex::encode),
+            commit: hex::encode(commit.id),
+            parent: source_parent.map(hex::encode),
+            mainline,
+            paths: commit.paths,
+            applied: true,
+            replayed,
+            already_applied: false,
+        })
+    }
+
+    async fn cherry_pick_base(
+        &self,
+        source: &VersionCommit,
+        mainline: Option<u32>,
+    ) -> Result<(Option<[u8; 32]>, Tree)> {
+        let parent = match source.parents.as_slice() {
+            [] => {
+                if mainline.is_some() {
+                    return Err(Error::invalid(
+                        "version cherry-pick mainline",
+                        "root commits do not accept a mainline parent",
+                    ));
+                }
+                None
+            }
+            [parent] => {
+                if mainline.is_some() {
+                    return Err(Error::invalid(
+                        "version cherry-pick mainline",
+                        "non-merge commits do not accept a mainline parent",
+                    ));
+                }
+                Some(*parent)
+            }
+            parents => {
+                let mainline = mainline.ok_or_else(|| {
+                    Error::invalid(
+                        "version cherry-pick mainline",
+                        "merge commits require a one-based mainline parent",
+                    )
+                })?;
+                if mainline == 0 {
+                    return Err(Error::invalid(
+                        "version cherry-pick mainline",
+                        format!("must be between 1 and {}", parents.len()),
+                    ));
+                }
+                let index = usize::try_from(mainline - 1).map_err(|_| {
+                    Error::invalid("version cherry-pick mainline", "parent index is too large")
+                })?;
+                Some(*parents.get(index).ok_or_else(|| {
+                    Error::invalid(
+                        "version cherry-pick mainline",
+                        format!("must be between 1 and {}", parents.len()),
+                    )
+                })?)
+            }
+        };
+        let tree = match parent {
+            Some(parent) => self.store.get_commit(&parent).await?.tree.to_tree(),
+            None => self.prolly.create(),
+        };
+        Ok((parent, tree))
+    }
+
+    async fn cherry_pick_plan(
+        &self,
+        base: &Tree,
+        target: &Tree,
+        source: &Tree,
+    ) -> Result<CherryPickPlan> {
+        let source_paths = self
+            .prolly
+            .diff(base, source)
+            .await
+            .map_err(prolly_error)?
+            .into_iter()
+            .map(|diff| version_path_from_tree_key(diff.key()).map(|(path, _)| path))
+            .collect::<Result<BTreeSet<_>>>()?;
+        let base_states = self.tree_path_states(base, &source_paths).await?;
+        let target_states = self.tree_path_states(target, &source_paths).await?;
+        let source_states = self.tree_path_states(source, &source_paths).await?;
+        let mut mutations = Vec::new();
+        let mut applied_paths = Vec::new();
+        let mut conflicts = Vec::new();
+        for path in &source_paths {
+            let base_state = base_states.get(path).cloned().unwrap_or_default();
+            let target_state = target_states.get(path).cloned().unwrap_or_default();
+            let source_state = source_states.get(path).cloned().unwrap_or_default();
+            if target_state == source_state {
+                continue;
+            }
+            if target_state != base_state {
+                conflicts.push(path.clone());
+                continue;
+            }
+            let keys = target_state
+                .keys()
+                .chain(source_state.keys())
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            for key in keys {
+                match source_state.get(&key) {
+                    Some(value) if target_state.get(&key) != Some(value) => {
+                        mutations.push(Mutation::Upsert {
+                            key,
+                            val: value.clone(),
+                        });
+                    }
+                    None if target_state.contains_key(&key) => {
+                        mutations.push(Mutation::Delete { key });
+                    }
+                    _ => {}
+                }
+            }
+            applied_paths.push(path.clone());
+        }
+        Ok(CherryPickPlan {
+            already_applied: mutations.is_empty() && conflicts.is_empty(),
+            mutations,
+            source_paths: source_paths.into_iter().collect(),
+            applied_paths,
+            conflicts,
+        })
+    }
+
+    async fn tree_path_states(
+        &self,
+        tree: &Tree,
+        paths: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, BTreeMap<Vec<u8>, Vec<u8>>>> {
+        let mut states = BTreeMap::new();
+        let mut range = self
+            .prolly
+            .range(tree, &[], None)
+            .await
+            .map_err(prolly_error)?;
+        while let Some(entry) = range.next().await {
+            let (key, value) = entry.map_err(prolly_error)?;
+            let (path, _) = version_path_from_tree_key(&key)?;
+            if paths.contains(&path) {
+                states
+                    .entry(path)
+                    .or_insert_with(BTreeMap::new)
+                    .insert(key, value);
+            }
+        }
+        Ok(states)
+    }
+
     async fn commit_is_ancestor(&self, ancestor: [u8; 32], descendant: [u8; 32]) -> Result<bool> {
         let mut pending = vec![descendant];
         let mut seen = HashSet::new();
@@ -6790,6 +7231,40 @@ fn version_commit_idempotency_intent(
         branch,
         message,
         paths: canonical_paths,
+        author: provenance.author(),
+        committer: provenance.committer(),
+    };
+    let request_fingerprint = Sha256::digest(postcard::to_allocvec(&request)?).into();
+    Ok(VersionCommitIdempotencyIntent {
+        key_hash: Sha256::digest(key.as_bytes()).into(),
+        request_fingerprint,
+    })
+}
+
+fn version_cherry_pick_idempotency_intent(
+    key: &str,
+    source: [u8; 32],
+    target: &str,
+    mainline: Option<u32>,
+    provenance: &VersionCommitProvenance,
+) -> Result<VersionCommitIdempotencyIntent> {
+    if key.is_empty() {
+        return Err(Error::invalid(
+            "version cherry-pick idempotency key",
+            "must not be empty",
+        ));
+    }
+    if key.len() > 256 {
+        return Err(Error::invalid(
+            "version cherry-pick idempotency key",
+            "must not exceed 256 UTF-8 bytes",
+        ));
+    }
+    let request = VersionCherryPickRequestFingerprint {
+        version: 1,
+        source,
+        target,
+        mainline,
         author: provenance.author(),
         committer: provenance.committer(),
     };

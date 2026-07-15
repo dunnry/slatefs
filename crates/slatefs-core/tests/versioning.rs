@@ -187,6 +187,303 @@ async fn historical_version_volume_is_immutable_and_synthesizes_ancestors() {
 }
 
 #[tokio::test]
+async fn cherry_pick_applies_complete_paths_atomically_and_requires_merge_mainline() {
+    let object_store: Arc<dyn ObjectStore> = store::resolve_root("memory:///").unwrap();
+    let control = ControlPlane::open(Arc::clone(&object_store), common::test_kms())
+        .await
+        .unwrap();
+    control.create_tenant("t", None).await.unwrap();
+    let record = volume::create_volume(
+        &control,
+        Arc::clone(&object_store),
+        "t",
+        "v",
+        common::create_opts(None, None),
+    )
+    .await
+    .unwrap();
+    control
+        .set_versioning_enabled("t", "v", true)
+        .await
+        .unwrap();
+    let dek = control.unwrap_volume_dek(&record).await.unwrap();
+    let live = Volume::open(&record, dek, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    let creds = Credentials::root();
+    let shared = live
+        .create(&creds, ROOT_INO, b"shared.txt", 0o640, true)
+        .await
+        .unwrap();
+    let target_only = live
+        .create(&creds, ROOT_INO, b"target.txt", 0o640, true)
+        .await
+        .unwrap();
+    let feature_only = live
+        .create(&creds, ROOT_INO, b"feature.txt", 0o640, true)
+        .await
+        .unwrap();
+    live.write(&creds, shared.ino, 0, b"base").await.unwrap();
+    live.write(&creds, target_only.ino, 0, b"base")
+        .await
+        .unwrap();
+    live.write(&creds, feature_only.ino, 0, b"base")
+        .await
+        .unwrap();
+
+    let repository = VersionRepository::open(&control, Arc::clone(&object_store), "t", "v")
+        .await
+        .unwrap();
+    let baseline = repository
+        .commit_paths(
+            live.as_ref(),
+            &[
+                "/shared.txt".into(),
+                "/target.txt".into(),
+                "/feature.txt".into(),
+            ],
+            "baseline".into(),
+            test_provenance(),
+        )
+        .await
+        .unwrap();
+    for branch in ["feature", "target", "conflict", "side", "merge-target"] {
+        repository
+            .create_branch(branch, &baseline.id)
+            .await
+            .unwrap();
+    }
+
+    live.write(&creds, shared.ino, 0, b"feature").await.unwrap();
+    live.write(&creds, feature_only.ino, 0, b"feature-only")
+        .await
+        .unwrap();
+    let feature = repository
+        .commit_paths_on_branch(
+            live.as_ref(),
+            "feature",
+            &["/shared.txt".into(), "/feature.txt".into()],
+            "feature change".into(),
+            test_provenance(),
+        )
+        .await
+        .unwrap();
+
+    live.write(&creds, target_only.ino, 0, b"target-only")
+        .await
+        .unwrap();
+    let target = repository
+        .commit_paths_on_branch(
+            live.as_ref(),
+            "target",
+            &["/target.txt".into()],
+            "target change".into(),
+            test_provenance(),
+        )
+        .await
+        .unwrap();
+    let preview = repository
+        .preview_cherry_pick(&feature.id, "target", None)
+        .await
+        .unwrap();
+    assert_eq!(preview.source(), feature.id);
+    assert_eq!(preview.target_head(), Some(target.id.as_str()));
+    assert_eq!(preview.parent(), Some(baseline.id.as_str()));
+    assert_eq!(
+        preview.paths(),
+        &["/feature.txt".to_string(), "/shared.txt".to_string()]
+    );
+    assert!(preview.can_apply());
+    assert!(!preview.already_applied());
+
+    let picked = repository
+        .cherry_pick(
+            &feature.id,
+            "target",
+            None,
+            test_provenance(),
+            Some("pick-feature"),
+        )
+        .await
+        .unwrap();
+    assert!(picked.applied());
+    assert!(!picked.replayed());
+    assert!(!picked.already_applied());
+    assert_eq!(picked.previous(), Some(target.id.as_str()));
+    assert_eq!(picked.parent(), Some(baseline.id.as_str()));
+    assert_eq!(picked.paths(), preview.paths());
+    let picked_commit = repository.inspect_commit(picked.commit()).await.unwrap();
+    assert_eq!(picked_commit.parents, vec![target.id.clone()]);
+    assert_eq!(
+        repository
+            .read_file(picked.commit(), "/shared.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"feature"
+    );
+    assert_eq!(
+        repository
+            .read_file(picked.commit(), "/feature.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"feature-only"
+    );
+    assert_eq!(
+        repository
+            .read_file(picked.commit(), "/target.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"target-only"
+    );
+    assert_eq!(
+        repository
+            .list_branches()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|branch| branch.name() == "feature")
+            .unwrap()
+            .commit(),
+        feature.id
+    );
+    assert_eq!(
+        repository.reflog("target", 1).await.unwrap()[0].action(),
+        VersionReflogAction::CherryPick
+    );
+
+    let replayed = repository
+        .cherry_pick(
+            &feature.id,
+            "target",
+            None,
+            test_provenance(),
+            Some("pick-feature"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replayed.commit(), picked.commit());
+    assert!(replayed.replayed());
+    let already = repository
+        .cherry_pick(&feature.id, "target", None, test_provenance(), None)
+        .await
+        .unwrap();
+    assert!(!already.applied());
+    assert!(already.already_applied());
+    assert_eq!(already.commit(), picked.commit());
+
+    live.write(&creds, shared.ino, 0, b"target-conflict")
+        .await
+        .unwrap();
+    let conflicting_target = repository
+        .commit_paths_on_branch(
+            live.as_ref(),
+            "conflict",
+            &["/shared.txt".into()],
+            "conflicting target".into(),
+            test_provenance(),
+        )
+        .await
+        .unwrap();
+    let conflict_preview = repository
+        .preview_cherry_pick(&feature.id, "conflict", None)
+        .await
+        .unwrap();
+    assert_eq!(conflict_preview.conflicts(), &["/shared.txt".to_string()]);
+    assert!(!conflict_preview.can_apply());
+    assert!(
+        repository
+            .cherry_pick(&feature.id, "conflict", None, test_provenance(), None,)
+            .await
+            .is_err()
+    );
+    let conflict_head = repository
+        .list_branches()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|branch| branch.name() == "conflict")
+        .unwrap();
+    assert_eq!(conflict_head.commit(), conflicting_target.id);
+    assert_eq!(
+        repository
+            .read_file(conflict_head.commit(), "/feature.txt")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"base",
+        "non-conflicting paths must not publish when any path conflicts"
+    );
+
+    live.write(&creds, target_only.ino, 0, b"side-change")
+        .await
+        .unwrap();
+    let side = repository
+        .commit_paths_on_branch(
+            live.as_ref(),
+            "side",
+            &["/target.txt".into()],
+            "side change".into(),
+            test_provenance(),
+        )
+        .await
+        .unwrap();
+    let merge = repository
+        .merge_branch(
+            "feature",
+            "side",
+            VersionMergeConflictStrategy::Fail,
+            test_provenance(),
+        )
+        .await
+        .unwrap();
+    assert!(!merge.fast_forward());
+    assert!(
+        repository
+            .preview_cherry_pick(merge.commit(), "merge-target", None)
+            .await
+            .is_err()
+    );
+    assert!(
+        repository
+            .preview_cherry_pick(merge.commit(), "merge-target", Some(3))
+            .await
+            .is_err()
+    );
+    assert!(
+        repository
+            .preview_cherry_pick(merge.commit(), "merge-target", Some(0))
+            .await
+            .is_err()
+    );
+    let merge_preview = repository
+        .preview_cherry_pick(merge.commit(), "merge-target", Some(1))
+        .await
+        .unwrap();
+    assert_eq!(merge_preview.parent(), Some(side.id.as_str()));
+    assert_eq!(merge_preview.paths(), preview.paths());
+    let merge_pick = repository
+        .cherry_pick(
+            merge.commit(),
+            "merge-target",
+            Some(1),
+            test_provenance(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(merge_pick.applied());
+    assert_eq!(merge_pick.mainline(), Some(1));
+    assert_eq!(merge_pick.parent(), Some(side.id.as_str()));
+
+    repository.close().await.unwrap();
+    live.shutdown().await.unwrap();
+    control.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn versioning_is_opt_in_and_restores_committed_files() {
     let object_store: Arc<dyn ObjectStore> = store::resolve_root("memory:///").unwrap();
     let control = ControlPlane::open(Arc::clone(&object_store), common::test_kms())
