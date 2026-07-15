@@ -222,6 +222,8 @@ slatefs -c /etc/slatefs/slatefs.toml versioning inspect <tenant> <volume> <commi
 slatefs versioning attestation-keygen --out release.key --public-out release.pub
 slatefs -c /etc/slatefs/slatefs.toml versioning attest <tenant> <volume> <commit-or-ref> --key-id release-2026 --key-file release.key --live
 slatefs -c /etc/slatefs/slatefs.toml versioning attestations <tenant> <volume> <commit-or-ref> --trusted-public-key release.pub --live
+slatefs -c /etc/slatefs/slatefs.toml versioning export-attestations <tenant> <volume> <commit-or-ref> --out release-attestations.json --live
+slatefs versioning verify-attestation-bundle --in release-attestations.json --trusted-public-key release.pub
 slatefs -c /etc/slatefs/slatefs.toml versioning merge <tenant> <volume> <source> <target> --author <content-author> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning merge <tenant> <volume> <source> <target> --conflict-strategy ours --live
 slatefs -c /etc/slatefs/slatefs.toml versioning merge-preview <tenant> <volume> <source> <target> --live
@@ -237,7 +239,9 @@ signature, never `release.key`. The signed statement binds the tenant, volume,
 resolved commit ID, key ID, algorithm, public key, and timestamp. The
 `attestations --trusted-public-key` command independently verifies each
 returned signature against the resolved commit and fails unless that exact
-public key signed it.
+public key signed it. The exported version-1 JSON bundle carries the tenant,
+volume, canonical commit ID, and detached attestations. Bundle verification is
+standalone: it does not load `/etc/slatefs/slatefs.toml` or contact SlateFS.
 
 To require a signer on a protected branch, first attest its current head, then
 configure the trust anchor:

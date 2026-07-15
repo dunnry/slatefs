@@ -181,6 +181,11 @@ enters SlateFS. `versioning attestations ... --trusted-public-key <public.key>`
 independently verifies every returned signature against the resolved commit and
 requires at least one from that exact public key. Add `--live` to sign or
 inspect through `slatefsd`.
+`versioning export-attestations ... --out <bundle.json>` writes the resolved
+commit and its signatures as a portable bundle.
+`versioning verify-attestation-bundle --in <bundle.json> --trusted-public-key <public.key>`
+verifies it without loading a SlateFS config or contacting a repository or
+daemon.
 
 A protected branch can additionally trust one or more exact signer keys with
 repeatable `--trust-attestation-key <key-id>=<public.key>`. Enabling that rule

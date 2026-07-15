@@ -87,7 +87,10 @@ are immutable side records keyed by commit ID and key ID, so signatures do not
 create a circular dependency in the content-addressed commit. SlateFS verifies
 each signature before storage and during repository verification; private keys
 remain client-side. Attestations follow their commit through quota accounting
-and garbage collection. Additional named branch
+and garbage collection. A versioned JSON bundle can carry the repository
+identity, canonical commit ID, and attestations outside SlateFS for standalone
+verification against an out-of-band trusted public key. Additional named
+branch
 references can point to any existing commit, tag, or branch and can be used by
 read, restore, diff, and history operations. Commits advance `main` by default
 or an existing named branch when selected explicitly. Publishing a commit and
