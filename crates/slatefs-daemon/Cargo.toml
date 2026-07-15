@@ -37,3 +37,4 @@ nfs3_server.workspace = true
 slatefs-nbd = { workspace = true, features = ["test-support"] }
 rcgen.workspace = true
 tempfile.workspace = true
+ed25519-dalek.workspace = true

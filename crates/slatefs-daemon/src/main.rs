@@ -40,9 +40,9 @@ use slatefs_core::rate::{RateLimiter, RateLimits};
 use slatefs_core::snapshot::SnapshotVolume;
 use slatefs_core::store;
 use slatefs_core::versioning::{
-    VersionCommitOrigin, VersionCommitProvenance, VersionMaintenanceLeaseInfo,
-    VersionMergeConflictStrategy, VersionRepository, VersionRestoreMode,
-    force_break_expired_version_maintenance_lease, purge_version_history,
+    VersionCommitAttestation, VersionCommitOrigin, VersionCommitProvenance,
+    VersionMaintenanceLeaseInfo, VersionMergeConflictStrategy, VersionRepository,
+    VersionRestoreMode, force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease,
 };
 use slatefs_core::vfs::Vfs;
@@ -2532,6 +2532,84 @@ async fn get_version_commit_response(
     Ok(AdminHttpResponse::json(200, json!({ "commit": commit })))
 }
 
+async fn add_version_commit_attestation_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+    reference: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let attestation: VersionCommitAttestation = parse_json_body(request)?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = async {
+        let commit = repository.inspect_commit(reference).await?;
+        let attestation = repository
+            .add_commit_attestation(&commit.id, attestation)
+            .await?;
+        Ok::<_, slatefs_core::error::Error>((commit.id, attestation))
+    }
+    .await;
+    let (commit, attestation) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            return finish_version_repository(control, repository, Err(error)).await;
+        }
+    };
+    let audit = append_version_audit(
+        &control,
+        request,
+        AuditAction::VersionAttest,
+        tenant,
+        volume,
+        [
+            (
+                "commit".to_string(),
+                AuditDetailValue::String(commit.clone()),
+            ),
+            (
+                "key_id".to_string(),
+                AuditDetailValue::String(attestation.key_id().to_string()),
+            ),
+            (
+                "algorithm".to_string(),
+                AuditDetailValue::String(attestation.algorithm().as_str().to_string()),
+            ),
+        ],
+    )
+    .await;
+    let repository_close = repository.close().await;
+    let control_close = control.close().await;
+    audit?;
+    repository_close.map_err(core_error)?;
+    control_close.map_err(core_error)?;
+    state
+        .export_metrics
+        .version_operation(tenant, volume, "attest");
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "commit": commit, "attestation": attestation }),
+    ))
+}
+
+async fn list_version_commit_attestations_response(
+    state: &AdminState,
+    tenant: &str,
+    volume: &str,
+    reference: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository.list_commit_attestations(reference).await;
+    let attestations = finish_version_repository(control, repository, result).await?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "attestations": attestations }),
+    ))
+}
+
 async fn diff_version_commits_response(
     state: &AdminState,
     request: &AdminHttpRequest,
@@ -3257,6 +3335,7 @@ async fn get_version_stats_response(
                 "nodes": stats.nodes,
                 "blobs": stats.blobs,
                 "commits": stats.commits,
+                "attestations": stats.attestations,
             }
         }),
     ))
@@ -3277,6 +3356,7 @@ async fn verify_version_history_response(
         json!({
             "verify": {
                 "commits": report.commits,
+                "attestations": report.attestations,
                 "nodes": report.nodes,
                 "node_bytes": report.node_bytes,
                 "blobs": report.blobs,
@@ -3435,6 +3515,7 @@ async fn run_version_gc_response(
             "gc": {
                 "retained_commits": report.retained_commits,
                 "deleted_commits": report.deleted_commits,
+                "deleted_attestations": report.deleted_attestations,
                 "deleted_nodes": report.deleted_nodes,
                 "deleted_blobs": report.deleted_blobs,
                 "reclaimed_bytes": report.reclaimed_bytes,
@@ -5017,6 +5098,38 @@ async fn route_admin_request(
                 "commits",
             ],
         ) => commit_live_version_response(state, request, tenant, volume).await,
+        (
+            "POST",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "commits",
+                reference,
+                "attestations",
+            ],
+        ) => {
+            add_version_commit_attestation_response(state, request, tenant, volume, reference).await
+        }
+        (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "commits",
+                reference,
+                "attestations",
+            ],
+        ) => list_version_commit_attestations_response(state, tenant, volume, reference).await,
         (
             "GET",
             [
@@ -8117,6 +8230,58 @@ mod tests {
             replay["commit"]["provenance"]["request_id"],
             "version-commit-1"
         );
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[23; 32]);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let payload = slatefs_core::versioning::version_commit_attestation_payload(
+            "t",
+            "v",
+            commit_id,
+            "release-2026",
+            &public_key,
+            1_700_000_000,
+        )
+        .unwrap();
+        let attestation = slatefs_core::versioning::VersionCommitAttestation::new_ed25519(
+            "release-2026",
+            public_key,
+            ed25519_dalek::Signer::sign(&signing_key, &payload).to_bytes(),
+            1_700_000_000,
+        )
+        .unwrap();
+        let attestation_body = serde_json::to_string(&attestation).unwrap();
+        let attestation_request = format!(
+            "POST /admin/v1/tenants/t/volumes/v/versioning/commits/{commit_id}/attestations HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nX-Request-Id: version-attest-1\r\nContent-Length: {}\r\n\r\n{}",
+            attestation_body.len(),
+            attestation_body
+        );
+        let attestation_response =
+            admin_exchange(Arc::clone(&state), attestation_request.as_bytes()).await;
+        assert_eq!(
+            response_status(&attestation_response),
+            200,
+            "{attestation_response}"
+        );
+        let attestation_response: Value =
+            serde_json::from_str(response_body(&attestation_response)).unwrap();
+        assert_eq!(attestation_response["commit"], commit_id);
+        assert_eq!(
+            attestation_response["attestation"]["key_id"],
+            "release-2026"
+        );
+        let attestations_request = format!(
+            "GET /admin/v1/tenants/t/volumes/v/versioning/commits/{commit_id}/attestations HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        let attestations_response =
+            admin_exchange(Arc::clone(&state), attestations_request.as_bytes()).await;
+        assert_eq!(
+            response_status(&attestations_response),
+            200,
+            "{attestations_response}"
+        );
+        let attestations: Value =
+            serde_json::from_str(response_body(&attestations_response)).unwrap();
+        assert_eq!(attestations["attestations"].as_array().unwrap().len(), 1);
+        assert_eq!(attestations["attestations"][0]["algorithm"], "ed25519");
         let conflict_body =
             r#"{"path":"/notes.txt","message":"other request","idempotency_key":"retry-live-1"}"#;
         let conflict_request = format!(
@@ -8614,6 +8779,7 @@ mod tests {
         assert_eq!(response_status(&stats_response), 200, "{stats_response}");
         let stats: Value = serde_json::from_str(response_body(&stats_response)).unwrap();
         assert_eq!(stats["stats"]["commits"], 3);
+        assert_eq!(stats["stats"]["attestations"], 1);
 
         let verify_response = admin_exchange(
             Arc::clone(&state),
@@ -8623,6 +8789,7 @@ mod tests {
         assert_eq!(response_status(&verify_response), 200, "{verify_response}");
         let verify: Value = serde_json::from_str(response_body(&verify_response)).unwrap();
         assert_eq!(verify["verify"]["commits"], 3);
+        assert_eq!(verify["verify"]["attestations"], 1);
         assert!(verify["verify"]["nodes"].as_u64().unwrap() > 0);
         assert!(verify["verify"]["blobs"].as_u64().unwrap() > 0);
 
@@ -8638,6 +8805,7 @@ mod tests {
         assert_eq!(gc["gc"]["dry_run"], true);
         assert_eq!(gc["gc"]["retained_commits"], 3);
         assert_eq!(gc["gc"]["deleted_commits"], 0);
+        assert_eq!(gc["gc"]["deleted_attestations"], 0);
         let delete_branch_response = admin_exchange(
             Arc::clone(&state),
             b"DELETE /admin/v1/tenants/t/volumes/v/versioning/branches/release HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -8736,6 +8904,12 @@ mod tests {
             metrics.contains("slatefs_version_operations_total{tenant=\"t\",volume=\"v\",operation=\"restore\"} 1"),
             "{metrics}"
         );
+        assert!(
+            metrics.contains(
+                "slatefs_version_operations_total{tenant=\"t\",volume=\"v\",operation=\"attest\"} 1"
+            ),
+            "{metrics}"
+        );
         for operation in [
             "policy", "commit", "merge", "reset", "delete", "recover", "purge",
         ] {
@@ -8751,6 +8925,7 @@ mod tests {
             .unwrap();
         for action in [
             AuditAction::VersionCommit,
+            AuditAction::VersionAttest,
             AuditAction::VersionRestore,
             AuditAction::VersionRetentionSet,
             AuditAction::VersionGc,

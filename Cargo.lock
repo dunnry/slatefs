@@ -4241,6 +4241,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "clap",
+ "ed25519-dalek",
  "nfs3_server",
  "rcgen",
  "rustls-pemfile",

@@ -411,6 +411,8 @@ enum VersioningCmd {
         key_id: String,
         #[arg(long)]
         key_file: PathBuf,
+        #[arg(long)]
+        live: bool,
     },
     /// List commit signatures and optionally require a trusted public key.
     Attestations {
@@ -420,6 +422,8 @@ enum VersioningCmd {
         /// File containing a trusted 32-byte Ed25519 public key in hex.
         #[arg(long)]
         trusted_public_key: Option<PathBuf>,
+        #[arg(long)]
+        live: bool,
     },
     /// Compare two commits and list changed paths.
     Diff {
@@ -2083,6 +2087,59 @@ fn print_version_attestation(attestation: &VersionCommitAttestation, trusted: Op
     }
 }
 
+fn create_version_attestation(
+    tenant: &str,
+    volume: &str,
+    commit: &str,
+    key_id: &str,
+    signing_key: &SigningKey,
+) -> anyhow::Result<VersionCommitAttestation> {
+    let public_key = signing_key.verifying_key().to_bytes();
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    let payload = version_commit_attestation_payload(
+        tenant,
+        volume,
+        commit,
+        key_id,
+        &public_key,
+        created_at,
+    )?;
+    VersionCommitAttestation::new_ed25519(
+        key_id,
+        public_key,
+        signing_key.sign(&payload).to_bytes(),
+        created_at,
+    )
+    .map_err(Into::into)
+}
+
+fn print_version_attestations(
+    reference: &str,
+    attestations: &[VersionCommitAttestation],
+    trusted: Option<[u8; 32]>,
+) -> anyhow::Result<()> {
+    if let Some(trusted) = trusted
+        && !attestations
+            .iter()
+            .any(|attestation| attestation.public_key() == trusted)
+    {
+        anyhow::bail!("commit {reference} has no attestation from the trusted public key");
+    }
+    for (index, attestation) in attestations.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        print_version_attestation(
+            attestation,
+            trusted.map(|key| attestation.public_key() == key),
+        );
+    }
+    Ok(())
+}
+
 async fn run(
     command: &Command,
     config: &Config,
@@ -2751,39 +2808,71 @@ async fn run(
             reference,
             key_id,
             key_file,
+            live,
         }) => {
             let signing_key = read_ed25519_signing_key(key_file)?;
-            let public_key = signing_key.verifying_key().to_bytes();
-            let created_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .context("system clock is before the Unix epoch")?
-                .as_secs();
-            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
-            let result = async {
-                let commit = repository.inspect_commit(reference).await?;
-                let payload = version_commit_attestation_payload(
+            if *live {
+                let response = live_versioning_json(
+                    config,
                     tenant,
                     volume,
-                    &commit.id,
-                    key_id,
-                    &public_key,
-                    created_at,
-                )?;
-                let attestation = VersionCommitAttestation::new_ed25519(
-                    key_id,
-                    public_key,
-                    signing_key.sign(&payload).to_bytes(),
-                    created_at,
-                )?;
-                repository
+                    "GET",
+                    &format!("commits/{reference}"),
+                    &[],
+                    None,
+                )
+                .await?;
+                let commit: VersionCommitInfo = serde_json::from_value(response["commit"].clone())
+                    .context("parsing admin version commit")?;
+                let attestation =
+                    create_version_attestation(tenant, volume, &commit.id, key_id, &signing_key)?;
+                let body = serde_json::to_value(&attestation)?;
+                let response = post_live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    &format!("commits/{}/attestations", commit.id),
+                    body,
+                )
+                .await?;
+                let attestation: VersionCommitAttestation =
+                    serde_json::from_value(response["attestation"].clone())
+                        .context("parsing admin version commit attestation")?;
+                println!("commit: {}", commit.id);
+                print_version_attestation(&attestation, None);
+                return Ok(());
+            }
+            let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
+            let result: anyhow::Result<_> = async {
+                let commit = repository.inspect_commit(reference).await?;
+                let attestation =
+                    create_version_attestation(tenant, volume, &commit.id, key_id, &signing_key)?;
+                let attestation = repository
                     .add_commit_attestation(&commit.id, attestation)
-                    .await
-                    .map(|attestation| (commit.id, attestation))
+                    .await?;
+                Ok((commit.id, attestation))
             }
             .await;
             let close = repository.close().await;
             let (commit, attestation) = result?;
             close?;
+            append_cli_version_audit(
+                control,
+                AuditAction::VersionAttest,
+                tenant,
+                volume,
+                [
+                    (
+                        "commit".to_string(),
+                        AuditDetailValue::String(commit.clone()),
+                    ),
+                    (
+                        "key_id".to_string(),
+                        AuditDetailValue::String(attestation.key_id().to_string()),
+                    ),
+                ],
+            )
+            .await?;
             println!("commit: {commit}");
             print_version_attestation(&attestation, None);
         }
@@ -2792,32 +2881,35 @@ async fn run(
             volume,
             reference,
             trusted_public_key,
+            live,
         }) => {
             let trusted = trusted_public_key
                 .as_deref()
                 .map(|path| read_hex_key::<32>(path, "trusted Ed25519 public key"))
                 .transpose()?;
+            if *live {
+                let response = live_versioning_json(
+                    config,
+                    tenant,
+                    volume,
+                    "GET",
+                    &format!("commits/{reference}/attestations"),
+                    &[],
+                    None,
+                )
+                .await?;
+                let attestations: Vec<VersionCommitAttestation> =
+                    serde_json::from_value(response["attestations"].clone())
+                        .context("parsing admin version commit attestations")?;
+                print_version_attestations(reference, &attestations, trusted)?;
+                return Ok(());
+            }
             let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
             let result = repository.list_commit_attestations(reference).await;
             let close = repository.close().await;
             let attestations = result?;
             close?;
-            if let Some(trusted) = trusted
-                && !attestations
-                    .iter()
-                    .any(|attestation| attestation.public_key() == trusted)
-            {
-                anyhow::bail!("commit {reference} has no attestation from the trusted public key");
-            }
-            for (index, attestation) in attestations.iter().enumerate() {
-                if index > 0 {
-                    println!();
-                }
-                print_version_attestation(
-                    attestation,
-                    trusted.map(|key| attestation.public_key() == key),
-                );
-            }
+            print_version_attestations(reference, &attestations, trusted)?;
         }
         Command::Versioning(VersioningCmd::Diff {
             tenant,
@@ -4701,11 +4793,16 @@ mod tests {
             "release-2026",
             "--key-file",
             "/tmp/release.key",
+            "--live",
         ])
         .unwrap();
         assert!(matches!(
             cli.command,
-            Command::Versioning(VersioningCmd::Attest { key_id, .. }) if key_id == "release-2026"
+            Command::Versioning(VersioningCmd::Attest {
+                key_id,
+                live: true,
+                ..
+            }) if key_id == "release-2026"
         ));
 
         let cli = Cli::try_parse_from([
@@ -4717,12 +4814,14 @@ mod tests {
             "main",
             "--trusted-public-key",
             "/tmp/release.pub",
+            "--live",
         ])
         .unwrap();
         assert!(matches!(
             cli.command,
             Command::Versioning(VersioningCmd::Attestations {
                 trusted_public_key: Some(_),
+                live: true,
                 ..
             })
         ));
