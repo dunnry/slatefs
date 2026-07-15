@@ -456,6 +456,9 @@ enum VersioningCmd {
         /// Authenticated committer identity allowed to publish; repeatable. Empty allows any committer.
         #[arg(long = "allow-committer")]
         allowed_committers: Vec<String>,
+        /// Server-derived identity allowed to change protection; repeatable. Empty allows any manager.
+        #[arg(long = "allow-manager")]
+        allowed_managers: Vec<String>,
         #[arg(long)]
         live: bool,
     },
@@ -1242,6 +1245,9 @@ fn print_version_branch(branch: &VersionBranchInfo) {
             "allowed_committers {}",
             branch.allowed_committers().join(",")
         );
+    }
+    if !branch.allowed_managers().is_empty() {
+        println!("allowed_managers {}", branch.allowed_managers().join(","));
     }
 }
 
@@ -2876,6 +2882,7 @@ async fn run(
             volume,
             name,
             allowed_committers,
+            allowed_managers,
             live,
         }) => {
             if *live {
@@ -2887,7 +2894,10 @@ async fn run(
                     "PUT",
                     &endpoint,
                     &[],
-                    Some(serde_json::json!({ "allowed_committers": allowed_committers })),
+                    Some(serde_json::json!({
+                        "allowed_committers": allowed_committers,
+                        "allowed_managers": allowed_managers,
+                    })),
                 )
                 .await?;
                 let branch: VersionBranchInfo = serde_json::from_value(response["branch"].clone())
@@ -2897,7 +2907,7 @@ async fn run(
             }
             let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
             let result = repository
-                .set_branch_protected(name, true, allowed_committers)
+                .set_branch_protected(name, true, allowed_committers, allowed_managers)
                 .await;
             let repository_close = repository.close().await;
             let branch = result?;
@@ -2944,7 +2954,7 @@ async fn run(
                 return Ok(());
             }
             let repository = VersionRepository::open(control, object_store, tenant, volume).await?;
-            let result = repository.set_branch_protected(name, false, &[]).await;
+            let result = repository.set_branch_protected(name, false, &[], &[]).await;
             let repository_close = repository.close().await;
             let branch = result?;
             repository_close?;
@@ -4728,6 +4738,8 @@ mod tests {
             "tenant:tenant-a",
             "--allow-committer",
             "admin-token",
+            "--allow-manager",
+            "admin-token",
             "--live",
         ])
         .unwrap();
@@ -4736,10 +4748,12 @@ mod tests {
             Command::Versioning(VersioningCmd::ProtectBranch {
                 name,
                 allowed_committers,
+                allowed_managers,
                 live: true,
                 ..
             }) if name == "release"
                 && allowed_committers == vec!["tenant:tenant-a", "admin-token"]
+                && allowed_managers == vec!["admin-token"]
         ));
 
         let cli = Cli::try_parse_from([

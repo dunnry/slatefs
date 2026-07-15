@@ -161,7 +161,9 @@ branch's history. `protect-branch` durably blocks reset, deletion, and reflog
 recovery while continuing to allow ordinary commits and merges;
 repeatable `--allow-committer <identity>` arguments can restrict those
 publications to exact committer identities. An empty allowlist permits any
-committer. `unprotect-branch --yes` removes that guard. `versioning reflog <branch>` lists
+committer. Repeatable `--allow-manager <identity>` arguments independently
+restrict live policy changes and removal; an empty manager list permits any
+authorized live operator. `unprotect-branch --yes` removes that guard. `versioning reflog <branch>` lists
 the newest 100 head
 transitions even after branch deletion. Every create, commit, fast-forward,
 merge, reset, and delete records its ref change atomically; retained reflog
@@ -306,7 +308,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | List branch heads, including `main`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/reflog` | List up to 100 retained head transitions, newest first, including deleted branches; optional `limit`. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches` | Create a branch from `{"name":"...","commit":"commit-or-ref"}`. |
-| `PUT` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/protection` | Protect a branch from reset, deletion, and reflog recovery with `{"allowed_committers":["tenant:acme"]}`; an empty list allows any committer to publish. |
+| `PUT` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/protection` | Protect a branch from reset, deletion, and reflog recovery with `{"allowed_committers":["tenant:acme"],"allowed_managers":["admin-token"]}`; empty lists leave publication or policy management unrestricted. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/protection` | Remove destructive-ref protection from a branch. |
 | `DELETE` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}` | Delete a non-main branch without deleting its commit immediately. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/branches/{name}/reset` | Compare-and-swap an existing branch, including `main`, to `{"commit":"commit-or-ref"}`. |

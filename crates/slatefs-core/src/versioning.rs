@@ -541,18 +541,24 @@ impl VersionStore {
         name: &str,
         protected: bool,
         allowed_committers: &[String],
+        allowed_managers: &[String],
+        manager: Option<&str>,
     ) -> Result<VersionRef> {
         let _guard = self.ref_lock.lock().await;
         let reference = self
             .get_branch(name)
             .await?
             .ok_or_else(|| Error::not_found("version branch", name))?;
+        if let Some(manager) = manager {
+            self.authorize_branch_policy_manager(name, manager).await?;
+        }
         let key = branch_protection_key(name);
         if protected {
             let protection = VersionBranchProtection {
                 branch: name.to_string(),
                 protected_at: crate::control::now_unix(),
                 allowed_committers: allowed_committers.to_vec(),
+                allowed_managers: allowed_managers.to_vec(),
             };
             self.db
                 .put_bytes(
@@ -599,6 +605,24 @@ impl VersionStore {
                 "committer {} is not allowed to publish to protected branch {name}",
                 provenance.committer()
             ),
+        ))
+    }
+
+    async fn authorize_branch_policy_manager(&self, name: &str, manager: &str) -> Result<()> {
+        let Some(protection) = self.branch_protection(name).await? else {
+            return Ok(());
+        };
+        if protection.allowed_managers.is_empty()
+            || protection
+                .allowed_managers
+                .iter()
+                .any(|allowed| allowed == manager)
+        {
+            return Ok(());
+        }
+        Err(Error::invalid(
+            "version branch policy authorization",
+            format!("manager {manager} is not allowed to change protected branch {name}"),
         ))
     }
 
@@ -1213,6 +1237,7 @@ struct VersionBranchProtection {
     branch: String,
     protected_at: u64,
     allowed_committers: Vec<String>,
+    allowed_managers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1322,6 +1347,7 @@ pub struct VersionBranchInfo {
     commit: String,
     protected: bool,
     allowed_committers: Vec<String>,
+    allowed_managers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1521,6 +1547,10 @@ impl VersionBranchInfo {
 
     pub fn allowed_committers(&self) -> &[String] {
         &self.allowed_committers
+    }
+
+    pub fn allowed_managers(&self) -> &[String] {
+        &self.allowed_managers
     }
 }
 
@@ -2935,6 +2965,7 @@ impl VersionRepository {
             commit: hex::encode(reference.commit_id),
             protected: false,
             allowed_committers: Vec::new(),
+            allowed_managers: Vec::new(),
         })
     }
 
@@ -2944,7 +2975,12 @@ impl VersionRepository {
             .list_branch_protections()
             .await?
             .into_iter()
-            .map(|protection| (protection.branch, protection.allowed_committers))
+            .map(|protection| {
+                (
+                    protection.branch,
+                    (protection.allowed_committers, protection.allowed_managers),
+                )
+            })
             .collect::<HashMap<_, _>>();
         Ok(self
             .store
@@ -2952,12 +2988,14 @@ impl VersionRepository {
             .await?
             .into_iter()
             .map(|(name, reference)| {
-                let allowed_committers = protections.get(&name).cloned().unwrap_or_default();
+                let (allowed_committers, allowed_managers) =
+                    protections.get(&name).cloned().unwrap_or_default();
                 VersionBranchInfo {
                     protected: protections.contains_key(&name),
                     name,
                     commit: hex::encode(reference.commit_id),
                     allowed_committers,
+                    allowed_managers,
                 }
             })
             .collect())
@@ -2971,22 +3009,69 @@ impl VersionRepository {
         name: &str,
         protected: bool,
         allowed_committers: &[String],
+        allowed_managers: &[String],
+    ) -> Result<VersionBranchInfo> {
+        self.set_branch_protection(name, protected, allowed_committers, allowed_managers, None)
+            .await
+    }
+
+    /// Change branch protection as a server-derived policy manager. Existing
+    /// manager restrictions are checked atomically with the policy update.
+    pub async fn set_branch_protected_as(
+        &self,
+        name: &str,
+        protected: bool,
+        allowed_committers: &[String],
+        allowed_managers: &[String],
+        manager: &str,
+    ) -> Result<VersionBranchInfo> {
+        validate_version_identity("version branch policy manager", manager)?;
+        self.set_branch_protection(
+            name,
+            protected,
+            allowed_committers,
+            allowed_managers,
+            Some(manager),
+        )
+        .await
+    }
+
+    async fn set_branch_protection(
+        &self,
+        name: &str,
+        protected: bool,
+        allowed_committers: &[String],
+        allowed_managers: &[String],
+        manager: Option<&str>,
     ) -> Result<VersionBranchInfo> {
         validate_version_branch_name(name)?;
-        let allowed_committers = if protected {
-            normalize_allowed_committers(allowed_committers)?
+        let (allowed_committers, allowed_managers) = if protected {
+            (
+                normalize_branch_identities(
+                    "version branch allowed committers",
+                    allowed_committers,
+                )?,
+                normalize_branch_identities("version branch allowed managers", allowed_managers)?,
+            )
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let reference = self
             .store
-            .set_branch_protected(name, protected, &allowed_committers)
+            .set_branch_protected(
+                name,
+                protected,
+                &allowed_committers,
+                &allowed_managers,
+                manager,
+            )
             .await?;
         Ok(VersionBranchInfo {
             name: name.to_string(),
             commit: hex::encode(reference.commit_id),
             protected,
             allowed_committers,
+            allowed_managers,
         })
     }
 
@@ -3047,6 +3132,7 @@ impl VersionRepository {
             commit: hex::encode(reference.commit_id),
             protected: false,
             allowed_committers: Vec::new(),
+            allowed_managers: Vec::new(),
         })
     }
 
@@ -4577,16 +4663,13 @@ fn validate_version_identity(what: &'static str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn normalize_allowed_committers(values: &[String]) -> Result<Vec<String>> {
+fn normalize_branch_identities(what: &'static str, values: &[String]) -> Result<Vec<String>> {
     if values.len() > 64 {
-        return Err(Error::invalid(
-            "version branch allowed committers",
-            "must contain at most 64 identities",
-        ));
+        return Err(Error::invalid(what, "must contain at most 64 identities"));
     }
     let mut normalized = values.to_vec();
     for value in &normalized {
-        validate_version_identity("version branch allowed committer", value)?;
+        validate_version_identity(what, value)?;
     }
     normalized.sort();
     normalized.dedup();

@@ -126,7 +126,7 @@ the live VFS request path. Its logical key prefixes are:
 | `pc/<sha256-commit-id>` | 2 | `VersionCommit`, including hash-bound provenance |
 | `pi/<sha256-idempotency-key>` | 1 | commit ID and branch-aware canonical request fingerprint |
 | `pr/heads/<name>` | 1 | mutable branch `VersionRef`; `main` is the default commit head |
-| `pr/protected/<name>` | 1 | durable destructive-ref protection and normalized committer allowlist for an existing branch |
+| `pr/protected/<name>` | 1 | durable destructive-ref protection and normalized publisher and policy-manager allowlists for an existing branch |
 | `pr/logs/<name>/<sequence>` | 1 | bounded branch-head transition record; the newest 100 per name are retained |
 | `pr/tags/<name>` | 1 | immutable named commit reference and creation time |
 
@@ -146,9 +146,10 @@ tags keep their referenced commit and tree reachable through garbage
 collection. Version repository history is retained when the policy is disabled
 and removed with the volume.
 Branch protection records name their branch, creation time, and up to 64
-normalized allowed committer identities. An empty allowlist permits any
-committer. Verification rejects a record whose payload does not match its key
-or whose branch no longer exists.
+normalized identities in each of the allowed committer and policy-manager
+lists. Empty lists permit any committer to publish or any authorized live manager
+to change the policy, respectively. Verification rejects a record whose
+payload does not match its key or whose branch no longer exists.
 
 `version-leases/<tenant>/<volume>` is a version-1 postcard record containing
 `tenant`, `volume`, an ephemeral owner UUID, operation name, acquisition time,

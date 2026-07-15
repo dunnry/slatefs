@@ -99,7 +99,11 @@ available because they retain the protected head in their ancestry. Protection
 may also carry an exact committer allowlist. Publication authorization is
 checked under the ref lock against hash-bound commit provenance for ordinary
 and divergent commits, and against the merge request provenance before a
-fast-forward. An empty allowlist leaves publication unrestricted.
+fast-forward. A separate exact manager allowlist controls live changes to the
+protection record itself, with authorization checked under the same ref lock
+against the existing policy. Empty publisher or manager allowlists leave that
+operation unrestricted. Offline repository access is the administrative
+recovery boundary.
 Disabling versioning blocks repository operations
 without deleting its history. Volume deletion removes both the live and
 optional version-store prefixes.

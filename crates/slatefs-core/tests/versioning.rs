@@ -272,11 +272,17 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         VersionReflogAction::Recover
     );
     let protected = repository
-        .set_branch_protected("release", true, &["other-committer".into()])
+        .set_branch_protected(
+            "release",
+            true,
+            &["other-committer".into()],
+            &["test-manager".into()],
+        )
         .await
         .unwrap();
     assert!(protected.protected());
     assert_eq!(protected.allowed_committers(), &["other-committer"]);
+    assert_eq!(protected.allowed_managers(), &["test-manager"]);
     assert!(
         repository
             .list_branches()
@@ -298,8 +304,32 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
             .await,
         Err(Error::Invalid { .. })
     ));
+    assert!(matches!(
+        repository
+            .set_branch_protected_as(
+                "release",
+                true,
+                &["test-committer".into()],
+                &["test-manager".into()],
+                "other-manager",
+            )
+            .await,
+        Err(Error::Invalid { .. })
+    ));
+    assert!(matches!(
+        repository
+            .set_branch_protected_as("release", false, &[], &[], "other-manager")
+            .await,
+        Err(Error::Invalid { .. })
+    ));
     let protected = repository
-        .set_branch_protected("release", true, &["test-committer".into()])
+        .set_branch_protected_as(
+            "release",
+            true,
+            &["test-committer".into()],
+            &["test-manager".into()],
+            "test-manager",
+        )
         .await
         .unwrap();
     assert_eq!(protected.allowed_committers(), &["test-committer"]);
@@ -328,7 +358,7 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         .unwrap();
     assert!(protected_fast_forward.fast_forward());
     let unprotected = repository
-        .set_branch_protected("release", false, &[])
+        .set_branch_protected_as("release", false, &[], &[], "test-manager")
         .await
         .unwrap();
     assert!(!unprotected.protected());

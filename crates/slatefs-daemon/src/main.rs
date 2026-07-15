@@ -1035,6 +1035,8 @@ struct VersionBranchRecoverRequest {
 struct VersionBranchProtectionRequest {
     #[serde(default)]
     allowed_committers: Vec<String>,
+    #[serde(default)]
+    allowed_managers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1533,7 +1535,10 @@ fn core_error(error: slatefs_core::error::Error) -> AdminError {
             409
         }
         slatefs_core::error::Error::Invalid { what, .. }
-            if *what == "version branch authorization" =>
+            if matches!(
+                *what,
+                "version branch authorization" | "version branch policy authorization"
+            ) =>
         {
             403
         }
@@ -2670,16 +2675,23 @@ async fn set_version_branch_protection_response(
     name: &str,
     protected: bool,
 ) -> Result<AdminHttpResponse, AdminError> {
-    let allowed_committers = if protected {
-        parse_json_body::<VersionBranchProtectionRequest>(request)?.allowed_committers
+    let (allowed_committers, allowed_managers) = if protected {
+        let policy = parse_json_body::<VersionBranchProtectionRequest>(request)?;
+        (policy.allowed_committers, policy.allowed_managers)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
     let (control, repository) = open_version_repository(state, tenant, volume).await?;
     let result = repository
-        .set_branch_protected(name, protected, &allowed_committers)
+        .set_branch_protected_as(
+            name,
+            protected,
+            &allowed_committers,
+            &allowed_managers,
+            &admin_committer(request),
+        )
         .await;
     let audit = match &result {
         Ok(branch) => {
@@ -3549,10 +3561,7 @@ fn admin_commit_provenance(
     request: &AdminHttpRequest,
     author: Option<String>,
 ) -> Result<VersionCommitProvenance, AdminError> {
-    let committer = request
-        .authenticated_principal
-        .clone()
-        .unwrap_or_else(|| "admin:unauthenticated".to_string());
+    let committer = admin_committer(request);
     VersionCommitProvenance::new(
         VersionCommitOrigin::Admin,
         author.unwrap_or_else(|| committer.clone()),
@@ -3560,6 +3569,13 @@ fn admin_commit_provenance(
         request.request_id.clone(),
     )
     .map_err(core_error)
+}
+
+fn admin_committer(request: &AdminHttpRequest) -> String {
+    request
+        .authenticated_principal
+        .clone()
+        .unwrap_or_else(|| "admin:unauthenticated".to_string())
 }
 
 async fn append_version_audit(
@@ -7077,6 +7093,15 @@ mod tests {
     }
 
     #[test]
+    fn version_branch_policy_authorization_maps_to_forbidden() {
+        let error = core_error(slatefs_core::error::Error::invalid(
+            "version branch policy authorization",
+            "manager is not allowed",
+        ));
+        assert_eq!(error.status, 403);
+    }
+
+    #[test]
     fn stale_restore_preview_maps_to_conflict() {
         let error = version_restore_error(slatefs_core::error::Error::Versioning(
             "restore preview is stale; generate a new preview before applying".into(),
@@ -7842,7 +7867,7 @@ mod tests {
         );
         let branches: Value = serde_json::from_str(response_body(&branches_response)).unwrap();
         assert_eq!(branches["branches"].as_array().unwrap().len(), 2);
-        let protect_body = r#"{"allowed_committers":["other-committer"]}"#;
+        let protect_body = r#"{"allowed_committers":["other-committer"],"allowed_managers":["admin:unauthenticated"]}"#;
         let protect_request = format!(
             "PUT /admin/v1/tenants/t/volumes/v/versioning/branches/release/protection HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             protect_body.len(),
@@ -7859,6 +7884,10 @@ mod tests {
         assert_eq!(
             protected["branch"]["allowed_committers"],
             json!(["other-committer"])
+        );
+        assert_eq!(
+            protected["branch"]["allowed_managers"],
+            json!(["admin:unauthenticated"])
         );
         let blocked_reset_body = r#"{"commit":"baseline"}"#;
         let blocked_reset_request = format!(
@@ -7938,7 +7967,7 @@ mod tests {
             403,
             "{denied_branch_commit}"
         );
-        let authorize_body = r#"{"allowed_committers":["admin:unauthenticated"]}"#;
+        let authorize_body = r#"{"allowed_committers":["admin:unauthenticated"],"allowed_managers":["admin:unauthenticated"]}"#;
         let authorize_request = format!(
             "PUT /admin/v1/tenants/t/volumes/v/versioning/branches/release/protection HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             authorize_body.len(),

@@ -210,7 +210,7 @@ slatefs -c /etc/slatefs/slatefs.toml versioning tags <tenant> <volume> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning untag <tenant> <volume> <name> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning branch <tenant> <volume> <name> <commit-or-ref> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning branches <tenant> <volume> --live
-slatefs -c /etc/slatefs/slatefs.toml versioning protect-branch <tenant> <volume> <name> --allow-committer tenant:<tenant> --live
+slatefs -c /etc/slatefs/slatefs.toml versioning protect-branch <tenant> <volume> <name> --allow-committer tenant:<tenant> --allow-manager admin-token --live
 slatefs -c /etc/slatefs/slatefs.toml versioning unprotect-branch <tenant> <volume> <name> --yes --live
 slatefs -c /etc/slatefs/slatefs.toml versioning reflog <tenant> <volume> <name> --limit 100 --live
 slatefs -c /etc/slatefs/slatefs.toml versioning recover-branch <tenant> <volume> <name> <reflog-sequence> --yes --live
@@ -240,9 +240,11 @@ recovery workflows to operators. Protection does not block commits or merges;
 those operations preserve the protected head as an ancestor. Repeat
 `--allow-committer` to restrict publication to exact server-derived committer
 identities such as `tenant:<tenant>`, `admin-token`, or a configured admin
-principal. Omitting it allows any committer. Unauthorized live publication
-returns HTTP `403`. Removing the guard requires `unprotect-branch --yes` and
-emits a durable maintenance audit record.
+principal. Repeat `--allow-manager` to independently restrict live policy
+updates and removal to exact authenticated identities. Omitting either list
+leaves that operation unrestricted. Unauthorized live publication or policy
+management returns HTTP `403`. Removing the guard requires
+`unprotect-branch --yes` and emits a durable maintenance audit record.
 
 Live commit and divergent-merge provenance records the authenticated admin or
 tenant principal as committer and the HTTP request ID for audit correlation.
