@@ -19,7 +19,8 @@ use slatefs_core::rate::RateLimits;
 use slatefs_core::versioning::{
     VersionBranchInfo, VersionBranchResetInfo, VersionCommitInfo, VersionMergeConflictStrategy,
     VersionMergeInfo, VersionMergePreview, VersionPathChangeKind, VersionRepository,
-    VersionTagInfo, VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
+    VersionRestoreActionKind, VersionRestoreMode, VersionRestorePreview, VersionTagInfo,
+    VersionWorkingTreeChangeKind, VersionWorkingTreeStatus,
     force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease,
 };
@@ -494,6 +495,17 @@ enum VersioningCmd {
         #[arg(long)]
         live: bool,
     },
+    /// Preview an overlay or exact restore without changing the live filesystem.
+    RestorePreview {
+        tenant: String,
+        volume: String,
+        commit: String,
+        path: String,
+        #[arg(long, default_value = "overlay", value_parser = parse_version_restore_mode)]
+        mode: VersionRestoreMode,
+        #[arg(long)]
+        live: bool,
+    },
     /// Restore a file, symlink, or directory tree from a commit.
     Restore {
         tenant: String,
@@ -957,6 +969,14 @@ fn parse_version_merge_conflict_strategy(s: &str) -> Result<VersionMergeConflict
     }
 }
 
+fn parse_version_restore_mode(s: &str) -> Result<VersionRestoreMode, String> {
+    match s {
+        "overlay" => Ok(VersionRestoreMode::Overlay),
+        "exact" => Ok(VersionRestoreMode::Exact),
+        _ => Err(format!("unknown restore mode {s:?} (overlay|exact)")),
+    }
+}
+
 fn parse_client_addr_rule(s: &str) -> Result<ClientAddrRule, String> {
     s.parse()
 }
@@ -1102,6 +1122,31 @@ fn print_working_tree_status(status: &VersionWorkingTreeStatus) {
             "{}\t{}",
             working_tree_change_label(change.change()),
             change.path()
+        );
+    }
+}
+
+fn restore_action_label(action: VersionRestoreActionKind) -> &'static str {
+    match action {
+        VersionRestoreActionKind::Create => "create",
+        VersionRestoreActionKind::Replace => "replace",
+        VersionRestoreActionKind::Delete => "delete",
+    }
+}
+
+fn print_restore_preview(preview: &VersionRestorePreview) {
+    println!("reference {}\t{}", preview.reference(), preview.commit());
+    println!("root {}", preview.root());
+    println!("mode {}", preview.mode().as_str());
+    if preview.is_clean() {
+        println!("clean");
+        return;
+    }
+    for action in preview.actions() {
+        println!(
+            "{}\t{}",
+            restore_action_label(action.action()),
+            action.path()
         );
     }
 }
@@ -2924,6 +2969,52 @@ async fn run(
                 println!("wrote {bytes} bytes to {}", out.display());
             }
         }
+        Command::Versioning(VersioningCmd::RestorePreview {
+            tenant,
+            volume: volume_name,
+            commit,
+            path,
+            mode,
+            live,
+        }) => {
+            if *live {
+                let query = vec![
+                    ("commit", commit.clone()),
+                    ("path", path.clone()),
+                    ("mode", mode.as_str().to_string()),
+                ];
+                let response = live_versioning_json(
+                    config,
+                    tenant,
+                    volume_name,
+                    "GET",
+                    "restore-preview",
+                    &query,
+                    None,
+                )
+                .await?;
+                let preview: VersionRestorePreview =
+                    serde_json::from_value(response["preview"].clone())
+                        .context("parsing admin restore preview")?;
+                print_restore_preview(&preview);
+                return Ok(());
+            }
+            let repository =
+                VersionRepository::open(control, Arc::clone(&object_store), tenant, volume_name)
+                    .await?;
+            let record = control.get_mountable_volume(tenant, volume_name).await?;
+            let dek = control.unwrap_volume_dek(&record).await?;
+            let live = volume::Volume::open(&record, dek, Arc::clone(&object_store)).await?;
+            let result = repository
+                .preview_restore(live.as_ref(), commit, path, *mode)
+                .await;
+            let live_close = live.shutdown().await;
+            let repository_close = repository.close().await;
+            let preview = result?;
+            live_close?;
+            repository_close?;
+            print_restore_preview(&preview);
+        }
         Command::Versioning(VersioningCmd::Restore {
             tenant,
             volume: volume_name,
@@ -4053,6 +4144,28 @@ mod tests {
                 live: true,
                 ..
             }) if path == "/projects" && reference == "draft"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "slatefs",
+            "versioning",
+            "restore-preview",
+            "tenant-a",
+            "docs",
+            "baseline",
+            "/projects",
+            "--mode",
+            "exact",
+            "--live",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Versioning(VersioningCmd::RestorePreview {
+                mode: VersionRestoreMode::Exact,
+                live: true,
+                ..
+            })
         ));
 
         let cli = Cli::try_parse_from([

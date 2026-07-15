@@ -11,8 +11,9 @@ use slatefs_core::meta::inode::ROOT_INO;
 use slatefs_core::store::{self, ObjectStore};
 use slatefs_core::versioning::{
     VersionMergeConflictStrategy, VersionPathChangeKind, VersionRepository,
-    VersionWorkingTreeChangeKind, force_break_expired_version_maintenance_lease,
-    purge_version_history, try_get_version_maintenance_lease,
+    VersionRestoreActionKind, VersionRestoreMode, VersionWorkingTreeChangeKind,
+    force_break_expired_version_maintenance_lease, purge_version_history,
+    try_get_version_maintenance_lease,
 };
 use slatefs_core::vfs::{Credentials, Vfs};
 use slatefs_core::volume::{self, Volume};
@@ -428,6 +429,21 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
         .restore_file(live.as_ref(), "draft", "/draft.txt")
         .await
         .unwrap();
+    let overlay = repository
+        .preview_restore(live.as_ref(), "draft", "/", VersionRestoreMode::Overlay)
+        .await
+        .unwrap();
+    assert!(overlay.is_clean());
+    let exact = repository
+        .preview_restore(live.as_ref(), "draft", "/", VersionRestoreMode::Exact)
+        .await
+        .unwrap();
+    assert_eq!(exact.actions().len(), 1);
+    assert_eq!(exact.actions()[0].path(), "/feature.txt");
+    assert_eq!(
+        exact.actions()[0].action(),
+        VersionRestoreActionKind::Delete
+    );
     let verified = repository.verify().await.unwrap();
     assert_eq!(verified.commits, 7);
     assert!(verified.nodes > 0);

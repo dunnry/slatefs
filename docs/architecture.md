@@ -108,6 +108,11 @@ writes, and reports added, modified, deleted, and type-changed paths in stable
 path order. A live scan validates the daemon writer lease before and after the
 comparison, but concurrent client writes may still make any status result
 immediately stale.
+Restore preview maps the same status into filesystem actions. Overlay mode
+plans creates and replacements while preserving live-only paths. Exact mode
+also plans deletion of live-only paths. Preview is read-only and does not yet
+act as an apply token; destructive exact restore remains a separate future
+operation.
 An unbounded GC retains the full reachable DAG; bounded retention evaluates
 first-parent history per branch and may prune older secondary ancestry.
 

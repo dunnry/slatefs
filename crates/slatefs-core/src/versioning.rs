@@ -1258,6 +1258,90 @@ impl VersionWorkingTreeStatus {
     }
 }
 
+/// Filesystem reconciliation policy used by restore preview and apply.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VersionRestoreMode {
+    /// Create or replace versioned paths and preserve live-only paths.
+    #[default]
+    Overlay,
+    /// Make the selected live subtree match the versioned tree exactly.
+    Exact,
+}
+
+impl VersionRestoreMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Overlay => "overlay",
+            Self::Exact => "exact",
+        }
+    }
+}
+
+/// One action a restore would perform on the live filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VersionRestoreActionKind {
+    Create,
+    Replace,
+    Delete,
+}
+
+/// One path-level action in a restore preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionRestoreAction {
+    path: String,
+    action: VersionRestoreActionKind,
+}
+
+impl VersionRestoreAction {
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn action(&self) -> VersionRestoreActionKind {
+        self.action
+    }
+}
+
+/// Read-only plan for reconciling a live subtree with version history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct VersionRestorePreview {
+    reference: String,
+    commit: String,
+    root: String,
+    mode: VersionRestoreMode,
+    actions: Vec<VersionRestoreAction>,
+}
+
+impl VersionRestorePreview {
+    pub fn reference(&self) -> &str {
+        &self.reference
+    }
+
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
+
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    pub fn mode(&self) -> VersionRestoreMode {
+        self.mode
+    }
+
+    pub fn actions(&self) -> &[VersionRestoreAction] {
+        &self.actions
+    }
+
+    pub fn is_clean(&self) -> bool {
+        self.actions.is_empty()
+    }
+}
+
 impl From<VersionCommit> for VersionCommitInfo {
     fn from(commit: VersionCommit) -> Self {
         Self {
@@ -2629,6 +2713,46 @@ impl VersionRepository {
             commit: commit_id,
             root,
             changes,
+        })
+    }
+
+    /// Build a read-only path-level restore plan from the same bounded
+    /// comparison used by [`Self::working_tree_status`].
+    pub async fn preview_restore(
+        &self,
+        live: &dyn Vfs,
+        reference: &str,
+        root: &str,
+        mode: VersionRestoreMode,
+    ) -> Result<VersionRestorePreview> {
+        let status = self.working_tree_status(live, reference, root).await?;
+        let actions = status
+            .changes
+            .iter()
+            .filter_map(|change| {
+                let action = match change.change {
+                    VersionWorkingTreeChangeKind::Added if mode == VersionRestoreMode::Overlay => {
+                        return None;
+                    }
+                    VersionWorkingTreeChangeKind::Added => VersionRestoreActionKind::Delete,
+                    VersionWorkingTreeChangeKind::Deleted => VersionRestoreActionKind::Create,
+                    VersionWorkingTreeChangeKind::Modified
+                    | VersionWorkingTreeChangeKind::TypeChanged => {
+                        VersionRestoreActionKind::Replace
+                    }
+                };
+                Some(VersionRestoreAction {
+                    path: change.path.clone(),
+                    action,
+                })
+            })
+            .collect();
+        Ok(VersionRestorePreview {
+            reference: status.reference,
+            commit: status.commit,
+            root: status.root,
+            mode,
+            actions,
         })
     }
 

@@ -166,6 +166,10 @@ shows the complete parent list, including both parents of a merge commit.
 `versioning status [path] --reference <commit-or-ref>` compares the live
 working tree with versioned metadata and bounded file contents, reporting
 added, modified, deleted, and type-changed paths without writing either side.
+`versioning restore-preview <commit-or-ref> <path> --mode overlay|exact`
+translates that comparison into create, replace, and delete actions. Overlay
+preserves live-only paths; exact reports the deletions needed for an exact
+match but does not apply them.
 `versioning policy` reports opt-in and repository-lease state.
 Show and restore stream versioned data in bounded chunks rather than loading a
 complete large file into memory.
@@ -271,6 +275,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Opt-in state, retention policy, and current or last repository lease. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning` | Enable or disable with `{"enabled":true|false}`; disabling retains history. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/status` | Compare the live working tree with query `reference` (default `main`) and `path` (default `/`) without modifying either side. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore-preview` | Preview `create`, `replace`, and `delete` actions for required `commit` and `path`, with optional `mode=overlay|exact`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits` | Commit history with optional `branch` (default `main`), `path`, `limit`, and exclusive `page_token`; returns `next_page_token`. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit-or-ref}` | Resolve a commit ID, tag, or branch and return the commit with its complete parent list. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/diff` | Added, modified, and deleted paths between required `from` and `to` commit IDs or tags; supports `limit` and exclusive path `page_token`. |

@@ -41,7 +41,7 @@ use slatefs_core::snapshot::SnapshotVolume;
 use slatefs_core::store;
 use slatefs_core::versioning::{
     VersionMaintenanceLeaseInfo, VersionMergeConflictStrategy, VersionRepository,
-    force_break_expired_version_maintenance_lease, purge_version_history,
+    VersionRestoreMode, force_break_expired_version_maintenance_lease, purge_version_history,
     try_get_version_maintenance_lease,
 };
 use slatefs_core::vfs::Vfs;
@@ -2217,6 +2217,46 @@ async fn get_working_tree_status_response(
     Ok(AdminHttpResponse::json(200, json!({ "status": status })))
 }
 
+async fn get_restore_preview_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let commit = request
+        .query
+        .get("commit")
+        .ok_or_else(|| bad_request("missing commit"))?;
+    let path = request
+        .query
+        .get("path")
+        .ok_or_else(|| bad_request("missing path"))?;
+    let mode = match request.query.get("mode").map(String::as_str) {
+        None | Some("overlay") => VersionRestoreMode::Overlay,
+        Some("exact") => VersionRestoreMode::Exact,
+        Some(mode) => return Err(bad_request(format!("invalid restore mode {mode:?}"))),
+    };
+    let target = live_filesystem_target(state, tenant, volume)?;
+    target
+        .validate_writer_lease()
+        .await
+        .map_err(|error| live_version_error(&target, tenant, volume, error))?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    let result = repository
+        .preview_restore(target.as_ref(), commit, path, mode)
+        .await;
+    let writer_validation = target.validate_writer_lease().await;
+    let repository_close = repository.close().await;
+    let control_close = control.close().await;
+    let preview = result.map_err(|error| live_version_error(&target, tenant, volume, error))?;
+    writer_validation.map_err(|error| live_version_error(&target, tenant, volume, error))?;
+    repository_close.map_err(core_error)?;
+    control_close.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(200, json!({ "preview": preview })))
+}
+
 async fn patch_versioning_response(
     state: &AdminState,
     request: &AdminHttpRequest,
@@ -4175,6 +4215,19 @@ async fn route_admin_request(
                 "status",
             ],
         ) => get_working_tree_status_response(state, request, tenant, volume).await,
+        (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "restore-preview",
+            ],
+        ) => get_restore_preview_response(state, request, tenant, volume).await,
         (
             "GET",
             [
@@ -7502,6 +7555,20 @@ mod tests {
         let status: Value = serde_json::from_str(response_body(&status_response)).unwrap();
         assert_eq!(status["status"]["changes"][0]["path"], "/notes.txt");
         assert_eq!(status["status"]["changes"][0]["change"], "modified");
+        let preview_response = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning/restore-preview?commit=main&path=/notes.txt&mode=overlay HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            response_status(&preview_response),
+            200,
+            "{preview_response}"
+        );
+        let preview: Value = serde_json::from_str(response_body(&preview_response)).unwrap();
+        assert_eq!(preview["preview"]["mode"], "overlay");
+        assert_eq!(preview["preview"]["actions"][0]["path"], "/notes.txt");
+        assert_eq!(preview["preview"]["actions"][0]["action"], "replace");
         let branch_commit_body =
             r#"{"path":"/notes.txt","message":"release update","branch":"release"}"#;
         let branch_commit_request = format!(

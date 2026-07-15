@@ -202,6 +202,7 @@ slatefs -c /etc/slatefs/slatefs.toml versioning commit <tenant> <volume> <path>.
 slatefs -c /etc/slatefs/slatefs.toml versioning restore <tenant> <volume> <commit> <path> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning log <tenant> <volume> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning status <tenant> <volume> /projects --reference main --live
+slatefs -c /etc/slatefs/slatefs.toml versioning restore-preview <tenant> <volume> main /projects --mode exact --live
 slatefs -c /etc/slatefs/slatefs.toml versioning policy <tenant> <volume> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning diff <tenant> <volume> <from-commit> <to-commit> --live
 slatefs -c /etc/slatefs/slatefs.toml versioning tag <tenant> <volume> <name> <commit> --live
