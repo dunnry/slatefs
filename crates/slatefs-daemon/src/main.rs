@@ -2746,9 +2746,6 @@ async fn export_version_repository_bundle_response(
     let (bundle, report) = match result {
         Ok(exported) => exported,
         Err(error) => {
-            state
-                .export_metrics
-                .version_sync_failure(tenant, volume, "sent");
             return finish_version_repository(control, repository, Err(error)).await;
         }
     };
@@ -2767,6 +2764,10 @@ async fn export_version_repository_bundle_response(
                 "bundle_bytes".to_string(),
                 AuditDetailValue::U64(report.bundle_bytes),
             ),
+            (
+                "bundle_sha256".to_string(),
+                AuditDetailValue::String(report.bundle_sha256.clone()),
+            ),
             ("objects".to_string(), AuditDetailValue::U64(report.objects)),
         ],
     )
@@ -2779,11 +2780,12 @@ async fn export_version_repository_bundle_response(
     state
         .export_metrics
         .version_operation(tenant, volume, "repository-export");
-    Ok(AdminHttpResponse::binary(
-        200,
-        VERSION_REPOSITORY_BUNDLE_CONTENT_TYPE,
-        bundle,
-    ))
+    let mut response =
+        AdminHttpResponse::binary(200, VERSION_REPOSITORY_BUNDLE_CONTENT_TYPE, bundle);
+    response
+        .headers
+        .push(("X-SlateFS-Bundle-Sha256", report.bundle_sha256));
+    Ok(response)
 }
 
 async fn import_version_repository_bundle_response(
@@ -2827,6 +2829,10 @@ async fn import_version_repository_bundle_response(
             (
                 "bundle_bytes".to_string(),
                 AuditDetailValue::U64(report.bundle_bytes),
+            ),
+            (
+                "bundle_sha256".to_string(),
+                AuditDetailValue::String(report.bundle_sha256.clone()),
             ),
             ("objects".to_string(), AuditDetailValue::U64(report.objects)),
         ],
@@ -2885,6 +2891,9 @@ async fn export_version_sync_response(
     let (bundle, report) = match result {
         Ok(exported) => exported,
         Err(error) => {
+            state
+                .export_metrics
+                .version_sync_failure(tenant, volume, "sent");
             return finish_version_repository(control, repository, Err(error)).await;
         }
     };
@@ -9337,6 +9346,10 @@ mod tests {
         );
         let report = VersionRepository::inspect_bundle(bundle).unwrap();
         assert_eq!(report.commits, 1);
+        assert!(head.contains(&format!(
+            "X-SlateFS-Bundle-Sha256: {}",
+            report.bundle_sha256
+        )));
 
         let mut import_request = format!(
             "POST /admin/v1/tenants/t/volumes/destination/versioning/bundle HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: bundle-import\r\nContent-Type: application/vnd.slatefs.version-repository\r\nContent-Length: {}\r\n\r\n",
@@ -9350,6 +9363,10 @@ mod tests {
         assert_eq!(
             imported["repository_bundle"]["identity"]["id"],
             report.identity.id()
+        );
+        assert_eq!(
+            imported["repository_bundle"]["bundle_sha256"],
+            report.bundle_sha256
         );
         assert_eq!(imported["repository_bundle"]["bundle_bytes"], bundle.len());
 

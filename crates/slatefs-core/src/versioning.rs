@@ -2354,6 +2354,7 @@ pub struct VersionStoreStats {
 #[non_exhaustive]
 pub struct VersionRepositoryBundleReport {
     pub identity: VersionRepositoryIdentity,
+    pub bundle_sha256: String,
     pub objects: u64,
     pub commits: u64,
     pub pruned_commits: u64,
@@ -3053,6 +3054,7 @@ impl VersionRepository {
         let mut report = validate_repository_bundle_payload(&payload)?;
         let bundle = encode_repository_bundle(&payload)?;
         report.bundle_bytes = bundle.len() as u64;
+        report.bundle_sha256 = hex::encode(Sha256::digest(&bundle));
         Ok((bundle, report))
     }
 
@@ -3670,21 +3672,7 @@ impl VersionRepository {
                 }
                 return Err(Error::not_found("version commit", hex::encode(id)));
             };
-            let body = VersionCommitBody {
-                parents: commit.parents.clone(),
-                tree: commit.tree.clone(),
-                created_at: commit.created_at,
-                message: commit.message.clone(),
-                paths: commit.paths.clone(),
-                provenance: commit.provenance.clone(),
-            };
-            let expected: [u8; 32] = Sha256::digest(postcard::to_allocvec(&body)?).into();
-            if expected != commit.id || commit.id != id {
-                return Err(Error::Versioning(format!(
-                    "commit {} does not match its content hash",
-                    hex::encode(id)
-                )));
-            }
+            validate_version_commit_object(&commit, id, "version repository verification")?;
             trees.push(commit.tree.to_tree());
             pending.extend(commit.parents.iter().copied());
             commits += 1;
@@ -6542,12 +6530,59 @@ fn repository_bundle_object_id(key: &[u8], prefix: &[u8], kind: &'static str) ->
         })
 }
 
+fn validate_version_commit_object(
+    commit: &VersionCommit,
+    id: [u8; 32],
+    what: &'static str,
+) -> Result<()> {
+    if commit.parents.len() > 2
+        || (commit.parents.len() == 2 && commit.parents[0] == commit.parents[1])
+    {
+        return Err(Error::invalid(
+            what,
+            format!("commit {} has invalid parents", hex::encode(id)),
+        ));
+    }
+    validate_version_identity("version commit author", commit.provenance.author())?;
+    validate_version_identity("version commit committer", commit.provenance.committer())?;
+    validate_version_request_id(commit.provenance.request_id())?;
+    if commit.paths.is_empty()
+        || commit.paths.windows(2).any(|paths| paths[0] >= paths[1])
+        || commit
+            .paths
+            .iter()
+            .any(|path| canonical_path(path).map_or(true, |canonical| canonical != *path))
+    {
+        return Err(Error::invalid(
+            what,
+            format!("commit {} has invalid changed paths", hex::encode(id)),
+        ));
+    }
+    let body = VersionCommitBody {
+        parents: commit.parents.clone(),
+        tree: commit.tree.clone(),
+        created_at: commit.created_at,
+        message: commit.message.clone(),
+        paths: commit.paths.clone(),
+        provenance: commit.provenance.clone(),
+    };
+    let actual: [u8; 32] = Sha256::digest(postcard::to_allocvec(&body)?).into();
+    if commit.id != id || actual != id {
+        return Err(Error::invalid(
+            what,
+            format!("commit {} does not match its content hash", hex::encode(id)),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_repository_bundle_payload(
     payload: &VersionRepositoryBundlePayload,
 ) -> Result<VersionRepositoryBundleReport> {
     validate_version_repository_identity(&payload.identity)?;
     let mut report = VersionRepositoryBundleReport {
         identity: payload.identity.clone(),
+        bundle_sha256: String::new(),
         objects: payload.objects.len() as u64,
         commits: 0,
         pruned_commits: 0,
@@ -6620,21 +6655,7 @@ fn validate_repository_bundle_payload(
             let id = repository_bundle_object_id(&object.key, COMMIT_PREFIX, "commit")?;
             let commit: VersionCommit =
                 decode_versioned(COMMIT_VERSION, &object.value, "version commit")?;
-            let body = VersionCommitBody {
-                parents: commit.parents.clone(),
-                tree: commit.tree.clone(),
-                created_at: commit.created_at,
-                message: commit.message.clone(),
-                paths: commit.paths.clone(),
-                provenance: commit.provenance.clone(),
-            };
-            let actual: [u8; 32] = Sha256::digest(postcard::to_allocvec(&body)?).into();
-            if commit.id != id || actual != id {
-                return Err(Error::invalid(
-                    "version repository bundle",
-                    format!("commit {} does not match its content hash", hex::encode(id)),
-                ));
-            }
+            validate_version_commit_object(&commit, id, "version repository bundle")?;
             commits.insert(id, commit);
             report.commits += 1;
         } else if object.key.starts_with(ATTESTATION_PREFIX) {
@@ -6707,6 +6728,15 @@ fn validate_repository_bundle_payload(
     }
 
     for (id, commit) in &commits {
+        if pruned_commits.contains(id) {
+            return Err(Error::invalid(
+                "version repository bundle",
+                format!(
+                    "commit {} also has a contradictory pruned marker",
+                    hex::encode(id)
+                ),
+            ));
+        }
         for parent in &commit.parents {
             if !commits.contains_key(parent) && !pruned_commits.contains(parent) {
                 return Err(Error::invalid(
@@ -6928,6 +6958,7 @@ fn decode_repository_bundle(
     let mut report = validate_repository_bundle_payload(&payload)
         .map_err(|error| Error::invalid("version repository bundle", error.to_string()))?;
     report.bundle_bytes = bundle.len() as u64;
+    report.bundle_sha256 = hex::encode(Sha256::digest(bundle));
     Ok((payload, report))
 }
 

@@ -2539,6 +2539,7 @@ fn print_repository_bundle_report(report: &VersionRepositoryBundleReport) {
     println!("repository_id: {}", report.identity.id());
     println!("repository_created_at: {}", report.identity.created_at());
     println!("bundle_bytes: {}", report.bundle_bytes);
+    println!("bundle_sha256: {}", report.bundle_sha256);
     println!("logical_bytes: {}", report.logical_bytes);
     println!("objects: {}", report.objects);
     println!("commits: {}", report.commits);

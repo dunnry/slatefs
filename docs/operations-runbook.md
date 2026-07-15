@@ -285,6 +285,15 @@ idempotency retry records are deliberately not imported. The live admin
 transport accepts bundles up to 512 MiB. For larger bundles, quiesce the source
 and destination volumes and omit the live flag.
 
+Record the printed `bundle_sha256` when exporting and compare it with the
+inspection or import report at the destination. Live exports also return the
+same value in `X-SlateFS-Bundle-Sha256`. A successful inspection verifies the
+envelope checksum, sorted unique object keys, object and commit hashes,
+canonical commit paths and provenance, Prolly child/blob references, branch,
+tag, and reflog targets, and detached signatures. Treat any mismatch as a
+corrupt or substituted artifact; do not retry import with verification
+disabled because no bypass exists.
+
 Push and pull are the incremental alternative to complete repository bundles.
 The local side is opened directly under its repository maintenance lease; the
 remote side uses the configured admin bearer token, CA, server name, and mTLS

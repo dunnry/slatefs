@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use ed25519_dalek::{Signer, SigningKey};
 use futures::TryStreamExt;
+use sha2::{Digest, Sha256};
 use slatefs_core::control::{ControlPlane, ControlReader};
 use slatefs_core::error::Error;
 use slatefs_core::meta::inode::ROOT_INO;
@@ -1591,6 +1592,11 @@ async fn detached_commit_attestations_are_optional_immutable_and_verified() {
     assert!(exported.nodes > 0);
     assert!(exported.blobs > 0);
     assert_eq!(exported.bundle_bytes, bundle.len() as u64);
+    assert_eq!(exported.bundle_sha256, hex::encode(Sha256::digest(&bundle)));
+    assert_eq!(
+        VersionRepository::inspect_bundle(&bundle).unwrap(),
+        exported
+    );
 
     repository.close().await.unwrap();
     let reopened = VersionRepository::open_with_identity(

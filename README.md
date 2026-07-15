@@ -195,14 +195,18 @@ The export-repository command writes a checksummed .slatevcs binary bundle
 containing the repository identity, commits, attestations, Prolly nodes,
 content blobs, branches, tags, reflogs, and pruned-parent markers. The
 import-repository command, with explicit --yes confirmation, validates every
-hash, signature, and reference before one atomic import into an uninitialized,
+envelope checksum, object hash, commit invariant, signature, and reference
+before one atomic import into an uninitialized,
 versioning-enabled destination repository. Enabling versioning alone does not
 initialize the repository. The destination retains the source
 repository UUID while SlateDB re-encrypts the logical records with the
 destination volume's key. Retention settings, branch protection, leases, and
 retry-idempotency records are local operational state and do not travel. Both
 commands support --live; the daemon transports the native binary media type
-without base64 conversion. Live imports are limited to a 512 MiB request body;
+without base64 conversion. Successful export, inspection, and import reports
+include `bundle_sha256`; live export also returns it as
+`X-SlateFS-Bundle-Sha256` for out-of-band transfer verification. Live imports
+are limited to a 512 MiB request body;
 larger repositories can use the offline commands while the involved volumes
 are quiesced.
 

@@ -95,8 +95,13 @@ verification against an out-of-band trusted public key. A separate version-1
 binary repository bundle carries the complete logical object graph and stable
 identity across volumes. Import validates that graph before an atomic SlateDB
 batch re-encrypts it with the empty destination volume's key. Placement-local
-policy, leases, retention settings, and retry state stay behind. Additional
-named branch references can point to any existing commit, tag, or branch and
+policy, leases, retention settings, and retry state stay behind. Bundle
+validation covers the envelope checksum, sorted unique keys,
+content-addressed nodes, blobs, and commits, commit provenance/path/parent
+invariants, graph references, ref targets, and attestations. Reports expose the
+SHA-256 fingerprint of the complete portable envelope for transfer
+correlation. Additional named branch references can point to any existing
+commit, tag, or branch and
 can be used by read, restore, diff, and history operations. Commits advance
 `main` by default
 or an existing named branch when selected explicitly. Publishing a commit and
