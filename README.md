@@ -232,7 +232,9 @@ leaving versioning enabled for a fresh next commit. Protected branches block
 purge until their guards are explicitly removed. Commit, restore, retention,
 GC, and purge actions emit durable audit records, and live daemon operations
 increment `slatefs_version_operations_total{tenant,volume,operation}`. An
-automatic collection uses the `gc-auto` operation label.
+automatic collection uses the `gc-auto` operation label. Protected-operation
+rejections increment
+`slatefs_version_operation_denials_total{tenant,volume,operation}`.
 
 Every explicit repository operation and purge acquires a per-volume lease with
 an atomic object-store conditional write. The lease is renewed while work is

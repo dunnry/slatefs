@@ -159,6 +159,7 @@ struct ExportMetrics {
     reconcile_failures: Arc<AtomicU64>,
     snapshot_retention_deleted: Arc<Mutex<HashMap<VolumeId, u64>>>,
     version_operations: Arc<Mutex<HashMap<(VolumeId, String), u64>>>,
+    version_operation_denials: Arc<Mutex<HashMap<(VolumeId, String), u64>>>,
     tls_reloads: Arc<Mutex<HashMap<String, u64>>>,
     tls_reload_failures: Arc<Mutex<HashMap<String, u64>>>,
     tls_expiry: Arc<Mutex<HashMap<String, i64>>>,
@@ -214,6 +215,16 @@ impl ExportMetrics {
             .lock()
             .expect("version operation metrics poisoned");
         *operations
+            .entry((VolumeId::from_parts(tenant, volume), operation.to_string()))
+            .or_insert(0) += 1;
+    }
+
+    fn version_operation_denied(&self, tenant: &str, volume: &str, operation: &str) {
+        let mut denials = self
+            .version_operation_denials
+            .lock()
+            .expect("version operation denial metrics poisoned");
+        *denials
             .entry((VolumeId::from_parts(tenant, volume), operation.to_string()))
             .or_insert(0) += 1;
     }
@@ -330,6 +341,22 @@ impl ExportMetrics {
         {
             samples.push(PrometheusSample::new(
                 "slatefs_version_operations_total",
+                [
+                    ("tenant", volume_id.tenant.as_str()),
+                    ("volume", volume_id.volume.as_str()),
+                    ("operation", operation.as_str()),
+                ],
+                *value as f64,
+            ));
+        }
+        for ((volume_id, operation), value) in self
+            .version_operation_denials
+            .lock()
+            .expect("version operation denial metrics poisoned")
+            .iter()
+        {
+            samples.push(PrometheusSample::new(
+                "slatefs_version_operation_denials_total",
                 [
                     ("tenant", volume_id.tenant.as_str()),
                     ("volume", volume_id.volume.as_str()),
@@ -2119,6 +2146,9 @@ async fn commit_live_version_response(
             .await
         }
         Err(error) if is_version_publication_authorization_error(error) => {
+            state
+                .export_metrics
+                .version_operation_denied(tenant, volume, "commit");
             append_version_audit_with_outcome(
                 &control,
                 request,
@@ -2777,6 +2807,9 @@ async fn set_version_branch_protection_response(
         Err(slatefs_core::error::Error::Invalid { what, .. })
             if *what == "version branch policy authorization" =>
         {
+            state
+                .export_metrics
+                .version_operation_denied(tenant, volume, "policy");
             append_version_audit_with_outcome(
                 &control,
                 request,
@@ -2841,6 +2874,9 @@ async fn delete_version_branch_response(
             .await
         }
         Err(error) if is_protected_branch_operation_error(error) => {
+            state
+                .export_metrics
+                .version_operation_denied(tenant, volume, "delete");
             append_version_audit_with_outcome(
                 &control,
                 request,
@@ -2914,6 +2950,9 @@ async fn reset_version_branch_response(
             .await
         }
         Err(error) if is_protected_branch_operation_error(error) => {
+            state
+                .export_metrics
+                .version_operation_denied(tenant, volume, "reset");
             append_version_audit_with_outcome(
                 &control,
                 request,
@@ -2991,6 +3030,9 @@ async fn recover_version_branch_response(
             .await
         }
         Err(error) if is_protected_branch_operation_error(error) => {
+            state
+                .export_metrics
+                .version_operation_denied(tenant, volume, "recover");
             append_version_audit_with_outcome(
                 &control,
                 request,
@@ -3084,6 +3126,9 @@ async fn merge_version_branch_response(
             .await
         }
         Err(error) if is_version_publication_authorization_error(error) => {
+            state
+                .export_metrics
+                .version_operation_denied(tenant, volume, "merge");
             append_version_audit_with_outcome(
                 &control,
                 request,
@@ -3432,6 +3477,9 @@ async fn purge_version_history_response(
             .await
         }
         Err(error) if is_protected_history_purge_error(error) => {
+            state
+                .export_metrics
+                .version_operation_denied(tenant, volume, "purge");
             append_version_audit_with_outcome(
                 &control,
                 request,
@@ -8688,6 +8736,16 @@ mod tests {
             metrics.contains("slatefs_version_operations_total{tenant=\"t\",volume=\"v\",operation=\"restore\"} 1"),
             "{metrics}"
         );
+        for operation in [
+            "policy", "commit", "merge", "reset", "delete", "recover", "purge",
+        ] {
+            assert!(
+                metrics.contains(&format!(
+                    "slatefs_version_operation_denials_total{{tenant=\"t\",volume=\"v\",operation=\"{operation}\"}} 1"
+                )),
+                "missing {operation} denial metric in {metrics}"
+            );
+        }
         let audit_control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
             .await
             .unwrap();

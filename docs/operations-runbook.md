@@ -253,6 +253,10 @@ merge event with the branch, selected paths or merge endpoints, author, and
 committer. They do not record the commit message or file contents.
 Rejected reset, delete, reflog recovery, and protected-history purge attempts
 also emit `Denied` maintenance or purge records with the requested target.
+Alert on sustained increases in
+`slatefs_version_operation_denials_total{tenant,volume,operation}`; the
+`operation` label is one of `policy`, `commit`, `merge`, `reset`, `delete`,
+`recover`, or `purge`.
 
 Live commit and divergent-merge provenance records the authenticated admin or
 tenant principal as committer and the HTTP request ID for audit correlation.

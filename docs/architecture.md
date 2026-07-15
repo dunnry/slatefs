@@ -337,6 +337,7 @@ includes:
 - volume liveness and degraded state;
 - storage error counters;
 - block decode failure counters;
+- successful version-operation and protected-operation denial counters;
 - SlateDB cache, flush, write, object-store, and backpressure samples.
 
 Starter alert rules are in
