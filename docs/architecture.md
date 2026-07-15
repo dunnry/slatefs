@@ -106,8 +106,9 @@ operation unrestricted. Offline repository access is the administrative
 recovery boundary. The live control plane durably audits successful and denied
 policy changes with the requested identity lists and server-derived actor; it
 also audits publication denials with branch, path or merge metadata, author,
-and committer. It does not record messages, file contents, or bearer
-credentials.
+and committer. Protected reset, delete, reflog recovery, and history-purge
+denials are audited with their requested target metadata. Audit records do not
+contain messages, file contents, or bearer credentials.
 Disabling versioning blocks repository operations
 without deleting its history. Volume deletion removes both the live and
 optional version-store prefixes.

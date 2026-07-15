@@ -166,7 +166,9 @@ restrict live policy changes and removal; an empty manager list permits any
 authorized live operator. Successful and denied live policy changes are
 durably audited with both identity lists. Denied protected-branch commits and
 merges also record their server-derived author/committer and target metadata,
-but never messages, file contents, or bearer tokens.
+and rejected reset, delete, recovery, and protected-history purge attempts are
+recorded as denied maintenance actions. Audits never contain messages, file
+contents, or bearer tokens.
 `unprotect-branch --yes` removes that guard. `versioning reflog <branch>` lists
 the newest 100 head
 transitions even after branch deletion. Every create, commit, fast-forward,

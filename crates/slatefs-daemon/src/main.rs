@@ -1572,6 +1572,22 @@ fn is_version_publication_authorization_error(error: &slatefs_core::error::Error
     )
 }
 
+fn is_protected_branch_operation_error(error: &slatefs_core::error::Error) -> bool {
+    matches!(
+        error,
+        slatefs_core::error::Error::Invalid { what, .. }
+            if *what == "version branch operation"
+    )
+}
+
+fn is_protected_history_purge_error(error: &slatefs_core::error::Error) -> bool {
+    matches!(
+        error,
+        slatefs_core::error::Error::Invalid { what, .. }
+            if *what == "version history purge"
+    )
+}
+
 fn version_restore_error(error: slatefs_core::error::Error) -> AdminError {
     if matches!(&error, slatefs_core::error::Error::Versioning(message) if message.contains("restore preview is stale"))
     {
@@ -2824,6 +2840,27 @@ async fn delete_version_branch_response(
             )
             .await
         }
+        Err(error) if is_protected_branch_operation_error(error) => {
+            append_version_audit_with_outcome(
+                &control,
+                request,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                AuditOutcome::Denied,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-branch-delete".to_string()),
+                    ),
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(name.to_string()),
+                    ),
+                ],
+            )
+            .await
+        }
         Err(_) => Ok(()),
     };
     let repository_close = repository.close().await;
@@ -2876,6 +2913,31 @@ async fn reset_version_branch_response(
             )
             .await
         }
+        Err(error) if is_protected_branch_operation_error(error) => {
+            append_version_audit_with_outcome(
+                &control,
+                request,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                AuditOutcome::Denied,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-branch-reset".to_string()),
+                    ),
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(name.to_string()),
+                    ),
+                    (
+                        "requested_commit".to_string(),
+                        AuditDetailValue::String(body.commit.clone()),
+                    ),
+                ],
+            )
+            .await
+        }
         Err(_) => Ok(()),
     };
     let repository_close = repository.close().await;
@@ -2923,6 +2985,31 @@ async fn recover_version_branch_response(
                     (
                         "commit".to_string(),
                         AuditDetailValue::String(recovery.commit().to_string()),
+                    ),
+                ],
+            )
+            .await
+        }
+        Err(error) if is_protected_branch_operation_error(error) => {
+            append_version_audit_with_outcome(
+                &control,
+                request,
+                AuditAction::Maintain,
+                tenant,
+                volume,
+                AuditOutcome::Denied,
+                [
+                    (
+                        "maintenance".to_string(),
+                        AuditDetailValue::String("version-branch-recover".to_string()),
+                    ),
+                    (
+                        "branch".to_string(),
+                        AuditDetailValue::String(name.to_string()),
+                    ),
+                    (
+                        "reflog_sequence".to_string(),
+                        AuditDetailValue::U64(body.sequence),
                     ),
                 ],
             )
@@ -3327,23 +3414,50 @@ async fn purge_version_history_response(
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
     let control = state.control_writer().await?;
-    let deleted_objects =
-        purge_version_history(&control, Arc::clone(&state.object_store), tenant, volume)
+    let result =
+        purge_version_history(&control, Arc::clone(&state.object_store), tenant, volume).await;
+    let audit = match &result {
+        Ok(deleted_objects) => {
+            append_version_audit(
+                &control,
+                request,
+                AuditAction::VersionPurge,
+                tenant,
+                volume,
+                [(
+                    "deleted_objects".to_string(),
+                    AuditDetailValue::U64(*deleted_objects as u64),
+                )],
+            )
             .await
-            .map_err(core_error)?;
-    append_version_audit(
-        &control,
-        request,
-        AuditAction::VersionPurge,
-        tenant,
-        volume,
-        [(
-            "deleted_objects".to_string(),
-            AuditDetailValue::U64(deleted_objects as u64),
-        )],
-    )
-    .await?;
-    control.close().await.map_err(core_error)?;
+        }
+        Err(error) if is_protected_history_purge_error(error) => {
+            append_version_audit_with_outcome(
+                &control,
+                request,
+                AuditAction::VersionPurge,
+                tenant,
+                volume,
+                AuditOutcome::Denied,
+                [
+                    (
+                        "confirmed".to_string(),
+                        AuditDetailValue::Bool(body.confirm),
+                    ),
+                    (
+                        "reason".to_string(),
+                        AuditDetailValue::String(error.to_string()),
+                    ),
+                ],
+            )
+            .await
+        }
+        Err(_) => Ok(()),
+    };
+    let control_close = control.close().await;
+    let deleted_objects = result.map_err(core_error)?;
+    audit?;
+    control_close.map_err(core_error)?;
     state
         .export_metrics
         .version_operation(tenant, volume, "purge");
@@ -8073,7 +8187,7 @@ mod tests {
         assert_eq!(denied_policy.status, 403);
         let blocked_reset_body = r#"{"commit":"baseline"}"#;
         let blocked_reset_request = format!(
-            "POST /admin/v1/tenants/t/volumes/v/versioning/branches/release/reset HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            "POST /admin/v1/tenants/t/volumes/v/versioning/branches/release/reset HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: denied-release-reset\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             blocked_reset_body.len(),
             blocked_reset_body
         );
@@ -8082,10 +8196,19 @@ mod tests {
         assert_eq!(response_status(&blocked_reset), 409, "{blocked_reset}");
         let blocked_delete = admin_exchange(
             Arc::clone(&state),
-            b"DELETE /admin/v1/tenants/t/volumes/v/versioning/branches/release HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            b"DELETE /admin/v1/tenants/t/volumes/v/versioning/branches/release HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: denied-release-delete\r\n\r\n",
         )
         .await;
         assert_eq!(response_status(&blocked_delete), 409, "{blocked_delete}");
+        let blocked_recover_body = r#"{"sequence":1}"#;
+        let blocked_recover_request = format!(
+            "POST /admin/v1/tenants/t/volumes/v/versioning/branches/release/recover HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: denied-release-recover\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            blocked_recover_body.len(),
+            blocked_recover_body
+        );
+        let blocked_recover =
+            admin_exchange(Arc::clone(&state), blocked_recover_request.as_bytes()).await;
+        assert_eq!(response_status(&blocked_recover), 409, "{blocked_recover}");
         let merge_preview = admin_exchange(
             Arc::clone(&state),
             b"GET /admin/v1/tenants/t/volumes/v/versioning/branches/release/merge?source=main HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -8253,7 +8376,7 @@ mod tests {
         );
         let blocked_purge_body = r#"{"confirm":true}"#;
         let blocked_purge_request = format!(
-            "DELETE /admin/v1/tenants/t/volumes/v/versioning/history HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            "DELETE /admin/v1/tenants/t/volumes/v/versioning/history HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: denied-protected-purge\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             blocked_purge_body.len(),
             blocked_purge_body
         );
@@ -8585,7 +8708,7 @@ mod tests {
             let expected = if action == AuditAction::VersionCommit {
                 5
             } else if action == AuditAction::Maintain {
-                15
+                18
             } else {
                 1
             };
@@ -8616,6 +8739,25 @@ mod tests {
                 );
             }
             if action == AuditAction::Maintain {
+                for (request_id, maintenance) in [
+                    ("denied-release-reset", "version-branch-reset"),
+                    ("denied-release-delete", "version-branch-delete"),
+                    ("denied-release-recover", "version-branch-recover"),
+                ] {
+                    let denied = records
+                        .iter()
+                        .find(|record| record.request_id == request_id)
+                        .expect("denied destructive branch audit");
+                    assert_eq!(denied.outcome, AuditOutcome::Denied);
+                    assert_eq!(
+                        denied.details.get("maintenance"),
+                        Some(&AuditDetailValue::String(maintenance.to_string()))
+                    );
+                    assert_eq!(
+                        denied.details.get("branch"),
+                        Some(&AuditDetailValue::String("release".to_string()))
+                    );
+                }
                 let denied_merge = records
                     .iter()
                     .find(|record| {
@@ -8723,7 +8865,23 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert_eq!(records.len(), 1);
+            let expected = if action == AuditAction::VersionPurge {
+                2
+            } else {
+                1
+            };
+            assert_eq!(records.len(), expected);
+            if action == AuditAction::VersionPurge {
+                let denied = records
+                    .iter()
+                    .find(|record| record.request_id == "denied-protected-purge")
+                    .expect("denied protected history purge audit");
+                assert_eq!(denied.outcome, AuditOutcome::Denied);
+                assert_eq!(
+                    denied.details.get("confirmed"),
+                    Some(&AuditDetailValue::Bool(true))
+                );
+            }
         }
         audit_control.close().await.unwrap();
 
