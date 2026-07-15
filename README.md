@@ -322,8 +322,10 @@ volumes are untouched. `versioning gc` runs the same collection explicitly in
 deterministic batches of at most 10,000 unreachable objects by default;
 `--max-deletions` may select 1 to 1,000,000. The report exposes
 `remaining_objects` and `complete`, so repeat until complete. `--dry-run`
-reports the next batch without deleting it, and `versioning stats` reports
-logical usage. Automatic retention processes one default-sized batch per poll.
+reports the next batch without deleting it. `versioning stats` reports logical
+usage, configured history quota, remaining headroom, percentage used, and an
+explicit over-limit state. Automatic retention processes one default-sized
+batch per poll.
 Tags and branch heads pin their commit and Prolly tree through both automatic
 and explicit GC until the reference is deleted. `show`, `restore`, and `diff`
 accept a commit ID, tag name, or branch name.
@@ -446,7 +448,7 @@ keeps the legacy live-writer snapshot route and serves admin API v1:
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit-or-ref}/attestations` | List detached commit attestations ordered by key ID. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/commits/{commit-or-tag}/content?path=&offset=&length=` | Read a bounded file or symlink range as base64 JSON; defaults to 1 MiB and rejects ranges over 4 MiB. |
 | `POST` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/restore` | Apply a current preview through the live writer from `{"commit":"...","path":"...","mode":"overlay|exact","token":"..."}`; stale tokens return `409`. |
-| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/stats` | Logical history bytes, nodes, blobs, commits, and attestations. |
+| `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/stats` | Logical history bytes, configured `max_bytes`, available bytes, usage percentage, over-limit state, nodes, blobs, commits, and attestations. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/verify` | Verify the reachable commit DAG, attestations, branch trust rules, Prolly nodes, and content blobs. |
 | `GET` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Current history retention and quota policy. |
 | `PATCH` | `/admin/v1/tenants/{tenant}/volumes/{volume}/versioning/retention` | Set `keep_last`, `max_age_secs`, `max_bytes`, and/or positive `reflog_keep_last`, or `{"clear":true}`. Lowering the reflog limit prunes immediately. |

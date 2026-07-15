@@ -2340,6 +2340,9 @@ impl VersionCommitResult {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VersionStoreStats {
     pub bytes: u64,
+    pub max_bytes: Option<u64>,
+    pub available_bytes: Option<u64>,
+    pub over_limit: bool,
     pub nodes: u64,
     pub blobs: u64,
     pub commits: u64,
@@ -3572,6 +3575,9 @@ impl VersionRepository {
                 stats.attestations += 1;
             }
         }
+        stats.max_bytes = self.max_bytes;
+        stats.available_bytes = self.max_bytes.map(|max| max.saturating_sub(stats.bytes));
+        stats.over_limit = self.max_bytes.is_some_and(|max| stats.bytes > max);
         Ok(stats)
     }
 

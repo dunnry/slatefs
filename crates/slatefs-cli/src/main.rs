@@ -5018,6 +5018,10 @@ async fn run(
                     live_versioning_json(config, tenant, volume, "GET", "stats", &[], None).await?;
                 let stats = &response["stats"];
                 println!("bytes: {}", stats["bytes"]);
+                println!("max_bytes: {}", stats["max_bytes"]);
+                println!("available_bytes: {}", stats["available_bytes"]);
+                println!("usage_percent: {}", stats["usage_percent"]);
+                println!("over_limit: {}", stats["over_limit"]);
                 println!("commits: {}", stats["commits"]);
                 println!("attestations: {}", stats["attestations"]);
                 println!("nodes: {}", stats["nodes"]);
@@ -5030,6 +5034,20 @@ async fn run(
             let stats = stats?;
             close?;
             println!("bytes: {}", stats.bytes);
+            println!("max_bytes: {}", format_limit(stats.max_bytes));
+            println!("available_bytes: {}", format_limit(stats.available_bytes));
+            match stats.max_bytes {
+                Some(max) => println!(
+                    "usage_percent: {:.2}",
+                    if max == 0 {
+                        0.0
+                    } else {
+                        stats.bytes as f64 * 100.0 / max as f64
+                    }
+                ),
+                None => println!("usage_percent: unlimited"),
+            }
+            println!("over_limit: {}", stats.over_limit);
             println!("commits: {}", stats.commits);
             println!("attestations: {}", stats.attestations);
             println!("nodes: {}", stats.nodes);

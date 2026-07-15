@@ -4119,11 +4119,22 @@ async fn get_version_stats_response(
     let (control, repository) = open_version_repository(state, tenant, volume).await?;
     let result = repository.stats().await;
     let stats = finish_version_repository(control, repository, result).await?;
+    let usage_percent = stats.max_bytes.map(|max| {
+        if max == 0 {
+            0.0
+        } else {
+            stats.bytes as f64 * 100.0 / max as f64
+        }
+    });
     Ok(AdminHttpResponse::json(
         200,
         json!({
             "stats": {
                 "bytes": stats.bytes,
+                "max_bytes": stats.max_bytes,
+                "available_bytes": stats.available_bytes,
+                "usage_percent": usage_percent,
+                "over_limit": stats.over_limit,
                 "nodes": stats.nodes,
                 "blobs": stats.blobs,
                 "commits": stats.commits,
@@ -10274,6 +10285,10 @@ mod tests {
         let stats: Value = serde_json::from_str(response_body(&stats_response)).unwrap();
         assert_eq!(stats["stats"]["commits"], 3);
         assert_eq!(stats["stats"]["attestations"], 1);
+        assert_eq!(stats["stats"]["max_bytes"], 1_048_576);
+        assert!(stats["stats"]["available_bytes"].as_u64().unwrap() < 1_048_576);
+        assert!(stats["stats"]["usage_percent"].as_f64().unwrap() > 0.0);
+        assert_eq!(stats["stats"]["over_limit"], false);
 
         let verify_response = admin_exchange(
             Arc::clone(&state),

@@ -2898,6 +2898,9 @@ async fn retention_gc_quota_and_purge_manage_history_lifecycle() {
         .await
         .unwrap();
     let before_rejected_commit = quota_repository.stats().await.unwrap();
+    assert_eq!(before_rejected_commit.max_bytes, Some(1));
+    assert_eq!(before_rejected_commit.available_bytes, Some(0));
+    assert!(before_rejected_commit.over_limit);
     live.write(&creds, file.ino, 0, b"quota").await.unwrap();
     assert!(
         quota_repository

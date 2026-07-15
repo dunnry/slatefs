@@ -449,6 +449,13 @@ next bounded batch. The daemon's automatic retention loop likewise performs
 one default-sized batch per poll, limiting transaction and pause size while
 eventually converging on large repositories.
 
+Use `versioning stats` as the storage-pressure check. When `max_bytes` is
+configured it reports `available_bytes`, `usage_percent`, and `over_limit` in
+addition to object counts. Alert before headroom reaches zero; an over-limit
+repository remains readable and collectible, but new commits, attestations,
+imports, and synchronization objects that increase logical usage are rejected
+until retention or quota changes restore capacity.
+
 `versioning show` and restore stream large files in volume-sized chunks. Admin
 API content reads are paged with `offset` and `length` (1 MiB default, 4 MiB
 maximum) and return `total_size`, `eof`, and `next_offset`. Show, restore, and
