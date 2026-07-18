@@ -57,6 +57,26 @@ cipher = "auto"              # auto | aes256gcm | xchacha20poly1305
 # [admin.tenant_token_files]
 # customer-b = "/run/slatefs/customer-b.tokens"
 
+# Loopback-only browser data plane. Authentication uses only the tenant token
+# sources above; the global admin token and certificate identities are rejected.
+# [consumer]
+# listen = "127.0.0.1:12082"
+# max_page_size = 500
+# max_range_bytes = 8388608
+# max_upload_bytes = 1073741824
+# max_recursive_entries = 10000
+# max_recursive_bytes = 1073741824
+# stream_chunk_bytes = 262144
+# idempotency_entries = 10000
+# historical_view_cache_entries = 32
+# [consumer.tenant_identities.customer-a]
+# uid = 1000
+# gid = 1000
+#
+# New volume roots are root:root 0755. Before using this unprivileged identity,
+# deliberately create/chown a writable top-level directory (recommended), or
+# deliberately change the root ownership/mode through a trusted setup mount.
+
 # Control-plane exports are reconciled live by slatefsd. Static [[exports]]
 # below are still supported as immutable bootstrap/compatibility exports.
 # The same poll interval also reloads served-volume quota limits, tenant rate

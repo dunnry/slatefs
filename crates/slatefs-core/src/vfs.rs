@@ -236,6 +236,14 @@ pub struct StatFs {
     pub free_inodes: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EntryPermissions {
+    pub can_read: bool,
+    pub can_write: bool,
+    pub can_delete: bool,
+    pub can_rename: bool,
+}
+
 /// Open-handle id from [`Vfs::open`]; required for orphan semantics (an
 /// unlinked-but-open file keeps its data until last close).
 pub type HandleId = u64;
@@ -254,6 +262,15 @@ pub trait Vfs: Send + Sync {
     fn read_only(&self) -> bool {
         false
     }
+
+    /// Evaluate effective access using the implementation's authoritative DAC
+    /// and sticky-directory rules. Parent-dependent flags are false for root.
+    async fn permissions(
+        &self,
+        creds: &Credentials,
+        ino: u64,
+        parent: Option<(u64, &[u8])>,
+    ) -> FsResult<EntryPermissions>;
 
     async fn lookup(&self, creds: &Credentials, parent: u64, name: &[u8]) -> FsResult<FileAttr>;
     async fn getattr(&self, creds: &Credentials, ino: u64) -> FsResult<FileAttr>;

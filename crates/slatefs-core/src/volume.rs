@@ -744,11 +744,14 @@ async fn open_volume_db_with_transform_metrics(
         Some(metrics) => SlateBlockTransformer::with_metrics(record.cipher, dek, metrics),
         None => SlateBlockTransformer::new(record.cipher, dek),
     };
-    let settings = caches.slatedb.apply_to_settings(Settings {
-        compression_codec: record.compression.to_slatedb(),
-        object_store_cache_options,
-        ..Settings::default()
-    });
+    let settings = store::compatible_settings(
+        &object_store,
+        caches.slatedb.apply_to_settings(Settings {
+            compression_codec: record.compression.to_slatedb(),
+            object_store_cache_options,
+            ..Settings::default()
+        }),
+    );
     let mut builder = Db::builder(path, object_store)
         .with_settings(settings)
         .with_block_transformer(Arc::new(transformer))

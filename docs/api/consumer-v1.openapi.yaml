@@ -1,0 +1,814 @@
+openapi: 3.1.0
+info:
+  title: SlateFS Consumer API
+  version: 1.0.0
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  description: |
+    Tenant-scoped filesystem data plane embedded in slatefsd. The authenticated
+    credential determines the tenant; tenant identifiers are never accepted in
+    consumer paths or request bodies. Version 1 is extend-only.
+servers:
+  - url: http://127.0.0.1:8081
+    description: Loopback consumer listener
+security:
+  - tenantBearer: []
+tags:
+  - name: Capabilities
+    description: Version, feature, and bounded-operation discovery.
+  - name: Volumes
+    description: Consumer-safe volume inventory and usage.
+  - name: Entries
+    description: Opaque-ID-first filesystem metadata operations.
+  - name: Content
+    description: Bounded, cancellable binary streams.
+  - name: Operations
+    description: Bounded compound filesystem operations.
+  - name: Extended attributes
+    description: Lossless extended-attribute access.
+paths:
+  /consumer/v1/capabilities:
+    get:
+      tags: [Capabilities]
+      operationId: getCapabilities
+      summary: Discover consumer API features and limits
+      responses:
+        "200":
+          description: Supported API version, features, and bounded-operation limits
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CapabilitiesResponse"
+              examples:
+                fixture:
+                  $ref: "#/components/examples/Capabilities"
+        default:
+          $ref: "#/components/responses/Error"
+  /consumer/v1/volumes:
+    get:
+      tags: [Volumes]
+      operationId: listVolumes
+      summary: List volumes visible to the authenticated tenant
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/PageToken"
+      responses:
+        "200":
+          description: Tenant-filtered volume page; block volumes are not browsable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VolumeListResponse"
+        default:
+          $ref: "#/components/responses/Error"
+  /consumer/v1/volumes/{volume}:
+    parameters:
+      - $ref: "#/components/parameters/Volume"
+    get:
+      tags: [Volumes]
+      operationId: getVolume
+      summary: Get consumer-safe volume and quota details
+      responses:
+        "200":
+          description: Volume detail and live statfs usage
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VolumeDetail"
+        default:
+          $ref: "#/components/responses/Error"
+  /consumer/v1/volumes/{volume}/entries:
+    parameters:
+      - $ref: "#/components/parameters/Volume"
+    get:
+      tags: [Entries]
+      operationId: listEntries
+      summary: Stat an entry and optionally list its children
+      description: Symbolic version refs are resolved once and returned as resolved_commit.
+      parameters:
+        - $ref: "#/components/parameters/EntryId"
+        - $ref: "#/components/parameters/Path"
+        - $ref: "#/components/parameters/View"
+        - $ref: "#/components/parameters/ViewRef"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/PageToken"
+        - name: include_symlink_target
+          in: query
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Entry and child page in a pinned view
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EntryListResponse"
+        default:
+          $ref: "#/components/responses/Error"
+    post:
+      tags: [Entries]
+      operationId: createEntry
+      summary: Create a live file, directory, or symlink
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/View"
+        - $ref: "#/components/parameters/ViewRef"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateEntryRequest"
+      responses:
+        "201":
+          description: Created live entry
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Entry"
+        default:
+          $ref: "#/components/responses/Error"
+    patch:
+      tags: [Entries]
+      operationId: updateEntry
+      summary: Rename, move, or update allowed metadata on a live entry
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/IfMatch"
+        - $ref: "#/components/parameters/View"
+        - $ref: "#/components/parameters/ViewRef"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateEntryRequest"
+      responses:
+        "200":
+          description: Updated live entry
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Entry"
+        default:
+          $ref: "#/components/responses/Error"
+    delete:
+      tags: [Entries]
+      operationId: deleteEntry
+      summary: Delete a live entry
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/EntryIdRequired"
+        - $ref: "#/components/parameters/View"
+        - $ref: "#/components/parameters/ViewRef"
+        - name: recursive
+          in: query
+          required: true
+          description: Must be explicit; recursive work is subject to advertised ceilings.
+          schema:
+            type: boolean
+      responses:
+        "204":
+          description: Entry deleted
+        default:
+          $ref: "#/components/responses/Error"
+  /consumer/v1/volumes/{volume}/content:
+    parameters:
+      - $ref: "#/components/parameters/Volume"
+    get:
+      tags: [Content]
+      operationId: readContent
+      summary: Stream file or symlink bytes
+      parameters:
+        - $ref: "#/components/parameters/EntryId"
+        - $ref: "#/components/parameters/Path"
+        - $ref: "#/components/parameters/View"
+        - $ref: "#/components/parameters/ViewRef"
+        - name: Range
+          in: header
+          description: Single RFC 9110 byte range, bounded by capabilities.
+          schema:
+            type: string
+            pattern: "^bytes=[0-9]*-[0-9]*$"
+      responses:
+        "200":
+          description: Complete binary content stream
+          headers:
+            Accept-Ranges:
+              schema: { type: string, const: bytes }
+            Content-Disposition:
+              schema: { type: string }
+            ETag:
+              $ref: "#/components/headers/ETag"
+            X-Content-Type-Options:
+              schema: { type: string, const: nosniff }
+            X-SlateFS-Resolved-Commit:
+              $ref: "#/components/headers/ResolvedCommit"
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "206":
+          description: Partial binary content stream
+          headers:
+            Accept-Ranges:
+              schema: { type: string, const: bytes }
+            Content-Range:
+              schema: { type: string }
+            ETag:
+              $ref: "#/components/headers/ETag"
+            X-SlateFS-Resolved-Commit:
+              $ref: "#/components/headers/ResolvedCommit"
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        default:
+          $ref: "#/components/responses/Error"
+    put:
+      tags: [Content]
+      operationId: writeContent
+      summary: Stream a staged live replacement and atomically rename it
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/IfMatch"
+        - $ref: "#/components/parameters/EntryId"
+        - $ref: "#/components/parameters/ParentEntryId"
+        - $ref: "#/components/parameters/View"
+        - $ref: "#/components/parameters/ViewRef"
+        - name: name
+          in: query
+          description: UTF-8 basename, required when creating through a parent selector.
+          schema: { type: string, minLength: 1 }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Existing file atomically replaced
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Entry"
+        "201":
+          description: File created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Entry"
+        default:
+          $ref: "#/components/responses/Error"
+  /consumer/v1/volumes/{volume}/operations:
+    parameters:
+      - $ref: "#/components/parameters/Volume"
+    post:
+      tags: [Operations]
+      operationId: startOperation
+      summary: Preview or perform a bounded server-side copy, move, or hardlink
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/IdempotencyKeyRequired"
+        - $ref: "#/components/parameters/View"
+        - $ref: "#/components/parameters/ViewRef"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OperationRequest"
+      responses:
+        "200":
+          description: Preview or completed operation counts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationResult"
+        default:
+          $ref: "#/components/responses/Error"
+  /consumer/v1/volumes/{volume}/xattrs:
+    parameters:
+      - $ref: "#/components/parameters/Volume"
+    get:
+      tags: [Extended attributes]
+      operationId: getXattrs
+      summary: List or read extended attributes in any readable view
+      parameters:
+        - $ref: "#/components/parameters/EntryIdRequired"
+        - $ref: "#/components/parameters/View"
+        - $ref: "#/components/parameters/ViewRef"
+        - name: name
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Attribute values encoded losslessly as base64
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/XattrListResponse"
+        default:
+          $ref: "#/components/responses/Error"
+    patch:
+      tags: [Extended attributes]
+      operationId: updateXattrs
+      summary: Set or remove allowed extended attributes on a live entry
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/EntryIdRequired"
+        - $ref: "#/components/parameters/IfMatch"
+        - $ref: "#/components/parameters/View"
+        - $ref: "#/components/parameters/ViewRef"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateXattrsRequest"
+      responses:
+        "200":
+          description: Current attribute values
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/XattrListResponse"
+        default:
+          $ref: "#/components/responses/Error"
+components:
+  securitySchemes:
+    tenantBearer:
+      type: http
+      scheme: bearer
+      description: Tenant-scoped token configured server-side; global admin tokens are rejected.
+  parameters:
+    Volume:
+      name: volume
+      in: path
+      required: true
+      description: Volume name within the authenticated tenant.
+      schema: { type: string, minLength: 1 }
+    EntryId:
+      name: entry_id
+      in: query
+      description: Opaque entry identifier; preferred over path.
+      schema: { type: string, minLength: 1 }
+    EntryIdRequired:
+      name: entry_id
+      in: query
+      required: true
+      description: Opaque entry identifier.
+      schema: { type: string, minLength: 1 }
+    ParentEntryId:
+      name: parent_entry_id
+      in: query
+      description: Opaque destination parent identifier.
+      schema: { type: string, minLength: 1 }
+    Path:
+      name: path
+      in: query
+      description: Canonical UTF-8 convenience path. Mutually exclusive with entry_id.
+      schema: { type: string }
+    View:
+      name: view
+      in: query
+      description: Mutations always operate on live and reject historical selection.
+      schema:
+        $ref: "#/components/schemas/ViewKind"
+    ViewRef:
+      name: ref
+      in: query
+      description: Required for snapshot/version views and forbidden for live.
+      schema: { type: string, minLength: 1 }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+    PageToken:
+      name: page_token
+      in: query
+      description: Opaque pagination token backed by a VFS directory cookie.
+      schema: { type: string }
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: true
+      description: Caller-provided correlation ID returned in errors and operation events.
+      schema: { type: string, minLength: 1, maxLength: 128 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: Stable key for safely retrying a mutation.
+      schema: { type: string, minLength: 1, maxLength: 128 }
+    IdempotencyKeyRequired:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Stable key required for safely retrying streaming or compound work.
+      schema: { type: string, minLength: 1, maxLength: 128 }
+    IfMatch:
+      name: If-Match
+      in: header
+      description: Weak entry ETag. Required whenever entry_id selects an existing file; omitted for parent/name creation.
+      schema: { type: string }
+  headers:
+    ETag:
+      description: Weak validator derived from immutable identity and current metadata.
+      schema: { type: string }
+    ResolvedCommit:
+      description: Exact immutable commit selected for a version response.
+      schema: { type: string }
+  responses:
+    Error:
+      description: Standard error envelope
+      headers:
+        X-Request-Id:
+          schema: { type: string }
+        Retry-After:
+          schema: { type: string }
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+  examples:
+    Capabilities:
+      value:
+        api_version: consumer/v1
+        limits:
+          max_page_size: 500
+          max_range_bytes: 8388608
+          max_recursive_entries: 10000
+          max_recursive_bytes: 1073741824
+          max_text_edit_bytes: 1048576
+          max_diff_bytes: 2097152
+          max_diff_lines: 50000
+        features:
+          historical_snapshots: true
+          historical_versions: true
+          hardlinks: true
+          symlinks: true
+          xattrs: true
+  schemas:
+    ViewKind:
+      type: string
+      enum: [live, snapshot, version]
+      default: live
+    ViewSelection:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      properties:
+        kind: { $ref: "#/components/schemas/ViewKind" }
+        ref: { type: string }
+        resolved_commit:
+          type: string
+          description: Present for version views after resolving a symbolic reference.
+      allOf:
+        - if:
+            properties:
+              kind: { const: live }
+            required: [kind]
+          then:
+            not:
+              required: [ref]
+        - if:
+            properties:
+              kind: { enum: [snapshot, version] }
+            required: [kind]
+          then:
+            required: [ref]
+    CapabilityLimits:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          max_page_size,
+          max_range_bytes,
+          max_recursive_entries,
+          max_recursive_bytes,
+          max_text_edit_bytes,
+          max_diff_bytes,
+          max_diff_lines,
+        ]
+      properties:
+        max_page_size: { type: integer, minimum: 1 }
+        max_range_bytes: { type: integer, format: int64, minimum: 1 }
+        max_recursive_entries: { type: integer, format: int64, minimum: 1 }
+        max_recursive_bytes: { type: integer, format: int64, minimum: 1 }
+        max_text_edit_bytes: { type: integer, format: int64, minimum: 1 }
+        max_diff_bytes: { type: integer, format: int64, minimum: 1 }
+        max_diff_lines: { type: integer, format: int64, minimum: 1 }
+    CapabilityFeatures:
+      type: object
+      additionalProperties: false
+      required:
+        [historical_snapshots, historical_versions, hardlinks, symlinks, xattrs]
+      properties:
+        historical_snapshots: { type: boolean }
+        historical_versions: { type: boolean }
+        hardlinks: { type: boolean }
+        symlinks: { type: boolean }
+        xattrs: { type: boolean }
+    CapabilitiesResponse:
+      type: object
+      additionalProperties: false
+      required: [api_version, limits, features]
+      properties:
+        api_version: { type: string, const: consumer/v1 }
+        limits: { $ref: "#/components/schemas/CapabilityLimits" }
+        features: { $ref: "#/components/schemas/CapabilityFeatures" }
+    QuotaUsage:
+      type: object
+      additionalProperties: false
+      required: [used_bytes, limit_bytes, used_inodes, limit_inodes]
+      properties:
+        used_bytes: { type: integer, format: int64, minimum: 0 }
+        limit_bytes: { type: [integer, "null"], format: int64, minimum: 0 }
+        used_inodes: { type: integer, format: int64, minimum: 0 }
+        limit_inodes: { type: [integer, "null"], format: int64, minimum: 0 }
+    VolumeSummary:
+      type: object
+      additionalProperties: false
+      required: [name, kind, browsable, readonly, quota]
+      properties:
+        name: { type: string }
+        kind: { type: string, enum: [filesystem, block] }
+        browsable: { type: boolean }
+        readonly: { type: boolean }
+        quota: { $ref: "#/components/schemas/QuotaUsage" }
+    VolumeListResponse:
+      type: object
+      additionalProperties: false
+      required: [volumes]
+      properties:
+        volumes:
+          type: array
+          items: { $ref: "#/components/schemas/VolumeSummary" }
+        next_page_token: { type: [string, "null"] }
+    VolumeDetail:
+      unevaluatedProperties: false
+      allOf:
+        - $ref: "#/components/schemas/VolumeSummary"
+        - type: object
+          required: [allocated_bytes, available_bytes, total_bytes]
+          properties:
+            allocated_bytes: { type: integer, format: int64, minimum: 0 }
+            available_bytes: { type: integer, format: int64, minimum: 0 }
+            total_bytes: { type: integer, format: int64, minimum: 0 }
+    Entry:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          entry_id,
+          parent_entry_id,
+          path,
+          name,
+          name_bytes_base64,
+          kind,
+          inode,
+          generation,
+          size,
+          allocated_bytes,
+          mode,
+          uid,
+          gid,
+          link_count,
+          created_at,
+          modified_at,
+          changed_at,
+          accessed_at,
+          readonly,
+          can_read,
+          can_write,
+          can_delete,
+          can_rename,
+          etag,
+          symlink_target,
+        ]
+      properties:
+        entry_id:
+          { type: string, description: Opaque and stable only for API use. }
+        parent_entry_id: { type: [string, "null"] }
+        path:
+          {
+            type: [string, "null"],
+            description: Null when the complete path cannot be represented as UTF-8.,
+          }
+        name: { type: [string, "null"], description: Exact UTF-8 name or null. }
+        name_bytes_base64: { type: string, contentEncoding: base64 }
+        kind: { type: string, enum: [file, directory, symlink, special] }
+        inode: { type: integer, format: int64, minimum: 0 }
+        inode_decimal:
+          {
+            type: string,
+            pattern: "^(0|[1-9][0-9]*)$",
+            description: Lossless u64 representation.,
+          }
+        generation: { type: integer, format: int64, minimum: 0 }
+        generation_decimal:
+          {
+            type: string,
+            pattern: "^(0|[1-9][0-9]*)$",
+            description: Lossless u64 representation.,
+          }
+        size: { type: integer, format: int64, minimum: 0 }
+        size_decimal:
+          {
+            type: string,
+            pattern: "^(0|[1-9][0-9]*)$",
+            description: Lossless u64 representation.,
+          }
+        allocated_bytes: { type: integer, format: int64, minimum: 0 }
+        allocated_bytes_decimal:
+          {
+            type: string,
+            pattern: "^(0|[1-9][0-9]*)$",
+            description: Lossless u64 representation.,
+          }
+        mode: { type: integer, minimum: 0, maximum: 4294967295 }
+        uid: { type: integer, minimum: 0, maximum: 4294967295 }
+        gid: { type: integer, minimum: 0, maximum: 4294967295 }
+        link_count: { type: integer, format: int64, minimum: 0 }
+        link_count_decimal:
+          {
+            type: string,
+            pattern: "^(0|[1-9][0-9]*)$",
+            description: Lossless u64 representation.,
+          }
+        created_at: { type: string, format: date-time }
+        modified_at: { type: string, format: date-time }
+        changed_at: { type: string, format: date-time }
+        accessed_at: { type: string, format: date-time }
+        readonly: { type: boolean }
+        can_read: { type: boolean }
+        can_write: { type: boolean }
+        can_delete: { type: boolean }
+        can_rename: { type: boolean }
+        etag: { type: string, pattern: '^W/".+"$' }
+        symlink_target: { type: [string, "null"] }
+    EntryListResponse:
+      type: object
+      additionalProperties: false
+      required: [view, entry, entries, next_page_token]
+      properties:
+        view: { $ref: "#/components/schemas/ViewSelection" }
+        entry: { $ref: "#/components/schemas/Entry" }
+        entries:
+          type: array
+          items: { $ref: "#/components/schemas/Entry" }
+        next_page_token: { type: [string, "null"] }
+    CreateEntryRequest:
+      type: object
+      additionalProperties: false
+      required: [parent_entry_id, name, kind]
+      properties:
+        parent_entry_id: { type: string }
+        name:
+          {
+            type: string,
+            minLength: 1,
+            description: Browser creation is UTF-8 only.,
+          }
+        kind: { type: string, enum: [file, directory, symlink] }
+        mode: { type: integer, minimum: 0, maximum: 4294967295 }
+        symlink_target: { type: string }
+    UpdateEntryRequest:
+      type: object
+      additionalProperties: false
+      required: [entry_id]
+      properties:
+        entry_id: { type: string }
+        destination_parent_entry_id: { type: string }
+        name: { type: string, minLength: 1 }
+        mode: { type: integer, minimum: 0, maximum: 4294967295 }
+    OperationRequest:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          operation,
+          source_entry_ids,
+          destination_parent_entry_id,
+          conflict_policy,
+          preview,
+        ]
+      properties:
+        operation: { type: string, enum: [copy, move, hardlink] }
+        source_entry_ids:
+          type: array
+          minItems: 1
+          items: { type: string }
+        destination_parent_entry_id: { type: string }
+        conflict_policy:
+          { type: string, enum: [fail, overwrite, keep_both, skip] }
+        preview: { type: boolean }
+    OperationResult:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          operation_id,
+          preview,
+          total_entries,
+          total_bytes,
+          completed_entries,
+          failed_entries,
+        ]
+      properties:
+        operation_id: { type: string }
+        preview: { type: boolean }
+        total_entries: { type: integer, format: int64, minimum: 0 }
+        total_bytes: { type: integer, format: int64, minimum: 0 }
+        completed_entries: { type: integer, format: int64, minimum: 0 }
+        failed_entries: { type: integer, format: int64, minimum: 0 }
+    XattrValue:
+      type: object
+      additionalProperties: false
+      required: [name, name_bytes_base64, value_base64]
+      properties:
+        name: { type: [string, "null"] }
+        name_bytes_base64: { type: string, contentEncoding: base64 }
+        value_base64: { type: string, contentEncoding: base64 }
+    XattrListResponse:
+      type: object
+      additionalProperties: false
+      required: [entry_id, xattrs]
+      properties:
+        entry_id: { type: string }
+        xattrs:
+          type: array
+          items: { $ref: "#/components/schemas/XattrValue" }
+        view: { $ref: "#/components/schemas/ViewSelection" }
+    UpdateXattrsRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        set:
+          type: object
+          additionalProperties: { type: string, contentEncoding: base64 }
+        remove:
+          type: array
+          items: { type: string }
+        set_bytes:
+          type: array
+          description: Lossless xattr updates for names that are not valid UTF-8.
+          items:
+            type: object
+            additionalProperties: false
+            required: [name_bytes_base64, value_base64]
+            properties:
+              name_bytes_base64: { type: string, contentEncoding: base64 }
+              value_base64: { type: string, contentEncoding: base64 }
+        remove_bytes_base64:
+          type: array
+          description: Base64-encoded lossless xattr name selectors.
+          items: { type: string, contentEncoding: base64 }
+    ErrorCode:
+      type: string
+      enum:
+        [
+          authentication_required,
+          permission_denied,
+          not_found,
+          conflict,
+          invalid_path,
+          invalid_request,
+          malformed_range,
+          range_not_satisfiable,
+          read_only_view,
+          precondition_failed,
+          quota_exceeded,
+          rate_limited,
+          primary_unavailable,
+          internal,
+        ]
+    ApiError:
+      type: object
+      additionalProperties: false
+      required: [code, message, request_id, details]
+      properties:
+        code: { $ref: "#/components/schemas/ErrorCode" }
+        message: { type: string }
+        request_id: { type: string }
+        details: { type: object, additionalProperties: true }
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error: { $ref: "#/components/schemas/ApiError" }

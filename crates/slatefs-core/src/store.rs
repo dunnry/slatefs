@@ -41,11 +41,105 @@ pub fn resolve_root(url: &str) -> Result<Arc<dyn ObjectStore>> {
         .try_into()
         .map_err(|e| Error::Config(format!("invalid object store URL {url:?}: {e}")))?;
     let (store, prefix) = parse_url_opts(&parsed, env_vars).map_err(Error::from)?;
-    if prefix.as_ref().is_empty() {
-        Ok(Arc::from(store))
+    let inner: Arc<dyn ObjectStore> = if prefix.as_ref().is_empty() {
+        Arc::from(store)
     } else {
-        Ok(Arc::new(PrefixStore::new(store, prefix)))
+        Arc::new(PrefixStore::new(store, prefix))
+    };
+    let local_file_system = parse_url.starts_with("file:");
+    if local_file_system {
+        tracing::info!(
+            "SlateDB garbage collection is disabled for the local filesystem object store because conditional updates are unsupported"
+        );
     }
+    Ok(Arc::new(ResolvedRootStore {
+        inner,
+        local_file_system,
+    }))
+}
+
+#[derive(Debug)]
+struct ResolvedRootStore {
+    inner: Arc<dyn ObjectStore>,
+    local_file_system: bool,
+}
+
+impl fmt::Display for ResolvedRootStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "slatefs-root(local={})", self.local_file_system)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for ResolvedRootStore {
+    async fn put_opts(
+        &self,
+        location: &ObjPath,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> ObjectStoreResult<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &ObjPath,
+        opts: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &ObjPath,
+        options: GetOptions,
+    ) -> ObjectStoreResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<ObjPath>>,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjPath>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&ObjPath>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&ObjPath>) -> ObjectStoreResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &ObjPath,
+        to: &ObjPath,
+        options: CopyOptions,
+    ) -> ObjectStoreResult<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// SlateDB's local filesystem backend cannot perform the conditional update
+/// used to coordinate its internal garbage collector. Leave GC enabled for
+/// production object stores, but do not schedule an operation that can only
+/// fail for a resolved local root. This retains all durable objects.
+pub(crate) fn is_local_file_system(object_store: &Arc<dyn ObjectStore>) -> bool {
+    object_store
+        .to_string()
+        .contains("slatefs-root(local=true)")
+}
+
+pub(crate) fn compatible_settings(
+    object_store: &Arc<dyn ObjectStore>,
+    mut settings: slatedb::config::Settings,
+) -> slatedb::config::Settings {
+    if is_local_file_system(object_store) {
+        settings.garbage_collector_options = None;
+    }
+    settings
 }
 
 fn object_store_env_vars() -> Vec<(String, String)> {
@@ -426,6 +520,19 @@ mod tests {
         assert!(validate_name("tenant", "has/slash").is_err());
         assert!(validate_name("tenant", "-leading").is_err());
         assert!(validate_name("tenant", &"x".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn disables_unsupported_slatedb_gc_only_for_local_roots() {
+        let local = resolve_root("file:///tmp/slatefs-settings-test").unwrap();
+        assert!(is_local_file_system(&local));
+        let local_settings = compatible_settings(&local, slatedb::config::Settings::default());
+        assert!(local_settings.garbage_collector_options.is_none());
+
+        let memory = resolve_root("memory:///").unwrap();
+        assert!(!is_local_file_system(&memory));
+        let memory_settings = compatible_settings(&memory, slatedb::config::Settings::default());
+        assert!(memory_settings.garbage_collector_options.is_some());
     }
 
     #[test]

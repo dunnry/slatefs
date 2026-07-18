@@ -7,6 +7,7 @@ members = [
     "crates/slatefs-nbd",
     "crates/slatefs-daemon",
     "crates/slatefs-cli",
+    "crates/slatefs-http",
     "crates/nfs3-server",
     "crates/rs9p",
 ]
@@ -23,6 +24,7 @@ slatefs-core = { path = "crates/slatefs-core" }
 slatefs-nfs = { path = "crates/slatefs-nfs" }
 slatefs-9p = { path = "crates/slatefs-9p" }
 slatefs-nbd = { path = "crates/slatefs-nbd" }
+slatefs-http = { path = "crates/slatefs-http" }
 
 # Storage engine. Pinned against the API surface verified in slatefs-plan.md §0;
 # re-verify the BlockTransformer/DbBuilder contract before bumping.
@@ -77,5 +79,10 @@ uuid = { version = "1", features = ["v4"] }
 # Test-only
 tempfile = "3"
 futures = "0.3"
+axum = "0.8"
+tower = "0.5"
+http = "1"
+http-body-util = "0.1"
+tokio-stream = "0.1"
 proptest = "1"
 rcgen = "0.14"

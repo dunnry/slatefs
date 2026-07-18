@@ -1,0 +1,9 @@
+packages:
+  - packages/*
+  - apps/*
+  - examples/*
+
+allowBuilds:
+  core-js: true
+  esbuild: true
+  protobufjs: true

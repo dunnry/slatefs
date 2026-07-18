@@ -1,0 +1,7 @@
+extends:
+  - recommended
+
+rules:
+  # Every operation uses the standard default Error response so adding the
+  # same explicit 4XX response to all twelve operations would add no contract.
+  operation-4xx-response: off

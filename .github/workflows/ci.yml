@@ -13,6 +13,26 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm format:check
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm openapi:check
+      - run: pnpm manifest:check
+      - run: pnpm build
+
   check:
     runs-on: ubuntu-latest
     steps:

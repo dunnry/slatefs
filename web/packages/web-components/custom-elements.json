@@ -1,0 +1,4273 @@
+{
+  "schemaVersion": "1.0.0",
+  "readme": "",
+  "modules": [
+    {
+      "kind": "javascript-module",
+      "path": "src/components.ts",
+      "declarations": [
+        {
+          "kind": "class",
+          "description": "Volume inventory and quota selector.",
+          "name": "SlateFsVolumePicker",
+          "members": [
+            {
+              "kind": "field",
+              "name": "includeUnbrowsable",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "include-unbrowsable"
+            },
+            {
+              "kind": "field",
+              "name": "autoSelectSingle",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "auto-select-single"
+            },
+            {
+              "kind": "field",
+              "name": "disabled",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "disabled",
+              "reflects": true
+            },
+            {
+              "kind": "method",
+              "name": "refresh"
+            },
+            {
+              "kind": "method",
+              "name": "focus",
+              "parameters": [
+                {
+                  "name": "options",
+                  "optional": true,
+                  "type": {
+                    "text": "FocusOptions"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "field",
+              "name": "client",
+              "privacy": "public",
+              "type": {
+                "text": "Client | undefined"
+              },
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "volume",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "path",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "attribute": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "view",
+              "privacy": "public",
+              "type": {
+                "text": "ViewSelection"
+              },
+              "default": "{ kind: \"live\" }",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "selection",
+              "privacy": "public",
+              "type": {
+                "text": "readonly string[]"
+              },
+              "default": "[]",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "readonly",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "readonly",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "density",
+              "privacy": "public",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "attribute": "density",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "hidden",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "hidden",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "attributes": [
+            {
+              "name": "include-unbrowsable",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "includeUnbrowsable"
+            },
+            {
+              "name": "auto-select-single",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "autoSelectSingle"
+            },
+            {
+              "name": "disabled",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "disabled"
+            },
+            {
+              "name": "volume",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "path",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "fieldName": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "readonly",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "readonly",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "density",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "fieldName": "density",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "hidden",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "hidden",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "superclass": {
+            "name": "SlateFsElement",
+            "module": "/src/base.js"
+          },
+          "tagName": "slatefs-volume-picker",
+          "customElement": true,
+          "events": [
+            {
+              "name": "slatefs-auth-required",
+              "type": {
+                "text": "CustomEvent<{ version: 1; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-operation-error",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation: string; entryIds: string[]; code: string; message: string; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-volume-change",
+              "type": {
+                "text": "CustomEvent<{ version: 1; volume: string }>"
+              },
+              "description": "Bubbles and is composed."
+            }
+          ],
+          "slots": [],
+          "cssParts": [
+            {
+              "name": "inspector"
+            },
+            {
+              "name": "toolbar"
+            },
+            {
+              "name": "loading"
+            },
+            {
+              "name": "empty"
+            },
+            {
+              "name": "error"
+            },
+            {
+              "name": "unsupported"
+            },
+            {
+              "name": "select"
+            },
+            {
+              "name": "option"
+            },
+            {
+              "name": "quota"
+            },
+            {
+              "name": "kind-badge"
+            }
+          ],
+          "cssProperties": [
+            {
+              "name": "--slatefs-color-text"
+            },
+            {
+              "name": "--slatefs-color-surface"
+            },
+            {
+              "name": "--slatefs-color-border"
+            },
+            {
+              "name": "--slatefs-color-muted"
+            },
+            {
+              "name": "--slatefs-color-accent"
+            },
+            {
+              "name": "--slatefs-color-readonly"
+            },
+            {
+              "name": "--slatefs-font-family"
+            },
+            {
+              "name": "--slatefs-font-size"
+            },
+            {
+              "name": "--slatefs-radius"
+            },
+            {
+              "name": "--slatefs-focus-ring"
+            }
+          ]
+        },
+        {
+          "kind": "class",
+          "description": "Paginated, keyboard-operable and bounded-DOM file explorer.",
+          "name": "SlateFsFileExplorer",
+          "members": [
+            {
+              "kind": "field",
+              "name": "directoryEntryId",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "directory-entry-id"
+            },
+            {
+              "kind": "field",
+              "name": "displayMode",
+              "privacy": "public",
+              "type": {
+                "text": "\"details\" | \"grid\""
+              },
+              "default": "\"details\"",
+              "attribute": "display-mode",
+              "reflects": true
+            },
+            {
+              "kind": "field",
+              "name": "sort",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"name\"",
+              "attribute": "sort"
+            },
+            {
+              "kind": "field",
+              "name": "filter",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "filter"
+            },
+            {
+              "kind": "field",
+              "name": "operationController",
+              "privacy": "public",
+              "type": {
+                "text": "OperationController | undefined"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "conflictPolicy",
+              "privacy": "public",
+              "type": {
+                "text": "\"fail\" | \"overwrite\" | \"keep_both\" | \"skip\""
+              },
+              "default": "\"fail\"",
+              "attribute": "conflict-policy"
+            },
+            {
+              "kind": "method",
+              "name": "refresh"
+            },
+            {
+              "kind": "method",
+              "name": "loadMore"
+            },
+            {
+              "kind": "method",
+              "name": "clearSelection"
+            },
+            {
+              "kind": "method",
+              "name": "clearTransientState"
+            },
+            {
+              "kind": "method",
+              "name": "cancelOperation",
+              "parameters": [
+                {
+                  "name": "id",
+                  "type": {
+                    "text": "string"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "method",
+              "name": "focusEntry",
+              "parameters": [
+                {
+                  "name": "id",
+                  "type": {
+                    "text": "string"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "method",
+              "name": "openEntry",
+              "parameters": [
+                {
+                  "name": "id",
+                  "type": {
+                    "text": "string"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "field",
+              "name": "client",
+              "privacy": "public",
+              "type": {
+                "text": "Client | undefined"
+              },
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "volume",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "path",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "attribute": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "view",
+              "privacy": "public",
+              "type": {
+                "text": "ViewSelection"
+              },
+              "default": "{ kind: \"live\" }",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "selection",
+              "privacy": "public",
+              "type": {
+                "text": "readonly string[]"
+              },
+              "default": "[]",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "readonly",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "readonly",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "density",
+              "privacy": "public",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "attribute": "density",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "hidden",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "hidden",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "attributes": [
+            {
+              "name": "directory-entry-id",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "directoryEntryId"
+            },
+            {
+              "name": "display-mode",
+              "type": {
+                "text": "\"details\" | \"grid\""
+              },
+              "default": "\"details\"",
+              "fieldName": "displayMode"
+            },
+            {
+              "name": "sort",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"name\"",
+              "fieldName": "sort"
+            },
+            {
+              "name": "filter",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "filter"
+            },
+            {
+              "name": "conflict-policy",
+              "type": {
+                "text": "\"fail\" | \"overwrite\" | \"keep_both\" | \"skip\""
+              },
+              "default": "\"fail\"",
+              "fieldName": "conflictPolicy"
+            },
+            {
+              "name": "volume",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "path",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "fieldName": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "readonly",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "readonly",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "density",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "fieldName": "density",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "hidden",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "hidden",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "superclass": {
+            "name": "SlateFsElement",
+            "module": "/src/base.js"
+          },
+          "tagName": "slatefs-file-explorer",
+          "customElement": true,
+          "events": [
+            {
+              "name": "slatefs-auth-required",
+              "type": {
+                "text": "CustomEvent<{ version: 1; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-operation-error",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation: string; entryIds: string[]; code: string; message: string; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-path-change",
+              "type": {
+                "text": "CustomEvent<{ version: 1; volume: string; path: string; entryId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-selection-change",
+              "type": {
+                "text": "CustomEvent<{ version: 1; selection: Entry[] }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-entry-open",
+              "type": {
+                "text": "CustomEvent<{ version: 1; entry: Entry; view: ViewSelection }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-preview-request",
+              "type": {
+                "text": "CustomEvent<{ version: 1; entry: Entry; view: ViewSelection }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-before-operation",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation: string; entryIds: string[] }>"
+              },
+              "description": "Bubbles, is composed, and is cancelable."
+            },
+            {
+              "name": "slatefs-operation-start",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation: string; entryIds: string[] }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-operation-complete",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation: string; entryIds: string[] }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-conflict",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation?: string; entry?: Entry; message: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-upload-progress",
+              "type": {
+                "text": "CustomEvent<{ version: 1; file: string; transferredBytes: number; totalBytes?: number }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-recursive-delete-request",
+              "type": {
+                "text": "CustomEvent<{ version: 1; volume: string; entries: Entry[]; reason: string }>"
+              },
+              "description": "Bubbles, is composed, and is cancelable."
+            }
+          ],
+          "slots": [
+            {
+              "name": "actions"
+            },
+            {
+              "name": "empty"
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "inspector"
+            },
+            {
+              "name": "toolbar"
+            },
+            {
+              "name": "loading"
+            },
+            {
+              "name": "empty"
+            },
+            {
+              "name": "error"
+            },
+            {
+              "name": "unsupported"
+            },
+            {
+              "name": "readonly-banner"
+            },
+            {
+              "name": "breadcrumb"
+            },
+            {
+              "name": "details-grid"
+            },
+            {
+              "name": "row"
+            },
+            {
+              "name": "pagination"
+            }
+          ],
+          "cssProperties": [
+            {
+              "name": "--slatefs-color-text"
+            },
+            {
+              "name": "--slatefs-color-surface"
+            },
+            {
+              "name": "--slatefs-color-border"
+            },
+            {
+              "name": "--slatefs-color-muted"
+            },
+            {
+              "name": "--slatefs-color-accent"
+            },
+            {
+              "name": "--slatefs-color-readonly"
+            },
+            {
+              "name": "--slatefs-font-family"
+            },
+            {
+              "name": "--slatefs-font-size"
+            },
+            {
+              "name": "--slatefs-radius"
+            },
+            {
+              "name": "--slatefs-focus-ring"
+            }
+          ]
+        },
+        {
+          "kind": "class",
+          "description": "Safe bounded preview and ETag-aware small text editor.",
+          "name": "SlateFsFilePreview",
+          "members": [
+            {
+              "kind": "field",
+              "name": "entry",
+              "privacy": "public",
+              "type": {
+                "text": "Entry | undefined"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "editable",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "editable",
+              "reflects": true
+            },
+            {
+              "kind": "field",
+              "name": "maxPreviewBytes",
+              "privacy": "public",
+              "type": {
+                "text": "number"
+              },
+              "attribute": "max-preview-bytes"
+            },
+            {
+              "kind": "method",
+              "name": "load"
+            },
+            {
+              "kind": "method",
+              "name": "save"
+            },
+            {
+              "kind": "field",
+              "name": "canEdit",
+              "readonly": true
+            },
+            {
+              "kind": "method",
+              "name": "download"
+            },
+            {
+              "kind": "method",
+              "name": "discard"
+            },
+            {
+              "kind": "field",
+              "name": "client",
+              "privacy": "public",
+              "type": {
+                "text": "Client | undefined"
+              },
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "volume",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "path",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "attribute": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "view",
+              "privacy": "public",
+              "type": {
+                "text": "ViewSelection"
+              },
+              "default": "{ kind: \"live\" }",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "selection",
+              "privacy": "public",
+              "type": {
+                "text": "readonly string[]"
+              },
+              "default": "[]",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "readonly",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "readonly",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "density",
+              "privacy": "public",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "attribute": "density",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "hidden",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "hidden",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "attributes": [
+            {
+              "name": "editable",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "editable"
+            },
+            {
+              "name": "max-preview-bytes",
+              "type": {
+                "text": "number"
+              },
+              "fieldName": "maxPreviewBytes"
+            },
+            {
+              "name": "volume",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "path",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "fieldName": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "readonly",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "readonly",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "density",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "fieldName": "density",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "hidden",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "hidden",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "superclass": {
+            "name": "SlateFsElement",
+            "module": "/src/base.js"
+          },
+          "tagName": "slatefs-file-preview",
+          "customElement": true,
+          "events": [
+            {
+              "name": "slatefs-auth-required",
+              "type": {
+                "text": "CustomEvent<{ version: 1; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-operation-error",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation: string; entryIds: string[]; code: string; message: string; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-save-complete",
+              "type": {
+                "text": "CustomEvent<{ version: 1; entry: Entry }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-conflict",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation?: string; entry?: Entry; message: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-download-request",
+              "type": {
+                "text": "CustomEvent<{ version: 1; entry: Entry; view: ViewSelection }>"
+              },
+              "description": "Bubbles, is composed, and is cancelable."
+            },
+            {
+              "name": "slatefs-edit-dirty",
+              "type": {
+                "text": "CustomEvent<{ version: 1; entry?: Entry; dirty: boolean }>"
+              },
+              "description": "Bubbles and is composed."
+            }
+          ],
+          "slots": [
+            {
+              "name": "fallback"
+            },
+            {
+              "name": "empty"
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "inspector"
+            },
+            {
+              "name": "toolbar"
+            },
+            {
+              "name": "loading"
+            },
+            {
+              "name": "empty"
+            },
+            {
+              "name": "error"
+            },
+            {
+              "name": "unsupported"
+            },
+            {
+              "name": "readonly-banner"
+            },
+            {
+              "name": "preview"
+            },
+            {
+              "name": "editor"
+            },
+            {
+              "name": "text"
+            },
+            {
+              "name": "image"
+            },
+            {
+              "name": "media"
+            }
+          ],
+          "cssProperties": [
+            {
+              "name": "--slatefs-color-text"
+            },
+            {
+              "name": "--slatefs-color-surface"
+            },
+            {
+              "name": "--slatefs-color-border"
+            },
+            {
+              "name": "--slatefs-color-muted"
+            },
+            {
+              "name": "--slatefs-color-accent"
+            },
+            {
+              "name": "--slatefs-color-readonly"
+            },
+            {
+              "name": "--slatefs-font-family"
+            },
+            {
+              "name": "--slatefs-font-size"
+            },
+            {
+              "name": "--slatefs-radius"
+            },
+            {
+              "name": "--slatefs-focus-ring"
+            }
+          ]
+        },
+        {
+          "kind": "class",
+          "description": "Identity, POSIX metadata, links, and byte-safe xattrs.",
+          "name": "SlateFsMetadataPanel",
+          "members": [
+            {
+              "kind": "field",
+              "name": "entry",
+              "privacy": "public",
+              "type": {
+                "text": "Entry | undefined"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "showAdvanced",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "show-advanced"
+            },
+            {
+              "kind": "method",
+              "name": "refresh"
+            },
+            {
+              "kind": "method",
+              "name": "beginEdit"
+            },
+            {
+              "kind": "method",
+              "name": "save"
+            },
+            {
+              "kind": "method",
+              "name": "setXattr"
+            },
+            {
+              "kind": "method",
+              "name": "setByteXattr"
+            },
+            {
+              "kind": "method",
+              "name": "removeXattr",
+              "parameters": [
+                {
+                  "name": "value",
+                  "type": {
+                    "text": "XattrValue"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "field",
+              "name": "client",
+              "privacy": "public",
+              "type": {
+                "text": "Client | undefined"
+              },
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "volume",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "path",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "attribute": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "view",
+              "privacy": "public",
+              "type": {
+                "text": "ViewSelection"
+              },
+              "default": "{ kind: \"live\" }",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "selection",
+              "privacy": "public",
+              "type": {
+                "text": "readonly string[]"
+              },
+              "default": "[]",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "readonly",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "readonly",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "density",
+              "privacy": "public",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "attribute": "density",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "hidden",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "hidden",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "attributes": [
+            {
+              "name": "show-advanced",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "showAdvanced"
+            },
+            {
+              "name": "volume",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "path",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "fieldName": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "readonly",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "readonly",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "density",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "fieldName": "density",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "hidden",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "hidden",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "superclass": {
+            "name": "SlateFsElement",
+            "module": "/src/base.js"
+          },
+          "tagName": "slatefs-file-properties",
+          "customElement": true,
+          "events": [
+            {
+              "name": "slatefs-auth-required",
+              "type": {
+                "text": "CustomEvent<{ version: 1; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-operation-error",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation: string; entryIds: string[]; code: string; message: string; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-before-operation",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation: string; entryIds: string[] }>"
+              },
+              "description": "Bubbles, is composed, and is cancelable."
+            },
+            {
+              "name": "slatefs-properties-change",
+              "type": {
+                "text": "CustomEvent<{ version: 1; entry: Entry }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-conflict",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation?: string; entry?: Entry; message: string }>"
+              },
+              "description": "Bubbles and is composed."
+            }
+          ],
+          "slots": [
+            {
+              "name": "empty"
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "inspector"
+            },
+            {
+              "name": "toolbar"
+            },
+            {
+              "name": "loading"
+            },
+            {
+              "name": "empty"
+            },
+            {
+              "name": "error"
+            },
+            {
+              "name": "unsupported"
+            },
+            {
+              "name": "metadata"
+            },
+            {
+              "name": "symlink"
+            },
+            {
+              "name": "xattrs"
+            },
+            {
+              "name": "xattr-row"
+            }
+          ],
+          "cssProperties": [
+            {
+              "name": "--slatefs-color-text"
+            },
+            {
+              "name": "--slatefs-color-surface"
+            },
+            {
+              "name": "--slatefs-color-border"
+            },
+            {
+              "name": "--slatefs-color-muted"
+            },
+            {
+              "name": "--slatefs-color-accent"
+            },
+            {
+              "name": "--slatefs-color-readonly"
+            },
+            {
+              "name": "--slatefs-font-family"
+            },
+            {
+              "name": "--slatefs-font-size"
+            },
+            {
+              "name": "--slatefs-radius"
+            },
+            {
+              "name": "--slatefs-focus-ring"
+            }
+          ]
+        },
+        {
+          "kind": "class",
+          "description": "Snapshot list/create/read-only browse/clone.",
+          "name": "SlateFsSnapshotBrowser",
+          "members": [
+            {
+              "kind": "method",
+              "name": "refresh"
+            },
+            {
+              "kind": "method",
+              "name": "loadMore"
+            },
+            {
+              "kind": "method",
+              "name": "createSnapshot"
+            },
+            {
+              "kind": "method",
+              "name": "openSnapshot",
+              "parameters": [
+                {
+                  "name": "ref",
+                  "type": {
+                    "text": "string"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "method",
+              "name": "returnLive"
+            },
+            {
+              "kind": "method",
+              "name": "cloneSnapshot",
+              "parameters": [
+                {
+                  "name": "ref",
+                  "type": {
+                    "text": "string"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "field",
+              "name": "client",
+              "privacy": "public",
+              "type": {
+                "text": "Client | undefined"
+              },
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "volume",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "path",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "attribute": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "view",
+              "privacy": "public",
+              "type": {
+                "text": "ViewSelection"
+              },
+              "default": "{ kind: \"live\" }",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "selection",
+              "privacy": "public",
+              "type": {
+                "text": "readonly string[]"
+              },
+              "default": "[]",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "readonly",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "readonly",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "density",
+              "privacy": "public",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "attribute": "density",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "hidden",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "hidden",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "superclass": {
+            "name": "SlateFsElement",
+            "module": "/src/base.js"
+          },
+          "tagName": "slatefs-snapshot-manager",
+          "customElement": true,
+          "attributes": [
+            {
+              "name": "volume",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "path",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "fieldName": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "readonly",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "readonly",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "density",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "fieldName": "density",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "hidden",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "hidden",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "events": [
+            {
+              "name": "slatefs-auth-required",
+              "type": {
+                "text": "CustomEvent<{ version: 1; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-operation-error",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation: string; entryIds: string[]; code: string; message: string; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-operation-complete",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation: string; entryIds: string[] }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-view-change",
+              "type": {
+                "text": "CustomEvent<{ version: 1; view: ViewSelection }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-volume-change",
+              "type": {
+                "text": "CustomEvent<{ version: 1; volume: string }>"
+              },
+              "description": "Bubbles and is composed."
+            }
+          ],
+          "slots": [
+            {
+              "name": "empty"
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "inspector"
+            },
+            {
+              "name": "toolbar"
+            },
+            {
+              "name": "loading"
+            },
+            {
+              "name": "empty"
+            },
+            {
+              "name": "error"
+            },
+            {
+              "name": "unsupported"
+            },
+            {
+              "name": "snapshot-list"
+            },
+            {
+              "name": "snapshot-row"
+            }
+          ],
+          "cssProperties": [
+            {
+              "name": "--slatefs-color-text"
+            },
+            {
+              "name": "--slatefs-color-surface"
+            },
+            {
+              "name": "--slatefs-color-border"
+            },
+            {
+              "name": "--slatefs-color-muted"
+            },
+            {
+              "name": "--slatefs-color-accent"
+            },
+            {
+              "name": "--slatefs-color-readonly"
+            },
+            {
+              "name": "--slatefs-font-family"
+            },
+            {
+              "name": "--slatefs-font-size"
+            },
+            {
+              "name": "--slatefs-radius"
+            },
+            {
+              "name": "--slatefs-focus-ring"
+            }
+          ]
+        },
+        {
+          "kind": "class",
+          "description": "",
+          "name": "SlateFsVersionStatus",
+          "members": [
+            {
+              "kind": "field",
+              "name": "reference",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"main\"",
+              "attribute": "reference"
+            },
+            {
+              "kind": "field",
+              "name": "paths",
+              "privacy": "public",
+              "type": {
+                "text": "readonly string[]"
+              },
+              "default": "[\"/\"]"
+            },
+            {
+              "kind": "field",
+              "name": "targetBranch",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"main\"",
+              "attribute": "target-branch"
+            },
+            {
+              "kind": "field",
+              "name": "author",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "author"
+            },
+            {
+              "kind": "field",
+              "name": "versioningEnabled",
+              "privacy": "public",
+              "type": {
+                "text": "boolean | undefined"
+              },
+              "description": "Known host state. Leave undefined to discover the volume policy."
+            },
+            {
+              "kind": "method",
+              "name": "refresh"
+            },
+            {
+              "kind": "method",
+              "name": "enable"
+            },
+            {
+              "kind": "method",
+              "name": "commitSelected"
+            },
+            {
+              "kind": "field",
+              "name": "client",
+              "privacy": "public",
+              "type": {
+                "text": "Client | undefined"
+              },
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "volume",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "path",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "attribute": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "view",
+              "privacy": "public",
+              "type": {
+                "text": "ViewSelection"
+              },
+              "default": "{ kind: \"live\" }",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "selection",
+              "privacy": "public",
+              "type": {
+                "text": "readonly string[]"
+              },
+              "default": "[]",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "readonly",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "readonly",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "density",
+              "privacy": "public",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "attribute": "density",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "hidden",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "hidden",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "attributes": [
+            {
+              "name": "reference",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"main\"",
+              "fieldName": "reference"
+            },
+            {
+              "name": "target-branch",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"main\"",
+              "fieldName": "targetBranch"
+            },
+            {
+              "name": "author",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "author"
+            },
+            {
+              "name": "volume",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "path",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "fieldName": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "readonly",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "readonly",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "density",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "fieldName": "density",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "hidden",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "hidden",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "superclass": {
+            "name": "SlateFsElement",
+            "module": "/src/base.js"
+          },
+          "tagName": "slatefs-version-status",
+          "customElement": true,
+          "events": [
+            {
+              "name": "slatefs-auth-required",
+              "type": {
+                "text": "CustomEvent<{ version: 1; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-operation-error",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation: string; entryIds: string[]; code: string; message: string; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-version-commit",
+              "type": {
+                "text": "CustomEvent<{ version: 1; commit: VersionCommit }>"
+              },
+              "description": "Bubbles and is composed."
+            }
+          ],
+          "slots": [
+            {
+              "name": "empty"
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "inspector"
+            },
+            {
+              "name": "toolbar"
+            },
+            {
+              "name": "loading"
+            },
+            {
+              "name": "empty"
+            },
+            {
+              "name": "error"
+            },
+            {
+              "name": "unsupported"
+            },
+            {
+              "name": "change-row"
+            }
+          ],
+          "cssProperties": [
+            {
+              "name": "--slatefs-color-text"
+            },
+            {
+              "name": "--slatefs-color-surface"
+            },
+            {
+              "name": "--slatefs-color-border"
+            },
+            {
+              "name": "--slatefs-color-muted"
+            },
+            {
+              "name": "--slatefs-color-accent"
+            },
+            {
+              "name": "--slatefs-color-readonly"
+            },
+            {
+              "name": "--slatefs-font-family"
+            },
+            {
+              "name": "--slatefs-font-size"
+            },
+            {
+              "name": "--slatefs-radius"
+            },
+            {
+              "name": "--slatefs-focus-ring"
+            }
+          ]
+        },
+        {
+          "kind": "class",
+          "description": "",
+          "name": "SlateFsVersionHistory",
+          "members": [
+            {
+              "kind": "field",
+              "name": "reference",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"main\"",
+              "attribute": "reference"
+            },
+            {
+              "kind": "field",
+              "name": "pathFilter",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "path-filter"
+            },
+            {
+              "kind": "field",
+              "name": "selectedCommit",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "selected-commit"
+            },
+            {
+              "kind": "method",
+              "name": "refresh"
+            },
+            {
+              "kind": "method",
+              "name": "loadMore"
+            },
+            {
+              "kind": "method",
+              "name": "openCommit",
+              "parameters": [
+                {
+                  "name": "id",
+                  "type": {
+                    "text": "string"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "method",
+              "name": "createTag",
+              "parameters": [
+                {
+                  "name": "id",
+                  "type": {
+                    "text": "string"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "method",
+              "name": "browse",
+              "parameters": [
+                {
+                  "name": "id",
+                  "type": {
+                    "text": "string"
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "field",
+              "name": "client",
+              "privacy": "public",
+              "type": {
+                "text": "Client | undefined"
+              },
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "volume",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "path",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "attribute": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "view",
+              "privacy": "public",
+              "type": {
+                "text": "ViewSelection"
+              },
+              "default": "{ kind: \"live\" }",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "selection",
+              "privacy": "public",
+              "type": {
+                "text": "readonly string[]"
+              },
+              "default": "[]",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "readonly",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "readonly",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "density",
+              "privacy": "public",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "attribute": "density",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "hidden",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "hidden",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "attributes": [
+            {
+              "name": "reference",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"main\"",
+              "fieldName": "reference"
+            },
+            {
+              "name": "path-filter",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "pathFilter"
+            },
+            {
+              "name": "selected-commit",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "selectedCommit"
+            },
+            {
+              "name": "volume",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "path",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "fieldName": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "readonly",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "readonly",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "density",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "fieldName": "density",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "hidden",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "hidden",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "superclass": {
+            "name": "SlateFsElement",
+            "module": "/src/base.js"
+          },
+          "tagName": "slatefs-version-history",
+          "customElement": true,
+          "events": [
+            {
+              "name": "slatefs-auth-required",
+              "type": {
+                "text": "CustomEvent<{ version: 1; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-operation-error",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation: string; entryIds: string[]; code: string; message: string; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-commit-select",
+              "type": {
+                "text": "CustomEvent<{ version: 1; commit: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-view-change",
+              "type": {
+                "text": "CustomEvent<{ version: 1; view: ViewSelection }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-reflog-request",
+              "type": {
+                "text": "CustomEvent<{ version: 1; reference: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-compare-request",
+              "type": {
+                "text": "CustomEvent<{ version: 1; from: string; to: string }>"
+              },
+              "description": "Bubbles and is composed."
+            }
+          ],
+          "slots": [
+            {
+              "name": "empty"
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "inspector"
+            },
+            {
+              "name": "toolbar"
+            },
+            {
+              "name": "loading"
+            },
+            {
+              "name": "empty"
+            },
+            {
+              "name": "error"
+            },
+            {
+              "name": "unsupported"
+            },
+            {
+              "name": "history"
+            },
+            {
+              "name": "commit-row"
+            },
+            {
+              "name": "parents"
+            },
+            {
+              "name": "commit-detail"
+            }
+          ],
+          "cssProperties": [
+            {
+              "name": "--slatefs-color-text"
+            },
+            {
+              "name": "--slatefs-color-surface"
+            },
+            {
+              "name": "--slatefs-color-border"
+            },
+            {
+              "name": "--slatefs-color-muted"
+            },
+            {
+              "name": "--slatefs-color-accent"
+            },
+            {
+              "name": "--slatefs-color-readonly"
+            },
+            {
+              "name": "--slatefs-font-family"
+            },
+            {
+              "name": "--slatefs-font-size"
+            },
+            {
+              "name": "--slatefs-radius"
+            },
+            {
+              "name": "--slatefs-focus-ring"
+            }
+          ]
+        },
+        {
+          "kind": "class",
+          "description": "",
+          "name": "SlateFsVersionDiff",
+          "members": [
+            {
+              "kind": "field",
+              "name": "from",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"main\"",
+              "attribute": "from"
+            },
+            {
+              "kind": "field",
+              "name": "to",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"main\"",
+              "attribute": "to"
+            },
+            {
+              "kind": "field",
+              "name": "selectedPath",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "selected-path"
+            },
+            {
+              "kind": "field",
+              "name": "mode",
+              "privacy": "public",
+              "type": {
+                "text": "\"unified\" | \"structured\""
+              },
+              "default": "\"structured\"",
+              "attribute": "mode"
+            },
+            {
+              "kind": "field",
+              "name": "ignoreWhitespace",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "ignore-whitespace"
+            },
+            {
+              "kind": "field",
+              "name": "wrap",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "true",
+              "attribute": "wrap",
+              "reflects": true
+            },
+            {
+              "kind": "method",
+              "name": "refresh"
+            },
+            {
+              "kind": "method",
+              "name": "loadMore"
+            },
+            {
+              "kind": "method",
+              "name": "copyPatch"
+            },
+            {
+              "kind": "field",
+              "name": "client",
+              "privacy": "public",
+              "type": {
+                "text": "Client | undefined"
+              },
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "volume",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "path",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "attribute": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "view",
+              "privacy": "public",
+              "type": {
+                "text": "ViewSelection"
+              },
+              "default": "{ kind: \"live\" }",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "selection",
+              "privacy": "public",
+              "type": {
+                "text": "readonly string[]"
+              },
+              "default": "[]",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "readonly",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "readonly",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "density",
+              "privacy": "public",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "attribute": "density",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "hidden",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "hidden",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "attributes": [
+            {
+              "name": "from",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"main\"",
+              "fieldName": "from"
+            },
+            {
+              "name": "to",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"main\"",
+              "fieldName": "to"
+            },
+            {
+              "name": "selected-path",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "selectedPath"
+            },
+            {
+              "name": "mode",
+              "type": {
+                "text": "\"unified\" | \"structured\""
+              },
+              "default": "\"structured\"",
+              "fieldName": "mode"
+            },
+            {
+              "name": "ignore-whitespace",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "ignoreWhitespace"
+            },
+            {
+              "name": "wrap",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "true",
+              "fieldName": "wrap"
+            },
+            {
+              "name": "volume",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "path",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "fieldName": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "readonly",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "readonly",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "density",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "fieldName": "density",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "hidden",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "hidden",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "superclass": {
+            "name": "SlateFsElement",
+            "module": "/src/base.js"
+          },
+          "tagName": "slatefs-diff-viewer",
+          "customElement": true,
+          "events": [
+            {
+              "name": "slatefs-auth-required",
+              "type": {
+                "text": "CustomEvent<{ version: 1; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-operation-error",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation: string; entryIds: string[]; code: string; message: string; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-path-change",
+              "type": {
+                "text": "CustomEvent<{ version: 1; volume: string; path: string; entryId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            }
+          ],
+          "slots": [
+            {
+              "name": "empty"
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "inspector"
+            },
+            {
+              "name": "toolbar"
+            },
+            {
+              "name": "loading"
+            },
+            {
+              "name": "empty"
+            },
+            {
+              "name": "error"
+            },
+            {
+              "name": "unsupported"
+            },
+            {
+              "name": "truncation"
+            },
+            {
+              "name": "diff"
+            },
+            {
+              "name": "addition"
+            },
+            {
+              "name": "deletion"
+            },
+            {
+              "name": "line"
+            }
+          ],
+          "cssProperties": [
+            {
+              "name": "--slatefs-color-text"
+            },
+            {
+              "name": "--slatefs-color-surface"
+            },
+            {
+              "name": "--slatefs-color-border"
+            },
+            {
+              "name": "--slatefs-color-muted"
+            },
+            {
+              "name": "--slatefs-color-accent"
+            },
+            {
+              "name": "--slatefs-color-readonly"
+            },
+            {
+              "name": "--slatefs-font-family"
+            },
+            {
+              "name": "--slatefs-font-size"
+            },
+            {
+              "name": "--slatefs-radius"
+            },
+            {
+              "name": "--slatefs-focus-ring"
+            }
+          ]
+        },
+        {
+          "kind": "class",
+          "description": "",
+          "name": "SlateFsBranchManager",
+          "members": [
+            {
+              "kind": "field",
+              "name": "branch",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"main\"",
+              "attribute": "branch"
+            },
+            {
+              "kind": "field",
+              "name": "source",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "source"
+            },
+            {
+              "kind": "field",
+              "name": "conflictStrategy",
+              "privacy": "public",
+              "type": {
+                "text": "\"fail\" | \"ours\" | \"theirs\""
+              },
+              "default": "\"fail\"",
+              "attribute": "conflict-strategy"
+            },
+            {
+              "kind": "field",
+              "name": "mainline",
+              "privacy": "public",
+              "type": {
+                "text": "number"
+              },
+              "default": "0",
+              "attribute": "mainline"
+            },
+            {
+              "kind": "field",
+              "name": "advanced",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "advanced",
+              "reflects": true
+            },
+            {
+              "kind": "method",
+              "name": "refresh"
+            },
+            {
+              "kind": "method",
+              "name": "create"
+            },
+            {
+              "kind": "method",
+              "name": "previewMerge"
+            },
+            {
+              "kind": "method",
+              "name": "applyMerge"
+            },
+            {
+              "kind": "method",
+              "name": "previewCherryPick"
+            },
+            {
+              "kind": "method",
+              "name": "applyCherryPick"
+            },
+            {
+              "kind": "method",
+              "name": "toggleProtection"
+            },
+            {
+              "kind": "field",
+              "name": "client",
+              "privacy": "public",
+              "type": {
+                "text": "Client | undefined"
+              },
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "volume",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "path",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "attribute": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "view",
+              "privacy": "public",
+              "type": {
+                "text": "ViewSelection"
+              },
+              "default": "{ kind: \"live\" }",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "selection",
+              "privacy": "public",
+              "type": {
+                "text": "readonly string[]"
+              },
+              "default": "[]",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "readonly",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "readonly",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "density",
+              "privacy": "public",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "attribute": "density",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "hidden",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "hidden",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "attributes": [
+            {
+              "name": "branch",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"main\"",
+              "fieldName": "branch"
+            },
+            {
+              "name": "source",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "source"
+            },
+            {
+              "name": "conflict-strategy",
+              "type": {
+                "text": "\"fail\" | \"ours\" | \"theirs\""
+              },
+              "default": "\"fail\"",
+              "fieldName": "conflictStrategy"
+            },
+            {
+              "name": "mainline",
+              "type": {
+                "text": "number"
+              },
+              "default": "0",
+              "fieldName": "mainline"
+            },
+            {
+              "name": "advanced",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "advanced"
+            },
+            {
+              "name": "volume",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "path",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "fieldName": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "readonly",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "readonly",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "density",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "fieldName": "density",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "hidden",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "hidden",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "superclass": {
+            "name": "SlateFsElement",
+            "module": "/src/base.js"
+          },
+          "tagName": "slatefs-branch-manager",
+          "customElement": true,
+          "events": [
+            {
+              "name": "slatefs-auth-required",
+              "type": {
+                "text": "CustomEvent<{ version: 1; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-operation-error",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation: string; entryIds: string[]; code: string; message: string; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-before-operation",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation: string; entryIds: string[] }>"
+              },
+              "description": "Bubbles, is composed, and is cancelable."
+            },
+            {
+              "name": "slatefs-publish-target-change",
+              "type": {
+                "text": "CustomEvent<{ version: 1; branch: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-view-change",
+              "type": {
+                "text": "CustomEvent<{ version: 1; view: ViewSelection }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-conflict",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation?: string; entry?: Entry; message: string }>"
+              },
+              "description": "Bubbles and is composed."
+            }
+          ],
+          "slots": [
+            {
+              "name": "empty"
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "inspector"
+            },
+            {
+              "name": "toolbar"
+            },
+            {
+              "name": "loading"
+            },
+            {
+              "name": "empty"
+            },
+            {
+              "name": "error"
+            },
+            {
+              "name": "unsupported"
+            },
+            {
+              "name": "branch-list"
+            },
+            {
+              "name": "branch-row"
+            },
+            {
+              "name": "preview"
+            },
+            {
+              "name": "reflog"
+            },
+            {
+              "name": "protection"
+            }
+          ],
+          "cssProperties": [
+            {
+              "name": "--slatefs-color-text"
+            },
+            {
+              "name": "--slatefs-color-surface"
+            },
+            {
+              "name": "--slatefs-color-border"
+            },
+            {
+              "name": "--slatefs-color-muted"
+            },
+            {
+              "name": "--slatefs-color-accent"
+            },
+            {
+              "name": "--slatefs-color-readonly"
+            },
+            {
+              "name": "--slatefs-font-family"
+            },
+            {
+              "name": "--slatefs-font-size"
+            },
+            {
+              "name": "--slatefs-radius"
+            },
+            {
+              "name": "--slatefs-focus-ring"
+            }
+          ]
+        },
+        {
+          "kind": "class",
+          "description": "Preview-first restore UI. Multi-path restore remains unavailable until the facade contracts it.",
+          "name": "SlateFsRestoreDialog",
+          "members": [
+            {
+              "kind": "field",
+              "name": "open",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "open",
+              "reflects": true
+            },
+            {
+              "kind": "field",
+              "name": "commit",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "commit"
+            },
+            {
+              "kind": "field",
+              "name": "paths",
+              "privacy": "public",
+              "type": {
+                "text": "readonly string[]"
+              },
+              "default": "[]"
+            },
+            {
+              "kind": "field",
+              "name": "mode",
+              "privacy": "public",
+              "type": {
+                "text": "\"overlay\" | \"exact\""
+              },
+              "default": "\"overlay\"",
+              "attribute": "mode"
+            },
+            {
+              "kind": "method",
+              "name": "show"
+            },
+            {
+              "kind": "method",
+              "name": "close"
+            },
+            {
+              "kind": "method",
+              "name": "previewRestore"
+            },
+            {
+              "kind": "method",
+              "name": "apply"
+            },
+            {
+              "kind": "field",
+              "name": "client",
+              "privacy": "public",
+              "type": {
+                "text": "Client | undefined"
+              },
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "volume",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "path",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "attribute": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "view",
+              "privacy": "public",
+              "type": {
+                "text": "ViewSelection"
+              },
+              "default": "{ kind: \"live\" }",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "selection",
+              "privacy": "public",
+              "type": {
+                "text": "readonly string[]"
+              },
+              "default": "[]",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "readonly",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "readonly",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "density",
+              "privacy": "public",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "attribute": "density",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "hidden",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "hidden",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "attributes": [
+            {
+              "name": "open",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "open"
+            },
+            {
+              "name": "commit",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "commit"
+            },
+            {
+              "name": "mode",
+              "type": {
+                "text": "\"overlay\" | \"exact\""
+              },
+              "default": "\"overlay\"",
+              "fieldName": "mode"
+            },
+            {
+              "name": "volume",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "path",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "fieldName": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "readonly",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "readonly",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "density",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "fieldName": "density",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "hidden",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "hidden",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "superclass": {
+            "name": "SlateFsElement",
+            "module": "/src/base.js"
+          },
+          "tagName": "slatefs-restore-dialog",
+          "customElement": true,
+          "events": [
+            {
+              "name": "slatefs-auth-required",
+              "type": {
+                "text": "CustomEvent<{ version: 1; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-operation-error",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation: string; entryIds: string[]; code: string; message: string; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-before-operation",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation: string; entryIds: string[] }>"
+              },
+              "description": "Bubbles, is composed, and is cancelable."
+            },
+            {
+              "name": "slatefs-restore-preview",
+              "type": {
+                "text": "CustomEvent<{ version: 1; preview: RestorePreviewResponse['preview'] }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-restore-complete",
+              "type": {
+                "text": "CustomEvent<{ version: 1; restored: unknown }>"
+              },
+              "description": "Bubbles and is composed."
+            }
+          ],
+          "slots": [
+            {
+              "name": "empty"
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "inspector"
+            },
+            {
+              "name": "toolbar"
+            },
+            {
+              "name": "loading"
+            },
+            {
+              "name": "empty"
+            },
+            {
+              "name": "error"
+            },
+            {
+              "name": "unsupported"
+            },
+            {
+              "name": "dialog"
+            },
+            {
+              "name": "warning"
+            },
+            {
+              "name": "summary"
+            },
+            {
+              "name": "action-list"
+            }
+          ],
+          "cssProperties": [
+            {
+              "name": "--slatefs-color-text"
+            },
+            {
+              "name": "--slatefs-color-surface"
+            },
+            {
+              "name": "--slatefs-color-border"
+            },
+            {
+              "name": "--slatefs-color-muted"
+            },
+            {
+              "name": "--slatefs-color-accent"
+            },
+            {
+              "name": "--slatefs-color-readonly"
+            },
+            {
+              "name": "--slatefs-font-family"
+            },
+            {
+              "name": "--slatefs-font-size"
+            },
+            {
+              "name": "--slatefs-radius"
+            },
+            {
+              "name": "--slatefs-focus-ring"
+            }
+          ]
+        },
+        {
+          "kind": "class",
+          "description": "",
+          "name": "SlateFsRepositoryTools",
+          "members": [
+            {
+              "kind": "field",
+              "name": "commit",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "commit"
+            },
+            {
+              "kind": "field",
+              "name": "branch",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"main\"",
+              "attribute": "branch"
+            },
+            {
+              "kind": "field",
+              "name": "section",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"stats\"",
+              "attribute": "section"
+            },
+            {
+              "kind": "method",
+              "name": "refresh"
+            },
+            {
+              "kind": "method",
+              "name": "verify"
+            },
+            {
+              "kind": "method",
+              "name": "inspectTrust"
+            },
+            {
+              "kind": "field",
+              "name": "client",
+              "privacy": "public",
+              "type": {
+                "text": "Client | undefined"
+              },
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "volume",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "attribute": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "path",
+              "privacy": "public",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "attribute": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "view",
+              "privacy": "public",
+              "type": {
+                "text": "ViewSelection"
+              },
+              "default": "{ kind: \"live\" }",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "selection",
+              "privacy": "public",
+              "type": {
+                "text": "readonly string[]"
+              },
+              "default": "[]",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "readonly",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "readonly",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "density",
+              "privacy": "public",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "attribute": "density",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "kind": "field",
+              "name": "hidden",
+              "privacy": "public",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "attribute": "hidden",
+              "reflects": true,
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "attributes": [
+            {
+              "name": "commit",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "commit"
+            },
+            {
+              "name": "branch",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"main\"",
+              "fieldName": "branch"
+            },
+            {
+              "name": "section",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"stats\"",
+              "fieldName": "section"
+            },
+            {
+              "name": "volume",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"\"",
+              "fieldName": "volume",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "path",
+              "type": {
+                "text": "string"
+              },
+              "default": "\"/\"",
+              "fieldName": "path",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "readonly",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "readonly",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "density",
+              "type": {
+                "text": "ComponentDensity"
+              },
+              "default": "\"comfortable\"",
+              "fieldName": "density",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            },
+            {
+              "name": "hidden",
+              "type": {
+                "text": "boolean"
+              },
+              "default": "false",
+              "fieldName": "hidden",
+              "inheritedFrom": {
+                "name": "SlateFsElement",
+                "module": "src/base.ts"
+              }
+            }
+          ],
+          "superclass": {
+            "name": "SlateFsElement",
+            "module": "/src/base.js"
+          },
+          "tagName": "slatefs-repository-tools",
+          "customElement": true,
+          "events": [
+            {
+              "name": "slatefs-auth-required",
+              "type": {
+                "text": "CustomEvent<{ version: 1; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            },
+            {
+              "name": "slatefs-operation-error",
+              "type": {
+                "text": "CustomEvent<{ version: 1; operation: string; entryIds: string[]; code: string; message: string; requestId?: string }>"
+              },
+              "description": "Bubbles and is composed."
+            }
+          ],
+          "slots": [
+            {
+              "name": "empty"
+            }
+          ],
+          "cssParts": [
+            {
+              "name": "inspector"
+            },
+            {
+              "name": "toolbar"
+            },
+            {
+              "name": "loading"
+            },
+            {
+              "name": "empty"
+            },
+            {
+              "name": "error"
+            },
+            {
+              "name": "unsupported"
+            },
+            {
+              "name": "stats"
+            },
+            {
+              "name": "verify"
+            },
+            {
+              "name": "trust"
+            }
+          ],
+          "cssProperties": [
+            {
+              "name": "--slatefs-color-text"
+            },
+            {
+              "name": "--slatefs-color-surface"
+            },
+            {
+              "name": "--slatefs-color-border"
+            },
+            {
+              "name": "--slatefs-color-muted"
+            },
+            {
+              "name": "--slatefs-color-accent"
+            },
+            {
+              "name": "--slatefs-color-readonly"
+            },
+            {
+              "name": "--slatefs-font-family"
+            },
+            {
+              "name": "--slatefs-font-size"
+            },
+            {
+              "name": "--slatefs-radius"
+            },
+            {
+              "name": "--slatefs-focus-ring"
+            }
+          ]
+        }
+      ],
+      "exports": [
+        {
+          "kind": "custom-element-definition",
+          "name": "slatefs-volume-picker",
+          "declaration": {
+            "name": "SlateFsVolumePicker",
+            "module": "src/components.ts"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "slatefs-file-explorer",
+          "declaration": {
+            "name": "SlateFsFileExplorer",
+            "module": "src/components.ts"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "slatefs-file-preview",
+          "declaration": {
+            "name": "SlateFsFilePreview",
+            "module": "src/components.ts"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "slatefs-file-properties",
+          "declaration": {
+            "name": "SlateFsMetadataPanel",
+            "module": "src/components.ts"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "slatefs-snapshot-manager",
+          "declaration": {
+            "name": "SlateFsSnapshotBrowser",
+            "module": "src/components.ts"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "slatefs-version-status",
+          "declaration": {
+            "name": "SlateFsVersionStatus",
+            "module": "src/components.ts"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "slatefs-version-history",
+          "declaration": {
+            "name": "SlateFsVersionHistory",
+            "module": "src/components.ts"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "slatefs-diff-viewer",
+          "declaration": {
+            "name": "SlateFsVersionDiff",
+            "module": "src/components.ts"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "slatefs-branch-manager",
+          "declaration": {
+            "name": "SlateFsBranchManager",
+            "module": "src/components.ts"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "slatefs-restore-dialog",
+          "declaration": {
+            "name": "SlateFsRestoreDialog",
+            "module": "src/components.ts"
+          }
+        },
+        {
+          "kind": "custom-element-definition",
+          "name": "slatefs-repository-tools",
+          "declaration": {
+            "name": "SlateFsRepositoryTools",
+            "module": "src/components.ts"
+          }
+        }
+      ]
+    }
+  ]
+}

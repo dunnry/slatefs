@@ -1,0 +1,12 @@
+GET /consumer/v1/capabilities getCapabilities
+GET /consumer/v1/volumes listVolumes
+GET /consumer/v1/volumes/{volume} getVolume
+GET /consumer/v1/volumes/{volume}/entries listEntries
+POST /consumer/v1/volumes/{volume}/entries createEntry
+PATCH /consumer/v1/volumes/{volume}/entries updateEntry
+DELETE /consumer/v1/volumes/{volume}/entries deleteEntry
+GET /consumer/v1/volumes/{volume}/content readContent
+PUT /consumer/v1/volumes/{volume}/content writeContent
+POST /consumer/v1/volumes/{volume}/operations startOperation
+GET /consumer/v1/volumes/{volume}/xattrs getXattrs
+PATCH /consumer/v1/volumes/{volume}/xattrs updateXattrs

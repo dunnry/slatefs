@@ -1,0 +1,34 @@
+{
+  "name": "@slatefs/web-components",
+  "version": "0.1.0",
+  "type": "module",
+  "sideEffects": true,
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "custom-elements.json"
+  ],
+  "customElements": "custom-elements.json",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "manifest:generate": "cem analyze --litelement --globs 'src/**/*.ts' && node scripts/postprocess-manifest.mjs",
+    "manifest:check": "pnpm manifest:generate && git diff --exit-code -- custom-elements.json"
+  },
+  "dependencies": {
+    "@slatefs/client": "workspace:*",
+    "lit": "3.3.1"
+  },
+  "devDependencies": {
+    "@custom-elements-manifest/analyzer": "0.10.5",
+    "jsdom": "26.1.0",
+    "vitest": "3.2.4"
+  }
+}

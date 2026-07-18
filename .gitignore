@@ -1,4 +1,8 @@
 /target
+/web/node_modules
+/web/**/node_modules
+/web/**/dist
+/web/**/coverage
 *.swp
 .DS_Store
 /tmp

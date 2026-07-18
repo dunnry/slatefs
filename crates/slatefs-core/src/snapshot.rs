@@ -23,8 +23,8 @@ use crate::meta::superblock::{KEY_SUPERBLOCK, Superblock, VolumeKind};
 use crate::quota::{self, CounterMergeOperator};
 use crate::store;
 use crate::vfs::{
-    Credentials, DirEntry, FileAttr, FsError, FsResult, HandleId, OpenMode, ReadDir, SetAttrs,
-    StatFs, Vfs,
+    Credentials, DirEntry, EntryPermissions, FileAttr, FsError, FsResult, HandleId, OpenMode,
+    ReadDir, SetAttrs, StatFs, Vfs,
 };
 use crate::volume::{HandleTable, verify_superblock_matches_record};
 
@@ -259,6 +259,19 @@ impl Vfs for SnapshotVolume {
 
     fn read_only(&self) -> bool {
         true
+    }
+
+    async fn permissions(
+        &self,
+        creds: &Credentials,
+        ino: u64,
+        _parent: Option<(u64, &[u8])>,
+    ) -> FsResult<EntryPermissions> {
+        self.getattr(creds, ino).await?;
+        Ok(EntryPermissions {
+            can_read: true,
+            ..EntryPermissions::default()
+        })
     }
 
     async fn lookup(&self, creds: &Credentials, parent: u64, name: &[u8]) -> FsResult<FileAttr> {

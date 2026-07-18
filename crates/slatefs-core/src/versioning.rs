@@ -2778,14 +2778,18 @@ async fn open_version_db(
     dek: crate::crypto::Secret32,
     object_store: Arc<dyn ObjectStore>,
 ) -> Result<Db> {
+    let settings = store::compatible_settings(
+        &object_store,
+        Settings {
+            compression_codec: record.compression.to_slatedb(),
+            ..Settings::default()
+        },
+    );
     Db::builder(
         store::version_db_path(&record.tenant, &record.name),
         object_store,
     )
-    .with_settings(Settings {
-        compression_codec: record.compression.to_slatedb(),
-        ..Settings::default()
-    })
+    .with_settings(settings)
     .with_block_transformer(Arc::new(SlateBlockTransformer::new(record.cipher, dek)))
     .build()
     .await
@@ -4764,6 +4768,19 @@ impl VersionRepository {
         strategy: VersionMergeConflictStrategy,
         provenance: VersionCommitProvenance,
     ) -> Result<VersionMergeInfo> {
+        self.merge_branch_inner(source, target, None, None, strategy, provenance)
+            .await
+    }
+
+    async fn merge_branch_inner(
+        &self,
+        source: &str,
+        target: &str,
+        expected_source: Option<&str>,
+        expected_target: Option<&str>,
+        strategy: VersionMergeConflictStrategy,
+        provenance: VersionCommitProvenance,
+    ) -> Result<VersionMergeInfo> {
         validate_version_branch_name(source)?;
         validate_version_branch_name(target)?;
         if source == target {
@@ -4782,6 +4799,8 @@ impl VersionRepository {
             .get_branch(target)
             .await?
             .ok_or_else(|| Error::not_found("version branch", target))?;
+        require_version_branch_head(source, &source_ref, expected_source)?;
+        require_version_branch_head(target, &target_ref, expected_target)?;
         if source_ref.commit_id == target_ref.commit_id
             || self
                 .commit_is_ancestor(source_ref.commit_id, target_ref.commit_id)
@@ -4887,6 +4906,30 @@ impl VersionRepository {
         })
     }
 
+    /// Merge only if the branch heads still match a prior preview. Expected
+    /// heads are checked against the same refs used to prepare the merge while
+    /// this repository holds its maintenance lease. Publication and
+    /// fast-forward then compare-and-swap those refs under the ref lock.
+    pub async fn merge_branch_if_heads(
+        &self,
+        source: &str,
+        target: &str,
+        expected_source: Option<&str>,
+        expected_target: Option<&str>,
+        strategy: VersionMergeConflictStrategy,
+        provenance: VersionCommitProvenance,
+    ) -> Result<VersionMergeInfo> {
+        self.merge_branch_inner(
+            source,
+            target,
+            expected_source,
+            expected_target,
+            strategy,
+            provenance,
+        )
+        .await
+    }
+
     /// Preview applying the selected commit's delta to `target`. Ordinary
     /// commits use their sole parent; merge commits require a one-based
     /// `mainline` parent. No branch or Prolly node is modified.
@@ -4933,6 +4976,19 @@ impl VersionRepository {
         provenance: VersionCommitProvenance,
         idempotency_key: Option<&str>,
     ) -> Result<VersionCherryPickInfo> {
+        self.cherry_pick_inner(source, target, None, mainline, provenance, idempotency_key)
+            .await
+    }
+
+    async fn cherry_pick_inner(
+        &self,
+        source: &str,
+        target: &str,
+        expected_target: Option<&str>,
+        mainline: Option<u32>,
+        provenance: VersionCommitProvenance,
+        idempotency_key: Option<&str>,
+    ) -> Result<VersionCherryPickInfo> {
         validate_version_branch_name(target)?;
         let source = self.resolve_commit(source).await?;
         let source_id = hex::encode(source.id);
@@ -4967,6 +5023,17 @@ impl VersionRepository {
                 replayed: true,
                 already_applied: false,
             });
+        }
+        if let Some(expected) = expected_target {
+            let actual = target_ref
+                .as_ref()
+                .map(|reference| hex::encode(reference.commit_id));
+            if actual.as_deref() != Some(expected) {
+                return Err(Error::invalid(
+                    "version branch operation",
+                    format!("branch {target} moved since preview"),
+                ));
+            }
         }
         let target_tree = target_ref
             .as_ref()
@@ -5056,6 +5123,27 @@ impl VersionRepository {
             replayed,
             already_applied: false,
         })
+    }
+
+    /// Cherry-pick only if the target head still matches a prior preview.
+    pub async fn cherry_pick_if_head(
+        &self,
+        source: &str,
+        target: &str,
+        expected_target: Option<&str>,
+        mainline: Option<u32>,
+        provenance: VersionCommitProvenance,
+        idempotency_key: Option<&str>,
+    ) -> Result<VersionCherryPickInfo> {
+        self.cherry_pick_inner(
+            source,
+            target,
+            expected_target,
+            mainline,
+            provenance,
+            idempotency_key,
+        )
+        .await
     }
 
     async fn cherry_pick_base(
@@ -7335,6 +7423,23 @@ fn verify_version_commit_attestation(
                 "signature verification failed",
             )
         })
+}
+
+fn require_version_branch_head(
+    branch: &str,
+    actual: &VersionRef,
+    expected: Option<&str>,
+) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if hex::encode(actual.commit_id) != expected {
+        return Err(Error::invalid(
+            "version branch operation",
+            format!("branch {branch} moved since preview"),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_version_branch_name(name: &str) -> Result<()> {

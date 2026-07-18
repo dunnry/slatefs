@@ -46,9 +46,53 @@ pub struct Config {
     /// Optional loopback-only daemon admin endpoint.
     #[serde(default)]
     pub admin: AdminConfig,
+    /// Optional tenant-scoped browser data plane embedded in `slatefsd`.
+    #[serde(default)]
+    pub consumer: ConsumerConfig,
     /// TLS certificate hot-reload settings for daemon listeners.
     #[serde(default)]
     pub tls: TlsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConsumerConfig {
+    pub listen: Option<String>,
+    pub tenant_identities: BTreeMap<String, ConsumerIdentityConfig>,
+    pub max_page_size: u32,
+    pub max_range_bytes: u64,
+    pub max_upload_bytes: u64,
+    pub max_recursive_entries: u64,
+    pub max_recursive_bytes: u64,
+    pub stream_chunk_bytes: u32,
+    /// Maximum completed mutations retained in the in-memory idempotency cache.
+    pub idempotency_entries: usize,
+    /// Maximum immutable snapshot/version readers retained by the consumer.
+    pub historical_view_cache_entries: usize,
+}
+
+impl Default for ConsumerConfig {
+    fn default() -> Self {
+        Self {
+            listen: None,
+            tenant_identities: BTreeMap::new(),
+            max_page_size: 500,
+            max_range_bytes: 8 * 1024 * 1024,
+            max_upload_bytes: 1024 * 1024 * 1024,
+            max_recursive_entries: 10_000,
+            max_recursive_bytes: 1024 * 1024 * 1024,
+            stream_chunk_bytes: 256 * 1024,
+            idempotency_entries: 10_000,
+            historical_view_cache_entries: 32,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsumerIdentityConfig {
+    pub uid: u32,
+    pub gid: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -683,6 +727,60 @@ impl Config {
             if !addr.ip().is_loopback() && !has_token && !has_cert_auth {
                 return Err(Error::Config(
                     "admin.listen must bind a loopback address unless admin.token, admin.token_file, or mTLS cert auth is set".into(),
+                ));
+            }
+        }
+        if let Some(listen) = &self.consumer.listen {
+            let addr: SocketAddr = listen.parse().map_err(|e| {
+                Error::Config(format!(
+                    "consumer.listen must be a loopback ip:port listener: {e}"
+                ))
+            })?;
+            if !addr.ip().is_loopback() {
+                return Err(Error::Config(
+                    "consumer.listen must bind a loopback address".into(),
+                ));
+            }
+            if self.admin.listen.as_deref() == Some(listen.as_str())
+                || self.metrics.listen.as_deref() == Some(listen.as_str())
+                || self.exports.iter().any(|export| export.listen == *listen)
+            {
+                return Err(Error::Config(
+                    "consumer.listen must not collide with another listener".into(),
+                ));
+            }
+            if self.consumer.tenant_identities.is_empty() {
+                return Err(Error::Config(
+                    "consumer.tenant_identities must not be empty when consumer.listen is set"
+                        .into(),
+                ));
+            }
+            for (tenant, identity) in &self.consumer.tenant_identities {
+                crate::store::validate_name("consumer tenant identity", tenant)?;
+                if identity.uid == 0 || identity.gid == 0 {
+                    return Err(Error::Config(format!(
+                        "consumer.tenant_identities.{tenant} must be unprivileged"
+                    )));
+                }
+                if !self.admin.tenant_tokens.contains_key(tenant)
+                    && !self.admin.tenant_token_files.contains_key(tenant)
+                {
+                    return Err(Error::Config(format!(
+                        "consumer tenant {tenant} requires an admin tenant token source"
+                    )));
+                }
+            }
+            if self.consumer.max_page_size == 0
+                || self.consumer.max_range_bytes == 0
+                || self.consumer.max_upload_bytes == 0
+                || self.consumer.max_recursive_entries == 0
+                || self.consumer.max_recursive_bytes == 0
+                || self.consumer.stream_chunk_bytes == 0
+                || self.consumer.idempotency_entries == 0
+                || self.consumer.historical_view_cache_entries == 0
+            {
+                return Err(Error::Config(
+                    "consumer limits must be greater than zero".into(),
                 ));
             }
         }

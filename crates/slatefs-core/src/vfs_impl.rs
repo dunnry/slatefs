@@ -17,8 +17,8 @@ use crate::meta::inode::{FileKind, Inode, MAX_NAME_LEN, ROOT_INO, Timespec};
 use crate::meta::keys;
 use crate::quota::encode_delta;
 use crate::vfs::{
-    Credentials, DirEntry, FileAttr, FsError, FsResult, HandleId, OpenMode, ReadDir, SetAttrs,
-    StatFs, TimeSet, Vfs,
+    Credentials, DirEntry, EntryPermissions, FileAttr, FsError, FsResult, HandleId, OpenMode,
+    ReadDir, SetAttrs, StatFs, TimeSet, Vfs,
 };
 use crate::volume::Volume;
 
@@ -464,6 +464,29 @@ impl Vfs for Volume {
 
     fn chunk_size(&self) -> u64 {
         self.chunk_size
+    }
+
+    async fn permissions(
+        &self,
+        creds: &Credentials,
+        ino: u64,
+        parent: Option<(u64, &[u8])>,
+    ) -> FsResult<EntryPermissions> {
+        let inode = self.load_inode(ino).await?;
+        let parent_mutation = if let Some((parent_ino, name)) = parent {
+            validate_name(name)?;
+            let dir = self.load_inode(parent_ino).await?;
+            access(creds, &dir, ACCESS_W | ACCESS_X).is_ok()
+                && check_sticky(creds, &dir, &inode).is_ok()
+        } else {
+            false
+        };
+        Ok(EntryPermissions {
+            can_read: access(creds, &inode, ACCESS_R).is_ok(),
+            can_write: access(creds, &inode, ACCESS_W).is_ok(),
+            can_delete: parent_mutation,
+            can_rename: parent_mutation,
+        })
     }
 
     async fn lookup(&self, creds: &Credentials, parent: u64, name: &[u8]) -> FsResult<FileAttr> {

@@ -1,0 +1,800 @@
+openapi: 3.1.0
+info:
+  title: SlateFS Consumer Demo BFF
+  version: 1.0.0
+  description: Same-origin, session-authenticated facade. Tenant identity and upstream credentials are never caller supplied.
+  license: { name: Apache-2.0, identifier: Apache-2.0 }
+servers:
+  - url: /
+security:
+  - cookieAuth: []
+paths:
+  /api/v1/session:
+    get:
+      summary: Get or create the browser session
+      operationId: getDemoSession
+      responses:
+        "200":
+          description: Current or newly-created pre-authentication session
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+  /api/v1/login:
+    post:
+      summary: Authenticate a demo account and rotate its session
+      operationId: loginDemoSession
+      parameters: [{ $ref: "#/components/parameters/Csrf" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string, enum: [alice, bob] }
+                password: { type: string }
+      responses:
+        "200":
+          description: Rotated authenticated session
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/logout:
+    post:
+      summary: Invalidate the current browser session
+      operationId: logoutDemoSession
+      parameters: [{ $ref: "#/components/parameters/Csrf" }]
+      responses:
+        "204": { description: Session invalidated }
+        default: { $ref: "#/components/responses/Error" }
+  /api/v1/volumes/{volume}/snapshots:
+    parameters: [{ $ref: "#/components/parameters/Volume" }]
+    get:
+      summary: List snapshots for a tenant-owned volume
+      operationId: listDemoSnapshots
+      parameters:
+        [
+          { $ref: "#/components/parameters/Limit" },
+          { $ref: "#/components/parameters/PageToken" },
+        ]
+      responses:
+        "200":
+          {
+            description: Tenant-scoped snapshots,
+            content:
+              {
+                application/json:
+                  {
+                    schema:
+                      {
+                        type: object,
+                        required: [snapshots],
+                        properties:
+                          {
+                            snapshots:
+                              {
+                                type: array,
+                                items:
+                                  { $ref: "#/components/schemas/Snapshot" },
+                              },
+                            next_page_token: { type: [string, "null"] },
+                          },
+                      },
+                  },
+              },
+          }
+    post:
+      summary: Create a snapshot from the live daemon writer
+      operationId: createDemoSnapshot
+      parameters: [{ $ref: "#/components/parameters/Csrf" }]
+      requestBody:
+        {
+          content:
+            {
+              application/json:
+                {
+                  schema:
+                    { type: object, properties: { name: { type: string } } },
+                },
+            },
+        }
+      responses:
+        {
+          "200": { description: Snapshot created },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/snapshots/{snapshot}/clones:
+    parameters:
+      [
+        { $ref: "#/components/parameters/Volume" },
+        { name: snapshot, in: path, required: true, schema: { type: string } },
+        { $ref: "#/components/parameters/Csrf" },
+      ]
+    post:
+      summary: Create a writable same-tenant copy from a snapshot
+      operationId: cloneDemoSnapshot
+      requestBody:
+        {
+          required: true,
+          content:
+            {
+              application/json:
+                {
+                  schema:
+                    {
+                      type: object,
+                      required: [new_volume],
+                      properties: { new_volume: { type: string } },
+                    },
+                },
+            },
+        }
+      responses:
+        {
+          "200": { description: Writable same-tenant copy created },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/status:
+    parameters: [{ $ref: "#/components/parameters/Volume" }]
+    get:
+      summary: Get working-tree version status
+      operationId: getDemoVersionStatus
+      parameters:
+        [
+          {
+            name: reference,
+            in: query,
+            required: true,
+            schema: { type: string },
+          },
+          { name: path, in: query, required: true, schema: { type: string } },
+        ]
+      responses:
+        {
+          "200": { description: Version status },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/overview:
+    parameters: [{ $ref: "#/components/parameters/Volume" }]
+    get:
+      summary: Get status, history, branches, and recovery log together
+      operationId: getDemoVersionOverview
+      parameters:
+        [
+          {
+            name: reference,
+            in: query,
+            required: true,
+            schema: { type: string },
+          },
+          { name: path, in: query, required: true, schema: { type: string } },
+          { name: branch, in: query, required: true, schema: { type: string } },
+          { $ref: "#/components/parameters/Limit" },
+        ]
+      responses:
+        {
+          "200": { description: Initial version-control workspace data },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/branch-overview:
+    parameters: [{ $ref: "#/components/parameters/Volume" }]
+    get:
+      summary: Get branches and the selected branch recovery log together
+      operationId: getDemoVersionBranchOverview
+      parameters:
+        [
+          { name: branch, in: query, required: true, schema: { type: string } },
+          { $ref: "#/components/parameters/Limit" },
+        ]
+      responses:
+        {
+          "200": { description: Branches and recovery-log entries },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/commits:
+    parameters: [{ $ref: "#/components/parameters/Volume" }]
+    get:
+      summary: List version commits
+      operationId: listDemoVersionCommits
+      parameters:
+        [
+          { name: branch, in: query, required: true, schema: { type: string } },
+          { $ref: "#/components/parameters/Limit" },
+          { $ref: "#/components/parameters/PageToken" },
+        ]
+      responses:
+        {
+          "200": { description: Commit page },
+          default: { $ref: "#/components/responses/Error" },
+        }
+    post:
+      summary: Commit selected live paths
+      operationId: createDemoVersionCommit
+      parameters: [{ $ref: "#/components/parameters/Csrf" }]
+      requestBody:
+        {
+          required: true,
+          content:
+            {
+              application/json:
+                {
+                  schema: { $ref: "#/components/schemas/VersionCommitRequest" },
+                },
+            },
+        }
+      responses:
+        {
+          "201": { description: Commit created },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/diff:
+    parameters: [{ $ref: "#/components/parameters/Volume" }]
+    get:
+      summary: Diff two version references
+      operationId: getDemoVersionDiff
+      parameters:
+        [
+          { name: from, in: query, required: true, schema: { type: string } },
+          { name: to, in: query, required: true, schema: { type: string } },
+          { $ref: "#/components/parameters/Limit" },
+          { $ref: "#/components/parameters/PageToken" },
+        ]
+      responses:
+        {
+          "200": { description: Diff page },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/tags:
+    parameters: [{ $ref: "#/components/parameters/Volume" }]
+    get:
+      summary: List version tags
+      operationId: listDemoVersionTags
+      responses:
+        {
+          "200": { description: Tag list },
+          default: { $ref: "#/components/responses/Error" },
+        }
+    post:
+      summary: Create a version tag
+      operationId: createDemoVersionTag
+      parameters: [{ $ref: "#/components/parameters/Csrf" }]
+      requestBody:
+        {
+          required: true,
+          content:
+            {
+              application/json:
+                { schema: { $ref: "#/components/schemas/TagRequest" } },
+            },
+        }
+      responses:
+        {
+          "201": { description: Tag created },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/branches:
+    parameters: [{ $ref: "#/components/parameters/Volume" }]
+    get:
+      summary: List version branches
+      operationId: listDemoVersionBranches
+      responses:
+        {
+          "200": { description: Branch list },
+          default: { $ref: "#/components/responses/Error" },
+        }
+    post:
+      summary: Create a version branch
+      operationId: createDemoVersionBranch
+      parameters: [{ $ref: "#/components/parameters/Csrf" }]
+      requestBody:
+        {
+          required: true,
+          content:
+            {
+              application/json:
+                { schema: { $ref: "#/components/schemas/BranchRequest" } },
+            },
+        }
+      responses:
+        {
+          "201": { description: Branch created },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/restore-preview:
+    parameters:
+      [
+        { $ref: "#/components/parameters/Volume" },
+        { $ref: "#/components/parameters/Csrf" },
+      ]
+    post:
+      summary: Preview a restore into live files
+      operationId: previewDemoVersionRestore
+      requestBody:
+        {
+          required: true,
+          content:
+            {
+              application/json:
+                {
+                  schema:
+                    { $ref: "#/components/schemas/RestorePreviewRequest" },
+                },
+            },
+        }
+      responses:
+        {
+          "200": { description: Restore preview },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/restore:
+    parameters:
+      [
+        { $ref: "#/components/parameters/Volume" },
+        { $ref: "#/components/parameters/Csrf" },
+      ]
+    post:
+      summary: Apply a previously previewed restore
+      operationId: applyDemoVersionRestore
+      requestBody:
+        {
+          required: true,
+          content:
+            {
+              application/json:
+                {
+                  schema: { $ref: "#/components/schemas/RestoreApplyRequest" },
+                },
+            },
+        }
+      responses:
+        {
+          "200": { description: Restore applied },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/stats:
+    parameters: [{ $ref: "#/components/parameters/Volume" }]
+    get:
+      summary: Get version repository statistics
+      operationId: getDemoVersionStats
+      responses:
+        {
+          "200": { description: Repository statistics },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/verify:
+    parameters: [{ $ref: "#/components/parameters/Volume" }]
+    get:
+      summary: Verify version repository integrity
+      operationId: verifyDemoVersionRepository
+      responses:
+        {
+          "200": { description: Verification report },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning:
+    parameters: [{ $ref: "#/components/parameters/Volume" }]
+    get:
+      summary: Get versioning policy and status
+      operationId: getDemoVersioning
+      responses:
+        {
+          "200": { description: Versioning policy },
+          default: { $ref: "#/components/responses/Error" },
+        }
+    patch:
+      summary: Enable or disable versioning
+      operationId: patchDemoVersioning
+      parameters: [{ $ref: "#/components/parameters/Csrf" }]
+      requestBody:
+        {
+          required: true,
+          content:
+            {
+              application/json:
+                {
+                  schema:
+                    {
+                      type: object,
+                      additionalProperties: false,
+                      required: [enabled],
+                      properties: { enabled: { type: boolean } },
+                    },
+                },
+            },
+        }
+      responses:
+        {
+          "200": { description: Updated versioning policy },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/commits/{commit}:
+    parameters:
+      [
+        { $ref: "#/components/parameters/Volume" },
+        { $ref: "#/components/parameters/Commit" },
+      ]
+    get:
+      summary: Inspect a commit
+      operationId: getDemoVersionCommit
+      responses:
+        {
+          "200": { description: Commit detail },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/commits/{commit}/attestations:
+    parameters:
+      [
+        { $ref: "#/components/parameters/Volume" },
+        { $ref: "#/components/parameters/Commit" },
+      ]
+    get:
+      summary: List commit attestations
+      operationId: listDemoVersionAttestations
+      responses:
+        {
+          "200": { description: Attestation list },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/branches/{branch}/reflog:
+    parameters:
+      [
+        { $ref: "#/components/parameters/Volume" },
+        { $ref: "#/components/parameters/Branch" },
+      ]
+    get:
+      summary: List branch reflog entries
+      operationId: listDemoVersionReflog
+      parameters: [{ $ref: "#/components/parameters/Limit" }]
+      responses:
+        {
+          "200": { description: Reflog entries },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/branches/{branch}/protection:
+    parameters:
+      [
+        { $ref: "#/components/parameters/Volume" },
+        { $ref: "#/components/parameters/Branch" },
+      ]
+    get:
+      summary: Get branch protection
+      operationId: getDemoVersionProtection
+      responses:
+        {
+          "200": { description: Protection policy },
+          default: { $ref: "#/components/responses/Error" },
+        }
+    put:
+      summary: Set or clear branch protection
+      operationId: setDemoVersionProtection
+      parameters: [{ $ref: "#/components/parameters/Csrf" }]
+      requestBody:
+        {
+          required: true,
+          content:
+            {
+              application/json:
+                { schema: { $ref: "#/components/schemas/ProtectionRequest" } },
+            },
+        }
+      responses:
+        {
+          "200": { description: Protection policy },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/branches/{branch}/attestation-quorum:
+    parameters:
+      [
+        { $ref: "#/components/parameters/Volume" },
+        { $ref: "#/components/parameters/Branch" },
+      ]
+    get:
+      summary: Get branch attestation quorum for a commit
+      operationId: getDemoVersionQuorum
+      parameters:
+        [{ name: commit, in: query, required: true, schema: { type: string } }]
+      responses:
+        {
+          "200": { description: Quorum report },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/branches/{branch}/merge:
+    parameters:
+      [
+        { $ref: "#/components/parameters/Volume" },
+        { $ref: "#/components/parameters/Branch" },
+        { $ref: "#/components/parameters/Csrf" },
+      ]
+    post:
+      summary: Apply a branch merge
+      operationId: applyDemoVersionMerge
+      requestBody:
+        {
+          required: true,
+          content:
+            {
+              application/json:
+                { schema: { $ref: "#/components/schemas/MergeRequest" } },
+            },
+        }
+      responses:
+        {
+          "200": { description: Merge result },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/branches/{branch}/merge/preview:
+    parameters:
+      [
+        { $ref: "#/components/parameters/Volume" },
+        { $ref: "#/components/parameters/Branch" },
+        { $ref: "#/components/parameters/Csrf" },
+      ]
+    post:
+      summary: Preview a branch merge
+      operationId: previewDemoVersionMerge
+      requestBody:
+        {
+          required: true,
+          content:
+            {
+              application/json:
+                { schema: { $ref: "#/components/schemas/MergeRequest" } },
+            },
+        }
+      responses:
+        {
+          "200": { description: Merge preview },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/branches/{branch}/cherry-pick:
+    parameters:
+      [
+        { $ref: "#/components/parameters/Volume" },
+        { $ref: "#/components/parameters/Branch" },
+        { $ref: "#/components/parameters/Csrf" },
+      ]
+    post:
+      summary: Apply a cherry-pick
+      operationId: applyDemoVersionCherryPick
+      requestBody:
+        {
+          required: true,
+          content:
+            {
+              application/json:
+                { schema: { $ref: "#/components/schemas/CherryPickRequest" } },
+            },
+        }
+      responses:
+        {
+          "200": { description: Cherry-pick result },
+          default: { $ref: "#/components/responses/Error" },
+        }
+  /api/v1/volumes/{volume}/versioning/branches/{branch}/cherry-pick/preview:
+    parameters:
+      [
+        { $ref: "#/components/parameters/Volume" },
+        { $ref: "#/components/parameters/Branch" },
+        { $ref: "#/components/parameters/Csrf" },
+      ]
+    post:
+      summary: Preview a cherry-pick
+      operationId: previewDemoVersionCherryPick
+      requestBody:
+        {
+          required: true,
+          content:
+            {
+              application/json:
+                { schema: { $ref: "#/components/schemas/CherryPickRequest" } },
+            },
+        }
+      responses:
+        {
+          "200": { description: Cherry-pick preview },
+          default: { $ref: "#/components/responses/Error" },
+        }
+components:
+  securitySchemes:
+    cookieAuth: { type: apiKey, in: cookie, name: slatefs_demo_session }
+  parameters:
+    Csrf:
+      {
+        name: X-CSRF-Token,
+        in: header,
+        required: true,
+        schema: { type: string },
+      }
+    Volume:
+      {
+        name: volume,
+        in: path,
+        required: true,
+        schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+      }
+    Commit:
+      {
+        name: commit,
+        in: path,
+        required: true,
+        schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+      }
+    Branch:
+      {
+        name: branch,
+        in: path,
+        required: true,
+        schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+      }
+    Limit:
+      {
+        name: limit,
+        in: query,
+        required: false,
+        schema: { type: integer, minimum: 1 },
+      }
+    PageToken:
+      { name: page_token, in: query, required: false, schema: { type: string } }
+  schemas:
+    Session:
+      type: object
+      required: [authenticated, csrfToken, capabilities]
+      properties:
+        authenticated: { type: boolean }
+        user:
+          {
+            type: object,
+            required: [username, displayName],
+            properties:
+              { username: { type: string }, displayName: { type: string } },
+          }
+        csrfToken: { type: string }
+        expiresAt: { type: string, format: date-time }
+        capabilities:
+          {
+            type: object,
+            required: [snapshots, versions, collaboration, repository],
+            properties:
+              {
+                snapshots: { type: boolean },
+                versions: { type: boolean },
+                collaboration: { type: boolean },
+                repository: { type: boolean },
+              },
+          }
+    VersionCommitRequest:
+      type: object
+      additionalProperties: false
+      required: [branch, paths, message]
+      properties:
+        branch: { type: string }
+        paths:
+          type: array
+          minItems: 1
+          items: { type: string }
+        message: { type: string, minLength: 1 }
+        author: { type: string }
+        idempotency_key: { type: string }
+    TagRequest:
+      type: object
+      additionalProperties: false
+      required: [name, commit]
+      properties:
+        name: { type: string }
+        commit: { type: string }
+    BranchRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: { type: string }
+        commit: { type: string }
+    RestorePreviewRequest:
+      type: object
+      additionalProperties: false
+      required: [commit, path, mode]
+      properties:
+        commit: { type: string }
+        path: { type: string }
+        mode: { type: string, enum: [overlay, exact] }
+    RestoreApplyRequest:
+      type: object
+      additionalProperties: false
+      required: [commit, path, mode, token]
+      properties:
+        commit: { type: string }
+        path: { type: string }
+        mode: { type: string, enum: [overlay, exact] }
+        token: { type: string }
+    MergeRequest:
+      type: object
+      additionalProperties: false
+      required: [source]
+      properties:
+        source: { type: string }
+        target:
+          { type: string, description: Optional facade consistency field. }
+        conflict_strategy: { type: string, enum: [fail, ours, theirs] }
+        expected_source:
+          {
+            type: string,
+            description: Source branch head returned before preview; stale values produce 409.,
+          }
+        expected_target:
+          {
+            type: string,
+            description: Target branch head returned before preview; stale values produce 409.,
+          }
+    CherryPickRequest:
+      type: object
+      additionalProperties: false
+      required: [source]
+      properties:
+        source: { type: string }
+        target:
+          { type: string, description: Optional facade consistency field. }
+        mainline: { type: integer, minimum: 1 }
+        expected_target:
+          {
+            type: string,
+            description: Target branch head returned before preview; stale values produce 409.,
+          }
+        idempotency_key: { type: string }
+    ProtectionRequest:
+      type: object
+      additionalProperties: false
+      required: [protected]
+      properties:
+        protected: { type: boolean }
+        allowed_committers:
+          { type: array, items: { type: string }, default: [] }
+        allowed_managers: { type: array, items: { type: string }, default: [] }
+        trusted_attestation_keys:
+          { type: array, items: { type: object }, default: [] }
+        required_attestations: { type: integer, minimum: 0 }
+    Snapshot:
+      {
+        type: object,
+        required: [id, manifest_id],
+        properties:
+          {
+            id: { type: string },
+            manifest_id: { type: string },
+            name: { type: [string, "null"] },
+            time: { type: integer, format: int64 },
+            expire_time: { type: [integer, "null"], format: int64 },
+          },
+        additionalProperties: true,
+      }
+    Error:
+      {
+        type: object,
+        required: [error],
+        properties:
+          {
+            error:
+              {
+                type: object,
+                required: [code, message, request_id, details],
+                properties:
+                  {
+                    code: { type: string },
+                    message: { type: string },
+                    request_id: { type: string },
+                    details: { type: object, additionalProperties: true },
+                  },
+              },
+          },
+      }
+  responses:
+    Error:
+      {
+        description: Sanitized error response,
+        content:
+          {
+            application/json:
+              { schema: { $ref: "#/components/schemas/Error" } },
+          },
+      }

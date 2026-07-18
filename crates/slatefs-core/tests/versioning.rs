@@ -297,10 +297,23 @@ async fn cherry_pick_applies_complete_paths_atomically_and_requires_merge_mainli
     assert!(preview.can_apply());
     assert!(!preview.already_applied());
 
-    let picked = repository
-        .cherry_pick(
+    let stale = repository
+        .cherry_pick_if_head(
             &feature.id,
             "target",
+            Some(&baseline.id),
+            None,
+            test_provenance(),
+            Some("pick-feature"),
+        )
+        .await
+        .unwrap_err();
+    assert!(stale.to_string().contains("moved since preview"));
+    let picked = repository
+        .cherry_pick_if_head(
+            &feature.id,
+            "target",
+            Some(&target.id),
             None,
             test_provenance(),
             Some("pick-feature"),
@@ -356,9 +369,10 @@ async fn cherry_pick_applies_complete_paths_atomically_and_requires_merge_mainli
     );
 
     let replayed = repository
-        .cherry_pick(
+        .cherry_pick_if_head(
             &feature.id,
             "target",
+            Some(&target.id),
             None,
             test_provenance(),
             Some("pick-feature"),
@@ -679,10 +693,36 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
     assert_eq!(fast_forward_preview.ahead(), 1);
     assert_eq!(fast_forward_preview.behind(), 0);
     assert_eq!(fast_forward_preview.merge_base(), first.id);
-    let merged = repository
-        .merge_branch(
+    let stale = repository
+        .merge_branch_if_heads(
             "main",
             "release",
+            Some(&first.id),
+            Some(&first.id),
+            VersionMergeConflictStrategy::Fail,
+            test_provenance(),
+        )
+        .await
+        .unwrap_err();
+    assert!(stale.to_string().contains("moved since preview"));
+    let stale = repository
+        .merge_branch_if_heads(
+            "main",
+            "release",
+            Some(&second.id),
+            Some(&second.id),
+            VersionMergeConflictStrategy::Fail,
+            test_provenance(),
+        )
+        .await
+        .unwrap_err();
+    assert!(stale.to_string().contains("moved since preview"));
+    let merged = repository
+        .merge_branch_if_heads(
+            "main",
+            "release",
+            Some(&second.id),
+            Some(&first.id),
             VersionMergeConflictStrategy::Fail,
             test_provenance(),
         )
@@ -691,6 +731,18 @@ async fn versioning_is_opt_in_and_restores_committed_files() {
     assert!(merged.fast_forward());
     assert!(!merged.already_up_to_date());
     assert_eq!(merged.commit(), second.id);
+    let stale_noop = repository
+        .merge_branch_if_heads(
+            "main",
+            "release",
+            Some(&second.id),
+            Some(&first.id),
+            VersionMergeConflictStrategy::Fail,
+            test_provenance(),
+        )
+        .await
+        .unwrap_err();
+    assert!(stale_noop.to_string().contains("moved since preview"));
     let unchanged = repository
         .merge_branch(
             "main",

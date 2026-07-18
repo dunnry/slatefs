@@ -1,0 +1,120 @@
+{
+  "capabilities": {
+    "api_version": "consumer/v1",
+    "limits": {
+      "max_page_size": 500,
+      "max_range_bytes": 8388608,
+      "max_recursive_entries": 10000,
+      "max_recursive_bytes": 1073741824,
+      "max_text_edit_bytes": 1048576,
+      "max_diff_bytes": 2097152,
+      "max_diff_lines": 50000
+    },
+    "features": {
+      "historical_snapshots": true,
+      "historical_versions": true,
+      "hardlinks": true,
+      "symlinks": true,
+      "xattrs": true
+    }
+  },
+  "volumes": {
+    "volumes": [
+      {
+        "name": "documents",
+        "kind": "filesystem",
+        "browsable": true,
+        "readonly": false,
+        "quota": {
+          "used_bytes": 4096,
+          "limit_bytes": 1073741824,
+          "used_inodes": 3,
+          "limit_inodes": 100000
+        }
+      }
+    ],
+    "next_page_token": null
+  },
+  "entries": {
+    "view": {
+      "kind": "version",
+      "ref": "main",
+      "resolved_commit": "01J00000000000000000000000"
+    },
+    "entry": {
+      "entry_id": "ent_root_opaque",
+      "parent_entry_id": null,
+      "path": "/",
+      "name": "",
+      "name_bytes_base64": "",
+      "kind": "directory",
+      "inode": 1,
+      "inode_decimal": "1",
+      "generation": 1,
+      "generation_decimal": "1",
+      "size": 0,
+      "size_decimal": "0",
+      "allocated_bytes": 0,
+      "allocated_bytes_decimal": "0",
+      "mode": 16877,
+      "uid": 1000,
+      "gid": 1000,
+      "link_count": 2,
+      "link_count_decimal": "2",
+      "created_at": "2026-07-15T12:00:00Z",
+      "modified_at": "2026-07-15T12:00:00Z",
+      "changed_at": "2026-07-15T12:00:00Z",
+      "accessed_at": "2026-07-15T12:00:00Z",
+      "readonly": true,
+      "can_read": true,
+      "can_write": false,
+      "can_delete": false,
+      "can_rename": false,
+      "etag": "W/\"ent_root_opaque-1\"",
+      "symlink_target": null
+    },
+    "entries": [
+      {
+        "entry_id": "ent_non_utf8_opaque",
+        "parent_entry_id": "ent_root_opaque",
+        "path": null,
+        "name": null,
+        "name_bytes_base64": "/2RvYw==",
+        "kind": "file",
+        "inode": 2,
+        "inode_decimal": "2",
+        "generation": 7,
+        "generation_decimal": "7",
+        "size": 12,
+        "size_decimal": "12",
+        "allocated_bytes": 4096,
+        "allocated_bytes_decimal": "4096",
+        "mode": 33188,
+        "uid": 1000,
+        "gid": 1000,
+        "link_count": 1,
+        "link_count_decimal": "1",
+        "created_at": "2026-07-15T12:00:00Z",
+        "modified_at": "2026-07-15T12:01:00Z",
+        "changed_at": "2026-07-15T12:01:00Z",
+        "accessed_at": "2026-07-15T12:02:00Z",
+        "readonly": true,
+        "can_read": true,
+        "can_write": false,
+        "can_delete": false,
+        "can_rename": false,
+        "etag": "W/\"ent_non_utf8_opaque-7\"",
+        "symlink_target": null
+      }
+    ],
+    "next_page_token": "page_opaque_2"
+  },
+  "error": {
+    "error": {
+      "code": "quota_exceeded",
+      "message": "volume byte quota exceeded",
+      "request_id": "req-01J00000000000000000000000",
+      "details": { "resource": "bytes" }
+    }
+  }
+}

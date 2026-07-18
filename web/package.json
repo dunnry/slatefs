@@ -1,0 +1,29 @@
+{
+  "name": "slatefs-web-workspace",
+  "private": true,
+  "packageManager": "pnpm@11.7.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm --filter @slatefs/client --filter @slatefs/web-components --filter @slatefs/demo --filter @slatefs/demo-server test",
+    "openapi:check": "redocly lint ../docs/api/consumer-v1.openapi.yaml ../docs/api/demo-bff-v1.openapi.yaml",
+    "manifest:generate": "pnpm --filter @slatefs/web-components manifest:generate",
+    "manifest:check": "pnpm --filter @slatefs/web-components manifest:check",
+    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm openapi:check && pnpm manifest:check && pnpm build"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.31.0",
+    "@redocly/cli": "1.34.3",
+    "eslint": "9.31.0",
+    "globals": "16.3.0",
+    "prettier": "3.6.2",
+    "typescript": "5.8.3",
+    "typescript-eslint": "8.37.0"
+  }
+}

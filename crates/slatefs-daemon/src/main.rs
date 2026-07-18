@@ -5,7 +5,7 @@
 //! control DB while the daemon runs) → open volumes → one listener per export
 //! (DD-10).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use slatedb::admin::AdminBuilder;
 use slatedb::object_store::ObjectStore;
+use slatefs_core::Error as CoreError;
 use slatefs_core::block::{
     BlockDev, BlockVolume, ReadOnlyBlockDev, SnapshotBlockVolume, StrictSyncBlockDev,
 };
@@ -31,7 +32,7 @@ use slatefs_core::config::{
 use slatefs_core::control::{
     AuditAction, AuditActor, AuditDetailValue, AuditOutcome, AuditPlane, AuditQuery, AuditRecord,
     AuditScope, ControlPlane, ControlReader, ExportRecord, QuotaLimits, SnapshotRetentionPolicy,
-    TenantRecord, VersioningRetentionPolicy, VolumePlacementRecord, VolumeRecord,
+    TenantRecord, VersioningRetentionPolicy, VolumePlacementRecord, VolumeRecord, VolumeState,
 };
 use slatefs_core::crypto::kms;
 use slatefs_core::meta::superblock::VolumeKind;
@@ -49,6 +50,13 @@ use slatefs_core::versioning::{
 };
 use slatefs_core::vfs::Vfs;
 use slatefs_core::volume::{self, Volume, VolumeCaches};
+use slatefs_http::auth::TenantAuthenticator;
+use slatefs_http::identifiers::TokenSigner;
+use slatefs_http::metrics::ConsumerMetrics;
+use slatefs_http::{
+    ConsumerState, HistoricalView, HistoricalViewError, HistoricalViewProvider, LiveVolumeRegistry,
+    ViewKind,
+};
 use slatefs_nbd::{NbdExportOptions, NbdShutdownHandle, NbdTlsConfig};
 use slatefs_nfs::{NFSTcp, NfsExportOptions, QuotaRejectionAudit, SquashPolicy};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -609,6 +617,7 @@ struct OpenBackend {
     volume: OpenVolume,
     nbd_shutdowns: Arc<Mutex<Vec<NbdShutdownHandle>>>,
     ref_count: usize,
+    consumer_held: bool,
 }
 
 impl OpenBackend {
@@ -648,6 +657,401 @@ enum BackendExport {
     },
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum HistoricalKind {
+    Snapshot,
+    Version,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct HistoricalKey {
+    tenant: String,
+    volume: String,
+    kind: HistoricalKind,
+    exact_id: String,
+}
+
+enum HistoricalOwned {
+    Snapshot(Arc<SnapshotVolume>),
+    Version(Arc<VersionHistoricalVolume>),
+}
+
+impl HistoricalOwned {
+    fn vfs(&self) -> Arc<dyn Vfs> {
+        match self {
+            Self::Snapshot(volume) => volume.clone(),
+            Self::Version(volume) => volume.clone(),
+        }
+    }
+
+    async fn shutdown(self) {
+        let result = match self {
+            Self::Snapshot(volume) => volume.shutdown().await,
+            Self::Version(volume) => volume.shutdown().await,
+        };
+        if let Err(error) = result {
+            tracing::error!(%error, "consumer historical view shutdown failed");
+        }
+    }
+}
+
+struct HistoricalCacheEntry {
+    owned: Mutex<Option<HistoricalOwned>>,
+}
+
+impl HistoricalCacheEntry {
+    fn new(owned: HistoricalOwned) -> Self {
+        Self {
+            owned: Mutex::new(Some(owned)),
+        }
+    }
+
+    fn vfs(&self) -> Arc<dyn Vfs> {
+        self.owned
+            .lock()
+            .expect("historical cache entry poisoned")
+            .as_ref()
+            .expect("historical cache entry already closed")
+            .vfs()
+    }
+
+    async fn shutdown_now(&self) {
+        let owned = self
+            .owned
+            .lock()
+            .expect("historical cache entry poisoned")
+            .take();
+        if let Some(owned) = owned {
+            owned.shutdown().await;
+        }
+    }
+}
+
+#[derive(Default)]
+struct HistoricalCache {
+    entries: HashMap<HistoricalKey, Arc<HistoricalCacheEntry>>,
+    lru: VecDeque<HistoricalKey>,
+    /// Evicted handles remain here until every response/stream lease is gone.
+    /// Cleanup is driven explicitly from async provider methods; `Drop` never
+    /// assumes that a Tokio runtime still exists.
+    retired: Vec<Arc<HistoricalCacheEntry>>,
+}
+
+struct DaemonHistoricalViews {
+    control: Arc<ControlReader>,
+    object_store: Arc<dyn ObjectStore>,
+    capacity: usize,
+    cache: AsyncMutex<HistoricalCache>,
+    version_locks: Arc<Mutex<HashMap<VolumeId, Arc<AsyncMutex<()>>>>>,
+    version_read_repositories: Arc<Mutex<HashMap<VolumeId, Arc<CachedReadVersionRepository>>>>,
+}
+
+impl DaemonHistoricalViews {
+    fn new(
+        control: Arc<ControlReader>,
+        object_store: Arc<dyn ObjectStore>,
+        capacity: usize,
+    ) -> Self {
+        Self {
+            control,
+            object_store,
+            capacity,
+            cache: AsyncMutex::new(HistoricalCache::default()),
+            version_locks: Arc::new(Mutex::new(HashMap::new())),
+            version_read_repositories: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn with_version_repository_cache(
+        mut self,
+        version_locks: Arc<Mutex<HashMap<VolumeId, Arc<AsyncMutex<()>>>>>,
+        version_read_repositories: Arc<Mutex<HashMap<VolumeId, Arc<CachedReadVersionRepository>>>>,
+    ) -> Self {
+        self.version_locks = version_locks;
+        self.version_read_repositories = version_read_repositories;
+        self
+    }
+
+    fn version_lock(&self, tenant: &str, volume: &str) -> Arc<AsyncMutex<()>> {
+        let id = VolumeId::from_parts(tenant, volume);
+        let mut locks = self.version_locks.lock().expect("version locks poisoned");
+        Arc::clone(
+            locks
+                .entry(id)
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        )
+    }
+
+    fn touch(cache: &mut HistoricalCache, key: &HistoricalKey) {
+        cache.lru.retain(|candidate| candidate != key);
+        cache.lru.push_back(key.clone());
+    }
+
+    async fn reap(cache: &mut HistoricalCache) {
+        let mut pending = Vec::with_capacity(cache.retired.len());
+        let mut ready = Vec::new();
+        for entry in cache.retired.drain(..) {
+            if Arc::strong_count(&entry) == 1 {
+                ready.push(entry);
+            } else {
+                pending.push(entry);
+            }
+        }
+        cache.retired = pending;
+        for entry in ready {
+            entry.shutdown_now().await;
+        }
+    }
+
+    fn classify_open_error(error: &CoreError) -> HistoricalViewError {
+        match error {
+            CoreError::NotFound { .. } | CoreError::Versioning(_) => HistoricalViewError::NotFound,
+            CoreError::Invalid { .. } => HistoricalViewError::Invalid,
+            CoreError::SlateDb(_)
+            | CoreError::ObjectStore(_)
+            | CoreError::Crypto(_)
+            | CoreError::AlreadyExists { .. }
+            | CoreError::Codec(_)
+            | CoreError::Config(_)
+            | CoreError::Io(_) => HistoricalViewError::Unavailable,
+        }
+    }
+
+    async fn insert(
+        &self,
+        cache: &mut HistoricalCache,
+        key: HistoricalKey,
+        opened: HistoricalOwned,
+    ) -> Arc<HistoricalCacheEntry> {
+        if let Some(existing) = cache.entries.get(&key).cloned() {
+            opened.shutdown().await;
+            Self::touch(cache, &key);
+            return existing;
+        }
+        let entry = Arc::new(HistoricalCacheEntry::new(opened));
+        cache.entries.insert(key.clone(), Arc::clone(&entry));
+        Self::touch(cache, &key);
+        while cache.entries.len() > self.capacity {
+            let Some(evicted_key) = cache.lru.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = cache.entries.remove(&evicted_key) {
+                cache.retired.push(evicted);
+            }
+        }
+        entry
+    }
+}
+
+#[async_trait::async_trait]
+impl HistoricalViewProvider for DaemonHistoricalViews {
+    fn supports(&self, kind: ViewKind) -> bool {
+        matches!(kind, ViewKind::Snapshot | ViewKind::Version)
+    }
+
+    async fn open(
+        &self,
+        tenant: &str,
+        volume: &str,
+        kind: ViewKind,
+        reference: &str,
+    ) -> Result<HistoricalView, HistoricalViewError> {
+        let mut cache = self.cache.lock().await;
+        Self::reap(&mut cache).await;
+        // Re-authorize ownership and active/mountable state before consulting
+        // the cache. A handle opened while a volume was active must not keep
+        // serving after suspension/deletion or ownership changes.
+        let record = self
+            .control
+            .get_mountable_volume(tenant, volume)
+            .await
+            .map_err(|_| HistoricalViewError::NotFound)?;
+        if !matches!(record.kind, VolumeKind::Filesystem) {
+            return Err(HistoricalViewError::NotFound);
+        }
+        let (key, opened, exact_id, response_kind) = match kind {
+            ViewKind::Snapshot => {
+                let exact_id = uuid::Uuid::parse_str(reference)
+                    .map_err(|_| HistoricalViewError::Invalid)?
+                    .to_string();
+                let snapshots = volume::list_snapshots_for_record(
+                    &record,
+                    Arc::clone(&self.object_store),
+                    None,
+                )
+                .await
+                .map_err(|_| HistoricalViewError::Unavailable)?;
+                if !snapshots.iter().any(|snapshot| snapshot.id == exact_id) {
+                    return Err(HistoricalViewError::NotFound);
+                }
+                let key = HistoricalKey {
+                    tenant: tenant.to_owned(),
+                    volume: volume.to_owned(),
+                    kind: HistoricalKind::Snapshot,
+                    exact_id: exact_id.clone(),
+                };
+                if let Some(entry) = cache.entries.get(&key).cloned() {
+                    Self::touch(&mut cache, &key);
+                    return Ok(HistoricalView::new(
+                        entry.vfs(),
+                        ViewKind::Snapshot,
+                        exact_id,
+                        entry,
+                    ));
+                }
+                let dek = self
+                    .control
+                    .unwrap_volume_dek(&record)
+                    .await
+                    .map_err(|_| HistoricalViewError::Unavailable)?;
+                let parents = clone_parent_prefixes_from_reader(&self.control, &record)
+                    .await
+                    .map_err(|_| HistoricalViewError::Unavailable)?;
+                let opened = SnapshotVolume::open(
+                    &record,
+                    dek,
+                    Arc::clone(&self.object_store),
+                    &exact_id,
+                    parents,
+                )
+                .await
+                .map_err(|error| Self::classify_open_error(&error))?;
+                (
+                    key,
+                    HistoricalOwned::Snapshot(opened),
+                    exact_id,
+                    ViewKind::Snapshot,
+                )
+            }
+            ViewKind::Version => {
+                if reference.len() == 64 && reference.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    let exact = reference.to_ascii_lowercase();
+                    let key = HistoricalKey {
+                        tenant: tenant.to_owned(),
+                        volume: volume.to_owned(),
+                        kind: HistoricalKind::Version,
+                        exact_id: exact.clone(),
+                    };
+                    if let Some(entry) = cache.entries.get(&key).cloned() {
+                        Self::touch(&mut cache, &key);
+                        return Ok(HistoricalView::new(
+                            entry.vfs(),
+                            ViewKind::Version,
+                            exact,
+                            entry,
+                        ));
+                    }
+                }
+                // Administrative reads keep one repository open briefly to
+                // avoid repeatedly paying SlateDB's cold-open cost. Share that
+                // handle while creating the immutable checkpoint instead of
+                // contending for its per-volume maintenance lease. The same
+                // lock also preserves mutation-driven cache invalidation.
+                let version_lock = self.version_lock(tenant, volume);
+                let _guard = version_lock.lock().await;
+                let id = VolumeId::from_parts(tenant, volume);
+                let cached = self
+                    .version_read_repositories
+                    .lock()
+                    .expect("version repository cache poisoned")
+                    .get(&id)
+                    .cloned();
+                let opened = match cached {
+                    Some(cached) => {
+                        cached.touch();
+                        VersionHistoricalVolume::open_readonly_with_repository(
+                            &self.control,
+                            Arc::clone(&self.object_store),
+                            tenant,
+                            volume,
+                            reference,
+                            &cached.repository,
+                        )
+                        .await
+                    }
+                    None => {
+                        VersionHistoricalVolume::open_readonly(
+                            &self.control,
+                            Arc::clone(&self.object_store),
+                            tenant,
+                            volume,
+                            reference,
+                        )
+                        .await
+                    }
+                }
+                .map_err(|error| Self::classify_open_error(&error))?;
+                let exact_id = opened.commit().to_owned();
+                let key = HistoricalKey {
+                    tenant: tenant.to_owned(),
+                    volume: volume.to_owned(),
+                    kind: HistoricalKind::Version,
+                    exact_id: exact_id.clone(),
+                };
+                (
+                    key,
+                    HistoricalOwned::Version(opened),
+                    exact_id,
+                    ViewKind::Version,
+                )
+            }
+            ViewKind::Live => return Err(HistoricalViewError::Invalid),
+        };
+        let entry = self.insert(&mut cache, key, opened).await;
+        Ok(HistoricalView::new(
+            entry.vfs(),
+            response_kind,
+            exact_id,
+            entry,
+        ))
+    }
+
+    async fn shutdown(&self) {
+        let mut entries = {
+            let mut cache = self.cache.lock().await;
+            cache.lru.clear();
+            let mut entries = cache
+                .entries
+                .drain()
+                .map(|(_, entry)| entry)
+                .collect::<Vec<_>>();
+            entries.append(&mut cache.retired);
+            entries
+        };
+
+        // Listener tasks are stopped before provider shutdown. Allow any
+        // already-created response body to release its lease, then close every
+        // reader deterministically while the runtime is still alive.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !entries.is_empty() {
+            let mut pending = Vec::new();
+            for entry in entries {
+                if Arc::strong_count(&entry) == 1 {
+                    entry.shutdown_now().await;
+                } else {
+                    pending.push(entry);
+                }
+            }
+            if pending.is_empty() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::error!(
+                    readers = pending.len(),
+                    "timed out waiting for consumer historical view leases to drain"
+                );
+                // Keep ownership in the provider so readers are not silently
+                // leaked or closed under an active stream. A subsequent
+                // shutdown call can retry once those leases are released.
+                self.cache.lock().await.retired = pending;
+                break;
+            }
+            entries = pending;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
 struct ExportManager {
     object_store: Arc<dyn ObjectStore>,
     kms: Arc<dyn kms::Kms>,
@@ -658,6 +1062,7 @@ struct ExportManager {
     metrics: ExportMetrics,
     metrics_targets: Arc<Mutex<Vec<MetricsTarget>>>,
     admin_targets: AdminTargets,
+    consumer_registry: LiveVolumeRegistry,
     admin_block_targets: AdminBlockTargets,
     running: HashMap<ExportKey, RunningExport>,
     open_backends: HashMap<BackendKey, OpenBackend>,
@@ -977,6 +1382,7 @@ async fn handle_metrics_connection(
     mut stream: TcpStream,
     targets: Arc<Mutex<Vec<MetricsTarget>>>,
     export_metrics: ExportMetrics,
+    consumer_metrics: ConsumerMetrics,
 ) -> std::io::Result<()> {
     let mut buf = [0u8; 1024];
     let read = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await;
@@ -999,7 +1405,14 @@ async fn handle_metrics_connection(
     let (status, content_type, body) = if method == Some("GET") && path == Some("/metrics") {
         ("200 OK", "text/plain; version=0.0.4; charset=utf-8", {
             let targets = targets.lock().expect("metrics targets poisoned").clone();
-            render_daemon_metrics_with_exports(&targets, &export_metrics)
+            let mut rendered = render_daemon_metrics_with_exports(&targets, &export_metrics);
+            for ((operation, status), sample) in consumer_metrics.snapshot() {
+                rendered.push_str(&format!("slatefs_consumer_requests_total{{operation=\"{operation}\",status=\"{status}\"}} {}\n", sample.requests));
+                rendered.push_str(&format!("slatefs_consumer_errors_total{{operation=\"{operation}\",status=\"{status}\"}} {}\n", sample.errors));
+                rendered.push_str(&format!("slatefs_consumer_response_bytes_total{{operation=\"{operation}\",status=\"{status}\"}} {}\n", sample.response_bytes));
+                rendered.push_str(&format!("slatefs_consumer_duration_seconds_total{{operation=\"{operation}\",status=\"{status}\"}} {}\n", sample.duration_nanos as f64 / 1_000_000_000.0));
+            }
+            rendered
         })
     } else {
         (
@@ -1016,6 +1429,7 @@ async fn serve_metrics(
     listen: String,
     targets: Arc<Mutex<Vec<MetricsTarget>>>,
     export_metrics: ExportMetrics,
+    consumer_metrics: ConsumerMetrics,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(&listen).await?;
     tracing::info!(listen, "metrics endpoint ready at /metrics");
@@ -1023,8 +1437,11 @@ async fn serve_metrics(
         let (stream, peer) = listener.accept().await?;
         let targets = Arc::clone(&targets);
         let export_metrics = export_metrics.clone();
+        let consumer_metrics = consumer_metrics.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_metrics_connection(stream, targets, export_metrics).await {
+            if let Err(error) =
+                handle_metrics_connection(stream, targets, export_metrics, consumer_metrics).await
+            {
                 tracing::debug!(%peer, "metrics scrape failed: {error}");
             }
         });
@@ -1042,11 +1459,16 @@ const MAX_ADMIN_REQUEST_BODY_BYTES: usize = 512 * 1024 * 1024;
 const VERSION_REPOSITORY_BUNDLE_CONTENT_TYPE: &str = "application/vnd.slatefs.version-repository";
 const VERSION_REPOSITORY_SYNC_CONTENT_TYPE: &str = "application/vnd.slatefs.version-sync";
 const SLATEDB_VERSION: &str = "0.14.1";
+const VERSION_READ_REPOSITORY_IDLE_TTL: Duration = Duration::from_secs(30);
 static RUSTLS_PROVIDER: Once = Once::new();
 
 #[derive(Clone)]
 enum AdminControl {
     Available(Arc<ControlReader>),
+    // Retained so readiness/status handling can represent a degraded control
+    // plane in tests and in future runtime recovery paths. Normal startup now
+    // shares the already-open daemon reader and fails before this state.
+    #[cfg_attr(not(test), allow(dead_code))]
     Unavailable(String),
 }
 
@@ -1064,8 +1486,31 @@ struct AdminState {
     tenant_tokens: BTreeMap<String, String>,
     tenant_token_files: BTreeMap<String, PathBuf>,
     version_locks: Arc<Mutex<HashMap<VolumeId, Arc<AsyncMutex<()>>>>>,
+    version_read_repositories: Arc<Mutex<HashMap<VolumeId, Arc<CachedReadVersionRepository>>>>,
+    version_read_writer_refresh: Arc<Mutex<HashSet<VolumeId>>>,
     allow_cert_auth: bool,
     node_id: Option<String>,
+}
+
+struct CachedReadVersionRepository {
+    repository: VersionRepository,
+    last_used: Mutex<Instant>,
+}
+
+impl CachedReadVersionRepository {
+    fn touch(&self) {
+        *self
+            .last_used
+            .lock()
+            .expect("version repository cache poisoned") = Instant::now();
+    }
+
+    fn idle_for(&self) -> Duration {
+        self.last_used
+            .lock()
+            .expect("version repository cache poisoned")
+            .elapsed()
+    }
 }
 
 struct AdminHttpRequest {
@@ -1212,6 +1657,10 @@ struct VersionBranchMergeRequest {
     conflict_strategy: VersionMergeConflictStrategy,
     #[serde(default)]
     author: Option<String>,
+    #[serde(default)]
+    expected_source: Option<String>,
+    #[serde(default)]
+    expected_target: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1224,12 +1673,22 @@ struct VersionCherryPickRequest {
     author: Option<String>,
     #[serde(default)]
     idempotency_key: Option<String>,
+    #[serde(default)]
+    expected_target: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VersionPolicyPatchRequest {
     enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsumerRootPatchRequest {
+    mode: u32,
+    uid: u32,
+    gid: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2282,6 +2741,10 @@ async fn open_version_repository(
     tenant: &str,
     volume: &str,
 ) -> Result<(ControlPlane, VersionRepository), AdminError> {
+    // Callers hold the per-volume version lock. Mutating and one-shot
+    // operations must evict the shared read repository before opening their
+    // own SlateDB handle and maintenance lease.
+    close_cached_read_version_repository(state, tenant, volume).await?;
     let control = state.control_writer().await?;
     match VersionRepository::open(&control, Arc::clone(&state.object_store), tenant, volume).await {
         Ok(repository) => Ok((control, repository)),
@@ -2292,13 +2755,162 @@ async fn open_version_repository(
     }
 }
 
+async fn cached_read_version_repository(
+    state: &AdminState,
+    tenant: &str,
+    volume: &str,
+) -> Result<Arc<CachedReadVersionRepository>, AdminError> {
+    let id = VolumeId::from_parts(tenant, volume);
+    if let Some(cached) = state
+        .version_read_repositories
+        .lock()
+        .expect("version repository cache poisoned")
+        .get(&id)
+        .cloned()
+    {
+        cached.touch();
+        return Ok(cached);
+    }
+
+    let force_writer_refresh = state
+        .version_read_writer_refresh
+        .lock()
+        .expect("version repository refresh set poisoned")
+        .remove(&id);
+    let repository = if force_writer_refresh {
+        match open_cached_read_version_repository_with_writer(state, tenant, volume).await {
+            Ok(repository) => repository,
+            Err(error) => {
+                state
+                    .version_read_writer_refresh
+                    .lock()
+                    .expect("version repository refresh set poisoned")
+                    .insert(id.clone());
+                return Err(error);
+            }
+        }
+    } else {
+        // Read panels can reuse the daemon's already-open ControlReader.
+        // Opening a fresh writable control plane accounted for most of the
+        // cold-tab delay.
+        let control = state.control_reader()?;
+        match VersionRepository::open_existing_readonly(
+            control.as_ref(),
+            Arc::clone(&state.object_store),
+            tenant,
+            volume,
+        )
+        .await
+        .map_err(core_error)?
+        {
+            Some(repository) => repository,
+            // A newly enabled volume has no repository prefix yet. Preserve
+            // the existing behavior by creating it through the writer once.
+            None => open_cached_read_version_repository_with_writer(state, tenant, volume).await?,
+        }
+    };
+
+    Ok(cache_read_version_repository(
+        state, tenant, volume, id, repository,
+    ))
+}
+
+async fn open_cached_read_version_repository_with_writer(
+    state: &AdminState,
+    tenant: &str,
+    volume: &str,
+) -> Result<VersionRepository, AdminError> {
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
+    if let Err(error) = control.close().await {
+        let _ = repository.close().await;
+        return Err(core_error(error));
+    }
+    Ok(repository)
+}
+
+fn cache_read_version_repository(
+    state: &AdminState,
+    tenant: &str,
+    volume: &str,
+    id: VolumeId,
+    repository: VersionRepository,
+) -> Arc<CachedReadVersionRepository> {
+    let cached = Arc::new(CachedReadVersionRepository {
+        repository,
+        last_used: Mutex::new(Instant::now()),
+    });
+    state
+        .version_read_repositories
+        .lock()
+        .expect("version repository cache poisoned")
+        .insert(id.clone(), Arc::clone(&cached));
+
+    let repositories = Arc::clone(&state.version_read_repositories);
+    let version_lock = state.version_lock(tenant, volume);
+    let cached_for_eviction = Arc::clone(&cached);
+    let tenant = tenant.to_string();
+    let volume = volume.to_string();
+    tokio::spawn(async move {
+        loop {
+            let idle_for = cached_for_eviction.idle_for();
+            if idle_for < VERSION_READ_REPOSITORY_IDLE_TTL {
+                tokio::time::sleep(VERSION_READ_REPOSITORY_IDLE_TTL - idle_for).await;
+                continue;
+            }
+
+            let _guard = version_lock.lock().await;
+            if cached_for_eviction.idle_for() < VERSION_READ_REPOSITORY_IDLE_TTL {
+                continue;
+            }
+            let removed = {
+                let mut repositories = repositories
+                    .lock()
+                    .expect("version repository cache poisoned");
+                if repositories
+                    .get(&id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &cached_for_eviction))
+                {
+                    repositories.remove(&id)
+                } else {
+                    None
+                }
+            };
+            let Some(removed) = removed else {
+                break;
+            };
+            if let Err(error) = removed.repository.close().await {
+                tracing::warn!(%error, %tenant, %volume, "failed to close idle version repository");
+            }
+            break;
+        }
+    });
+
+    cached
+}
+
+async fn close_cached_read_version_repository(
+    state: &AdminState,
+    tenant: &str,
+    volume: &str,
+) -> Result<(), AdminError> {
+    let id = VolumeId::from_parts(tenant, volume);
+    let cached = state
+        .version_read_repositories
+        .lock()
+        .expect("version repository cache poisoned")
+        .remove(&id);
+    if let Some(cached) = cached {
+        cached.repository.close().await.map_err(core_error)?;
+    }
+    Ok(())
+}
+
 async fn finish_version_repository<T>(
     control: ControlPlane,
     repository: VersionRepository,
     result: slatefs_core::error::Result<T>,
 ) -> Result<T, AdminError> {
-    let repository_close = repository.close().await;
-    let control_close = control.close().await;
+    let (repository_close, control_close) = tokio::join!(repository.close(), control.close());
     let value = result.map_err(core_error)?;
     repository_close.map_err(core_error)?;
     control_close.map_err(core_error)?;
@@ -2329,17 +2941,7 @@ async fn commit_live_version_response(
         .validate_writer_lease()
         .await
         .map_err(|error| live_version_error(&target, tenant, volume, error))?;
-    let control = state.control_writer().await?;
-    let repository =
-        match VersionRepository::open(&control, Arc::clone(&state.object_store), tenant, volume)
-            .await
-        {
-            Ok(repository) => repository,
-            Err(error) => {
-                let _ = control.close().await;
-                return Err(core_error(error));
-            }
-        };
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
 
     let commit = match idempotency_key.as_deref() {
         Some(key) => repository
@@ -2442,8 +3044,7 @@ async fn commit_live_version_response(
         }
         Err(_) => Ok(()),
     };
-    let repository_close = repository.close().await;
-    let control_close = control.close().await;
+    let (repository_close, control_close) = tokio::join!(repository.close(), control.close());
     let (commit, replayed) =
         commit.map_err(|error| live_version_error(&target, tenant, volume, error))?;
     audit?;
@@ -2484,17 +3085,7 @@ async fn restore_live_version_response(
         .map_err(|error| live_version_error(&target, tenant, volume, error))?;
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
-    let control = state.control_writer().await?;
-    let repository =
-        match VersionRepository::open(&control, Arc::clone(&state.object_store), tenant, volume)
-            .await
-        {
-            Ok(repository) => repository,
-            Err(error) => {
-                let _ = control.close().await;
-                return Err(core_error(error));
-            }
-        };
+    let (control, repository) = open_version_repository(state, tenant, volume).await?;
 
     let restore = repository
         .apply_restore(
@@ -2535,8 +3126,7 @@ async fn restore_live_version_response(
     } else {
         Ok(())
     };
-    let repository_close = repository.close().await;
-    let control_close = control.close().await;
+    let (repository_close, control_close) = tokio::join!(repository.close(), control.close());
     let applied = restore.map_err(|error| {
         if target.is_dead() {
             live_version_error(&target, tenant, volume, error)
@@ -2592,19 +3182,15 @@ async fn get_versioning_response(
     tenant: &str,
     volume: &str,
 ) -> Result<AdminHttpResponse, AdminError> {
-    let control = state.control_writer().await?;
-    let policy = control
-        .try_get_versioning_policy(tenant, volume)
-        .await
-        .map_err(core_error)?;
-    let retention = control
-        .try_get_versioning_retention_policy(tenant, volume)
-        .await
-        .map_err(core_error)?;
-    control.close().await.map_err(core_error)?;
-    let lease = try_get_version_maintenance_lease(Arc::clone(&state.object_store), tenant, volume)
-        .await
-        .map_err(core_error)?;
+    let control = state.control_reader()?;
+    let (policy, retention, lease) = tokio::join!(
+        control.try_get_versioning_policy(tenant, volume),
+        control.try_get_versioning_retention_policy(tenant, volume),
+        try_get_version_maintenance_lease(Arc::clone(&state.object_store), tenant, volume),
+    );
+    let policy = policy.map_err(core_error)?;
+    let retention = retention.map_err(core_error)?;
+    let lease = lease.map_err(core_error)?;
     Ok(AdminHttpResponse::json(
         200,
         json!({
@@ -2642,13 +3228,79 @@ async fn get_working_tree_status_response(
         .working_tree_status(target.as_ref(), reference, path)
         .await;
     let writer_validation = target.validate_writer_lease().await;
-    let repository_close = repository.close().await;
-    let control_close = control.close().await;
+    let (repository_close, control_close) = tokio::join!(repository.close(), control.close());
     let status = result.map_err(|error| live_version_error(&target, tenant, volume, error))?;
     writer_validation.map_err(|error| live_version_error(&target, tenant, volume, error))?;
     repository_close.map_err(core_error)?;
     control_close.map_err(core_error)?;
     Ok(AdminHttpResponse::json(200, json!({ "status": status })))
+}
+
+async fn get_version_overview_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let reference = request
+        .query
+        .get("reference")
+        .map(String::as_str)
+        .unwrap_or("main");
+    let path = request.query.get("path").map(String::as_str).unwrap_or("/");
+    let branch = request
+        .query
+        .get("branch")
+        .map(String::as_str)
+        .unwrap_or("main");
+    let limit = page_limit(&request.query)?;
+    let target = live_filesystem_target(state, tenant, volume)?;
+    target
+        .validate_writer_lease()
+        .await
+        .map_err(|error| live_version_error(&target, tenant, volume, error))?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let cached = cached_read_version_repository(state, tenant, volume).await?;
+    let (status, history, branches, entries) = tokio::join!(
+        cached
+            .repository
+            .working_tree_status(target.as_ref(), reference, path),
+        cached
+            .repository
+            .history_page_on_branch(branch, None, limit, None),
+        cached.repository.list_branches(),
+        cached.repository.reflog(branch, limit),
+    );
+    let writer_validation = target.validate_writer_lease().await;
+    let status = status.map_err(|error| live_version_error(&target, tenant, volume, error))?;
+    let (commits, next_page_token) = history.map_err(core_error)?;
+    let branches = branches.map_err(core_error)?;
+    let entries = entries.map_err(core_error)?;
+    writer_validation.map_err(|error| live_version_error(&target, tenant, volume, error))?;
+    let commits = commits
+        .into_iter()
+        .map(|commit| {
+            json!({
+                "id": commit.id,
+                "parents": commit.parents,
+                "created_at": commit.created_at,
+                "message": commit.message,
+                "paths": commit.paths,
+                "provenance": commit.provenance,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({
+            "status": status,
+            "commits": commits,
+            "next_page_token": next_page_token,
+            "branches": branches,
+            "entries": entries,
+        }),
+    ))
 }
 
 async fn get_restore_preview_response(
@@ -2700,6 +3352,7 @@ async fn patch_versioning_response(
     let body: VersionPolicyPatchRequest = parse_json_body(request)?;
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
+    close_cached_read_version_repository(state, tenant, volume).await?;
     let control = state.control_writer().await?;
     let policy = control
         .set_versioning_enabled(tenant, volume, body.enabled)
@@ -2722,6 +3375,11 @@ async fn patch_versioning_response(
     )
     .await?;
     control.close().await.map_err(core_error)?;
+    state
+        .version_read_writer_refresh
+        .lock()
+        .expect("version repository refresh set poisoned")
+        .insert(VolumeId::from_parts(tenant, volume));
     Ok(AdminHttpResponse::json(
         200,
         json!({
@@ -2730,6 +3388,45 @@ async fn patch_versioning_response(
                 "updated_at": policy.updated_at,
             }
         }),
+    ))
+}
+
+async fn patch_consumer_root_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let body: ConsumerRootPatchRequest = parse_json_body(request)?;
+    if body.mode & !0o7777 != 0 {
+        return Err(bad_request(
+            "consumer root mode must contain only permission bits",
+        ));
+    }
+    let target = live_filesystem_target(state, tenant, volume)?;
+    target
+        .validate_writer_lease()
+        .await
+        .map_err(|error| live_version_error(&target, tenant, volume, error))?;
+    let attr = target
+        .setattr(
+            &slatefs_core::vfs::Credentials::root(),
+            slatefs_core::meta::inode::ROOT_INO,
+            slatefs_core::vfs::SetAttrs {
+                mode: Some(body.mode),
+                uid: Some(body.uid),
+                gid: Some(body.gid),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| AdminError {
+            status: 409,
+            message: format!("consumer root update failed: {error}"),
+        })?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "consumer_root": { "mode": attr.mode, "uid": attr.uid, "gid": attr.gid } }),
     ))
 }
 
@@ -2799,6 +3496,7 @@ async fn import_version_repository_bundle_response(
     }
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
+    close_cached_read_version_repository(state, tenant, volume).await?;
     let control = state.control_writer().await?;
     let result = VersionRepository::import_bundle(
         &control,
@@ -2856,6 +3554,7 @@ async fn get_version_sync_state_response(
 ) -> Result<AdminHttpResponse, AdminError> {
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
+    close_cached_read_version_repository(state, tenant, volume).await?;
     let control = state.control_writer().await?;
     let repository =
         VersionRepository::open_existing(&control, Arc::clone(&state.object_store), tenant, volume)
@@ -2961,6 +3660,7 @@ async fn apply_version_sync_response(
     let force = query_bool(&request.query, "force", false);
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
+    close_cached_read_version_repository(state, tenant, volume).await?;
     let control = state.control_writer().await?;
     let result = VersionRepository::apply_sync_bundle(
         &control,
@@ -3389,12 +4089,43 @@ async fn list_version_branches_response(
 ) -> Result<AdminHttpResponse, AdminError> {
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
-    let (control, repository) = open_version_repository(state, tenant, volume).await?;
-    let result = repository.list_branches().await;
-    let branches = finish_version_repository(control, repository, result).await?;
+    let cached = cached_read_version_repository(state, tenant, volume).await?;
+    let branches = cached
+        .repository
+        .list_branches()
+        .await
+        .map_err(core_error)?;
     Ok(AdminHttpResponse::json(
         200,
         json!({ "branches": branches }),
+    ))
+}
+
+async fn get_version_branch_overview_response(
+    state: &AdminState,
+    request: &AdminHttpRequest,
+    tenant: &str,
+    volume: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    let branch = request
+        .query
+        .get("branch")
+        .map(String::as_str)
+        .unwrap_or("main");
+    let limit = page_limit(&request.query)?;
+    let version_lock = state.version_lock(tenant, volume);
+    let _guard = version_lock.lock().await;
+    let cached = cached_read_version_repository(state, tenant, volume).await?;
+    let (branches, entries) = tokio::join!(
+        cached.repository.list_branches(),
+        cached.repository.reflog(branch, limit),
+    );
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({
+            "branches": branches.map_err(core_error)?,
+            "entries": entries.map_err(core_error)?,
+        }),
     ))
 }
 
@@ -3411,9 +4142,12 @@ async fn get_version_attestation_quorum_response(
         .ok_or_else(|| bad_request("commit query parameter is required"))?;
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
-    let (control, repository) = open_version_repository(state, tenant, volume).await?;
-    let result = repository.attestation_quorum(branch, commit).await;
-    let quorum = finish_version_repository(control, repository, result).await?;
+    let cached = cached_read_version_repository(state, tenant, volume).await?;
+    let quorum = cached
+        .repository
+        .attestation_quorum(branch, commit)
+        .await
+        .map_err(core_error)?;
     Ok(AdminHttpResponse::json(200, json!({ "quorum": quorum })))
 }
 
@@ -3427,9 +4161,12 @@ async fn list_version_reflog_response(
     let limit = page_limit(&request.query)?;
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
-    let (control, repository) = open_version_repository(state, tenant, volume).await?;
-    let result = repository.reflog(branch, limit).await;
-    let entries = finish_version_repository(control, repository, result).await?;
+    let cached = cached_read_version_repository(state, tenant, volume).await?;
+    let entries = cached
+        .repository
+        .reflog(branch, limit)
+        .await
+        .map_err(core_error)?;
     Ok(AdminHttpResponse::json(200, json!({ "entries": entries })))
 }
 
@@ -3819,7 +4556,14 @@ async fn merge_version_branch_response(
     let _guard = version_lock.lock().await;
     let (control, repository) = open_version_repository(state, tenant, volume).await?;
     let result = repository
-        .merge_branch(&body.source, target, body.conflict_strategy, provenance)
+        .merge_branch_if_heads(
+            &body.source,
+            target,
+            body.expected_source.as_deref(),
+            body.expected_target.as_deref(),
+            body.conflict_strategy,
+            provenance,
+        )
         .await;
     let audit = match &result {
         Ok(merge) => {
@@ -3922,9 +4666,12 @@ async fn preview_version_branch_merge_response(
         .ok_or_else(|| bad_request("source query parameter is required"))?;
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
-    let (control, repository) = open_version_repository(state, tenant, volume).await?;
-    let result = repository.preview_branch_merge(source, target).await;
-    let preview = finish_version_repository(control, repository, result).await?;
+    let cached = cached_read_version_repository(state, tenant, volume).await?;
+    let preview = cached
+        .repository
+        .preview_branch_merge(source, target)
+        .await
+        .map_err(version_merge_error)?;
     Ok(AdminHttpResponse::json(200, json!({ "preview": preview })))
 }
 
@@ -3943,9 +4690,10 @@ async fn cherry_pick_version_response(
     let _guard = version_lock.lock().await;
     let (control, repository) = open_version_repository(state, tenant, volume).await?;
     let result = repository
-        .cherry_pick(
+        .cherry_pick_if_head(
             &body.source,
             target,
+            body.expected_target.as_deref(),
             body.mainline,
             provenance,
             body.idempotency_key.as_deref(),
@@ -4066,11 +4814,12 @@ async fn preview_version_cherry_pick_response(
         .transpose()?;
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
-    let (control, repository) = open_version_repository(state, tenant, volume).await?;
-    let result = repository
+    let cached = cached_read_version_repository(state, tenant, volume).await?;
+    let preview = cached
+        .repository
         .preview_cherry_pick(source, target, mainline)
-        .await;
-    let preview = finish_version_repository(control, repository, result).await?;
+        .await
+        .map_err(version_cherry_pick_error)?;
     Ok(AdminHttpResponse::json(200, json!({ "preview": preview })))
 }
 
@@ -4125,9 +4874,8 @@ async fn get_version_stats_response(
 ) -> Result<AdminHttpResponse, AdminError> {
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
-    let (control, repository) = open_version_repository(state, tenant, volume).await?;
-    let result = repository.stats().await;
-    let stats = finish_version_repository(control, repository, result).await?;
+    let cached = cached_read_version_repository(state, tenant, volume).await?;
+    let stats = cached.repository.stats().await.map_err(core_error)?;
     let usage_percent = stats.max_bytes.map(|max| {
         if max == 0 {
             0.0
@@ -4160,9 +4908,8 @@ async fn verify_version_history_response(
 ) -> Result<AdminHttpResponse, AdminError> {
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
-    let (control, repository) = open_version_repository(state, tenant, volume).await?;
-    let result = repository.verify().await;
-    let report = finish_version_repository(control, repository, result).await?;
+    let cached = cached_read_version_repository(state, tenant, volume).await?;
+    let report = cached.repository.verify().await.map_err(core_error)?;
     Ok(AdminHttpResponse::json(
         200,
         json!({
@@ -4183,12 +4930,11 @@ async fn get_version_retention_response(
     tenant: &str,
     volume: &str,
 ) -> Result<AdminHttpResponse, AdminError> {
-    let control = state.control_writer().await?;
+    let control = state.control_reader()?;
     let policy = control
         .try_get_versioning_retention_policy(tenant, volume)
         .await
         .map_err(core_error)?;
-    control.close().await.map_err(core_error)?;
     Ok(AdminHttpResponse::json(
         200,
         json!({ "retention": version_retention_json(policy.as_ref()) }),
@@ -4219,6 +4965,7 @@ async fn patch_version_retention_response(
 
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
+    close_cached_read_version_repository(state, tenant, volume).await?;
     let control = state.control_writer().await?;
     let policy = if body.clear {
         control
@@ -4269,6 +5016,11 @@ async fn patch_version_retention_response(
     )
     .await?;
     control.close().await.map_err(core_error)?;
+    state
+        .version_read_writer_refresh
+        .lock()
+        .expect("version repository refresh set poisoned")
+        .insert(VolumeId::from_parts(tenant, volume));
     Ok(AdminHttpResponse::json(
         200,
         json!({ "retention": version_retention_json(policy.as_ref()) }),
@@ -4284,6 +5036,7 @@ async fn run_version_gc_response(
     let body: VersionGcRequest = parse_json_body(request)?;
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
+    close_cached_read_version_repository(state, tenant, volume).await?;
     let control = state.control_writer().await?;
     let retention = control
         .try_get_versioning_retention_policy(tenant, volume)
@@ -4378,6 +5131,7 @@ async fn purge_version_history_response(
     }
     let version_lock = state.version_lock(tenant, volume);
     let _guard = version_lock.lock().await;
+    close_cached_read_version_repository(state, tenant, volume).await?;
     let control = state.control_writer().await?;
     let result =
         purge_version_history(&control, Arc::clone(&state.object_store), tenant, volume).await;
@@ -5177,6 +5931,32 @@ async fn list_snapshots_response(
     ))
 }
 
+async fn delete_snapshot_response(
+    state: &AdminState,
+    tenant: &str,
+    volume: &str,
+    snapshot: &str,
+) -> Result<AdminHttpResponse, AdminError> {
+    // Checkpoint administration does not open a writable Volume and therefore
+    // preserves the daemon's one-writer invariant for the served volume.
+    let control = state.control_writer().await?;
+    let result = volume::delete_snapshot(
+        &control,
+        Arc::clone(&state.object_store),
+        tenant,
+        volume,
+        snapshot,
+    )
+    .await;
+    let close = control.close().await;
+    result.map_err(core_error)?;
+    close.map_err(core_error)?;
+    Ok(AdminHttpResponse::json(
+        200,
+        json!({ "deleted_snapshot": snapshot }),
+    ))
+}
+
 async fn get_snapshot_retention_response(
     state: &AdminState,
     tenant: &str,
@@ -5666,6 +6446,18 @@ async fn route_admin_request(
             patch_volume_quota_response(state, request, tenant, volume).await
         }
         (
+            "PATCH",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "consumer-root",
+            ],
+        ) => patch_consumer_root_response(state, request, tenant, volume).await,
+        (
             "POST",
             [
                 "admin",
@@ -5687,9 +6479,48 @@ async fn route_admin_request(
                 tenant,
                 "volumes",
                 volume,
+                "versioning",
+                "branch-overview",
+            ],
+        ) => get_version_branch_overview_response(state, request, tenant, volume).await,
+        (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "versioning",
+                "overview",
+            ],
+        ) => get_version_overview_response(state, request, tenant, volume).await,
+        (
+            "GET",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
                 "snapshots",
             ],
         ) => list_snapshots_response(state, request, tenant, volume).await,
+        (
+            "DELETE",
+            [
+                "admin",
+                "v1",
+                "tenants",
+                tenant,
+                "volumes",
+                volume,
+                "snapshots",
+                snapshot,
+            ],
+        ) => delete_snapshot_response(state, tenant, volume, snapshot).await,
         (
             "GET",
             [
@@ -7390,6 +8221,7 @@ impl ExportManager {
             metrics,
             metrics_targets: targets.metrics,
             admin_targets: targets.admin,
+            consumer_registry: LiveVolumeRegistry::default(),
             admin_block_targets: targets.admin_blocks,
             running: HashMap::new(),
             open_backends: HashMap::new(),
@@ -7840,6 +8672,7 @@ impl ExportManager {
                 volume: OpenVolume::FsVersion(version),
                 nbd_shutdowns: Arc::new(Mutex::new(Vec::new())),
                 ref_count: 0,
+                consumer_held: false,
             })
         } else if let Some(snapshot) = &export.snapshot {
             let snapshot_volume = SnapshotVolume::open(
@@ -7869,6 +8702,7 @@ impl ExportManager {
                 volume: OpenVolume::FsSnapshot(snapshot_volume),
                 nbd_shutdowns: Arc::new(Mutex::new(Vec::new())),
                 ref_count: 0,
+                consumer_held: false,
             })
         } else {
             let mut caches = VolumeCaches::from_config(
@@ -7917,6 +8751,7 @@ impl ExportManager {
                 volume: OpenVolume::FsWritable(volume),
                 nbd_shutdowns: Arc::new(Mutex::new(Vec::new())),
                 ref_count: 0,
+                consumer_held: false,
             })
         }
     }
@@ -7956,6 +8791,7 @@ impl ExportManager {
                 volume: OpenVolume::BlockSnapshot(snapshot_volume),
                 nbd_shutdowns,
                 ref_count: 0,
+                consumer_held: false,
             })
         } else {
             let caches = VolumeCaches::from_config(
@@ -8009,6 +8845,7 @@ impl ExportManager {
                 volume: OpenVolume::BlockWritable(volume),
                 nbd_shutdowns,
                 ref_count: 0,
+                consumer_held: false,
             })
         }
     }
@@ -8102,6 +8939,131 @@ impl ExportManager {
         Ok(())
     }
 
+    async fn reconcile_consumer_backends(
+        &mut self,
+        reader: &ControlReader,
+        tenants: &HashSet<String>,
+    ) -> anyhow::Result<()> {
+        let mut desired = HashSet::new();
+        for tenant in tenants {
+            for record in reader.list_volumes(tenant).await? {
+                if record.state == VolumeState::Active
+                    && matches!(record.kind, VolumeKind::Filesystem)
+                {
+                    desired.insert(BackendKey {
+                        tenant: tenant.clone(),
+                        volume: record.name,
+                        snapshot: None,
+                        version: None,
+                    });
+                }
+            }
+        }
+        let exported_live = self
+            .open_backends
+            .iter()
+            .filter(|(key, backend)| {
+                key.snapshot.is_none() && key.version.is_none() && backend.ref_count > 0
+            })
+            .map(|(key, _)| (key.tenant.clone(), key.volume.clone()))
+            .collect::<HashSet<_>>();
+        self.live_share_count = exported_live
+            .into_iter()
+            .chain(
+                desired
+                    .iter()
+                    .map(|key| (key.tenant.clone(), key.volume.clone())),
+            )
+            .collect::<HashSet<_>>()
+            .len()
+            .max(1);
+
+        for key in &desired {
+            if let Some(backend) = self.open_backends.get_mut(key) {
+                backend.consumer_held = true;
+                if let Some(volume) = backend.writable() {
+                    self.consumer_registry.insert(
+                        key.tenant.clone(),
+                        key.volume.clone(),
+                        Arc::clone(volume),
+                    );
+                }
+                continue;
+            }
+            let record = reader
+                .get_mountable_volume(&key.tenant, &key.volume)
+                .await?;
+            let dek = reader.unwrap_volume_dek(&record).await?;
+            let clone_parent_prefixes = clone_parent_prefixes_from_reader(reader, &record).await?;
+            let mut caches = VolumeCaches::from_config(
+                &self.cache,
+                &self.slatedb,
+                &key.tenant,
+                &key.volume,
+                self.live_share_count,
+            );
+            let recorder = Arc::new(AggregatingRecorder::default());
+            caches.recorder = Some(Arc::clone(&recorder));
+            let volume =
+                Volume::open_with_caches(&record, dek, Arc::clone(&self.object_store), &caches)
+                    .await
+                    .with_context(|| {
+                        format!("opening consumer volume {}/{}", key.tenant, key.volume)
+                    })?;
+            self.metrics_targets
+                .lock()
+                .expect("metrics targets poisoned")
+                .push(MetricsTarget::Writable {
+                    tenant: key.tenant.clone(),
+                    volume_name: key.volume.clone(),
+                    recorder,
+                    volume: Arc::clone(&volume),
+                });
+            self.admin_targets
+                .lock()
+                .expect("admin targets poisoned")
+                .insert(key.volume_id(), Arc::clone(&volume));
+            self.consumer_registry.insert(
+                key.tenant.clone(),
+                key.volume.clone(),
+                Arc::clone(&volume),
+            );
+            self.open_backends.insert(
+                key.clone(),
+                OpenBackend {
+                    volume: OpenVolume::FsWritable(volume),
+                    nbd_shutdowns: Arc::new(Mutex::new(Vec::new())),
+                    ref_count: 0,
+                    consumer_held: true,
+                },
+            );
+            drop(clone_parent_prefixes);
+        }
+
+        let released = self
+            .open_backends
+            .keys()
+            .filter(|key| {
+                key.snapshot.is_none()
+                    && key.version.is_none()
+                    && !desired.contains(*key)
+                    && self
+                        .open_backends
+                        .get(*key)
+                        .is_some_and(|backend| backend.consumer_held)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in released {
+            if let Some(backend) = self.open_backends.get_mut(&key) {
+                backend.consumer_held = false;
+            }
+            self.consumer_registry.remove(&key.tenant, &key.volume);
+            self.close_backend_if_unused(&key).await;
+        }
+        Ok(())
+    }
+
     async fn stop_export(&mut self, key: &ExportKey) {
         let Some(running) = self.running.remove(key) else {
             return;
@@ -8133,7 +9095,7 @@ impl ExportManager {
         if self
             .open_backends
             .get(backend_key)
-            .is_some_and(|backend| backend.ref_count > 0)
+            .is_some_and(|backend| backend.ref_count > 0 || backend.consumer_held)
         {
             return;
         }
@@ -8144,6 +9106,8 @@ impl ExportManager {
         let volume_id = backend_key.volume_id();
         match backend.volume {
             OpenVolume::FsWritable(volume) => {
+                self.consumer_registry
+                    .remove(&backend_key.tenant, &backend_key.volume);
                 if let Err(error) = volume.shutdown().await {
                     self.admin_targets
                         .lock()
@@ -8287,6 +9251,19 @@ impl ExportManager {
         for key in keys {
             self.stop_export(&key).await;
         }
+        let held = self
+            .open_backends
+            .iter()
+            .filter(|(_, backend)| backend.consumer_held)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in held {
+            if let Some(backend) = self.open_backends.get_mut(&key) {
+                backend.consumer_held = false;
+            }
+            self.consumer_registry.remove(&key.tenant, &key.volume);
+            self.close_backend_if_unused(&key).await;
+        }
     }
 }
 
@@ -8400,6 +9377,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("opening control-plane DB")?;
     let fh_key = control.server_fh_key().await?;
+    let consumer_signing_key = fh_key.expose_secret().to_vec();
     control.close().await.context("closing control-plane DB")?;
 
     let mut servers = tokio::task::JoinSet::new();
@@ -8416,45 +9394,83 @@ async fn main() -> anyhow::Result<()> {
             admin_blocks: Arc::clone(&admin_block_targets),
         },
     )));
+    let consumer_registry = manager.lock().await.consumer_registry.clone();
+    let consumer_metrics = ConsumerMetrics::default();
 
-    let control_reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
-        .await
-        .context("opening control-plane reader")?;
+    let control_reader = Arc::new(
+        ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .context("opening control-plane reader")?,
+    );
+    let version_locks = Arc::new(Mutex::new(HashMap::new()));
+    let version_read_repositories = Arc::new(Mutex::new(HashMap::new()));
+    let version_read_writer_refresh = Arc::new(Mutex::new(HashSet::new()));
+    let historical_views = Arc::new(
+        DaemonHistoricalViews::new(
+            Arc::clone(&control_reader),
+            Arc::clone(&object_store),
+            config.consumer.historical_view_cache_entries,
+        )
+        .with_version_repository_cache(
+            Arc::clone(&version_locks),
+            Arc::clone(&version_read_repositories),
+        ),
+    );
+    let consumer_tenants = config
+        .consumer
+        .tenant_identities
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
     {
         let mut manager_guard = manager.lock().await;
         manager_guard
             .reconcile(&control_reader)
             .await
             .context("initial export reconcile")?;
+        if config.consumer.listen.is_some() {
+            manager_guard
+                .reconcile_consumer_backends(&control_reader, &consumer_tenants)
+                .await
+                .context("initial consumer volume reconcile")?;
+        }
     }
 
     let watcher_manager = Arc::clone(&manager);
+    let watcher_reader = Arc::clone(&control_reader);
     let watcher_store = Arc::clone(&object_store);
     let watcher_kms = Arc::clone(&kms);
     let watcher_metrics = export_metrics.clone();
     let watcher_admin_targets = Arc::clone(&admin_targets);
+    let watcher_consumer_tenants = consumer_tenants.clone();
+    let watcher_consumer_enabled = config.consumer.listen.is_some();
     let poll_interval = Duration::from_secs(config.export_control.poll_interval_secs);
     servers.spawn(async move {
         let mut tick = tokio::time::interval(poll_interval);
         tick.tick().await;
         loop {
             tick.tick().await;
-            let reader = ControlReader::open(Arc::clone(&watcher_store), Arc::clone(&watcher_kms))
-                .await
-                .map_err(std::io::Error::other)?;
             {
                 let mut manager = watcher_manager.lock().await;
-                if let Err(error) = manager.reconcile(&reader).await {
+                if let Err(error) = manager.reconcile(&watcher_reader).await {
                     watcher_metrics.failure();
                     tracing::error!("export reconcile failed: {error:#}");
                 }
-                if let Err(error) = manager.reload_live_limits(&reader).await {
+                if watcher_consumer_enabled
+                    && let Err(error) = manager
+                        .reconcile_consumer_backends(&watcher_reader, &watcher_consumer_tenants)
+                        .await
+                {
+                    watcher_metrics.failure();
+                    tracing::error!("consumer volume reconcile failed: {error:#}");
+                }
+                if let Err(error) = manager.reload_live_limits(&watcher_reader).await {
                     watcher_metrics.failure();
                     tracing::error!("live limit reload failed: {error:#}");
                 }
             }
             if let Err(error) = enforce_snapshot_retention(
-                &reader,
+                &watcher_reader,
                 Arc::clone(&watcher_store),
                 Arc::clone(&watcher_kms),
                 watcher_metrics.clone(),
@@ -8465,7 +9481,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::error!("snapshot retention enforcement failed: {error:#}");
             }
             if let Err(error) = enforce_version_retention(
-                &reader,
+                &watcher_reader,
                 Arc::clone(&watcher_store),
                 Arc::clone(&watcher_kms),
                 &watcher_admin_targets,
@@ -8476,7 +9492,6 @@ async fn main() -> anyhow::Result<()> {
                 watcher_metrics.failure();
                 tracing::error!("version retention enforcement failed: {error:#}");
             }
-            reader.close().await.map_err(std::io::Error::other)?;
         }
     });
 
@@ -8501,13 +9516,7 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(listen) = config.admin.listen.clone() {
         let targets = Arc::clone(&admin_targets);
-        let control = match ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms)).await {
-            Ok(reader) => AdminControl::Available(Arc::new(reader)),
-            Err(error) => {
-                tracing::warn!(%error, "admin control reader unavailable at startup");
-                AdminControl::Unavailable(error.to_string())
-            }
-        };
+        let control = AdminControl::Available(Arc::clone(&control_reader));
         let state = Arc::new(AdminState {
             targets,
             block_targets: Arc::clone(&admin_block_targets),
@@ -8520,15 +9529,39 @@ async fn main() -> anyhow::Result<()> {
             auth_token: admin_token,
             tenant_tokens: config.admin.tenant_tokens.clone(),
             tenant_token_files: config.admin.tenant_token_files.clone(),
-            version_locks: Arc::new(Mutex::new(HashMap::new())),
+            version_locks: Arc::clone(&version_locks),
+            version_read_repositories: Arc::clone(&version_read_repositories),
+            version_read_writer_refresh: Arc::clone(&version_read_writer_refresh),
             allow_cert_auth: admin_cert_auth_allowed,
             node_id: None,
         });
         servers.spawn(async move { serve_admin(listen, state, admin_tls_config).await });
     }
 
+    if let Some(listen) = config.consumer.listen.clone() {
+        let listen: SocketAddr = listen.parse().context("parsing consumer.listen")?;
+        let auth = TenantAuthenticator::new(
+            config.admin.tenant_tokens.clone(),
+            config.admin.tenant_token_files.clone(),
+            config.consumer.tenant_identities.clone(),
+        );
+        let provider: Arc<dyn HistoricalViewProvider> = historical_views.clone();
+        let mut state = ConsumerState::new(
+            consumer_registry,
+            Arc::clone(&control_reader),
+            auth,
+            TokenSigner::new(consumer_signing_key),
+            config.consumer.clone(),
+        )
+        .with_historical_views(provider);
+        state.metrics = consumer_metrics.clone();
+        servers.spawn(async move { slatefs_http::serve(listen, state).await });
+    }
+
     if let Some(listen) = config.metrics.listen.clone() {
-        servers.spawn(async move { serve_metrics(listen, metrics_targets, export_metrics).await });
+        servers.spawn(async move {
+            serve_metrics(listen, metrics_targets, export_metrics, consumer_metrics).await
+        });
     }
 
     tokio::select! {
@@ -8541,6 +9574,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     servers.abort_all();
+    historical_views.shutdown().await;
     manager.lock().await.shutdown().await;
     Ok(())
 }
@@ -8549,7 +9583,10 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    use axum::body::Body;
+    use axum::http::Request;
     use bytes::Bytes;
+    use http_body_util::BodyExt as _;
     use nfs3_server::nfs3_types::nfs3::{filename3, nfsstat3, sattr3, stable_how};
     use nfs3_server::nfs3_types::xdr_codec::Opaque;
     use nfs3_server::vfs::{NfsFileSystem, NfsReadFileSystem};
@@ -8563,6 +9600,7 @@ mod tests {
     use slatefs_core::meta::inode::ROOT_INO;
     use slatefs_core::snapshot::SnapshotVolume;
     use slatefs_core::vfs::{Credentials, Vfs};
+    use slatefs_core::volume::CreateVolumeOptions;
     use slatefs_nbd::test_support::NbdTestClient;
     use slatefs_nfs::SlateFsNfs;
     use std::fs;
@@ -8570,6 +9608,7 @@ mod tests {
     use tokio::task::JoinHandle;
     use tokio_rustls::TlsConnector;
     use tokio_rustls::rustls::pki_types::ServerName;
+    use tower::ServiceExt as _;
 
     use rcgen::{
         BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -8587,6 +9626,253 @@ mod tests {
             uuid::Uuid::new_v4().to_string(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn consumer_historical_views_pin_refs_and_isolate_cache_keys() {
+        const AUDIT_BRANCH: &str =
+            "audit-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([77; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("acme", None).await.unwrap();
+        control.create_tenant("globex", None).await.unwrap();
+        let record = volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "acme",
+            "documents",
+            CreateVolumeOptions {
+                cipher: Cipher::Aes256Gcm,
+                chunk_size: 4096,
+                compression: Compression::Lz4,
+                quota: QuotaLimits::default(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+        control
+            .set_versioning_enabled("acme", "documents", true)
+            .await
+            .unwrap();
+        let dek = control.unwrap_volume_dek(&record).await.unwrap();
+        let live = Volume::open(&record, dek, Arc::clone(&object_store))
+            .await
+            .unwrap();
+        let creds = Credentials::root();
+        let file = live
+            .create(&creds, ROOT_INO, b"history.txt", 0o644, true)
+            .await
+            .unwrap();
+        live.write(&creds, file.ino, 0, b"first").await.unwrap();
+        let snapshot = live
+            .create_live_snapshot(Some("baseline".into()))
+            .await
+            .unwrap();
+        let snapshot_two = live
+            .create_live_snapshot(Some("second".into()))
+            .await
+            .unwrap();
+        let repository =
+            VersionRepository::open(&control, Arc::clone(&object_store), "acme", "documents")
+                .await
+                .unwrap();
+        let first = repository
+            .commit_paths(
+                live.as_ref(),
+                &["/history.txt".into()],
+                "first".into(),
+                test_commit_provenance(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(AUDIT_BRANCH.len(), 64);
+        repository
+            .create_branch(AUDIT_BRANCH, &first.id)
+            .await
+            .unwrap();
+        repository.close().await.unwrap();
+        control.close().await.unwrap();
+
+        let reader = Arc::new(
+            ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+                .await
+                .unwrap(),
+        );
+        let admin_state = available_admin_state(
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            HashMap::from([(VolumeId::from_parts("acme", "documents"), Arc::clone(&live))]),
+            None,
+        )
+        .await;
+        let cached = cached_read_version_repository(&admin_state, "acme", "documents")
+            .await
+            .unwrap();
+        assert!(
+            cached
+                .repository
+                .list_branches()
+                .await
+                .unwrap()
+                .iter()
+                .any(|branch| branch.name() == AUDIT_BRANCH && branch.commit() == first.id)
+        );
+
+        let views = Arc::new(
+            DaemonHistoricalViews::new(Arc::clone(&reader), Arc::clone(&object_store), 2)
+                .with_version_repository_cache(
+                    Arc::clone(&admin_state.version_locks),
+                    Arc::clone(&admin_state.version_read_repositories),
+                ),
+        );
+        let snapshot_view = views
+            .open("acme", "documents", ViewKind::Snapshot, &snapshot.id)
+            .await
+            .unwrap();
+        let snapshot_again = views
+            .open(
+                "acme",
+                "documents",
+                ViewKind::Snapshot,
+                &snapshot.id.to_uppercase(),
+            )
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&snapshot_view.vfs, &snapshot_again.vfs));
+        assert!(matches!(
+            views
+                .open("globex", "documents", ViewKind::Snapshot, &snapshot.id)
+                .await,
+            Err(HistoricalViewError::NotFound)
+        ));
+
+        let pinned = views
+            .open("acme", "documents", ViewKind::Version, &first.id)
+            .await
+            .unwrap();
+        assert_eq!(pinned.exact_id, first.id);
+        let historical_file = pinned
+            .vfs
+            .lookup(&creds, ROOT_INO, b"history.txt")
+            .await
+            .unwrap();
+        assert_eq!(
+            &pinned
+                .vfs
+                .read(&creds, historical_file.ino, 0, 32)
+                .await
+                .unwrap()[..],
+            b"first"
+        );
+        assert_eq!(
+            pinned
+                .vfs
+                .write(&creds, historical_file.ino, 0, b"no")
+                .await,
+            Err(slatefs_core::vfs::FsError::ReadOnly)
+        );
+        let _second_snapshot = views
+            .open("acme", "documents", ViewKind::Snapshot, &snapshot_two.id)
+            .await
+            .unwrap();
+        let reopened_snapshot = views
+            .open("acme", "documents", ViewKind::Snapshot, &snapshot.id)
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&snapshot_view.vfs, &reopened_snapshot.vfs));
+        let registry = LiveVolumeRegistry::default();
+        registry.insert("acme".into(), "documents".into(), Arc::clone(&live));
+        let auth = TenantAuthenticator::new(
+            BTreeMap::from([
+                ("acme".into(), "acme-token".into()),
+                ("globex".into(), "globex-token".into()),
+            ]),
+            BTreeMap::new(),
+            BTreeMap::from([
+                (
+                    "acme".into(),
+                    slatefs_core::config::ConsumerIdentityConfig {
+                        uid: 1000,
+                        gid: 1000,
+                    },
+                ),
+                (
+                    "globex".into(),
+                    slatefs_core::config::ConsumerIdentityConfig {
+                        uid: 1000,
+                        gid: 1000,
+                    },
+                ),
+            ]),
+        );
+        let provider: Arc<dyn HistoricalViewProvider> = views.clone();
+        let app = slatefs_http::router(
+            ConsumerState::new(
+                registry,
+                Arc::clone(&reader),
+                auth,
+                TokenSigner::new([19; 32]),
+                slatefs_core::config::ConsumerConfig::default(),
+            )
+            .with_historical_views(provider),
+        );
+        let request = Request::builder()
+            .uri("/consumer/v1/volumes/documents/content?path=history.txt&view=version&ref=main")
+            .header("authorization", "Bearer acme-token")
+            .header("range", "bytes=1-3")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), 206);
+        assert_eq!(response.headers()["x-slatefs-resolved-commit"], first.id);
+        assert_eq!(
+            &response.into_body().collect().await.unwrap().to_bytes()[..],
+            b"irs"
+        );
+        let cross_tenant = Request::builder()
+            .uri(format!(
+                "/consumer/v1/volumes/documents/entries?path=&view=snapshot&ref={}",
+                snapshot.id
+            ))
+            .header("authorization", "Bearer globex-token")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(cross_tenant).await.unwrap().status(), 404);
+
+        let zero_capacity = Arc::new(DaemonHistoricalViews::new(
+            Arc::clone(&reader),
+            Arc::clone(&object_store),
+            0,
+        ));
+        let leased = zero_capacity
+            .open("acme", "documents", ViewKind::Snapshot, &snapshot.id)
+            .await
+            .unwrap();
+        let retired = {
+            let cache = zero_capacity.cache.lock().await;
+            assert!(cache.entries.is_empty());
+            assert!(cache.retired[0].owned.lock().unwrap().is_some());
+            Arc::downgrade(&cache.retired[0])
+        };
+        drop(leased);
+        let trigger = zero_capacity
+            .open("acme", "documents", ViewKind::Snapshot, &snapshot_two.id)
+            .await
+            .unwrap();
+        assert!(retired.upgrade().is_none());
+        drop(trigger);
+        zero_capacity.shutdown().await;
+        drop(snapshot_again);
+        drop(snapshot_view);
+        drop(pinned);
+        views.shutdown().await;
+        reader.close().await.unwrap();
+        live.shutdown().await.unwrap();
     }
 
     #[test]
@@ -8717,6 +10003,8 @@ mod tests {
             tenant_tokens: BTreeMap::new(),
             tenant_token_files: BTreeMap::new(),
             version_locks: Arc::new(Mutex::new(HashMap::new())),
+            version_read_repositories: Arc::new(Mutex::new(HashMap::new())),
+            version_read_writer_refresh: Arc::new(Mutex::new(HashSet::new())),
             allow_cert_auth: false,
             node_id: None,
         })
@@ -8740,6 +10028,8 @@ mod tests {
             tenant_tokens: BTreeMap::new(),
             tenant_token_files: BTreeMap::new(),
             version_locks: Arc::new(Mutex::new(HashMap::new())),
+            version_read_repositories: Arc::new(Mutex::new(HashMap::new())),
+            version_read_writer_refresh: Arc::new(Mutex::new(HashSet::new())),
             allow_cert_auth: false,
             node_id: None,
         })
@@ -9125,6 +10415,8 @@ mod tests {
         let volume = Volume::open(&record, dek, Arc::clone(&object_store))
             .await
             .unwrap();
+        let snapshot_dek = control.unwrap_volume_dek(&record).await.unwrap();
+        control.close().await.unwrap();
         let creds = Credentials::root();
         let file = volume
             .create(&creds, ROOT_INO, b"file", 0o644, true)
@@ -9195,7 +10487,7 @@ mod tests {
             .to_string();
 
         let alias_response = admin_exchange(
-            state,
+            Arc::clone(&state),
             b"POST /admin/v1/tenants/t/volumes/v/snapshot?name=v1 HTTP/1.1\r\nHost: localhost\r\nX-Request-Id: alias-req\r\nContent-Length: 0\r\n\r\n",
         )
         .await;
@@ -9213,7 +10505,6 @@ mod tests {
             .unwrap();
         volume.flush().await.unwrap();
 
-        let snapshot_dek = control.unwrap_volume_dek(&record).await.unwrap();
         let snapshot = SnapshotVolume::open(
             &record,
             snapshot_dek,
@@ -9242,8 +10533,16 @@ mod tests {
             "{metrics}"
         );
         snapshot.shutdown().await.unwrap();
+        let delete_request = format!(
+            "DELETE /admin/v1/tenants/t/volumes/v/snapshots/{snapshot_id} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        let deleted = admin_exchange(state, delete_request.as_bytes()).await;
+        assert_eq!(response_status(&deleted), 200, "{deleted}");
+        assert_eq!(
+            serde_json::from_str::<Value>(response_body(&deleted)).unwrap()["deleted_snapshot"],
+            snapshot_id
+        );
         volume.shutdown().await.unwrap();
-        control.close().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9892,6 +11191,14 @@ mod tests {
             json!(["release-2026"])
         );
         assert_eq!(quorum["quorum"]["satisfied"], true);
+        assert!(
+            state
+                .version_read_repositories
+                .lock()
+                .expect("version repository cache poisoned")
+                .contains_key(&VolumeId::from_parts("t", "v")),
+            "read-only quorum requests should retain the shared repository"
+        );
         let denied_policy_request = AdminHttpRequest {
             method: "DELETE".to_string(),
             path: "/admin/v1/tenants/t/volumes/v/versioning/branches/release/protection"
@@ -9953,6 +11260,14 @@ mod tests {
         assert_eq!(merge_preview["preview"]["ahead"], 0);
         assert_eq!(merge_preview["preview"]["behind"], 0);
         assert_eq!(merge_preview["preview"]["conflicts"], json!([]));
+        assert!(
+            state
+                .version_read_repositories
+                .lock()
+                .expect("version repository cache poisoned")
+                .contains_key(&VolumeId::from_parts("t", "v")),
+            "merge previews should retain the shared read repository"
+        );
         let merge_body = r#"{"source":"main"}"#;
         let merge_request = format!(
             "POST /admin/v1/tenants/t/volumes/v/versioning/branches/release/merge HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -10757,6 +12072,39 @@ mod tests {
         let feature: Value = serde_json::from_str(response_body(&feature_response)).unwrap();
         let feature_id = feature["commit"]["id"].as_str().unwrap();
 
+        let branches_response = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning/branches HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            response_status(&branches_response),
+            200,
+            "{branches_response}"
+        );
+        let cache_id = VolumeId::from_parts("t", "v");
+        let read_repository = state
+            .version_read_repositories
+            .lock()
+            .expect("version repository cache poisoned")
+            .get(&cache_id)
+            .cloned()
+            .expect("branch list should populate the read repository cache");
+        let reflog_response = admin_exchange(
+            Arc::clone(&state),
+            b"GET /admin/v1/tenants/t/volumes/v/versioning/branches/target/reflog HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response_status(&reflog_response), 200, "{reflog_response}");
+        let reflog_repository = state
+            .version_read_repositories
+            .lock()
+            .expect("version repository cache poisoned")
+            .get(&cache_id)
+            .cloned()
+            .expect("reflog should retain the read repository cache");
+        assert!(Arc::ptr_eq(&read_repository, &reflog_repository));
+
         let preview_request = format!(
             "GET /admin/v1/tenants/t/volumes/v/versioning/branches/target/cherry-pick?source={feature_id} HTTP/1.1\r\nHost: localhost\r\n\r\n"
         );
@@ -10771,6 +12119,14 @@ mod tests {
         assert_eq!(preview["preview"]["target_head"], baseline_id);
         assert_eq!(preview["preview"]["paths"], json!(["/notes.txt"]));
         assert_eq!(preview["preview"]["conflicts"], json!([]));
+        let preview_repository = state
+            .version_read_repositories
+            .lock()
+            .expect("version repository cache poisoned")
+            .get(&cache_id)
+            .cloned()
+            .expect("cherry-pick preview should retain the read repository cache");
+        assert!(Arc::ptr_eq(&read_repository, &preview_repository));
 
         let cherry_body =
             format!(r#"{{"source":"{feature_id}","idempotency_key":"admin-cherry-1"}}"#);
@@ -11502,6 +12858,8 @@ mod tests {
             tenant_tokens: BTreeMap::new(),
             tenant_token_files: BTreeMap::new(),
             version_locks: Arc::new(Mutex::new(HashMap::new())),
+            version_read_repositories: Arc::new(Mutex::new(HashMap::new())),
+            version_read_writer_refresh: Arc::new(Mutex::new(HashSet::new())),
             allow_cert_auth: false,
             node_id: None,
         });
@@ -11994,6 +13352,8 @@ mod tests {
             tenant_tokens: BTreeMap::new(),
             tenant_token_files: BTreeMap::new(),
             version_locks: Arc::new(Mutex::new(HashMap::new())),
+            version_read_repositories: Arc::new(Mutex::new(HashMap::new())),
+            version_read_writer_refresh: Arc::new(Mutex::new(HashSet::new())),
             allow_cert_auth: false,
             node_id: None,
         });
@@ -12863,6 +14223,8 @@ mod tests {
             tenant_tokens: BTreeMap::new(),
             tenant_token_files: BTreeMap::new(),
             version_locks: Arc::new(Mutex::new(HashMap::new())),
+            version_read_repositories: Arc::new(Mutex::new(HashMap::new())),
+            version_read_writer_refresh: Arc::new(Mutex::new(HashSet::new())),
             allow_cert_auth: false,
             node_id: None,
         });
@@ -13025,6 +14387,8 @@ mod tests {
             tenant_tokens: BTreeMap::new(),
             tenant_token_files: BTreeMap::new(),
             version_locks: Arc::new(Mutex::new(HashMap::new())),
+            version_read_repositories: Arc::new(Mutex::new(HashMap::new())),
+            version_read_writer_refresh: Arc::new(Mutex::new(HashSet::new())),
             allow_cert_auth: false,
             node_id: None,
         });
@@ -13822,6 +15186,105 @@ mod tests {
             metrics.contains("slatefs_rate_limit_rejections_total{tenant=\"t\"} 1"),
             "{metrics}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consumer_registry_reuses_export_writer_and_holds_lifecycle() {
+        let object_store = store::resolve_root("memory:///").unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(StaticKms::new(Secret32::from_bytes([67; 32])));
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.create_tenant("t", None).await.unwrap();
+        slatefs_core::volume::create_volume(
+            &control,
+            Arc::clone(&object_store),
+            "t",
+            "v",
+            create_opts(),
+        )
+        .await
+        .unwrap();
+        let fh_key = control.server_fh_key().await.unwrap();
+        control
+            .create_export(nfs_export("consumer-shared", "127.0.0.1:0"))
+            .await
+            .unwrap();
+        control.close().await.unwrap();
+
+        let config = test_config(Vec::new());
+        let mut manager = ExportManager::new(
+            Arc::clone(&object_store),
+            Arc::clone(&kms),
+            fh_key,
+            &config,
+            config_export_records(&config.exports),
+            ExportMetrics::default(),
+            ExportManagerTargets {
+                metrics: Arc::new(Mutex::new(Vec::new())),
+                admin: Arc::new(Mutex::new(HashMap::new())),
+                admin_blocks: Arc::new(Mutex::new(HashMap::new())),
+            },
+        );
+        let reader = ControlReader::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        manager.reconcile(&reader).await.unwrap();
+        let key = BackendKey {
+            tenant: "t".to_string(),
+            volume: "v".to_string(),
+            snapshot: None,
+            version: None,
+        };
+        let export_writer = Arc::clone(manager.open_backends[&key].writable().unwrap());
+
+        manager
+            .reconcile_consumer_backends(&reader, &HashSet::from(["t".to_string()]))
+            .await
+            .unwrap();
+        let consumer_writer = manager.consumer_registry.get("t", "v").unwrap();
+        assert!(Arc::ptr_eq(&export_writer, &consumer_writer));
+        assert_eq!(
+            manager.open_backends.len(),
+            1,
+            "must not open a second writer"
+        );
+
+        // Releasing the consumer hold must not close a volume still exported.
+        manager
+            .reconcile_consumer_backends(&reader, &HashSet::new())
+            .await
+            .unwrap();
+        assert!(manager.consumer_registry.get("t", "v").is_none());
+        assert!(manager.open_backends.contains_key(&key));
+        assert_eq!(manager.open_backends[&key].ref_count, 1);
+
+        // Conversely, stopping the export must retain the exact writer while
+        // the consumer surface still holds it.
+        manager
+            .reconcile_consumer_backends(&reader, &HashSet::from(["t".to_string()]))
+            .await
+            .unwrap();
+        let control = ControlPlane::open(Arc::clone(&object_store), Arc::clone(&kms))
+            .await
+            .unwrap();
+        control.disable_export("consumer-shared").await.unwrap();
+        control.close().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        manager.reconcile(&reader).await.unwrap();
+        let held_writer = manager.consumer_registry.get("t", "v").unwrap();
+        assert!(Arc::ptr_eq(&export_writer, &held_writer));
+        assert_eq!(manager.open_backends[&key].ref_count, 0);
+        assert!(manager.open_backends[&key].consumer_held);
+        held_writer
+            .getattr(&Credentials::root(), ROOT_INO)
+            .await
+            .unwrap();
+
+        manager.shutdown().await;
+        assert!(manager.open_backends.is_empty());
+        assert!(manager.consumer_registry.get("t", "v").is_none());
+        reader.close().await.unwrap();
     }
 
     #[test]

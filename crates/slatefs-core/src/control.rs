@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use slatedb::bytes::Bytes;
@@ -38,6 +39,11 @@ const VERSIONING_POLICY_RECORD_VERSION: u8 = 1;
 const VERSIONING_RETENTION_RECORD_VERSION: u8 = 1;
 const MAX_AUDIT_DETAILS_BYTES: usize = 128 * 1024;
 const MAX_AUDIT_PAGE_LIMIT: usize = 1_000;
+const CONTROL_READER_CHECKPOINT_LIFETIME: Duration = Duration::from_secs(60);
+// Local object stores cannot run SlateDB GC, so frequent checkpoint renewal
+// only creates durable manifest garbage. Keep the checkpoint long-lived while
+// preserving the normal short recovery window for production object stores.
+const LOCAL_CONTROL_READER_CHECKPOINT_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Contents of `<root>/control.dek`. The cipher is recorded here (not chosen
 /// per process) so every node opens the control DB with the same AEAD.
@@ -749,11 +755,15 @@ impl ControlPlane {
     /// single-admin at a time, which is fine for Phase 0 CLI use.
     pub async fn open(object_store: Arc<dyn ObjectStore>, kms: Arc<dyn Kms>) -> Result<Self> {
         let (cipher, dek) = Self::load_or_init_dek(&object_store, kms.as_ref()).await?;
-        let db = Db::builder(store::CONTROL_DB_PATH, Arc::clone(&object_store))
-            .with_settings(Settings {
+        let settings = store::compatible_settings(
+            &object_store,
+            Settings {
                 compression_codec: Some(slatedb::config::CompressionCodec::Lz4),
                 ..Settings::default()
-            })
+            },
+        );
+        let db = Db::builder(store::CONTROL_DB_PATH, Arc::clone(&object_store))
+            .with_settings(settings)
             .with_block_transformer(Arc::new(SlateBlockTransformer::new(cipher, dek)))
             .build()
             .await?;
@@ -2169,10 +2179,15 @@ impl ControlReader {
     /// Open the encrypted control DB in read-only mode.
     pub async fn open(object_store: Arc<dyn ObjectStore>, kms: Arc<dyn Kms>) -> Result<Self> {
         let (cipher, dek) = ControlPlane::load_existing_dek(&object_store, kms.as_ref()).await?;
+        let checkpoint_lifetime = if store::is_local_file_system(&object_store) {
+            LOCAL_CONTROL_READER_CHECKPOINT_LIFETIME
+        } else {
+            CONTROL_READER_CHECKPOINT_LIFETIME
+        };
         let db = DbReader::builder(store::CONTROL_DB_PATH, object_store)
             .with_options(DbReaderOptions {
-                manifest_poll_interval: std::time::Duration::from_secs(1),
-                checkpoint_lifetime: std::time::Duration::from_secs(60),
+                manifest_poll_interval: Duration::from_secs(1),
+                checkpoint_lifetime,
                 ..DbReaderOptions::default()
             })
             .with_block_transformer(Arc::new(SlateBlockTransformer::new(cipher, dek)))

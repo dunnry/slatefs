@@ -27,8 +27,8 @@ use crate::versioning::{
     VersionStoreError, file_chunk_key,
 };
 use crate::vfs::{
-    Credentials, DirEntry, FileAttr, FsError, FsResult, HandleId, OpenMode, ReadDir, SetAttrs,
-    StatFs, Vfs,
+    Credentials, DirEntry, EntryPermissions, FileAttr, FsError, FsResult, HandleId, OpenMode,
+    ReadDir, SetAttrs, StatFs, Vfs,
 };
 use crate::volume::HandleTable;
 
@@ -230,6 +230,32 @@ impl VersionHistoricalVolume {
         .await
     }
 
+    /// Open an immutable historical view using an already-open repository.
+    ///
+    /// Daemons use this when a read-only administrative repository is cached.
+    /// The repository is borrowed only while resolving the reference and
+    /// creating the checkpoint; the returned view remains pinned to that
+    /// checkpoint and does not retain the repository or its maintenance lease.
+    pub async fn open_readonly_with_repository(
+        control: &ControlReader,
+        object_store: Arc<dyn ObjectStore>,
+        tenant: &str,
+        volume: &str,
+        reference: &str,
+        repository: &VersionRepository,
+    ) -> Result<Arc<Self>> {
+        let record = control.get_mountable_volume(tenant, volume).await?;
+        if !matches!(record.kind, VolumeKind::Filesystem) {
+            return Err(Error::invalid(
+                "version historical export",
+                "only filesystem volumes have version history",
+            ));
+        }
+        let dek = control.unwrap_volume_dek(&record).await?;
+        let plan = repository.prepare_historical_export(reference).await?;
+        Self::open_plan(record, dek, object_store, tenant, volume, plan).await
+    }
+
     async fn open_repository(
         record: VolumeRecord,
         dek: Secret32,
@@ -252,6 +278,17 @@ impl VersionHistoricalVolume {
             return Err(error);
         }
 
+        Self::open_plan(record, dek, object_store, tenant, volume, plan).await
+    }
+
+    async fn open_plan(
+        record: VolumeRecord,
+        dek: Secret32,
+        object_store: Arc<dyn ObjectStore>,
+        tenant: &str,
+        volume: &str,
+        plan: VersionHistoricalExportPlan,
+    ) -> Result<Arc<Self>> {
         let db_path = store::version_db_path(tenant, volume);
         let index = match build_index(&plan) {
             Ok(index) => index,
@@ -416,6 +453,19 @@ impl Vfs for VersionHistoricalVolume {
 
     fn read_only(&self) -> bool {
         true
+    }
+
+    async fn permissions(
+        &self,
+        creds: &Credentials,
+        ino: u64,
+        _parent: Option<(u64, &[u8])>,
+    ) -> FsResult<EntryPermissions> {
+        self.getattr(creds, ino).await?;
+        Ok(EntryPermissions {
+            can_read: true,
+            ..EntryPermissions::default()
+        })
     }
 
     async fn lookup(&self, creds: &Credentials, parent: u64, name: &[u8]) -> FsResult<FileAttr> {
