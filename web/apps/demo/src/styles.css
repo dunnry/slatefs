@@ -1,22 +1,22 @@
 /* ————————————————————————————————————————————————————————————————
-   SlateFS · "Obsidian Slate" design system
-   Deep-slate dark surfaces, aurora accents, glass elevation.
+   SlateFS · "Aurora Slate" design system
+   Deep-space slate, bioluminescent accents, layered glass elevation.
    ———————————————————————————————————————————————————————————————— */
 :root {
   color-scheme: dark;
 
-  /* palette */
-  --ink-0: #06090b;
-  --ink-1: #0a0f12;
-  --ink-2: #10171b;
-  --ink-3: #162026;
-  --ink-4: #1d2a31;
-  --line: #22323a;
-  --line-soft: #1a272e;
-  --text-1: #ecf4f1;
-  --text-2: #a9bcb6;
-  --text-3: #6d817b;
-  --lime: #d4f74a;
+  /* palette — deep slate with a cool undertone */
+  --ink-0: #05080a;
+  --ink-1: #080d10;
+  --ink-2: #0d1418;
+  --ink-3: #131d23;
+  --ink-4: #1a272f;
+  --line: #203038;
+  --line-soft: #17242b;
+  --text-1: #eef6f3;
+  --text-2: #a4b8b2;
+  --text-3: #647a73;
+  --lime: #d9f75c;
   --mint: #5fe8c0;
   --sky: #6ec6ff;
   --amber: #ffd166;
@@ -25,30 +25,34 @@
   /* component theming contract (read by @slatefs/web-components) */
   --slatefs-color-text: var(--text-1);
   --slatefs-color-surface: transparent;
-  --slatefs-color-accent: #8dd8bb;
-  --slatefs-color-accent-contrast: #08130e;
+  --slatefs-color-accent: #93dcbe;
+  --slatefs-color-accent-contrast: #07120d;
   --slatefs-color-border: var(--line);
   --slatefs-color-muted: var(--text-2);
   --slatefs-color-readonly: #2b2410;
   --slatefs-color-readonly-border: #54430f;
-  --slatefs-color-control: #141d22;
-  --slatefs-color-subtle: #1b262c;
-  --slatefs-color-selected: #22343c;
+  --slatefs-color-control: #111a20;
+  --slatefs-color-subtle: #182229;
+  --slatefs-color-selected: #1e3038;
   --slatefs-color-danger: #b8413e;
   --slatefs-color-danger-bg: #2b1618;
   --slatefs-color-danger-text: #ff9d9a;
-  --slatefs-color-dialog: #141d22;
+  --slatefs-color-dialog: #10181d;
   --slatefs-color-source: #152030;
   --slatefs-color-source-border: #33517a;
-  --slatefs-color-map: #0d1418;
+  --slatefs-color-map: #0b1216;
   --slatefs-color-warn: #d5a72e;
   --slatefs-color-warn-bg: #2a2210;
   --slatefs-frame: 0;
-  --slatefs-radius: 16px;
+  --slatefs-radius: 18px;
   --slatefs-focus-ring: 2px solid var(--lime);
   --slatefs-font-family:
     "Inter", "SF Pro Text", ui-sans-serif, system-ui, -apple-system, sans-serif;
   --slatefs-font-size: 0.925rem;
+
+  /* motion */
+  --ease-spring: cubic-bezier(0.34, 1.4, 0.44, 1);
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
 
   font-family:
     "Inter",
@@ -58,6 +62,10 @@
     -apple-system,
     sans-serif;
   font-size: 16px;
+  font-feature-settings:
+    "ss01" 1,
+    "cv11" 1,
+    "liga" 1;
   color: var(--text-1);
   background: var(--ink-0);
   font-synthesis: none;
@@ -84,25 +92,43 @@ body {
   min-height: 100vh;
   background:
     radial-gradient(
-      58rem 36rem at 108% -12%,
-      rgb(95 232 192 / 0.09),
-      transparent 62%
-    ),
-    radial-gradient(
-      50rem 34rem at -14% 112%,
-      rgb(110 198 255 / 0.07),
+      64rem 40rem at 112% -16%,
+      rgb(95 232 192 / 0.11),
       transparent 60%
     ),
     radial-gradient(
-      36rem 26rem at 55% 118%,
-      rgb(212 247 74 / 0.05),
-      transparent 65%
+      52rem 36rem at -16% 116%,
+      rgb(110 198 255 / 0.08),
+      transparent 58%
+    ),
+    radial-gradient(
+      40rem 28rem at 52% 122%,
+      rgb(217 247 92 / 0.055),
+      transparent 64%
     ),
     var(--ink-0);
   background-attachment: fixed;
 }
+/* faint topographic grain over the whole canvas */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background-image:
+    linear-gradient(rgb(255 255 255 / 0.014) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(255 255 255 / 0.014) 1px, transparent 1px);
+  background-size: 56px 56px;
+  mask-image: radial-gradient(90% 70% at 50% 30%, black, transparent);
+  -webkit-mask-image: radial-gradient(90% 70% at 50% 30%, black, transparent);
+}
+#app {
+  position: relative;
+  z-index: 1;
+}
 ::selection {
-  background: rgb(212 247 74 / 0.85);
+  background: rgb(217 247 92 / 0.85);
   color: var(--ink-0);
 }
 button {
@@ -123,13 +149,13 @@ button {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #26363e;
+  background: #24343c;
   border-radius: 8px;
   border: 2px solid transparent;
   background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #374a54;
+  background: #354a55;
   border: 2px solid transparent;
   background-clip: content-box;
 }
@@ -141,7 +167,7 @@ button {
   min-height: 100vh;
   min-height: 100dvh;
   display: grid;
-  grid-template: 4.5rem 1fr / 15rem minmax(0, 1fr);
+  grid-template: 4.5rem 1fr / 15.5rem minmax(0, 1fr);
   grid-template-areas: "top top" "rail work";
 }
 .topbar {
@@ -149,12 +175,12 @@ button {
   min-width: 0;
   display: flex;
   align-items: center;
-  padding: 0 1.5rem;
+  padding: 0 1.6rem;
   gap: 1rem;
   color: var(--text-1);
-  background: rgb(10 15 18 / 0.72);
-  backdrop-filter: blur(18px) saturate(1.3);
-  -webkit-backdrop-filter: blur(18px) saturate(1.3);
+  background: rgb(8 13 16 / 0.66);
+  backdrop-filter: blur(22px) saturate(1.5);
+  -webkit-backdrop-filter: blur(22px) saturate(1.5);
   border-bottom: 1px solid var(--line-soft);
   position: sticky;
   top: 0;
@@ -166,35 +192,45 @@ button {
   gap: 0.7rem;
   color: var(--text-1);
   text-decoration: none;
-  font-size: 1.18rem;
-  font-weight: 720;
-  letter-spacing: -0.02em;
+  font-size: 1.16rem;
+  font-weight: 760;
+  letter-spacing: -0.025em;
   margin-right: auto;
+  transition: opacity 0.18s ease;
+}
+.brand:hover {
+  opacity: 0.85;
 }
 .brand > span,
 .brand-mark {
   display: grid;
   place-items: center;
-  width: 2.15rem;
-  height: 2.15rem;
-  border-radius: 10px;
-  background: linear-gradient(135deg, var(--lime), #7fe3a9 90%);
-  color: #0c1410;
+  width: 2.2rem;
+  height: 2.2rem;
+  border-radius: 11px;
+  background: linear-gradient(135deg, var(--lime), #6fe8b6 85%);
+  color: #0a120e;
   font-weight: 900;
-  font-size: 1.05rem;
+  font-size: 1.08rem;
   letter-spacing: -0.03em;
   box-shadow:
-    0 0 0 1px rgb(212 247 74 / 0.25),
-    0 6px 18px -6px rgb(212 247 74 / 0.45);
+    0 0 0 1px rgb(217 247 92 / 0.3),
+    0 0 24px -4px rgb(217 247 92 / 0.5),
+    0 8px 20px -8px rgb(95 232 192 / 0.4);
 }
 .tenant {
   display: flex;
   align-items: center;
   gap: 0.65rem;
-  padding: 0.35rem 0.85rem 0.35rem 0.55rem;
+  padding: 0.4rem 0.95rem 0.4rem 0.65rem;
   border: 1px solid var(--line-soft);
   border-radius: 999px;
-  background: rgb(255 255 255 / 0.03);
+  background: linear-gradient(
+    180deg,
+    rgb(255 255 255 / 0.045),
+    rgb(255 255 255 / 0.015)
+  );
+  box-shadow: 0 1px 0 rgb(255 255 255 / 0.04) inset;
 }
 .tenant span:not(.tenant-dot) {
   display: grid;
@@ -209,7 +245,7 @@ button {
   height: 0.55rem;
   border-radius: 50%;
   background: var(--lime);
-  box-shadow: 0 0 10px 1px rgb(212 247 74 / 0.65);
+  box-shadow: 0 0 12px 2px rgb(217 247 92 / 0.7);
   animation: pulse 2.6s ease-in-out infinite;
 }
 @keyframes pulse {
@@ -219,8 +255,8 @@ button {
     transform: scale(1);
   }
   50% {
-    opacity: 0.55;
-    transform: scale(0.82);
+    opacity: 0.5;
+    transform: scale(0.78);
   }
 }
 .topbar button,
@@ -234,21 +270,27 @@ button {
   transition:
     background 0.18s ease,
     color 0.18s ease,
-    transform 0.18s ease;
+    transform 0.18s var(--ease-spring);
 }
 .topbar button:hover,
 .rail button:hover {
   background: rgb(255 255 255 / 0.06);
 }
+.topbar button:active,
+.rail button:active {
+  transform: scale(0.97);
+}
 #switch {
   border: 1px solid var(--line) !important;
-  padding-inline: 1rem !important;
+  padding-inline: 1.05rem !important;
   font-size: 0.85rem;
   color: var(--text-2);
+  border-radius: 999px !important;
 }
 #switch:hover {
   color: var(--text-1);
-  border-color: #324650 !important;
+  border-color: #33484f !important;
+  background: rgb(255 255 255 / 0.04);
 }
 
 /* ———————————————————————————————————————— navigation rail */
@@ -256,12 +298,12 @@ button {
   grid-area: rail;
   min-width: 0;
   color: var(--text-2);
-  padding: 1.4rem 0.8rem;
+  padding: 1.5rem 0.9rem;
   display: flex;
   flex-direction: column;
   gap: 0.3rem;
   border-right: 1px solid var(--line-soft);
-  background: rgb(10 15 18 / 0.4);
+  background: rgb(8 13 16 / 0.35);
 }
 .rail .tab {
   position: relative;
@@ -269,44 +311,65 @@ button {
   display: flex;
   gap: 0.85rem;
   align-items: center;
-  padding: 0.7rem 0.9rem;
+  padding: 0.72rem 0.95rem;
   font-size: 0.92rem;
-  font-weight: 560;
+  font-weight: 540;
   letter-spacing: -0.005em;
+  border-radius: 11px;
+  isolation: isolate;
 }
 .rail .tab b {
   display: grid;
   place-items: center;
-  width: 1.6rem;
-  height: 1.6rem;
+  width: 1.55rem;
+  height: 1.55rem;
   font-weight: 400;
-  font-size: 1.05rem;
+  font-size: 1.02rem;
   color: var(--text-3);
-  transition: color 0.18s ease;
+  transition:
+    color 0.18s ease,
+    transform 0.22s var(--ease-spring);
+}
+.rail .tab b svg {
+  width: 1.15rem;
+  height: 1.15rem;
 }
 .rail .tab:hover b {
   color: var(--text-1);
+  transform: scale(1.12);
 }
 .rail .tab[aria-selected="true"] {
   background: linear-gradient(
-    90deg,
-    rgb(212 247 74 / 0.14),
-    rgb(95 232 192 / 0.05)
+    92deg,
+    rgb(217 247 92 / 0.15),
+    rgb(95 232 192 / 0.06) 70%
   );
   color: var(--text-1);
-  font-weight: 680;
-  box-shadow: inset 0 0 0 1px rgb(212 247 74 / 0.16);
+  font-weight: 660;
+  box-shadow:
+    inset 0 0 0 1px rgb(217 247 92 / 0.18),
+    0 1px 0 rgb(255 255 255 / 0.04) inset;
 }
 .rail .tab[aria-selected="true"]::before {
   content: "";
   position: absolute;
-  left: -0.8rem;
-  top: 22%;
-  bottom: 22%;
+  left: -0.9rem;
+  top: 50%;
+  translate: 0 -50%;
   width: 3px;
+  height: 52%;
   border-radius: 3px;
   background: linear-gradient(180deg, var(--lime), var(--mint));
-  box-shadow: 0 0 12px rgb(212 247 74 / 0.55);
+  box-shadow: 0 0 14px rgb(217 247 92 / 0.6);
+  animation: rail-ind-in 0.3s var(--ease-spring);
+}
+@keyframes rail-ind-in {
+  from {
+    scale: 1 0;
+  }
+  to {
+    scale: 1 1;
+  }
 }
 .rail .tab[aria-selected="true"] b {
   color: var(--lime);
@@ -319,11 +382,11 @@ button {
   gap: 0.4rem;
 }
 .rail-foot span {
-  font-size: 0.68rem;
+  font-size: 0.66rem;
   text-transform: uppercase;
-  letter-spacing: 0.14em;
+  letter-spacing: 0.16em;
   color: var(--text-3);
-  padding-inline: 0.9rem;
+  padding-inline: 0.95rem;
 }
 .rail-foot #logout {
   text-align: left;
@@ -338,51 +401,54 @@ button {
 /* ———————————————————————————————————————— workspace */
 .workspace {
   grid-area: work;
-  padding: 1.6rem 1.8rem 2.4rem;
+  padding: 1.7rem 1.9rem 2.6rem;
   min-width: 0;
   max-width: 100%;
-  animation: workspace-in 0.38s cubic-bezier(0.22, 1, 0.36, 1);
+  animation: workspace-in 0.45s var(--ease-out);
 }
 @keyframes workspace-in {
   from {
     opacity: 0;
-    transform: translateY(8px);
+    transform: translateY(10px);
+    filter: blur(3px);
   }
   to {
     opacity: 1;
     transform: none;
+    filter: blur(0);
   }
 }
 .host-message {
   margin: 0 0 1rem;
   padding: 0.8rem 1.1rem;
-  border: 1px solid rgb(255 209 102 / 0.3);
+  border: 1px solid rgb(255 209 102 / 0.32);
   border-left-width: 3px;
   border-radius: 12px;
   color: #f2dfa8;
   background: rgb(255 209 102 / 0.07);
   font-size: 0.9rem;
+  animation: workspace-in 0.35s var(--ease-out);
 }
 .workspace-head {
   display: flex;
   align-items: end;
   justify-content: space-between;
-  margin-bottom: 1.3rem;
+  margin-bottom: 1.4rem;
   gap: 1rem;
 }
 .workspace-head h1 {
-  margin: 0.15rem 0 0;
-  font-size: clamp(1.8rem, 1.4rem + 1.2vw, 2.4rem);
-  line-height: 1.05;
-  font-weight: 780;
-  letter-spacing: -0.035em;
-  background: linear-gradient(120deg, var(--text-1) 40%, var(--text-2));
+  margin: 0.2rem 0 0;
+  font-size: clamp(1.9rem, 1.4rem + 1.3vw, 2.5rem);
+  line-height: 1.02;
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  background: linear-gradient(115deg, #ffffff 35%, #b9cdc6 80%);
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
 }
 .workspace-head slatefs-volume-picker {
-  width: min(24rem, 45vw);
+  width: min(25rem, 45vw);
 }
 .workspace-actions {
   display: flex;
@@ -395,29 +461,31 @@ button {
   white-space: nowrap;
 }
 #return-live {
-  border: 1px solid rgb(212 247 74 / 0.35);
-  background: rgb(212 247 74 / 0.1);
+  border: 1px solid rgb(217 247 92 / 0.38);
+  background: rgb(217 247 92 / 0.1);
   color: var(--lime);
-  border-radius: 10px;
-  padding: 0.5rem 0.95rem;
+  border-radius: 999px;
+  padding: 0.5rem 1rem;
   min-height: 2.4rem;
-  font-weight: 650;
+  font-weight: 640;
   font-size: 0.88rem;
   cursor: pointer;
   transition:
     background 0.18s ease,
-    box-shadow 0.18s ease;
+    box-shadow 0.18s ease,
+    transform 0.18s var(--ease-spring);
 }
 #return-live:hover {
-  background: rgb(212 247 74 / 0.18);
-  box-shadow: 0 0 18px -4px rgb(212 247 74 / 0.4);
+  background: rgb(217 247 92 / 0.18);
+  box-shadow: 0 0 22px -4px rgb(217 247 92 / 0.45);
+  transform: translateY(-1px);
 }
 .eyebrow {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.55rem;
   font-size: 0.68rem;
-  letter-spacing: 0.18em;
+  letter-spacing: 0.2em;
   font-weight: 800;
   color: var(--mint);
   margin: 0;
@@ -425,7 +493,7 @@ button {
 }
 .eyebrow::before {
   content: "";
-  width: 1.4rem;
+  width: 1.5rem;
   height: 1px;
   background: linear-gradient(90deg, var(--mint), transparent);
 }
@@ -433,7 +501,7 @@ button {
 /* ———————————————————————————————————————— panels & surfaces */
 .panel {
   display: none;
-  gap: 1.1rem;
+  gap: 1.15rem;
   width: 100%;
   min-width: 0;
   max-width: 100%;
@@ -468,7 +536,31 @@ button {
   grid-template-columns: minmax(0, 62rem);
 }
 
-/* every web component becomes a glass card */
+/* stagger card entrance when a panel becomes active */
+.panel.active > * {
+  animation: card-in 0.5s var(--ease-out) backwards;
+}
+.panel.active > *:nth-child(2) {
+  animation-delay: 0.06s;
+}
+.panel.active > *:nth-child(3) {
+  animation-delay: 0.12s;
+}
+.panel.active > *:nth-child(4) {
+  animation-delay: 0.18s;
+}
+@keyframes card-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.995);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* every web component becomes a floating glass card */
 slatefs-file-explorer,
 slatefs-file-preview,
 slatefs-file-properties,
@@ -480,31 +572,37 @@ slatefs-branch-manager,
 slatefs-restore-dialog,
 slatefs-repository-tools {
   background: linear-gradient(
-    180deg,
-    rgb(22 32 38 / 0.66),
-    rgb(16 23 27 / 0.72)
+    165deg,
+    rgb(19 29 35 / 0.72),
+    rgb(13 20 24 / 0.78)
   );
   border: 1px solid var(--line-soft);
   border-radius: var(--slatefs-radius);
   box-shadow:
-    0 1px 0 rgb(255 255 255 / 0.04) inset,
-    0 24px 48px -24px rgb(0 0 0 / 0.55);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+    0 1px 0 rgb(255 255 255 / 0.05) inset,
+    0 30px 60px -30px rgb(0 0 0 / 0.65);
+  backdrop-filter: blur(14px) saturate(1.25);
+  -webkit-backdrop-filter: blur(14px) saturate(1.25);
   overflow: hidden;
   transition:
-    border-color 0.22s ease,
-    box-shadow 0.22s ease,
-    transform 0.22s ease;
+    border-color 0.24s ease,
+    box-shadow 0.24s ease,
+    transform 0.24s var(--ease-out);
 }
 slatefs-file-explorer:hover,
+slatefs-file-preview:hover,
+slatefs-file-properties:hover,
 slatefs-snapshot-manager:hover,
 slatefs-version-status:hover,
 slatefs-version-history:hover,
 slatefs-diff-viewer:hover,
 slatefs-branch-manager:hover,
 slatefs-repository-tools:hover {
-  border-color: #26363f;
+  border-color: #283a44;
+  box-shadow:
+    0 1px 0 rgb(255 255 255 / 0.06) inset,
+    0 34px 70px -30px rgb(0 0 0 / 0.7);
+  transform: translateY(-1px);
 }
 slatefs-file-explorer:focus-within,
 slatefs-file-preview:focus-within,
@@ -512,11 +610,11 @@ slatefs-snapshot-manager:focus-within,
 slatefs-version-history:focus-within,
 slatefs-diff-viewer:focus-within,
 slatefs-branch-manager:focus-within {
-  border-color: rgb(141 216 187 / 0.45);
+  border-color: rgb(147 220 190 / 0.5);
   box-shadow:
     0 1px 0 rgb(255 255 255 / 0.05) inset,
-    0 0 0 3px rgb(141 216 187 / 0.08),
-    0 24px 48px -24px rgb(0 0 0 / 0.55);
+    0 0 0 3px rgb(147 220 190 / 0.09),
+    0 30px 60px -30px rgb(0 0 0 / 0.65);
 }
 
 /* shadow-DOM part hooks (styled from outside, safely) */
@@ -530,19 +628,42 @@ slatefs-diff-viewer::part(toolbar),
 slatefs-branch-manager::part(toolbar),
 slatefs-repository-tools::part(toolbar),
 slatefs-volume-picker::part(toolbar) {
-  background: rgb(255 255 255 / 0.02);
+  background: rgb(255 255 255 / 0.025);
+  border-bottom: 1px solid var(--line-soft);
 }
 slatefs-file-explorer::part(breadcrumb) {
-  background: rgb(6 9 11 / 0.35);
+  background: rgb(5 8 10 / 0.45);
+  border-bottom: 1px solid var(--line-soft);
 }
 slatefs-file-preview::part(text),
 slatefs-file-preview::part(editor) {
   background: var(--ink-1);
-  color: #d7e7e1;
+  color: #d9e9e3;
 }
 slatefs-file-preview::part(preview),
 slatefs-file-properties::part(metadata) {
   background: transparent;
+}
+
+/* semantic accents inside components */
+slatefs-diff-viewer::part(addition) {
+  background: rgb(95 232 192 / 0.07);
+  box-shadow: inset 3px 0 rgb(95 232 192 / 0.6);
+}
+slatefs-diff-viewer::part(deletion) {
+  background: rgb(255 122 144 / 0.06);
+  box-shadow: inset 3px 0 rgb(255 122 144 / 0.55);
+}
+slatefs-version-status::part(change-row),
+slatefs-version-history::part(commit-row),
+slatefs-snapshot-manager::part(snapshot-row),
+slatefs-file-explorer::part(row) {
+  transition: background 0.16s ease;
+}
+slatefs-version-status::part(change-row):hover,
+slatefs-version-history::part(commit-row):hover,
+slatefs-snapshot-manager::part(snapshot-row):hover {
+  background: rgb(255 255 255 / 0.028);
 }
 
 .inspector {
@@ -554,42 +675,48 @@ slatefs-file-properties::part(metadata) {
   display: grid;
   grid-template-rows: auto 1fr;
   align-content: start;
-  gap: 1.1rem;
+  gap: 1.15rem;
 }
 .inspector-tabs {
   display: flex;
   gap: 0.35rem;
   padding: 0.35rem;
   border: 1px solid var(--line-soft);
-  border-radius: 12px;
-  background: rgb(16 23 27 / 0.7);
+  border-radius: 13px;
+  background: rgb(13 20 24 / 0.75);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
   width: fit-content;
+  box-shadow: 0 1px 0 rgb(255 255 255 / 0.04) inset;
 }
 .inspector-tabs button {
   border: 0;
   background: transparent;
   color: var(--text-3);
-  padding: 0.5rem 1.05rem;
+  padding: 0.5rem 1.1rem;
   min-height: 2.1rem;
   border-radius: 9px;
   font-size: 0.86rem;
-  font-weight: 620;
+  font-weight: 600;
   cursor: pointer;
   transition:
     background 0.18s ease,
-    color 0.18s ease;
+    color 0.18s ease,
+    box-shadow 0.18s ease;
 }
 .inspector-tabs button:hover {
   color: var(--text-1);
 }
 .inspector-tabs button[aria-selected="true"] {
-  background: rgb(212 247 74 / 0.14);
+  background: rgb(217 247 92 / 0.14);
   color: var(--lime);
-  box-shadow: inset 0 0 0 1px rgb(212 247 74 / 0.2);
+  box-shadow:
+    inset 0 0 0 1px rgb(217 247 92 / 0.22),
+    0 2px 10px -4px rgb(217 247 92 / 0.35);
 }
 .stack {
   display: grid;
-  gap: 1.1rem;
+  gap: 1.15rem;
   align-content: start;
 }
 .panel > slatefs-file-explorer,
@@ -629,23 +756,23 @@ slatefs-file-properties::part(metadata) {
   max-height: min(32rem, calc(100vh - 2rem));
   overflow: auto;
   z-index: 10;
-  padding: 0.85rem 1rem;
+  padding: 0.9rem 1.05rem;
   border: 1px solid var(--line);
-  border-radius: 16px;
+  border-radius: 18px;
   color: var(--text-1);
-  background: rgb(16 23 27 / 0.92);
-  backdrop-filter: blur(20px) saturate(1.3);
-  -webkit-backdrop-filter: blur(20px) saturate(1.3);
+  background: rgb(13 20 24 / 0.9);
+  backdrop-filter: blur(24px) saturate(1.5);
+  -webkit-backdrop-filter: blur(24px) saturate(1.5);
   box-shadow:
-    0 0 0 1px rgb(255 255 255 / 0.03) inset,
-    0 24px 60px -12px rgb(0 0 0 / 0.75);
-  animation: drawer-in 0.28s cubic-bezier(0.22, 1, 0.36, 1);
+    0 0 0 1px rgb(255 255 255 / 0.04) inset,
+    0 30px 70px -14px rgb(0 0 0 / 0.8);
+  animation: drawer-in 0.35s var(--ease-spring);
   font-size: 0.9rem;
 }
 @keyframes drawer-in {
   from {
     opacity: 0;
-    transform: translateY(14px) scale(0.985);
+    transform: translateY(18px) scale(0.97);
   }
   to {
     opacity: 1;
@@ -669,11 +796,12 @@ slatefs-file-properties::part(metadata) {
   letter-spacing: -0.01em;
 }
 .operation-drawer header > span {
-  font-size: 0.75rem;
+  font-size: 0.74rem;
+  font-weight: 650;
   color: var(--mint);
   background: rgb(95 232 192 / 0.1);
-  border: 1px solid rgb(95 232 192 / 0.2);
-  padding: 0.15rem 0.55rem;
+  border: 1px solid rgb(95 232 192 / 0.22);
+  padding: 0.18rem 0.6rem;
   border-radius: 999px;
 }
 .operation-drawer ul {
@@ -684,7 +812,7 @@ slatefs-file-properties::part(metadata) {
 .operation-drawer li {
   flex-wrap: wrap;
   border-top: 1px solid var(--line-soft);
-  padding: 0.6rem 0;
+  padding: 0.65rem 0;
 }
 .operation-drawer li > span:first-child {
   flex: 1 1 12rem;
@@ -715,7 +843,7 @@ slatefs-file-properties::part(metadata) {
 }
 .operation-drawer progress {
   max-width: 7rem;
-  height: 0.45rem;
+  height: 0.4rem;
   appearance: none;
   border: 0;
   border-radius: 99px;
@@ -729,6 +857,7 @@ slatefs-file-properties::part(metadata) {
 .operation-drawer progress::-webkit-progress-value {
   background: linear-gradient(90deg, var(--mint), var(--lime));
   border-radius: 99px;
+  box-shadow: 0 0 8px rgb(95 232 192 / 0.5);
 }
 .operation-drawer progress::-moz-progress-bar {
   background: linear-gradient(90deg, var(--mint), var(--lime));
@@ -742,7 +871,24 @@ slatefs-file-properties::part(metadata) {
   display: grid;
   grid-template-columns: minmax(24rem, 1.05fr) 1fr;
   background: var(--ink-0);
-  animation: workspace-in 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.login > * {
+  animation: login-rise 0.65s var(--ease-out) backwards;
+}
+.login-art {
+  animation-delay: 0.1s;
+}
+@keyframes login-rise {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+    filter: blur(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+    filter: blur(0);
+  }
 }
 .login-card {
   align-self: center;
@@ -751,19 +897,30 @@ slatefs-file-properties::part(metadata) {
   padding: 3rem 3.2rem;
 }
 .brand-mark {
-  width: 3rem;
-  height: 3rem;
-  border-radius: 14px;
-  font-size: 1.5rem;
-  margin-bottom: 1.6rem;
+  width: 3.1rem;
+  height: 3.1rem;
+  border-radius: 15px;
+  font-size: 1.55rem;
+  margin-bottom: 1.7rem;
+  animation: brand-pop 0.7s var(--ease-spring) 0.15s backwards;
+}
+@keyframes brand-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.7) rotate(-8deg);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 .login-card h1 {
-  font-size: clamp(2.6rem, 4.6vw, 4.2rem);
-  line-height: 0.98;
-  font-weight: 800;
-  letter-spacing: -0.045em;
-  margin: 0.6rem 0 1.2rem;
-  background: linear-gradient(115deg, #ffffff 30%, #9db8b0 75%, #5fe8c0 110%);
+  font-size: clamp(2.7rem, 4.8vw, 4.3rem);
+  line-height: 0.97;
+  font-weight: 820;
+  letter-spacing: -0.05em;
+  margin: 0.65rem 0 1.25rem;
+  background: linear-gradient(112deg, #ffffff 28%, #a9c4bb 68%, #5fe8c0 108%);
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
@@ -771,18 +928,18 @@ slatefs-file-properties::part(metadata) {
 .lede {
   color: var(--text-2);
   font-size: 1.06rem;
-  line-height: 1.6;
+  line-height: 1.62;
   max-width: 30rem;
 }
 .login fieldset {
   border: 0;
   padding: 0;
-  margin: 2.4rem 0 1.2rem;
+  margin: 2.5rem 0 1.2rem;
 }
 .login legend {
   font-size: 0.72rem;
   font-weight: 800;
-  letter-spacing: 0.16em;
+  letter-spacing: 0.18em;
   text-transform: uppercase;
   color: var(--text-3);
   margin-bottom: 0.9rem;
@@ -795,27 +952,40 @@ slatefs-file-properties::part(metadata) {
   text-align: left;
   align-items: center;
   border: 1px solid var(--line-soft);
-  background: linear-gradient(180deg, rgb(22 32 38 / 0.5), rgb(16 23 27 / 0.6));
+  background: linear-gradient(
+    165deg,
+    rgb(19 29 35 / 0.6),
+    rgb(13 20 24 / 0.68)
+  );
   color: var(--text-1);
-  padding: 0.95rem 1.1rem;
-  border-radius: 14px;
-  margin: 0.6rem 0;
+  padding: 0.95rem 1.15rem;
+  border-radius: 16px;
+  margin: 0.65rem 0;
   cursor: pointer;
+  box-shadow: 0 1px 0 rgb(255 255 255 / 0.04) inset;
   transition:
-    border-color 0.2s ease,
-    box-shadow 0.2s ease,
-    transform 0.2s cubic-bezier(0.22, 1, 0.36, 1),
-    background 0.2s ease;
+    border-color 0.22s ease,
+    box-shadow 0.22s ease,
+    transform 0.22s var(--ease-spring),
+    background 0.22s ease;
+  animation: login-rise 0.6s var(--ease-out) backwards;
+}
+.account:nth-of-type(1) {
+  animation-delay: 0.25s;
+}
+.account:nth-of-type(2) {
+  animation-delay: 0.34s;
 }
 .account:hover {
-  border-color: rgb(212 247 74 / 0.4);
+  border-color: rgb(217 247 92 / 0.45);
   box-shadow:
-    0 0 0 1px rgb(212 247 74 / 0.12),
-    0 16px 40px -18px rgb(212 247 74 / 0.35);
+    0 0 0 1px rgb(217 247 92 / 0.14),
+    0 1px 0 rgb(255 255 255 / 0.05) inset,
+    0 20px 44px -18px rgb(217 247 92 / 0.38);
   transform: translateY(-2px);
 }
 .account:active {
-  transform: translateY(0);
+  transform: translateY(0) scale(0.99);
   transition-duration: 0.05s;
 }
 .account small,
@@ -835,11 +1005,11 @@ slatefs-file-properties::part(metadata) {
   color: var(--text-3);
   font-size: 1.15rem;
   transition:
-    transform 0.2s cubic-bezier(0.22, 1, 0.36, 1),
+    transform 0.24s var(--ease-spring),
     color 0.2s ease;
 }
 .account:hover .go {
-  transform: translateX(4px);
+  transform: translateX(5px);
   color: var(--lime);
 }
 .avatar {
@@ -847,20 +1017,20 @@ slatefs-file-properties::part(metadata) {
   place-items: center;
   width: 3rem;
   height: 3rem;
-  border-radius: 12px;
+  border-radius: 13px;
   font-weight: 850;
   font-size: 1.15rem;
   letter-spacing: -0.02em;
 }
 .alice {
-  background: linear-gradient(135deg, #d4f74a, #5fe8c0);
-  color: #0c1410;
-  box-shadow: 0 6px 20px -6px rgb(95 232 192 / 0.5);
+  background: linear-gradient(135deg, #d9f75c, #5fe8c0);
+  color: #0a120e;
+  box-shadow: 0 8px 22px -8px rgb(95 232 192 / 0.55);
 }
 .bob {
   background: linear-gradient(135deg, #ffd166, #ff9e7a);
   color: #221304;
-  box-shadow: 0 6px 20px -6px rgb(255 209 102 / 0.45);
+  box-shadow: 0 8px 22px -8px rgb(255 209 102 / 0.5);
 }
 .login [role="status"] {
   min-height: 1.4rem;
@@ -873,7 +1043,7 @@ slatefs-file-properties::part(metadata) {
   line-height: 1.55;
   color: var(--text-3);
   border-top: 1px solid var(--line-soft);
-  padding-top: 1.2rem;
+  padding-top: 1.25rem;
   max-width: 30rem;
 }
 .login-art {
@@ -882,19 +1052,37 @@ slatefs-file-properties::part(metadata) {
   display: grid;
   place-items: center;
   color: var(--text-1);
-  background:
-    radial-gradient(
-      40rem 30rem at 70% 20%,
-      rgb(95 232 192 / 0.12),
-      transparent 60%
-    ),
-    radial-gradient(
-      34rem 30rem at 20% 85%,
-      rgb(110 198 255 / 0.1),
-      transparent 62%
-    ),
-    linear-gradient(160deg, #0b1216, #06090b 70%);
+  background: linear-gradient(158deg, #0a1115, #05080a 72%);
   border-left: 1px solid var(--line-soft);
+}
+/* aurora field — layered, slowly breathing radial washes */
+.login-art::before {
+  content: "";
+  position: absolute;
+  inset: -20%;
+  background:
+    radial-gradient(38% 30% at 68% 22%, rgb(95 232 192 / 0.2), transparent 70%),
+    radial-gradient(
+      34% 30% at 20% 80%,
+      rgb(110 198 255 / 0.17),
+      transparent 70%
+    ),
+    radial-gradient(
+      26% 22% at 86% 76%,
+      rgb(217 247 92 / 0.12),
+      transparent 72%
+    ),
+    radial-gradient(30% 26% at 34% 28%, rgb(147 220 190 / 0.1), transparent 70%);
+  filter: blur(30px);
+  animation: aurora-drift 22s ease-in-out infinite alternate;
+}
+@keyframes aurora-drift {
+  from {
+    transform: translate3d(-2.5%, -1.5%, 0) scale(1);
+  }
+  to {
+    transform: translate3d(2.5%, 2%, 0) scale(1.06);
+  }
 }
 .login-art::after {
   content: "";
@@ -912,14 +1100,14 @@ slatefs-file-properties::part(metadata) {
   margin: 0;
   padding: 0 2rem;
   font-size: clamp(1.9rem, 3.4vw, 3.4rem);
-  line-height: 1.32;
-  font-weight: 760;
+  line-height: 1.3;
+  font-weight: 780;
   letter-spacing: -0.035em;
-  text-shadow: 0 8px 40px rgb(0 0 0 / 0.6);
+  text-shadow: 0 10px 44px rgb(0 0 0 / 0.65);
 }
 .login-art p span {
   color: transparent;
-  -webkit-text-stroke: 1px rgb(169 188 182 / 0.55);
+  -webkit-text-stroke: 1px rgb(164 184 178 / 0.5);
   font-weight: 720;
 }
 .strata {
@@ -939,24 +1127,24 @@ slatefs-file-properties::part(metadata) {
 }
 .strata i {
   display: block;
-  height: 17%;
-  border: 1.5px solid rgb(212 247 74 / 0.28);
+  height: 15%;
+  border: 1px solid rgb(217 247 92 / 0.2);
   border-radius: 50%;
-  margin: -1.5%;
+  margin: -2.5%;
   transform: skewX(-15deg);
-  box-shadow: 0 0 42px -8px rgb(212 247 74 / 0.25);
+  box-shadow: 0 0 40px -10px rgb(217 247 92 / 0.18);
   animation: strata-glow 7s ease-in-out infinite;
 }
 .strata i:nth-child(2) {
-  border-color: rgb(95 232 192 / 0.3);
+  border-color: rgb(95 232 192 / 0.22);
   animation-delay: -1.8s;
 }
 .strata i:nth-child(3) {
-  border-color: rgb(110 198 255 / 0.26);
+  border-color: rgb(110 198 255 / 0.19);
   animation-delay: -3.6s;
 }
 .strata i:nth-child(4) {
-  border-color: rgb(212 247 74 / 0.18);
+  border-color: rgb(217 247 92 / 0.12);
   animation-delay: -5.4s;
 }
 @keyframes strata-glow {
@@ -1042,7 +1230,7 @@ slatefs-file-properties::part(metadata) {
     padding: 0.4rem;
     border-right: 0;
     border-top: 1px solid var(--line-soft);
-    background: rgb(10 15 18 / 0.9);
+    background: rgb(8 13 16 / 0.92);
     backdrop-filter: blur(18px);
     -webkit-backdrop-filter: blur(18px);
   }
@@ -1074,6 +1262,7 @@ slatefs-file-properties::part(metadata) {
     bottom: 0.15rem;
     width: auto;
     height: 2.5px;
+    translate: none;
   }
   .rail-foot {
     display: none;

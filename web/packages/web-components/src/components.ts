@@ -225,15 +225,34 @@ export class SlateFsVolumePicker extends SlateFsElement<
         ? html`<div class="body split" part="quota">
             ${(() => {
               const v = this.volumes.find((x) => x.name === this.volume);
-              return v
-                ? html`<span class="badge" part="kind-badge">${v.kind}</span
-                    ><span class="muted"
-                      >${fmtBytes(v.quota.used_bytes)}
-                      used${v.quota.limit_bytes === null
-                        ? ""
-                        : ` of ${fmtBytes(v.quota.limit_bytes)}`}</span
-                    >`
-                : nothing;
+              if (!v) return nothing;
+              const used = Number(v.quota.used_bytes ?? 0);
+              const limit =
+                v.quota.limit_bytes === null
+                  ? null
+                  : Number(v.quota.limit_bytes);
+              const ratio =
+                limit && Number.isFinite(used) && limit > 0
+                  ? Math.min(1, used / limit)
+                  : null;
+              return html`<span class="badge" part="kind-badge">${v.kind}</span
+                ><span class="muted grow"
+                  >${fmtBytes(v.quota.used_bytes)}
+                  used${v.quota.limit_bytes === null
+                    ? ""
+                    : ` of ${fmtBytes(v.quota.limit_bytes)}`}</span
+                >${ratio === null
+                  ? nothing
+                  : html`<span
+                      class="quota-meter"
+                      part="quota-meter"
+                      role="meter"
+                      aria-valuemin="0"
+                      aria-valuemax="100"
+                      aria-valuenow=${Math.round(ratio * 100)}
+                      aria-label="Quota used"
+                      ><i style="inline-size: ${(ratio * 100).toFixed(1)}%"></i
+                    ></span>`}`;
             })()}
           </div>`
         : nothing}
@@ -274,14 +293,22 @@ export class SlateFsFileExplorer extends SlateFsElement<ExplorerClient> {
         padding: 0.55rem 0.75rem;
         border-bottom: 1px solid var(--_border);
         display: flex;
-        gap: 0.2rem;
+        gap: 0.25rem;
         overflow: auto;
+        align-items: center;
+        color: var(--_muted);
+        font-size: 0.85rem;
       }
       .crumbs button {
         border: 0;
-        padding: 0.2rem;
+        padding: 0.2rem 0.35rem;
         background: transparent;
         color: var(--_accent);
+        border-radius: 6px;
+        min-height: 0;
+      }
+      .crumbs button:hover {
+        background: color-mix(in srgb, var(--_accent) 12%, transparent);
       }
       .table {
         display: grid;
@@ -302,23 +329,54 @@ export class SlateFsFileExplorer extends SlateFsElement<ExplorerClient> {
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
+        transition: background 0.14s ease;
       }
       .head .cell {
         position: sticky;
         top: 0;
         background: var(--_subtle-bg);
         z-index: 1;
-        font-size: 0.78rem;
-        font-weight: 700;
+        font-size: 0.72rem;
+        font-weight: 750;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--_muted);
+      }
+      .entry:hover .cell {
+        background: color-mix(in srgb, var(--_selected-bg) 45%, transparent);
       }
       .entry[aria-selected="true"] .cell {
         background: var(--_selected-bg);
+      }
+      .entry[aria-selected="true"] .cell:first-child {
+        box-shadow: inset 3px 0
+          color-mix(in srgb, var(--_accent) 75%, transparent);
+      }
+      .entry[aria-selected="true"]:hover .cell {
+        background: color-mix(
+          in srgb,
+          var(--_selected-bg) 82%,
+          var(--_accent) 18%
+        );
       }
       .entry.focused .cell {
         box-shadow: inset 3px 0 var(--_accent);
       }
       .name {
         font-weight: 600;
+        display: flex;
+        align-items: center;
+        gap: 0.55rem;
+      }
+      .entry-icon {
+        flex: 0 0 auto;
+        width: 1rem;
+        height: 1rem;
+        color: var(--_muted);
+      }
+      .entry[aria-selected="true"] .entry-icon,
+      .entry:hover .entry-icon {
+        color: var(--_accent);
       }
       .drop {
         outline: 3px dashed var(--_accent);
@@ -1204,11 +1262,26 @@ export class SlateFsFileExplorer extends SlateFsElement<ExplorerClient> {
                   @keydown=${(e: KeyboardEvent) => this.key(e, i)}
                 >
                   <div class="cell name" role="gridcell">
-                    ${entry.kind === "directory"
-                      ? "▰"
-                      : entry.kind === "symlink"
-                        ? "↗"
-                        : "▤"}
+                    <svg
+                      class="entry-icon"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.7"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      ${entry.kind === "directory"
+                        ? html`<path
+                            d="M3 7a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"
+                          />`
+                        : entry.kind === "symlink"
+                          ? html`<path d="M7 17 17 7" /><path d="M9 7h8v8" />`
+                          : html`<path
+                                d="M6 3h8l4 4v13a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z"
+                              /><path d="M14 3v4h4" />`}
+                    </svg>
                     ${displayEntryName(entry)}<span class="mobile"
                       >${entry.kind} · ${fmtBytes(entry.size)} ·
                       ${date(entry.modified_at)}</span
@@ -2618,12 +2691,26 @@ export class SlateFsBranchManager extends SlateFsElement<BranchClient> {
         gap: 0.5rem;
         max-width: 100%;
         border: 1px solid var(--_border);
-        border-radius: 10px;
+        border-radius: 12px;
         background: var(--slatefs-color-control, #fff);
+        transition:
+          border-color 0.18s ease,
+          box-shadow 0.18s ease,
+          transform 0.18s ease;
+      }
+      .branch-row:hover {
+        border-color: color-mix(
+          in srgb,
+          var(--_border) 50%,
+          var(--_accent) 50%
+        );
+        transform: translateY(-1px);
       }
       .branch-row.target {
         border-color: var(--_accent);
-        box-shadow: inset 0 0 0 1px var(--_accent);
+        box-shadow:
+          inset 0 0 0 1px var(--_accent),
+          0 6px 18px -10px var(--_accent);
       }
       .branch-row.source {
         background: var(--slatefs-color-source, #f4f8ff);

@@ -317,6 +317,9 @@
             },
             {
               "name": "kind-badge"
+            },
+            {
+              "name": "quota-meter"
             }
           ],
           "cssProperties": [
@@ -413,7 +416,7 @@
               "type": {
                 "text": "\"fail\" | \"overwrite\" | \"keep_both\" | \"skip\""
               },
-              "default": "\"fail\"",
+              "default": "\"keep_both\"",
               "attribute": "conflict-policy"
             },
             {
@@ -618,7 +621,7 @@
               "type": {
                 "text": "\"fail\" | \"overwrite\" | \"keep_both\" | \"skip\""
               },
-              "default": "\"fail\"",
+              "default": "\"keep_both\"",
               "fieldName": "conflictPolicy"
             },
             {

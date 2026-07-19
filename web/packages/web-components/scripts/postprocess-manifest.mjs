@@ -77,7 +77,7 @@ const eventTypes = {
 const metadata = {
   SlateFsVolumePicker: {
     events: ["slatefs-volume-change"],
-    parts: ["select", "option", "quota", "kind-badge"],
+    parts: ["select", "option", "quota", "kind-badge", "quota-meter"],
   },
   SlateFsFileExplorer: {
     events: [

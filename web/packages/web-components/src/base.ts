@@ -88,12 +88,14 @@ export abstract class SlateFsElement<Client extends object> extends LitElement {
       align-items: center;
       gap: 0.5rem;
       min-height: 3rem;
-      padding: 0.55rem 0.7rem;
+      padding: 0.55rem 0.75rem;
       border-bottom: 1px solid var(--_border);
       flex-wrap: wrap;
     }
     h2 {
-      font-size: 0.98rem;
+      font-size: 0.95rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
       margin: 0 auto 0 0;
     }
     button,
@@ -107,40 +109,74 @@ export abstract class SlateFsElement<Client extends object> extends LitElement {
       border: 1px solid var(--_border);
       background: var(--_control-bg);
       color: var(--_control-text);
-      border-radius: 8px;
+      border-radius: 9px;
       min-height: 2.25rem;
-      padding: 0.4rem 0.7rem;
+      padding: 0.4rem 0.75rem;
       cursor: pointer;
+      box-shadow: 0 1px 0 rgb(255 255 255 / 0.04) inset;
       transition:
         border-color 0.16s ease,
         background 0.16s ease,
-        box-shadow 0.16s ease;
+        box-shadow 0.16s ease,
+        transform 0.12s ease;
     }
     button:hover {
       border-color: var(--_accent);
+      background: color-mix(
+        in srgb,
+        var(--_control-bg) 82%,
+        var(--_accent) 18%
+      );
+    }
+    button:active {
+      transform: scale(0.97);
     }
     button:disabled {
       cursor: not-allowed;
       opacity: 0.48;
     }
     button.primary {
-      background: var(--_accent);
-      border-color: var(--_accent);
+      background: linear-gradient(
+        135deg,
+        var(--_accent),
+        color-mix(in srgb, var(--_accent) 72%, #5fe8c0 28%)
+      );
+      border-color: transparent;
       color: var(--_accent-contrast);
-      font-weight: 650;
+      font-weight: 680;
+      box-shadow:
+        0 0 0 1px color-mix(in srgb, var(--_accent) 40%, transparent),
+        0 6px 18px -8px var(--_accent);
     }
     button.primary:hover {
-      box-shadow: 0 4px 16px -6px var(--_accent);
+      box-shadow:
+        0 0 0 1px color-mix(in srgb, var(--_accent) 55%, transparent),
+        0 8px 22px -6px var(--_accent);
     }
     input,
     select,
     textarea {
       border: 1px solid var(--_border);
-      border-radius: 8px;
+      border-radius: 9px;
       padding: 0.45rem 0.6rem;
       min-height: 2.25rem;
       background: var(--_control-bg);
       color: var(--_control-text);
+      box-shadow: 0 1px 0 rgb(255 255 255 / 0.03) inset;
+      transition:
+        border-color 0.16s ease,
+        box-shadow 0.16s ease;
+    }
+    input:hover,
+    select:hover,
+    textarea:hover {
+      border-color: color-mix(in srgb, var(--_border) 55%, var(--_accent) 45%);
+    }
+    input:focus,
+    select:focus,
+    textarea:focus {
+      border-color: var(--_accent);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--_accent) 18%, transparent);
     }
     textarea {
       width: 100%;
@@ -170,10 +206,34 @@ export abstract class SlateFsElement<Client extends object> extends LitElement {
     }
     .badge {
       display: inline-flex;
+      align-items: center;
       border-radius: 999px;
       background: var(--_subtle-bg);
-      padding: 0.15rem 0.5rem;
-      font-size: 0.78rem;
+      border: 1px solid color-mix(in srgb, var(--_border) 80%, transparent);
+      padding: 0.16rem 0.55rem;
+      font-size: 0.76rem;
+      font-weight: 620;
+      letter-spacing: 0.01em;
+    }
+    .quota-meter {
+      flex: 0 0 auto;
+      inline-size: 5.5rem;
+      block-size: 0.4rem;
+      border-radius: 99px;
+      background: color-mix(in srgb, var(--_subtle-bg) 80%, black 20%);
+      overflow: hidden;
+      box-shadow: 0 0 0 1px color-mix(in srgb, var(--_border) 70%, transparent);
+    }
+    .quota-meter > i {
+      display: block;
+      block-size: 100%;
+      border-radius: 99px;
+      background: linear-gradient(
+        90deg,
+        color-mix(in srgb, var(--_accent) 70%, #5fe8c0 30%),
+        var(--_accent)
+      );
+      transition: inline-size 0.5s cubic-bezier(0.22, 1, 0.36, 1);
     }
     .body {
       padding: 0.75rem;
